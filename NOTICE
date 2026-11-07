@@ -1,0 +1,76 @@
+mgpu —— 把游戏渲染卡与帧生成卡拆到两块 GPU 上
+Copyright (C) 2026 bilibili夕阳虹舞
+
+本仓库整体以 GNU General Public License v3.0（或任何更新版本）发布，
+全文见仓库根目录的 LICENSE。
+
+注意：第三方组件各自保留原有许可（见下）。GPL-3.0 与其中"专有许可"的
+组件（Intel XeSS SDK、NVIDIA DLSS SDK）**不兼容** —— 那些组件不在本仓库
+内分发，只在本地构建时使用，因此不构成本仓库的一部分。
+
+
+===============================================================================
+一、本仓库内包含的第三方代码
+===============================================================================
+
+1) OptiScaler                                        GPL-3.0
+   https://github.com/optiscaler/OptiScaler
+   （取用时的 master 快照，2026-11-06；许可全文 third_party/optiscaler/LICENSE）
+
+   - third_party/optiscaler/shaders/camera_motion/**    逐字保留的参考实现
+   - third_party/optiscaler/inputs/FG/**                逐字保留的参考实现
+   - src/xefg_dynamic_count.h                           **逐字移植**自
+        OptiScaler/framegen/xefg/XeFG_DynamicCount.h（用到它的开关是 --dyn-mfg）
+   - OptiScaler 的 Dynamic MFG 设计思路也影响了 --dyn-mfg 的接线方式
+
+   这几处是本仓库选择 GPL-3.0 的直接原因：OptiScaler 是 copyleft，
+   而 xefg_dynamic_count.h 被编译进了 bridge.exe。
+
+2) AMD FidelityFX SDK 1.1.4                              MIT
+   https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+   Copyright (C) 2024 Advanced Micro Devices, Inc.
+
+   - third_party/ffx/include/FidelityFX/**      （242 个头文件，含 v1.1.4 的 ffx_opticalflow.h）
+   - third_party/ffx/api/**                     （ffx_api 头文件 + 原许可证，见其中的 LICENSE.txt / SOURCE.txt）
+   - third_party/ffx/lib/ffx_opticalflow_x64.lib
+   - third_party/ffx/lib/ffx_backend_dx12_x64.lib
+     两个 .lib 由上述 SDK 源码编译而来（重建步骤见 docs/ops/BUILD.md）。
+
+3) Universal MFG Unlocker                                MIT
+   https://github.com/dashdogy/MFG-Unlocker  （作者 Michael Robles）
+   src/xefg_unlock.h 里那六个字节补丁的位置与改法出自它（含 "fg_keep_2x_model"
+   的做法）。本仓库只沿用了这些**事实性偏移量与改法**，没有拷贝它的代码。
+
+
+===============================================================================
+二、构建 / 运行期依赖 —— 不在本仓库内分发
+===============================================================================
+
+ReShade 6.8.0                        BSD-3-Clause   https://github.com/crosire/reshade
+  add-on 的宿主（ABI 必须与它对齐）。部署包里会带一份 ReShade64.dll，
+  因此发布二进制包时要同时附上它的 LICENSE.md。
+
+MinHook                              BSD-2-Clause   https://github.com/TsudaKageyu/minhook
+  add-on 用来钩 Present / upscaler 入口。
+
+Intel XeSS SDK 3.0.2                 Intel 专有许可  https://github.com/intel/xess
+  含 libxess_fg.dll / libxell.dll / libxess.dll。**本仓库不提交这些 DLL**
+  （.gitignore 已排除 third_party/xess/bin/），发布二进制包前必须先读它的
+  LICENSE.txt。见 docs/ops/LEGAL.md。
+
+NVIDIA DLSS SDK                      NVIDIA 专有许可
+  只作 DLSS 输入约定的参考，不参与编译。
+
+
+===============================================================================
+三、商标
+===============================================================================
+AMD、Radeon、FidelityFX、Intel、XeSS、NVIDIA、DLSS、RTX、ReShade 等名称与
+标识是其各自所有者的商标。本项目与上述公司无任何隶属或背书关系。
+
+
+===============================================================================
+四、游戏资产
+===============================================================================
+本仓库不含任何游戏的资产、反编译产物或补丁。docs/ 里提到的游戏名只用于
+说明"在哪款游戏上实测过"。
