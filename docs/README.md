@@ -43,12 +43,11 @@
 | 路径 | 内容 |
 |---|---|
 | [`findings/milestones/`](findings/milestones/) | M0–M4 各里程碑的步骤与结果（当时的结论，未必仍然成立） |
-| [`history/`](history/) | 立项初期的四份计划笔记 |
 | [`findings/ARCHIVED_EXPERIMENTS.md`](findings/ARCHIVED_EXPERIMENTS.md) | 已移除的历史实验脚本：每个当时的参数与结论 |
 
 ## 阅读提醒
 
-- `docs/findings/milestones/` 与 `history/` 是**历史记录**，里面有些结论后来被推翻了
+- `docs/findings/milestones/` 是**历史记录**，里面有些结论后来被推翻了
   （最典型的是"MV 是死输入"）。当前结论只看 `findings/CONCLUSIONS.md`。
 - 仓库里没有本机路径：看到 `<GAME_DIR>` / `<TOOLS_DIR>` 这类尖括号就是占位符，
   含义见 `ops/CONFIG.md` §1。

@@ -33,7 +33,7 @@ mgpu-<版本>/
 │   ├─ 4 - dump frames.bat        抓帧做离线分析（排障/对比用）
 │   ├─ bridge.exe             帧生成进程（真正干活的）
 │   ├─ mgpu_ui.exe            前端（选游戏窗口 / 开关 / 看状态）
-│   ├─ libxess_fg.dll, libxell.dll   XeSS 帧生成运行时
+│   ├─ libxess_fg.dll, libxell.dll   XeSS 帧生成运行时（**公开版包里不带**，见 §3.2）
 │   └─ game_capture.addon64   备用副本（正常安装走 game-pack/，这是给手动拷贝用的）
 ├─ game-pack/             ★ 游戏侧：装进游戏目录的那一半
 │   ├─ install.bat / uninstall.bat    拖 exe 即装 / 即卸
@@ -77,6 +77,22 @@ mgpu-<版本>/
 把整个 `bin\` 目录放到任意位置（例如 `D:\mgpu\bin`），**保持里面文件在同一层**：
 `bridge.exe` 与 `libxess_fg.dll` / `libxell.dll` 必须同目录，否则起不来。
 不需要管理员权限，不需要安装。
+
+#### 还差两个 Intel 的 DLL（公开版包不含）
+
+`libxess_fg.dll`（XeSS 帧生成）和 `libxell.dll`（低延迟）属于 **Intel**，
+按 Intel 自己的许可分发，**不能随本项目打包**。所以公开下载的包里它们不在了，
+你需要自己放进去（本目录里有个 `README-DLL.txt` 也是这段说明）：
+
+1. 取 **Intel XeSS SDK v3.0.2**：<https://github.com/intel/xess>（tag `v3.0.2`，
+   或任何 XeSS 3 SDK 的 `bin/` 目录）；
+2. 把 `bin\libxess_fg.dll` 和 `bin\libxell.dll` 拷到 `bin\` 里（与 `bridge.exe` 同一层）；
+3. 完事，双击 `0 - UI.bat` 或任一配方脚本。
+
+| 用途 | 版本要求 |
+|---|---|
+| 2x（`--interp 1`） | 任意 1.3.x 即可 |
+| 3x 及以上（要 `--unlock-mfg`） | 只对实测版本成立：`libxess_fg 1.3.1.78` / `libxell 1.3.2.10`；别的版本会拒绝执行并打印 `*_unexpected_bytes`（故意的，不会瞎改） |
 
 ## 4. 游戏内设置
 
@@ -218,7 +234,8 @@ game-pack\uninstall.bat "D:\Games\XXX\bin\x64"
 ## 11. 合规
 
 - 本包是 **GPL-3.0** 软件，全文见 `LICENSE`；第三方组件署名见 `NOTICE`；
-- `libxess_fg.dll` / `libxell.dll` 属于 **Intel**，按其自身许可使用，不是本项目的一部分；
+- `libxess_fg.dll` / `libxell.dll` 属于 **Intel**，按其自身许可使用，不是本项目的一部分
+  —— 所以**公开下载的包里不含它们**，需自备（见 §3.2）；
   `game-pack\files\ReShade64.dll` 属于 **ReShade**（BSD-3-Clause）；
 - `--unlock-mfg` 的风险见 §7 与 `docs/ops/LEGAL.md`；
 - 联机游戏请勿使用（会钩游戏进程）。

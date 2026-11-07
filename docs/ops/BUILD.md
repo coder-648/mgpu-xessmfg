@@ -94,6 +94,10 @@ RESHADE_SRC=/path/ReShade64.dll ./scripts/make_release.sh
 
 > `libxess_fg.dll` / `libxell.dll` 是 Intel 的，按 Intel 许可使用：
 > **公开分发请加 `SKIP_XESS_DLLS=1`**，让用户自己从 XeSS SDK 取（见 `docs/ops/LEGAL.md` §3）。
+> 加了之后包里会多一份 `bin/README-DLL.txt`，写清"去哪取、放哪里、版本要求"。
+
+本地自用想开箱即跑：出一份含 DLL 的包，例如
+`MGPU_VERSION=0.10-local ./scripts/make_release.sh`（这两份包别混着发）。
 
 ## 5. 测试程序（历史探针）
 

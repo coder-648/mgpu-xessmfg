@@ -100,6 +100,21 @@ if [ "${SKIP_XESS_DLLS:-0}" != "1" ]; then
     done
 else
     say "SKIP_XESS_DLLS=1: leaving Intel's DLLs out of the bundle"
+    cat > "$OUT/bin/README-DLL.txt" <<'TXT'
+本包不含 Intel 的 XeSS 运行时（libxess_fg.dll / libxell.dll）——它们属于
+Intel，按 Intel 自己的许可分发，不能随本项目一起打包。放好它们才能跑：
+
+  1. 取 Intel XeSS SDK v3.0.2（https://github.com/intel/xess ，tag v3.0.2），
+     或任何 XeSS 3 SDK 的 bin/ 目录
+  2. 把 libxess_fg.dll 与 libxell.dll 拷进本目录（与 bridge.exe 同一层）
+  3. 双击 "0 - UI.bat" 或任一配方脚本
+
+版本提示：
+  - 2x（--interp 1）：任意 1.3.x 都能跑
+  - 3x 及以上要 --unlock-mfg，它只对实测过的版本成立
+    （libxess_fg 1.3.1.78 / libxell 1.3.2.10）；别的版本会拒绝执行并打印
+    *_unexpected_bytes —— 这是故意的，不会瞎改
+TXT
 fi
 
 # The recipe scripts cd into their own folder, so they belong next to bridge.exe.

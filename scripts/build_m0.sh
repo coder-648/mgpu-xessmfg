@@ -9,7 +9,7 @@
 #  sources are staged into <STAGE_DIR>\<module>, built there, and the artifacts
 #  are copied back into <repo>/build/.
 #
-#  Per PLAN.md 补充 1, all terminal output goes to a file and is then read,
+#  All terminal output goes to a file and is then read,
 #  instead of relying on live console echoes.
 # ===========================================================================
 set -uo pipefail
