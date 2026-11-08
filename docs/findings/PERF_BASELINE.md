@@ -354,6 +354,35 @@ DWM 合成、WGC 交付、以及**我们自己的顶层覆盖窗口**（它在�
    游戏窗口恢复到 independent-flip 后 `arr(vb)` 应该更干净。
 3. **`--pool 2/4/8`**：已经测过对 `arr` 无影响。
 
+### 3.12 已实现并验证：`--overlay-hidden` 证明"就是覆盖窗口"，`--overlay-monitor` 可用但受拓扑限制
+
+**实验（2x@60，同一场景，同一会话连跑两组，只差 `--overlay-hidden`）**：
+
+| 配置 | 窗口 | `game>2vb` | `arr>2vb` | **空刷新率** | `load` | `gpu` | `present` |
+|---|---|---|---|---|---|---|---|
+| `--overlay-hidden`（窗口不显示，Present 照跑） | 74 | 0.0% | **0.7%** | **1.2%** | 28% | 3.2 | **1.5** |
+| 可见覆盖窗口（紧接着的同一会话） | 68 | 0.8% | **8.5%** | **6.6%** | 40% | 2.9 | 4.1 |
+
+结论：**抖动就是我们的覆盖窗口造成的**。把窗口藏起来（其余一切不变）之后，
+`arr>2vb` 从 8.5% 掉到 0.7%，空刷新从 6.6% 掉到 1.2%，`present` 从 4.1 降到 1.5 ms。
+机制和推断一致：全屏 topmost 覆盖窗口让游戏窗口失去 independent flip，
+游戏和我们都得走 DWM 合成。
+
+**`--overlay-monitor N` 实现情况**（本机两块屏：AMD 驱动 (0,0)-(3840,2160)、
+NVIDIA 驱动 (3840,0)-(7680,2160)）：
+
+| 检查项 | 结果 |
+|---|---|
+| 自动选卡 | `consumer adapter: 'NVIDIA GeForce RTX 3080 Ti' - drives the overlay monitor` ✅（按上屏屏选卡） |
+| 覆盖窗口位置 | `overlay target: monitor ... rect=(3840,0)-(7680,2160) 3840x2160 (--overlay-monitor)` ✅ |
+| 交换链 | `hwnd popup 10bit FLIP_DISCARD hr=0x00000000` ✅ |
+| **但** | 因为那块屏接在**渲染卡**上，XeFG 被换到 3080 Ti ⇒ `note: same GPU as the producer` ⇒ 插帧和游戏抢同一张 GPU：`gpu` 3.2 → **66–72 ms**、`load` 249–293%、`slow=40`、游戏自己掉到 ~35 fps ❌ |
+
+⇒ **在本机这个布线（一块屏接 A 卡、一块接 N 卡）上，`--overlay-monitor` 不可用**，
+必须**两块屏都接帧生成卡**（同卡双输出）才有意义。代码已加前置校验：
+目标屏若不由消费卡驱动，会先 WARNING 再回落到游戏窗口所在屏，不会黑屏。
+
+
 
 
 

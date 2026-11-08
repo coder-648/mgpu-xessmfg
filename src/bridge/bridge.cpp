@@ -575,6 +575,101 @@ static UINT g_full_w = 5120;   // window size: always the full screen
 static UINT g_full_h = 2880;
 static UINT g_height = 2880;
 
+// ---------------------------------------------------------------- overlay placement
+// Which display the overlay (and therefore XeSS-FG's swap chain) is presented on.
+//   -1    follow the game window (historical behaviour)
+//   >=0   the Nth monitor in EnumDisplayMonitors() order   (--overlay-monitor N)
+//
+// This is the mirror of --capture-monitor ("which screen do we capture"): the present
+// side is a separate decision, and it is also the only way to give the game its
+// independent flip back - with a fullscreen topmost overlay on the SAME monitor, DWM has
+// to compose both, which measured as 5-10% of captures arriving one vblank late
+// (docs/findings/PERF_BASELINE.md 3.10/3.11).
+static int  g_overlay_monitor = -1;
+// --overlay-hidden: create the swap chain and keep presenting, but never show the window.
+// Measurement only - it answers "is our overlay the reason the game loses its flip layer?"
+// because with the overlay hidden the game window is the topmost visible thing again.
+static bool g_overlay_hidden = false;
+static bool g_overlay_hidden_warned = false;
+// The adapter XeSS-FG runs on, kept so --overlay-monitor can be validated before the
+// window/swap chain are created (CreateSwapChainForHwnd requires the device to drive the
+// output, and failing there leaves the user with no picture at all).
+static ComPtr<IDXGIAdapter1> g_consumer_adapter;
+
+struct MonitorPick { int want; int index; HMONITOR mon; };
+
+static BOOL CALLBACK pick_monitor_proc(HMONITOR mon, HDC, LPRECT, LPARAM lp)
+{
+    auto* p = reinterpret_cast<MonitorPick*>(lp);
+    if (p->index == p->want) { p->mon = mon; return FALSE; }   // stop enumerating
+    ++p->index;
+    return TRUE;
+}
+
+static HMONITOR overlay_monitor(HWND game_wnd)
+{
+    if (g_overlay_monitor >= 0) {
+        MonitorPick p{ g_overlay_monitor, 0, nullptr };
+        EnumDisplayMonitors(nullptr, nullptr, pick_monitor_proc,
+                            reinterpret_cast<LPARAM>(&p));
+        if (p.mon) { return p.mon; }
+        if (!g_overlay_hidden_warned) {
+            g_overlay_hidden_warned = true;
+            logf_("[bridge] WARNING: --overlay-monitor %d matched no monitor (%d present)"
+                  " - following the game window instead\n", g_overlay_monitor, p.index);
+        }
+    }
+    if (game_wnd) { return MonitorFromWindow(game_wnd, MONITOR_DEFAULTTOPRIMARY); }
+    const POINT origin{ 0, 0 };
+    return MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
+}
+
+// The display mode of the monitor we actually present on. It used to read the *primary*
+// display (EnumDisplaySettingsW(nullptr, ...)), which is wrong the moment the overlay
+// lives on another output: --fg-rt-mode quant and --list-modes would snap to the wrong
+// vblank. --overlay-monitor makes that a supported configuration, so read the right one.
+static bool overlay_display_mode(DEVMODEW* dm)
+{
+    if (!dm) { return false; }
+    ZeroMemory(dm, sizeof(*dm));
+    dm->dmSize = sizeof(*dm);
+    const HMONITOR mon = overlay_monitor(nullptr);
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof(mi);
+    if (mon && GetMonitorInfoW(mon, reinterpret_cast<MONITORINFO*>(&mi))) {
+        if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, dm)) { return true; }
+    }
+    return EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, dm) != FALSE;
+}
+
+// Where the overlay window has to be: exactly the monitor we present on. --den/--scale
+// change the swap chain's back-buffer size, never the window rect (DXGI stretches it).
+static void overlay_rect(RECT* out)
+{
+    if (!out) { return; }
+    out->left = 0;
+    out->top = 0;
+    out->right = static_cast<LONG>(g_full_w);
+    out->bottom = static_cast<LONG>(g_full_h);
+
+    const HMONITOR mon = overlay_monitor(nullptr);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (!mon || !GetMonitorInfoW(mon, &mi)) { return; }
+    *out = mi.rcMonitor;
+
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        logf_("[bridge] overlay target: monitor %p rect=(%ld,%ld)-(%ld,%ld) %lux%lu"
+              " (%s)\n", reinterpret_cast<void*>(mon),
+              mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right, mi.rcMonitor.bottom,
+              static_cast<unsigned long>(mi.rcMonitor.right - mi.rcMonitor.left),
+              static_cast<unsigned long>(mi.rcMonitor.bottom - mi.rcMonitor.top),
+              (g_overlay_monitor >= 0) ? "--overlay-monitor" : "follows the game window");
+    }
+}
+
 static mgpu::SharedControl*   g_ctl = nullptr;
 static ComPtr<ID3D12Resource> g_mv[mgpu::kMaxSlots];
 static ComPtr<ID3D12Resource> g_depth[mgpu::kMaxSlots];
@@ -769,7 +864,7 @@ static void focus_game()
     if (attached) { AttachThreadInput(my_thread, fg_thread, FALSE); }
 }
 
-static void make_borderless(HWND hwnd, UINT w, UINT h)
+static void make_borderless(HWND hwnd, int x, int y, UINT w, UINT h)
 {
     // WS_EX_TRANSPARENT  - the window is skipped when the mouse is hit tested
     // WS_EX_NOACTIVATE   - it never becomes active, so the game keeps focus
@@ -787,7 +882,22 @@ static void make_borderless(HWND hwnd, UINT w, UINT h)
                               reinterpret_cast<LONG_PTR>(overlay_proc)));
     }
 
-    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, static_cast<int>(w), static_cast<int>(h),
+    // --overlay-hidden: same window, same swap chain, same presents - just never shown.
+    // Everything the frame loop measures (arr/out/game histograms, age, colour) still
+    // works; what changes is that the game window is the topmost visible thing on its
+    // monitor again. That is the whole point of the switch: it isolates "our overlay
+    // costs the game its flip layer" from "WGC/composition is lossy anyway".
+    if (g_overlay_hidden) {
+        SetWindowPos(hwnd, nullptr, x, y, static_cast<int>(w), static_cast<int>(h),
+                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW);
+        ShowWindow(hwnd, SW_HIDE);
+        focus_game();
+        logf_("[bridge] --overlay-hidden: window stays hidden (presents keep running);"
+              " the game window should be the topmost visible one now\n");
+        return;
+    }
+
+    SetWindowPos(hwnd, HWND_TOPMOST, x, y, static_cast<int>(w), static_cast<int>(h),
                  SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
@@ -924,9 +1034,8 @@ static AdapterPick find_consumer_adapter(HWND game_wnd)
     ComPtr<IDXGIFactory6> factory;
     if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) { return pick; }
 
-    const HMONITOR mon = game_wnd ? MonitorFromWindow(game_wnd, MONITOR_DEFAULTTOPRIMARY)
-                                  : nullptr;
-    logf_("[bridge] enumerating adapters (game window monitor %p)\n",
+    const HMONITOR mon = overlay_monitor(game_wnd);
+    logf_("[bridge] enumerating adapters (overlay monitor %p)\n",
           reinterpret_cast<void*>(mon));
 
     AdapterPick by_gpu, by_monitor, by_other, by_vram;
@@ -954,14 +1063,14 @@ static AdapterPick find_consumer_adapter(HWND game_wnd)
               outputs,
               static_cast<unsigned long>(d.AdapterLuid.HighPart),
               static_cast<unsigned long>(d.AdapterLuid.LowPart),
-              on_mon ? "  <== game window" : "", producer ? "  (producer)" : "");
+              on_mon ? "  <== overlay monitor" : "", producer ? "  (producer)" : "");
 
         if (!g_gpu_spec.empty() && !by_gpu.adapter && adapter_matches(d, i, g_gpu_spec)) {
             by_gpu.adapter = a; by_gpu.desc = d; by_gpu.why = L"--gpu";
         }
         if (!by_monitor.adapter && on_mon) {
             by_monitor.adapter = a; by_monitor.desc = d;
-            by_monitor.why = L"drives the game window's monitor";
+            by_monitor.why = L"drives the overlay monitor";
         }
         if (!by_other.adapter && g_have_producer && !producer) {
             by_other.adapter = a; by_other.desc = d; by_other.why = L"not the producer";
@@ -985,9 +1094,9 @@ static AdapterPick find_consumer_adapter(HWND game_wnd)
               pick.desc.Description, vendor_name(pick.desc.VendorId), pick.desc.VendorId,
               pick.why);
         if (mon && !drives_monitor(pick.adapter.Get(), mon)) {
-            logf_("[bridge] WARNING: this adapter does not drive the game window's monitor;"
-                  " CreateSwapChainForHwnd may fail with E_ACCESSDENIED - move the game"
-                  " window to this adapter's display, or pick another --gpu\n");
+            logf_("[bridge] WARNING: this adapter does not drive the monitor the overlay is"
+                  " on; CreateSwapChainForHwnd may fail with E_ACCESSDENIED - move the"
+                  " overlay there with --overlay-monitor, or pick another --gpu\n");
         }
         if (g_have_producer && pack_luid(pick.desc.AdapterLuid) == g_producer_luid) {
             logf_("[bridge]   note: same GPU as the producer - frame generation competes"
@@ -1675,35 +1784,44 @@ static void fg_auto_interp_tick(const char* why)
 // to 4K by the driver - two resamples for nothing. Sized to the monitor, a 4K
 // output lands exactly 1:1 on a 4K desktop (and a 5K output still fills a 5K
 // desktop as before).
-static void overlay_size(UINT* w, UINT* h)
+static void overlay_size(UINT* x, UINT* y, UINT* w, UINT* h)
 {
-    *w = g_full_w;
-    *h = g_full_h;
+    RECT r{};
+    overlay_rect(&r);
+    *x = static_cast<UINT>(r.left);
+    *y = static_cast<UINT>(r.top);
+    *w = static_cast<UINT>(r.right - r.left);
+    *h = static_cast<UINT>(r.bottom - r.top);
 
-    const HMONITOR mon = MonitorFromWindow(g_game_wnd, MONITOR_DEFAULTTOPRIMARY);
-    MONITORINFO mi{};
-    mi.cbSize = sizeof(mi);
-    if (mon && GetMonitorInfoW(mon, &mi)) {
-        const UINT mw = static_cast<UINT>(mi.rcMonitor.right - mi.rcMonitor.left);
-        const UINT mh = static_cast<UINT>(mi.rcMonitor.bottom - mi.rcMonitor.top);
-        if (mw && mh) {
-            *w = mw;
-            *h = mh;
-            logf_("[bridge] overlay fits the monitor %ux%u (capture %ux%u)\n",
-                  mw, mh, g_full_w, g_full_h);
-            if (mw != g_full_w || mh != g_full_h) {
-                logf_("[bridge]   captured %ux%u will be resampled once by us to the output size;"
-                      " pick it with --scale/--den so it matches the panel for a 1:1 present\n",
-                      g_full_w, g_full_h);
-            }
-        }
+    logf_("[bridge] overlay fits the monitor %ux%u at (%u,%u) (capture %ux%u)\n",
+          *w, *h, *x, *y, g_full_w, g_full_h);
+    if (*w != g_full_w || *h != g_full_h) {
+        logf_("[bridge]   captured %ux%u will be resampled once by us to the output size;"
+              " pick it with --scale/--den so it matches the panel for a 1:1 present\n",
+              g_full_w, g_full_h);
     }
 }
 
 static bool init_fg()
 {
-    UINT ow = 0, oh = 0;
-    overlay_size(&ow, &oh);
+    // --overlay-monitor must name a display the *consumer* adapter drives, otherwise every
+    // CreateSwapChainForHwnd attempt returns E_ACCESSDENIED and bridge would exit with no
+    // picture - the opposite of a useful fallback. Validate it here and fall back to the
+    // game window's display instead.
+    if (g_overlay_monitor >= 0 && g_consumer_adapter) {
+        const HMONITOR want = overlay_monitor(g_game_wnd);
+        if (!drives_monitor(g_consumer_adapter.Get(), want)) {
+            logf_("[bridge] WARNING: --overlay-monitor %d is not driven by the consumer"
+                  " adapter (%ls), so the swap chain cannot be created there - presenting"
+                  " on the game window's display instead. Put both displays on one GPU, or"
+                  " use --gpu to move frame generation to the card that drives that"
+                  " display.\n", g_overlay_monitor, g_consumer_desc.Description);
+            g_overlay_monitor = -1;
+        }
+    }
+
+    UINT ox = 0, oy = 0, ow = 0, oh = 0;
+    overlay_size(&ox, &oy, &ow, &oh);
     g_bridge_wnd = create_bridge_window(ow, oh);
     if (!g_bridge_wnd) { logf_("[bridge] window creation FAILED\n"); return false; }
 
@@ -1867,10 +1985,13 @@ static bool init_fg()
                     DXGI_OUTPUT_DESC1 od1{};
                     if (SUCCEEDED(o6->GetDesc1(&od1))) {
                         DEVMODEW dm{};
-        dm.dmSize = sizeof(dm);
-        if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm)) {
-            logf_("[bridge] display mode: %lux%lu @ %lu Hz\n",
-                  dm.dmPelsWidth, dm.dmPelsHeight, dm.dmDisplayFrequency);
+                        // The mode of the display we present on, not of the primary one:
+                        // with --overlay-monitor they are different monitors, and quant
+                        // would otherwise snap frameRenderTime to the wrong vblank.
+        if (overlay_display_mode(&dm)) {
+            logf_("[bridge] display mode: %lux%lu @ %lu Hz%s\n",
+                  dm.dmPelsWidth, dm.dmPelsHeight, dm.dmDisplayFrequency,
+                  (g_overlay_monitor >= 0) ? " (overlay monitor)" : "");
 
             g_refresh_hz = dm.dmDisplayFrequency;
             // A 30 fps x4 profile needs the panel to actually run at 120 Hz. 4K HDR over
@@ -2077,7 +2198,7 @@ static bool init_fg()
     // The swap chain exists now, so the window that owns it becomes the visible
     // overlay. Our own window stays hidden unless it was the one that won, which
     // avoids a blank white window sitting on top of the picture.
-    make_borderless(overlay_wnd(), ow, oh);
+    make_borderless(overlay_wnd(), static_cast<int>(ox), static_cast<int>(oy), ow, oh);
     if (g_overlay_layered) {
         const LONG_PTR ex = GetWindowLongPtrW(overlay_wnd(), GWL_EXSTYLE);
         SetWindowLongPtrW(overlay_wnd(), GWL_EXSTYLE, ex | WS_EX_LAYERED);
@@ -3451,6 +3572,17 @@ static void assert_topmost()
     const ULONGLONG now = GetTickCount64();
     if (now - g_last_topmost < 400) { return; }
     g_last_topmost = now;
+
+    // --overlay-hidden: the window must stay invisible and must NOT be forced above the
+    // game, otherwise the experiment measures nothing. Only the focus guard still runs.
+    if (g_overlay_hidden) {
+        focus_game();
+        if (g_game_wnd && !IsWindow(g_game_wnd)) {
+            logf_("[bridge] the game window disappeared - exiting\n");
+            PostQuitMessage(0);
+        }
+        return;
+    }
 
     // Re-assert the overlay's place in the topmost band, but *below* the OSD window.
     // HWND_TOPMOST means "top of the whole topmost band", so doing it unconditionally
@@ -6309,6 +6441,16 @@ int main()
     // for a crash, where the last lines before the process dies are the interesting ones.
     if (wcsstr(GetCommandLineW(), L"--log-flush")) { g_log_flush_each = 1; }
     if (wcsstr(GetCommandLineW(), L"--capture-monitor")) { g_capture_monitor = true; }
+    // --overlay-monitor N: present on the Nth display instead of the game window's display.
+    // Parsed before the game window is found, because the consumer adapter is chosen by
+    // "which adapter drives the overlay monitor".
+    if (const wchar_t* om = wcsstr(GetCommandLineW(), L"--overlay-monitor ")) {
+        const int n = _wtoi(om + 18);
+        if (n >= 0) { g_overlay_monitor = n; }
+    }
+    // --overlay-hidden: keep presenting, never show the window (measurement only).
+    if (wcsstr(GetCommandLineW(), L"--overlay-hidden")) { g_overlay_hidden = true; }
+
     // --pid N: target a process by id (the GUI knows the window's pid).
     if (const wchar_t* pp = wcsstr(GetCommandLineW(), L"--pid ")) {
         const int n = _wtoi(pp + 6);
@@ -6712,6 +6854,12 @@ int main()
           g_no_xell ? "no-sleep" : "on", g_xell_mode,
           g_no_inputs ? "off" : "on", g_sharpen, g_colour_mode, g_fg_interp,
           g_unlock_mfg ? 1 : 0, g_down);
+    if (g_overlay_monitor >= 0 || g_overlay_hidden) {
+        logf_("[bridge] overlay: monitor=%s hidden=%d (capture stays %s)\n",
+              (g_overlay_monitor >= 0) ? "explicit" : "game window",
+              g_overlay_hidden ? 1 : 0,
+              g_capture_monitor ? "monitor" : "window");
+    }
 
     if (g_game_hwnd != nullptr || g_game_pid != 0) {
         if (g_game_hwnd != nullptr) {
@@ -6867,6 +7015,7 @@ int main()
     }
     g_consumer_desc   = pick.desc;
     g_consumer_vendor = pick.desc.VendorId;
+    g_consumer_adapter = pick.adapter;
 
     if (!init_devices(pick.adapter.Get())) { return 4; }
 

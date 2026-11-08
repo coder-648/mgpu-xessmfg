@@ -58,6 +58,23 @@ RESHADE_SRC=/mnt/d/ReShade64.dll ./scripts/make_addon_package.sh
 |---|---|
 | `--input-ms X` | 把"输入间隔"当成 X ms（**仅影响 `load`/`slow` 统计**；`--fg-rt-mode quant` 下不再参与 pacing）。界面已不开放这一项 |
 | `--no-mv` / `--fg-of` | 前者完全不产 MV，后者改用 AMD 光流算 MV。**两者互斥** |
+
+### 4.1 上屏放哪块屏（2026-11-08 新增）
+
+| 参数 | 说明 |
+|---|---|
+| `--overlay-monitor N` | 把覆盖窗口（也就是 XeFG 的上屏）放到**第 N 块显示器**（`EnumDisplayMonitors` 顺序，0 起）。默认跟随游戏窗口所在屏。它的镜像参数是 `--capture-monitor`（抓哪块屏）—— **抓屏和上屏是两个独立的决定**，可以抓屏 1 上屏 2 |
+| `--overlay-hidden` | 只做测量：交换链照建、Present 照跑，但窗口不显示。用来分辨"抖动是我们这层覆盖窗口造成的"还是"WGC/合成器本来就抖"（实测见 `docs/findings/PERF_BASELINE.md` §3.12） |
+
+两条硬性前提：
+
+1. **显示器必须接在"跑 XeFG 的那张卡"上**。`--overlay-monitor` 指向的那块屏如果不由消费卡驱动，
+   `CreateSwapChainForHwnd` 会 `E_ACCESSDENIED`，所以 bridge 会**先校验再回落**到游戏窗口所在屏，
+   并在日志里写明原因。
+2. **两块屏接同一张卡才有意义**。如果第二块屏接在渲染卡上，自动选卡会为了"驱动上屏屏"把
+   XeFG 换到渲染卡（日志会出现 `note: same GPU as the producer`），此时插帧和游戏抢同一张 GPU，
+   `gpu` 会从个位数涨到 60+ ms（实测）。正确形态是**两块屏都接帧生成卡**。
+
 | `--fg-jitter-zero` | **已弃用**：只打一行提示，不再生效。jitter 必须用游戏自己的 |
 
 限帧器（`<RTSS_DIR>`）：**必须用外部限帧器把游戏锁到目标输入帧率**，
