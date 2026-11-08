@@ -83,16 +83,30 @@ bridge 在窗口显示之后做四件事，日志里各占一行：
 
 | 手段 | 日志 | 作用 |
 |---|---|---|
-| `WS_EX_TOOLWINDOW` | 无（`make_borderless` 设置） | 不进任务栏 / Alt+Tab |
-| **owner = 游戏窗口**（`GWLP_HWNDPARENT`） | `overlay owner -> game window ...` | 被拥有的窗口**不单独列出**，Task View 把它归到游戏名下；并且跟随游戏的显示/最小化 |
+| **创建时** `WS_EX_TOOLWINDOW` | 无 | 从源头就不登记为应用窗口（不进任务栏 / Alt+Tab / Task View） |
 | `DWMWA_EXCLUDED_FROM_PEEK` / `DWMWA_DISALLOW_PEEK` | `switcher: peek excl hr=...` | 不进 Aero Peek / 缩略图预览 |
-| `ITaskbarList::DeleteTab` | `switcher: ... DeleteTab hr=0x00000000` | 删掉"样式设置之前就已经登记"的条目 |
+| `ITaskbarList::DeleteTab` | `switcher: ... DeleteTab hr=0x00000000` | 删掉可能已登记的条目 |
+
+> ⚠️ **不要**用 `SetWindowLongPtr(GWLP_HWNDPARENT, 游戏窗口)` 把覆盖窗口变成游戏的"被拥有窗口"。
+> 它确实能让 Task View 分组，但**实测会让游戏的鼠标输入完全失效（键盘仍正常）**：
+> `click probe` 显示点击仍然落在游戏上（不是 hit-test 吃掉的），是 owner 关系改变了输入/激活语义。
+> 覆盖窗口必须保持普通顶层窗口。
 
 另外 **Task View / Alt+Tab / Win+D 不再算"焦点丢失"**：`explorer.exe` 的
 `XamlExplorerHostIslandWindow` / `Windows.UI.Core.CoreWindow` / `TaskSwitcherWnd` /
 `ForegroundStaging` / `Progman` / `WorkerW` / `Shell_TrayWnd` 这些窗口被显式排除，
 所以按 Win+Tab 待 8 秒 bridge 也不会退出（实测 `alive after 8 s in Task View: True`）。
 真正的其他应用（浏览器、另一个游戏）仍然会触发 `--exit-on-focus-loss`。
+
+输入是否被吃掉，看这行（整场会话持续采样，前 12 次每 3 s、之后每 30 s）：
+
+```
+[bridge] click probe: cursor 1920,1079 under=...pid=22084 root=...game=...  (ok)
+[bridge] click probe: ... <== OUR OVERLAY eats this click      ← 我们吃了点击
+[bridge] click probe: ... <== the OSD window eats it           ← OSD 吃了点击
+[bridge] click probe: ... <-- NOT the game                     ← 别的程序在前面（如 VS Code）
+```
+
 
 
 | `--fg-jitter-zero` | **已弃用**：只打一行提示，不再生效。jitter 必须用游戏自己的 |
