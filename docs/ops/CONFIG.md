@@ -56,7 +56,7 @@ RESHADE_SRC=/mnt/d/ReShade64.dll ./scripts/make_addon_package.sh
 
 | 参数 | 说明 |
 |---|---|
-| `--input-ms X` | 把"输入间隔"当成 X ms。**这是"容忍迟到"的旋钮**，不是设置刷新率；3x 建议 `33.3` |
+| `--input-ms X` | 把"输入间隔"当成 X ms（**仅影响 `load`/`slow` 统计**；`--fg-rt-mode quant` 下不再参与 pacing）。界面已不开放这一项 |
 | `--no-mv` / `--fg-of` | 前者完全不产 MV，后者改用 AMD 光流算 MV。**两者互斥** |
 | `--fg-jitter-zero` | **已弃用**：只打一行提示，不再生效。jitter 必须用游戏自己的 |
 

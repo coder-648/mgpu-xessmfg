@@ -11,8 +11,8 @@ rem    --interp 1      one interpolated frame per real frame (2x).
 rem    no --no-mv      the game's own motion vectors are tagged. At 2x this is
 rem                    the cleanest edge result - the vectors describe what the
 rem                    game actually moved.
-rem    no --input-ms   the 2x path does not drop frames the way 3x does; leave
-rem                    the interval at the measured one unless you see drops.
+rem    --fg-rt-mode quant  the measured 16/17 ms of a 60 fps lock snaps to 2 x 8.33 =
+rem                    16.67 ms, i.e. exactly 120.0 fps out (1.00 vblank/frame).
 rem    jitter          the game's own jitter is used automatically - do NOT pass
 rem                    --fg-jitter-zero (deprecated, prints a notice and does
 rem                    nothing now).
@@ -49,7 +49,7 @@ echo ============================================================
 echo.
 
 bridge.exe %GAMEOPT% --den 1 --pool 4 --interp 1 ^
-           --fg-ui none --fg-proj-rz --fg-rt-mode median > bridge_2x_quality.txt 2>&1
+           --fg-ui none --fg-proj-rz --fg-rt-mode quant > bridge_2x_quality.txt 2>&1
 type bridge_2x_quality.txt
 
 echo.

@@ -1321,7 +1321,7 @@ static void fg_solve_cadence(const char* why)
 //   --fg-rt-mode ema|raw|median|quant   what we hand XeFG as frameRenderTime
 //   --interp-auto [floor|round]         keep the output on a whole-vblank cadence
 enum { kFgRtEma = 0, kFgRtRaw = 1, kFgRtMedian = 2, kFgRtQuant = 3 };
-static int g_fg_rt_mode = kFgRtEma;      // ema = the historical behaviour
+static int g_fg_rt_mode = kFgRtQuant;   // quant: median snapped to whole vblanks (see fg_render_time_ms)
 static const char* fg_rt_mode_name()
 {
     switch (g_fg_rt_mode) {

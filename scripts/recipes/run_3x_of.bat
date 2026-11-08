@@ -15,10 +15,10 @@ rem                   colour. Measured cost ~0.3 ms. The game's own vectors cost
 rem                   +7.4 ms on the render GPU and make 3x flicker, because the
 rem                   3x path reuses the 2x model for every generated frame
 rem                   (docs/findings/FINAL_CONFIG.md 5.17 / 5.19).
-rem    --input-ms 33.3  tells XeFG the real input interval is a whole vblank
-rem                   longer than the theoretical (interp+1) x vblank. Without
-rem                   it XeFG drops generated frames whenever throttle + present
-rem                   overshoots by a hair (5.18.1).
+rem    --fg-rt-mode quant  feeds XeFG the measured input interval rounded to whole
+rem                   vblanks (it is also the default). At 3x that lands on 4 x 8.33 =
+rem                   33.3 ms for a 40 fps lock, which is the "+1 vblank slack" that
+rem                   removed the dropped generated frames (FINAL_CONFIG 5.18.1).
 rem    --unlock-mfg   lifts the non-Intel 2x clamp. See docs/ops/LEGAL.md before
 rem                   you use it.
 rem
@@ -50,8 +50,8 @@ echo  Game must be running, in-world, locked to 40 fps.
 echo ============================================================
 echo.
 
-bridge.exe %GAMEOPT% --den 1 --pool 4 --interp 2 --fg-of --input-ms 33.3 ^
-           --unlock-mfg --fg-ui none --fg-proj-rz --fg-rt-mode median > bridge_3x_of.txt 2>&1
+bridge.exe %GAMEOPT% --den 1 --pool 4 --interp 2 --fg-of ^
+           --unlock-mfg --fg-ui none --fg-proj-rz --fg-rt-mode quant > bridge_3x_of.txt 2>&1
 type bridge_3x_of.txt
 
 echo.

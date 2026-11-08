@@ -107,7 +107,7 @@ mgpu-<版本>/
 
 1. 先启动游戏，进到游戏世界里；
 2. 双击 `bin\0 - UI.bat`（或直接双击 `mgpu_ui.exe`）；
-3. "运动矢量"选 **AMD 光流**、"倍数" 选 **3x**、"输入间隔" 保持 **自动**；
+3. "运动矢量"选 **AMD 光流**、"倍数" 选 **3x**；
 4. 点标题栏右上角的 **启动**（或按热键，默认 `Ctrl+PageUp`）；
 5. 屏幕左上角出现单行 OSD 就说明通了：
 
@@ -135,16 +135,16 @@ mgpu-<版本>/
 等价的手打命令：
 
 ```bat
-rem 3x 满帧（推荐）：光流 MV + 输入间隔 33.3 ms
-bridge.exe --den 1 --pool 4 --interp 2 --fg-of --input-ms 33.3 ^
-           --unlock-mfg --fg-ui none --fg-proj-rz --fg-rt-mode median
+rem 3x 满帧（推荐）：光流 MV；--fg-rt-mode quant 把实测间隔吸附到整 vblank
+bridge.exe --den 1 --pool 4 --interp 2 --fg-of ^
+           --unlock-mfg --fg-ui none --fg-proj-rz --fg-rt-mode quant
 
 rem 2x 画质优先：用游戏自己的 MV（game_capture.ini 的 SkipMv=0，默认就是）
-bridge.exe --den 1 --pool 4 --interp 1 --fg-ui none --fg-proj-rz --fg-rt-mode median
+bridge.exe --den 1 --pool 4 --interp 1 --fg-ui none --fg-proj-rz --fg-rt-mode quant
 
 rem 最低开销：不用任何 MV
-bridge.exe --den 1 --pool 4 --interp 2 --no-mv --input-ms 33.3 ^
-           --unlock-mfg --fg-ui none --fg-proj-rz --fg-rt-mode median
+bridge.exe --den 1 --pool 4 --interp 2 --no-mv ^
+           --unlock-mfg --fg-ui none --fg-proj-rz --fg-rt-mode quant
 ```
 
 目标窗口的三种指定方式（任选其一）：
@@ -162,7 +162,7 @@ bridge.exe --den 1 --pool 4 --interp 2 --no-mv --input-ms 33.3 ^
 
 | 取向 | 命令要点 | 输出 | 画质 |
 |---|---|---|---|
-| **3x 满帧（推荐）** | `--interp 2 --fg-of --input-ms 33.3` | 40 → 120 fps | 光流 MV，无闪烁 |
+| **3x 满帧（推荐）** | `--interp 2 --fg-of` | 40 → 120 fps | 光流 MV，无闪烁 |
 | 2x 画质优先 | `--interp 1`（+ 游戏 MV） | 60 → 120 fps | 边缘伪影最少 |
 | 最低开销 | `--interp 2 --no-mv` | 40 → 120 fps | 快转时边缘更脏 |
 
@@ -187,7 +187,7 @@ bridge.exe --den 1 --pool 4 --interp 2 --no-mv --input-ms 33.3 ^
 | 看什么 | 正常 | 异常含义 |
 |---|---|---|
 | 左上角 OSD | `x3` 与设定一致，`in` ≈ 锁帧值 | 没有 OSD ⇒ bridge 没起来或没找到窗口 |
-| `drop` | 0，或偶发 1–2 | 持续增长 ⇒ 输入端给不够（限帧或 `--input-ms`） |
+| `drop` | 0，或偶发 1–2 | 持续增长 ⇒ 输入端给不够（限帧没生效） |
 | `gpu` | 4K 3x 光流约 8–10 ms | 明显超标 ⇒ 插帧卡太弱，降倍率或加 `--scale 0.75` |
 | 日志 `gen N/N` | `3/3` 这种成对 | `2/3` ⇒ 生成帧没凑齐 |
 | 日志 `[mv]` | 选游戏 MV 时出现 `stream enabled` | 没出现 ⇒ `game_capture.ini` 的 `SkipMv` 不是 0 |
@@ -206,7 +206,7 @@ bridge.exe --den 1 --pool 4 --interp 2 --no-mv --input-ms 33.3 ^
 多半是没找到游戏窗口：先让游戏进到世界里再启动，或用 `--game Game.exe` 指定进程名。
 
 **Q：OSD 有了但更卡**
-用外部限帧器把输入帧率锁住（3x 就锁 40）；再检查 `--input-ms`（自动档一般够）。
+用外部限帧器把输入帧率**锁准**（2x 锁 60、3x 锁 40、4x 锁 30）；`--fg-rt-mode quant` 会自动把实测间隔吸附到整 vblank。
 
 **Q：快速转视角边缘脏 / 闪**
 3x/4x 用游戏 MV 会闪 ⇒ 改 `--fg-of`；2x 时用游戏 MV 画质最好。

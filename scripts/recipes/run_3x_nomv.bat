@@ -40,8 +40,8 @@ echo  Game must be running, in-world, locked to 40 fps.
 echo ============================================================
 echo.
 
-bridge.exe %GAMEOPT% --den 1 --pool 4 --interp 2 --no-mv --input-ms 33.3 ^
-           --unlock-mfg --fg-ui none --fg-proj-rz --fg-rt-mode median > bridge_3x_nomv.txt 2>&1
+bridge.exe %GAMEOPT% --den 1 --pool 4 --interp 2 --no-mv ^
+           --unlock-mfg --fg-ui none --fg-proj-rz --fg-rt-mode quant > bridge_3x_nomv.txt 2>&1
 type bridge_3x_nomv.txt
 
 echo.

@@ -49,19 +49,22 @@
 - **光流不闪**，因为每对相邻帧的运动都由当帧重新算，不依赖游戏 MV 的时序；
 - 所以定稿是：**3x 用光流**、**2x 用游戏 MV**。
 
-## 5. 节拍：`--input-ms` 是"容忍迟到"，不是刷新率
+## 5. 节拍：`frameRenderTime` 必须吸附到整 vblank（`--fg-rt-mode quant`）
 
-输出间隔必须是整数个 vblank，否则"不卡但不匀"。`--input-ms X` 告诉 XeFG
-"真实输入间隔是 X ms"，比理论值多给一个 vblank 就能消除"迟到一点点就丢生成帧"：
+输出间隔必须是整数个 vblank，否则"不卡但不匀"。这件事现在由 **`--fg-rt-mode quant`**
+自动完成，也是 `bridge.exe` 的默认值：取实测输入间隔，四舍五入到整数个 vblank 再喂给 XeFG。
 
-| 倍率 | 理论输入间隔 | 建议 `--input-ms` |
-|---|---|---|
-| 2x | `2 × vblank` | 通常不用加 |
-| 3x | `3 × vblank` | **+1 vblank**（120 Hz → `33.3`） |
-| 4x | `4 × vblank` | +1 vblank |
+| 场景 | 实测间隔 | quant 吸附后 | 结果 |
+|---|---|---|---|
+| 2x，锁 60 fps | 16.0 ms（锁帧器 1 ms 粒度让间隔在 16/17 之间交替，中位数偏低） | **16.67 ms** = 2 vblanks | 120.0 fps = **1.00 vblank/帧** |
+| 3x，输入约 31 ms | 31 ms | **33.3 ms** = 4 vblanks | 等价于 §5.18.1 的"+1 vblank 余量" |
 
-用理论值会丢生成帧；多给 1 个 vblank 后 `slow` 从 17→0、`skip` 19→13，
-**延迟不变**（`docs/findings/FINAL_CONFIG.md` §5.18.1）。
+为什么必须吸附：16.0 ms 的 2x 输出是 **125 fps**，比 120 Hz 面板快 4%，
+多出来的帧被合成器周期性丢弃（每 ~0.2 s 一次）；吸附到 16.67 ms 后正好 120.0 fps。
+
+`--input-ms X` 现在**只影响 `load`/`slow` 统计**，不再参与 pacing（`quant` 用实测中位数）；
+历史实现在 EMA 模式下才用它，实测 3x 下 `slow` 17→0、`skip` 19→13、**延迟不变**
+（`docs/findings/FINAL_CONFIG.md` §5.18.1）。
 
 ## 6. 协议与构建必须同源
 

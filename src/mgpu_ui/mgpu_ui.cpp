@@ -259,10 +259,6 @@ static const RowDef kRowsCap[] = {
     { ID_POOL,    L"帧池深度",        RK_SPIN },
     { ID_LAT,     L"最大帧延迟数",    RK_SPIN },
 };
-static const RowDef kRowsAdv[] = {
-    { ID_FOV,     L"FOV（合成投影）", RK_DD },
-    { ID_IVL,     L"输入间隔",        RK_DD },
-};
 static const RowDef kRowsDev[] = {
     { ID_GPUSEL,  L"帧生成用的 GPU",      RK_DD   },
     { ID_DISPLAY, L"输出显示器（只读）", RK_INFO },
@@ -285,9 +281,9 @@ static const CardDef kCards[] = {
     { L"启动",         kRowsLaunch, 3, 0 },
     { L"GPU / 显示器", kRowsDev,    2, 1 },
     { L"叠加层",       kRowsOverlay, 3, 1 },
-    // FOV only feeds the synthetic projection, which the XeFG FG path ignores (docs 5.16),
-    // but our own --fg-warp / --fg-of paths do use it. 输入间隔 feeds --input-ms.
-    { L"高级",         kRowsAdv,    2, 0 },
+    // The "高级" card (FOV / 输入间隔) was removed on 2026-11-08: XeFG ignores the
+    // synthetic projection, and frameRenderTime is now vblank-snapped (--fg-rt-mode
+    // quant), which subsumes what --input-ms was used for. Both stay CLI-only.
 };
 static const int kCardCount = (int)(sizeof(kCards) / sizeof(kCards[0]));
 
@@ -298,7 +294,6 @@ static const wchar_t* kOptMv[]     = { L"关闭", L"游戏 MV", L"游戏 MV (反
 static const wchar_t* kOptFov[]    = { L"55.0", L"58.7", L"60.0", L"65.0" };
 static const wchar_t* kOptIvl[]    = { L"自动（倍数+1 vblank 余量）", L"16.7 ms (60 fps)", L"20 ms (50 fps)",
                                       L"25 ms (40 fps)", L"33 ms (30 fps)", L"41.7 ms (24 fps)" };
-static const double   kIvlMs[]     = { 0.0, 16.7, 20.0, 25.0, 33.0, 41.7 };
 static const wchar_t* kOptUi[]     = { L"关闭", L"自动" };
 static const wchar_t* kOptRt[]     = { L"ema", L"median (16 帧)" };
 static const wchar_t* kOptLock[]   = { L"关闭", L"30 fps", L"24 fps", L"40 fps", L"60 fps" };
@@ -716,36 +711,24 @@ static std::wstring build_cmdline(HWND target, bool display)
         cmd += g;
     }
 
-    // Fixed part: reversed-Z projection, no UI texture, first 6x unlock, median
-    // frame-time feed. jitter is NOT in the fixed part any more - see below.
+    // Fixed part: reversed-Z projection, no UI texture, 3x..6x unlock, and the
+    // vblank-snapped frame-time feed. jitter is NOT in the fixed part - see below.
+    //
+    // --fg-rt-mode quant (2026-11-08): feed XeFG the *measured* input interval rounded
+    // to a whole number of vblanks. The raw median lands on 16.0 ms for a 60 fps game
+    // (a 1 ms-granularity limiter alternates 16/17 ms), and 16.0 ms makes 2x output
+    // 125 fps - 4% faster than a 120 Hz panel - so the compositor drops a frame every
+    // ~0.2 s. Snapping to 2 x 8.33 = 16.67 ms gives exactly 120.0 fps (1.00 vblank
+    // per output frame). Same reasoning at 3x/4x: 31 ms snaps to 33.3 ms, which is the
+    // "+1 vblank of slack" that docs FINAL_CONFIG 5.18.1 measured as necessary.
     if (S().overlay_layered) { cmd += L" --overlay-layered"; }
     if (S().relay_input) { cmd += L" --relay-input"; }
     if (!S().osd) { cmd += L" --no-osd"; }
-    cmd += L" --unlock-mfg --fg-ui none --fg-proj-rz --fg-rt-mode median";
-    // The FOV dropdown used to be decorative: the cmdline hard-coded 58.7. Emit the
-    // selected value instead (`--fg-fov` only feeds the synthetic projection, which is
-    // used when the input source has no camera - FSR exports a real one and wins).
-    {
-        static const wchar_t* kFov[] = { L"55.0", L"58.7", L"60.0", L"65.0" };
-        const int sel = (S().fov_sel >= 0 && S().fov_sel < 4) ? S().fov_sel : 1;
-        cmd += L" --fg-fov ";
-        cmd += kFov[sel];
-    }
-    if (S().ivl_sel > 0 && S().ivl_sel < 6) {
-        wchar_t iv[32];
-        _snwprintf_s(iv, _TRUNCATE, L" --input-ms %.1f", kIvlMs[S().ivl_sel]);
-        cmd += iv;
-    } else if (S().ivl_sel == 0 && g_refresh > 1.0) {
-        // Smart default: one whole vblank of slack over the theoretical (interp+1) vblanks.
-        // Measured 2026-11-08: the exact theoretical value makes XeFG drop generated frames
-        // whenever throttle+present overshoots by a hair; +1 vblank removes the drops with
-        // no latency cost (docs FINAL_CONFIG 5.18.1).
-        const double vblank = 1000.0 / g_refresh;
-        const double ms = (S().interp + 2) * vblank;
-        wchar_t iv[32];
-        _snwprintf_s(iv, _TRUNCATE, L" --input-ms %.1f", ms);
-        cmd += iv;
-    }
+    cmd += L" --unlock-mfg --fg-ui none --fg-proj-rz --fg-rt-mode quant";
+    // FOV and 输入间隔 are no longer exposed in the UI (2026-11-08): FOV only feeds the
+    // synthetic projection, which the XeFG frame-generation path ignores (5.16), and
+    // --input-ms no longer matters for pacing now that frameRenderTime is vblank-snapped.
+    // Both remain available as bridge.exe command-line switches.
     // MV: 0 = off, 1 = the game vectors (bridge asks the add-on for the MV stream;
     // the add-on has to run with SkipMv=0), 2 = reversed (--mv-flip).
     if (S().mv_mode == 0) {

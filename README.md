@@ -56,7 +56,7 @@ run_3x_of.bat Game.exe          rem 3x 满帧，推荐
 
 | 取向 | 命令 | 输出 | 备注 |
 |---|---|---|---|
-| **3x 满帧（推荐）** | `--interp 2 --fg-of --input-ms 33.3` | 40 → 120 fps | 光流 MV、无闪烁、`gpu` ≈ 9 ms |
+| **3x 满帧（推荐）** | `--interp 2 --fg-of` | 40 → 120 fps | 光流 MV、无闪烁、`gpu` ≈ 9 ms |
 | 2x 画质优先 | `--interp 1`（+ 游戏 MV，`SkipMv=0`） | 60 → 120 fps | 边缘伪影最少 |
 | 最低开销 | `--interp 2 --no-mv` | 40 → 120 fps | 快转时边缘更脏 |
 
@@ -91,14 +91,16 @@ run_3x_of.bat Game.exe          rem 3x 满帧，推荐
 | 叠加层 | 分层窗口 (A/B) | 默认 **开**（菜单才收得到点击） | `--overlay-layered` |
 | | 输入转发 (A/B) | 默认关（与上面互斥） | `--relay-input` |
 | | 单行 OSD | 默认 **开** | 关掉时 `--no-osd` |
-| 高级 | FOV（合成投影） | 55.0 / **58.7** / 60.0 / 65.0 | `--fg-fov F` |
-| | 输入间隔 | **自动**（倍数+1 vblank）/ 16.7 / 20 / 25 / 33 / 41.7 ms | `--input-ms X` |
 | 启动 | 开关热键 | 6 个预设 + 自定义，默认 **Ctrl+PageUp** | — |
 | | 建议锁帧 | 只提示（算出 锁帧 × 倍数 = 上屏帧率），**不改**别人的限帧器 | — |
 | | 启动命令 | 只读回显 | — |
 
+> 「高级」卡片（FOV / 输入间隔）**已从界面移除**：XeFG 本来就不读合成投影（§5.16），
+> 而 `frameRenderTime` 现在由 `--fg-rt-mode quant` 自动吸附到整 vblank，
+> 比手填输入间隔更准。两项都还留在 `bridge.exe` 命令行里。
+
 它还会**固定**发出这几个参数，界面不暴露：
-`--unlock-mfg --fg-ui none --fg-proj-rz --fg-rt-mode median` + `--hwnd 0x…`（目标窗口）。
+`--unlock-mfg --fg-ui none --fg-proj-rz --fg-rt-mode quant` + `--hwnd 0x…`（目标窗口）。
 
 要点：
 
@@ -143,7 +145,8 @@ ReShade 侧的三条硬要求（部署包已处理，手工装时必看）：
 - XeFG **确实消费运动矢量**（早期"死输入"的结论是错的）；
 - **深度和投影/FOV 对画质没有可测量的影响**，别在这上面花时间；
 - 3x 的闪烁来自"MFG 补丁把 2x 模型跑多遍"，不是你的配对写错了 ⇒ 3x 用光流；
-- `--input-ms` 是"容忍迟到"的旋钮，不是刷新率。
+- **节拍是 vblank 算术**：`--fg-rt-mode quant` 把实测输入间隔吸附到整 vblank
+  （2x@60 → 16.67 ms、3x@40 → 33.3 ms），输出正好 1.00 vblank/帧，不做这件事就会有周期性丢帧。
 
 完整变量表与实测数据：`docs/findings/QUALITY_VARIABLES.md`、
 `docs/findings/CONCLUSIONS.md`。
