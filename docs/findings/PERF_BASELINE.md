@@ -649,6 +649,14 @@ v3 的实测（未锁帧、帧率稳定在 40 fps 附近）：
 **结论**：v3 判据安全（不会再误翻），但**保守**：在这种"未锁帧但帧率其实很稳"的状态里它选 `quant`，
 比手动 `raw` 差 0.3 个百分点。想要那 0.3 pt 就手动 `--fg-rt-mode raw`；想要"绝不抖"就用 `auto`/`quant`。
 
+**锁帧场景验证（60 fps）**：`--interp 5 --interp-cadence --fg-rt-mode auto` 跑 60 s，
+**`flips=0`**、`cadence: rt=16.7ms (auto:quant) … = 1.00 vblank/frame`、
+空刷新 **0.8%**（与纯 `quant` 的 0.8% 完全一致）⇒ auto 在锁帧下安静地等于 quant，符合设计。
+
+> 尚未验证的一条：v3 在多长时间、多大变化下真的会切 `raw`。要触发它需要帧率**持续**移动
+> （比如从密集街区走到空旷区），日志会出现 `input rate is moving (median … vs …)`。
+> 手动测的话：`--fg-rt-mode auto` 不锁帧，在场景间来回走，`flips` 应该 ≥1 且不来回跳。
+
 ### 3.21 定稿：120 Hz 面板上的四档设置（4K 捕获，`--den 2` 输出）
 
 一条命令覆盖全部四档：
