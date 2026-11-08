@@ -52,9 +52,13 @@ def parse(path):
     return wins
 
 
+# Nominal vblanks per input frame: 2 for 2x@60 on 120 Hz, 3 for 3x@40, 4 for 4x@30.
+# Anything above it is a late/skipped input, anything below it is an early (catch-up) one.
+NOMINAL = 2
+
+
 def late(h):
-    """Frames that arrived later than the nominal spacing of 2 vblanks."""
-    return sum(v for k, v in h.items() if k > 2)
+    return sum(v for k, v in h.items() if k > NOMINAL)
 
 
 def stats(wins):
@@ -83,13 +87,18 @@ def stats(wins):
 
 
 def main(argv):
+    global NOMINAL
     show_all = "--all" in argv
+    for a in argv:
+        if a.startswith("--nominal="):
+            NOMINAL = int(a.split("=", 1)[1])
     files = [a for a in argv if not a.startswith("--")]
     if not files:
         print(__doc__)
         return 2
 
-    print(f"{'file':22s}{'win':>5s}{'game>2vb':>10s}{'arr>2vb':>9s}"
+    print(f"nominal = {NOMINAL} vblank(s) per input frame")
+    print(f"{'file':22s}{'win':>5s}{'game>nom':>10s}{'arr>nom':>9s}"
           f"{'empty vb':>10s}{'load':>7s}{'gpu':>7s}{'present':>9s}{'skipped':>9s}")
     print("-" * 88)
     for path in files:
