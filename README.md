@@ -1,197 +1,204 @@
-# mgpu —— 把"渲染卡"和"帧生成卡"拆到两块 GPU 上
+# mgpu —— 把"渲染"和"帧生成"拆到两块 GPU 上
 
-游戏照常用**自己的**卡渲染 + 超分（DLSS / FSR / XeSS），ReShade add-on 把
-运动矢量 / 深度写进共享显存，另一个进程 `bridge.exe` 在**另一块卡**上用
-**XeSS-FG** 插帧，再通过覆盖窗口上屏。
-
-A 卡 + N 卡混插也能跑：渲染在 3080 Ti 上、帧生成在 6750 GRE 上（实测环境）。
+> 游戏照常用**自己的卡**渲染 + 超分（DLSS / FSR / XeSS），
+> 运动矢量与深度走共享显存，另一块卡专职用 **XeSS-FG** 插帧，再通过覆盖窗口上屏。
+> 实测环境：**RTX 3080 Ti 渲染 + RX 6750 GRE 插帧，4K / 120 Hz**。
+> A 卡 + N 卡混插能用，**单卡也能用**（插帧和渲染落在同一块卡上）。
 
 ```
 游戏 ──► 超分 ──► game_capture.addon64 ──► 共享显存 + 跨卡 fence ──► bridge.exe ──► 屏幕
-        (DLSS/FSR/XeSS)   (D3D12, 渲染卡)                          (XeSS-FG, 另一块卡)
-                                                                        ▲
-                                                              mgpu_ui.exe（前端/热键）
+       (DLSS/FSR/XeSS)  (D3D12, 渲染卡)                              (XeSS-FG, 另一块卡)
+                                                                          ▲
+                                                                mgpu_ui.exe（前端 / 热键 / 状态）
 ```
 
-为什么必须是两个进程、协议长什么样：`docs/design/ARCHITECTURE.md`、
-`docs/design/PROTOCOL.md`。
+---
+
+## 亮点
+
+| 亮点 | 说明 |
+|---|---|
+| **双卡分工** | 插帧不抢游戏的 GPU：游戏帧率不降，插出来的帧在另一块卡上算。也可以用单卡只借 XeFG 的能力 |
+| **2x – 6x 倍率** | 2x 是原生；3x–6x 靠 `--unlock-mfg`（**内存补丁，仅供个人研究**，见 §许可）。40 → 120、30 → 120 都能整拍 |
+| **两种模式** | **固定倍数**（稳定、可预测）与**动态逐帧**（每帧按实际经过的 vblank 数取倍率，输入 35–45 fps 抖动时也能把 120 Hz 填满，实测空刷新 **1.3%**） |
+| **整流输出** | 输出恒定 1 帧/vblank；`--fg-out-hz` 还能把"120 Hz 面板但只想要 60 fps"变成 2x 而不是 4x |
+| **不碰你的画质设置** | 不改游戏文件、不从渲染管线取色（颜色走 WGC 抓屏），add-on 只**读**超分阶段已经算好的 MV/深度 |
+| **带宽自己会喊** | MV + 深度默认压到 1440p（**28 MB/帧**，而不是 63），把渲染卡的余量留给游戏；日志 `bus:` / `headroom:` 直接告诉你超没超 |
+| **可诊断** | `breakdown` / `bus:` / `arr(vb):` / `out:` 一整套计数器，`--dump` 抓成对帧做离线逐像素分析；每个结论都有实测出处（`docs/findings/`） |
+| **纯本地、无服务** | 三个产物（两个 exe + 一个 add-on DLL），无驱动、不注入其他进程、无网络；全部可逆卸载 |
+| **GPL-3.0** | 协议、shader、实验记录全在仓库里，欢迎改和提 |
+
+> 不吹的部分写在下面「已知限制」里 —— 这个项目对"做不到的事"的记录比对"能做到的事"更详细。
+
+---
+
+## 三个组件，各管一段
+
+### 1. `game_capture.addon64` —— 游戏侧（ReShade add-on）
+
+跑在**游戏进程**里（也就是渲染卡上），挂在超分库（NGX / FfxApi / XeSS）的输出阶段，
+把这一帧的**运动矢量 + 深度**（可选颜色）写进共享显存，并用跨卡 fence 通知另一侧。
+
+- 依赖 **ReShade 6.8**（`dxgi.dll`），且必须**启用至少一个效果**（部署包带的
+  `MGPU_DepthTap.fx` 就是干这个的，空转不耗性能）；
+- 零配置可用：部署包会放一份调好的 `game_capture.ini`。
+
+**`game_capture.ini`（放在 add-on 旁边，即游戏 exe 同级目录）**
+
+| 键 | 默认 | 作用 | 建议 |
+|---|---|---|---|
+| `Input` | `auto` | 输入源：`auto` / `ngx`(DLSS) / `ffx`(FSR) / `xess` / `depth` | 保持 `auto` |
+| `StreamHeight` | **`1440`** | 跨卡流（MV+深度）的**高度上限**，宽度按宽高比算 | 4K 游戏别改。`0` = 跟随渲染尺寸（63 MB/帧，容易 drop）；`1080` 再省一半；`2160` = 全分辨率 |
+| `StreamPercent` | `100` | 在 `StreamHeight` 之上再按比例缩（`150` = 渲染的 2/3） | 一般不用动 |
+| `SkipMv` | `0` | `1` = 永不产出 MV；`0` = 听 bridge 的请求（选"游戏 MV"必须 `0`） | 保持 `0` |
+| `DepthConvert` | `1` | 深度转 R32_FLOAT 再共享 | **别设 0**，缺这个键旧版会静默失效 |
+| `Color` | `0` | `1` = 额外把后台缓冲也拷过去 | 保持 `0`（颜色由 bridge 抓屏，开 1 是纯成本） |
+| `StreamAlign` / `MvNormalize` / `MvFlip` | `1` / `0` / `0` | 对齐与 MV 单位/符号修正 | 别乱改 |
+| `Log` | `0` | 写 `game_capture.log` | 排查时设 `1` |
+
+### 2. `bridge.exe` —— 帧生成侧（真正干活的进程）
+
+WGC 抓帧 → 跨卡取 MV/深度 → **XeSS-FG** 插帧 → DirectComposition 覆盖窗口上屏。
+同时负责节拍（整 vblank）、OSD、热键响应和全部诊断输出。
+
+**日常会用到的参数**
+
+| 参数 | 作用 | 备注 |
+|---|---|---|
+| `--game Game.exe` / `--hwnd 0x…` | 指定目标窗口 | 配方脚本传第一个参数；前端传 hwnd |
+| `--interp N` | 两帧真实帧之间插 N 帧（`2` = 3x、`1` = 2x） | 3x 以上需 `--unlock-mfg` |
+| `--interp-cadence` | **动态逐帧**：按实际经过的 vblank 数逐帧决定倍率 | 把 `--interp` 当容量上限用（推荐 `--interp 5`） |
+| `--cadence-smooth N` | 决定倍率前先对"到达间隔"做 N 帧 EMA（默认 `8`） | 输入抖动大时**别关**（关了倍率会跟着抖 1:1） |
+| `--fg-out-hz N` | 输出帧率上限（`0` = 面板刷新） | 最低 2x；够不到会打 warning |
+| `--fg-rt-mode ema\|raw\|median\|quant\|auto` | 喂给 XeFG 的 `frameRenderTime` 用哪种估计 | 默认 `quant`（吸附整 vblank）；前端用 `auto` |
+| `--mv-flip` / `--no-mv` | 游戏 MV 反向 / 不用 MV | UI 里对应"运动矢量"下拉 |
+| `--fg-of` | 用 **AMD 光流**代替游戏 MV | 固定 3x/4x 首选（不闪）；**动态逐帧别用**（同卡多一个 pass ⇒ drop 更多） |
+| `--no-depth` | 不传深度 | **别用**：disocclusion 会渗色 |
+| `--unlock-mfg` | 内存里改 `libxess_fg` 打开 3x–6x | 仅供个人研究，见 §许可 |
+| `--den N` / `--scale F` | 生成分辨率 = 抓到的 1/N / 上屏缩放 F | `--den 2` 省算力；`--scale 0.75` 是 5K 的折衷 |
+| `--gpu N` | 指定插帧用哪块卡 | 不传则自动（按输出显示器 / 避开游戏卡） |
+| `--pool N` / `--latency N` | 帧池深度 / 最大帧延迟数 | 默认 4 / 1；延迟敏感就保持 `1` |
+| `--overlay-monitor N` / `--overlay-hidden` | 覆盖窗口放到指定显示器 / 只跑不上屏 | 后者用来隔离"同屏覆盖窗口"造成的抖动 |
+| `--overlay-layered` / `--relay-input` | 分层窗口（菜单可点击）/ 输入转发 | 二选一 |
+| `--no-osd` | 关掉左上角单行 OSD | |
+| `--dump N` | 抓成对帧（颜色/深度/MV）到磁盘 | 排障与 A/B 量化用 |
+| `--report N` / `--log-flush` | 统计窗口长度（帧）/ 立刻刷日志 | 调性能时用 |
+
+完整开关（含实验性）在 `docs/findings/FINAL_CONFIG.md` §4。
+
+### 3. `mgpu_ui.exe` —— 前端
+
+选窗口 → 选模式/倍数/输出 → 开始；热键开关（默认 `Ctrl+PageUp`），状态栏显示关键日志。
+界面上每一行都对应一个 bridge 参数，卡片底部"启动命令"是**实时回显**，所见即所传。
+支持多个单游戏配置档，每档独立保存设置与目标窗口。详见 `docs/ops/UI.md`。
+
+### 4. `game-pack/` —— 安装器
+
+把游戏 `.exe` **拖到 `install.bat` 上**即可：装 ReShade 6.8 + add-on + 调好的 ini + 空转效果，
+`uninstall.bat` 一键还原。三个必踩的坑写在 `docs/ops/DEPLOY.md`。
+
+---
+
+## 按场景选配置
+
+| 你的情况 | 怎么配 | 输出 | 实测 |
+|---|---|---|---|
+| **游戏 35–45 fps 抖、不想锁帧** | 动态逐帧：`--interp 5 --interp-cadence` + 游戏 MV | 120 fps（1 帧/vblank） | 空刷新 **1.3%**，倍率切换 12 次/秒 |
+| **能稳定 40 fps，想要最稳** | 固定 3x：`--interp 2 --unlock-mfg`，MV 用游戏 MV 或 `--fg-of` | 120 fps | 空刷新 **0.1–0.3%** |
+| **能稳定 60 fps，画质优先** | 2x：`--interp 1` + 游戏 MV | 120 fps | 边缘伪影最少（光流 0.3 ms 可省掉） |
+| **能稳定 30 fps** | 4x：`--interp 3 --unlock-mfg` | 120 fps | 空刷新 2.6%（改用动态逐帧 + `--interp 5` 容量可到 0.6%） |
+| **120 Hz 面板但只想要 60 fps** | 动态逐帧 + `--fg-out-hz 60` | 60 fps | 输入 30 时自动 2x，不是 4x |
+| **5K / 高分辨率** | 加 `--scale 0.75` | 按比例 | 5K 原生只有 2x@30 ≈ 60 fps 跑得动 |
+| **预算最紧 / 插帧卡较弱** | `--interp 2 --no-mv` | 120 fps | 少一个 pass；快转时边缘略脏 |
+| **只有一块显卡** | 一样能跑 | — | 插帧与渲染同卡，收益比双卡小很多 |
+| **要抓数据做离线分析** | `--dump 200` | — | 输出 `f<NN>_colour/depth/mv.raw` + `_meta.txt` |
+
+现成配方在 `scripts/recipes/`；发布包里是 `bin\` 里的 `.bat`，双击即可
+（`5 - smoothest (cadence).bat` 就是上表第一行）。
+
+---
 
 ## 5 分钟上手
 
-> 想直接拿成品包？`./scripts/make_release.sh` 会编译三件产物并打出
-> `dist/mgpu-<版本>.zip`（含 `bin/`＋`game-pack/`＋`docs/`＋校验值），
-> 用法写在包里那份 `README.md`（= [`docs/ops/USAGE.md`](docs/ops/USAGE.md)）。
+1. **装进游戏**：把游戏 exe 拖到 `game-pack\install.bat` 上（或先跑 `./scripts/make_addon_package.sh`）；
+2. **游戏内设置**：关掉游戏自带帧生成；超分选 **DLSS / FSR2+ / XeSS**；用外部限帧器（RTX 驱动的
+   Max Frame Rate / RTSS）锁到"目标上屏帧率 ÷ 倍数" —— 不想锁就直接用动态逐帧；
+3. **起 bridge**：双击 `bin\5 - smoothest (cadence).bat`，或打开 `mgpu_ui.exe` 选窗口 → 开始；
+4. **确认通了**：OSD 显示 `x3` 且 `drop` 不涨；日志 `gen 3/3`（生成帧成对）。
 
-> 前提：Windows 10 1809+、两块 GPU、游戏支持 DLSS / FSR2+ / XeSS。
-> 构建见 `docs/ops/BUILD.md`；下面假设你已经有 `build/` 里的三件产物。
+判读与排障：`docs/ops/USAGE.md` §8–§9。
 
-**① 装进游戏** —— 用打包好的部署包，把游戏的 `.exe` **拖到 `install.bat` 上**：
+---
 
-```bash
-./scripts/make_addon_package.sh        # -> dist/mgpu_reshade_pack.zip
-```
+## 已知限制（先看这里，省你几天）
 
-装完游戏目录里会有 `dxgi.dll`(ReShade 6.8)、`game_capture.addon64`、
-`game_capture.ini`、`mgpu_depth_tap.fx`。全部可逆（`uninstall.bat`）。
-细节与三个必踩的坑：`docs/ops/DEPLOY.md`。
-
-**② 游戏内设置**
-
-- **关掉**游戏自带的帧生成；
-- 抗锯齿/超分选 **DLSS** 或 **FSR**（XeSS 也行，见 `docs/design/INPUT_SOURCES.md`）；
-- 用**外部限帧器**（RTSS）把游戏锁到目标输入帧率 —— 消费者侧锁帧做不到这件事。
-
-**③ 起 bridge**（在 `bridge.exe` 所在目录，推荐直接用配方脚本）
-
-```bat
-run_3x_of.bat Game.exe          rem 3x 满帧，推荐
-```
-
-或者用前端：双击 `mgpu_ui.exe`（要和 `bridge.exe` 同目录），选窗口 → 选倍率 → 开始，
-热键开关。界面与每个开关的对应关系：`docs/ops/UI.md`。
-
-看到 `gen 3/3`（生成帧配对成功）就算通了。日志判据：`docs/findings/FINAL_CONFIG.md` §6。
-
-## 定稿配方
-
-| 取向 | 命令 | 输出 | 备注 |
-|---|---|---|---|
-| **动态逐帧（推荐，输入不稳时最顺）** | `--interp 5 --interp-cadence` + 游戏 MV | 35–45 → 120 fps | 每帧按实际 vblank 数取倍率，输出恒定 1 帧/vblank；**前提是 add-on 的 `StreamHeight=1440`** |
-| 3x 满帧（固定） | `--interp 2 --fg-of` | 40 → 120 fps | 光流 MV、无闪烁、`gpu` ≈ 9 ms（固定模式下光流仍可用） |
-| 2x 画质优先 | `--interp 1`（+ 游戏 MV，`SkipMv=0`） | 60 → 120 fps | 边缘伪影最少 |
-| 最低开销 | `--interp 2 --no-mv` | 40 → 120 fps | 快转时边缘更脏 |
-
-可执行版本在 `scripts/recipes/`：`run_smooth.bat`（动态逐帧）/ `run_3x_of.bat` /
-`run_2x_quality.bat` / `run_3x_nomv.bat` / `run_dump.bat` / `run_smooth_batchfeed.bat`（A/B 对照）。
-
-倍率与输入帧率必须让**输出间隔等于整数个 vblank**，否则"不卡但不匀"。
-`--interp 2` = 3x，非 Intel 显卡需要 `--unlock-mfg`（**读 `docs/ops/LEGAL.md` 再用**）。
-
-## 参数速查
-
-两张表：**前端（UI）** 和 **游戏侧（ReShade add-on）**。命令行开关全集在
-`docs/findings/FINAL_CONFIG.md` §4，这里只列你日常会碰的。
-
-### A. `mgpu_ui.exe`（前端）
-
-把 `mgpu_ui.exe` 放在 **`bridge.exe` 同目录**，双击运行。界面上每改一项，它拼出的
-`bridge.exe` 命令行都会变 —— 卡片上"启动命令"那一行就是实时回显，**所见即所传**。
-
-| 卡片 | 行 | 取值（默认 **加粗**） | 传给 bridge |
-|---|---|---|---|
-| 帧生成 | 类型 | `XeFG 1.3.1 (libxess_fg)`（只读） | — |
-| | 模式 | **固定** / **动态逐帧**（两块互斥，模式外的行会灰显） | 固定：`--interp N-1`；动态：`--interp 5 --interp-cadence`（`--interp 5` = 6x 容量上限） |
-| | 倍数 | 2x / 3x / **4x** / 5x / 6x（动态模式下当作**容量上限**） | `--interp N-1` |
-| | 输出帧率 (Hz) | **0**（= 面板刷新，填满每个 vblank）/ 5–1000（仅动态模式） | `--fg-out-hz N`（`0` 不发） |
-| | 输出 | **1:1 原生** / 5K→4K (0.75x) / 半分辨率 | `--den 1` / `--scale 0.75` / `--den 2` |
-| | 运动矢量 | **关闭** / 游戏 MV（动态模式下可能闪烁）/ 游戏 MV(反向) / AMD 光流（动态模式下更易 drop） | `--no-mv` / （不带）/ `--mv-flip` / `--fg-of` |
-| 捕获 | 捕获 API | `WGC`（只读） | — |
-| | 帧池深度 | 2..6，默认 **4** | `--pool N` |
-| | 最大帧延迟数 | 1..3，默认 **1** | `--latency N` |
-| GPU / 显示器 | 帧生成用的 GPU | **自动**（bridge 按显示器/避开游戏卡选）或列表里任一块 | `--gpu N`（自动时不传） |
-| | 输出显示器 | 只读：当前桌面模式 | — |
-| 叠加层 | 分层窗口 (A/B) | 默认 **开**（菜单才收得到点击） | `--overlay-layered` |
-| | 输入转发 (A/B) | 默认关（与上面互斥） | `--relay-input` |
-| | 单行 OSD | 默认 **开** | 关掉时 `--no-osd` |
-| 启动 | 开关热键 | 6 个预设 + 自定义，默认 **Ctrl+PageUp** | — |
-| | 建议锁帧 | 只提示（算出 锁帧 × 倍数 = 上屏帧率），**不改**别人的限帧器 | — |
-| | 启动命令 | 只读回显 | — |
-
-> 「高级」卡片（FOV / 输入间隔）**已从界面移除**：XeFG 本来就不读合成投影（§5.16），
-> 而 `frameRenderTime` 现在由 `--fg-rt-mode quant` 自动吸附到整 vblank，
-> 比手填输入间隔更准。两项都还留在 `bridge.exe` 命令行里。
-
-它还会**固定**发出这几个参数，界面不暴露：
-`--unlock-mfg --fg-ui none --fg-proj-rz --fg-rt-mode auto` + `--hwnd 0x…`（目标窗口）。
-
-要点：
-
-- **限帧要你自己做**（RTSS 锁到 目标上屏帧率 ÷ 倍数）；UI 只是把数字算给你看。
-- 热键默认作用于**前景窗口**（鼠标点进游戏里按就行），也可以钉死某个配置里的窗口。
-- 热键：点一下开关 → 启动/停止；**Ctrl+点击**进按键捕捉（Esc 取消）。
-- 配置存在 `mgpu_ui.ini`（与 exe 同目录），每个配置档独立保存全部设置 + 目标窗口。
-- `mgpu_ui.ini` 里还留着 `jitter_zero` / `tearing` / `sdr` 等旧键，但**界面已不暴露、
-  命令行也不再发送**（`--fg-jitter-zero` 已弃用：jitter 一律用游戏自己的）。
-- 界面与实现细节：`docs/ops/UI.md`。
-
-### B. ReShade / add-on（游戏侧）
-
-add-on 读**自己旁边**的 `game_capture.ini`（即 `<GAME_DIR>\game_capture.ini`）。
-部署包会放一份调好的，正常不用改。
-
-| 键 | 取值（默认 **加粗**） | 说明 |
-|---|---|---|
-| `Input` | **auto** / ngx / ffx / xess / depth | 输入源，`auto` = 谁先给数据用谁。见 `docs/design/INPUT_SOURCES.md` |
-| `Color` | **0** / 1 | `0` = 不做颜色跨卡拷贝（颜色由 bridge 用 WGC 抓屏）；`1` = 拷后台缓冲 |
-| `DepthConvert` | **1** / 0 | 把深度转成 R32_FLOAT 再共享。**别设 0**，缺这个键时旧版会静默失效 |
-| `SkipMv` | **0** / 1 | `1` = 永不产出 MV；`0` = 听 bridge 的请求位。**UI 里选"游戏 MV"必须 `0`** |
-| `StreamHeight` | **1440** / 0 / 1080 / 2160 | **跨卡流（MV+深度）的高度上限，宽度按宽高比算**。默认 1440 ⇒ 4K 渲染传 2560x1440（28 MB/帧，而不是 63）。`0` = 跟随渲染尺寸 |
-| `StreamPercent` | **100** / >100 | 在 `StreamHeight` 结果之上**再**按比例缩（相对渲染尺寸，`150` = 2/3） |
-| `StreamAlign` | **1** / 0 | 行对齐处理，别乱改 |
-| `Log` | **0** / 1 | add-on 日志（也可用环境变量 `MGPU_CAPTURE_LOG=1`）；正常玩不写文件 |
-| `SlotPolicy` | **0** / 1 | `0` = 没空槽就丢帧；`1` = 等 `SlotWaitUs` 微秒。**实测 `1` 无收益**，遗留开关 |
-| `SlotWaitUs` | **2000** | 仅 `SlotPolicy=1` 生效 |
-| `RenderWidth` / `RenderHeight` | 不设 | `≥256` 才生效，只在游戏上报渲染分辨率错误时强制 |
-| `MvNormalize` / `MvFlip` | **0** / 0 | MV 单位/符号修正（一般用 bridge 的 `--mv-flip`，别动这里） |
-
-ReShade 侧的三条硬要求（部署包已处理，手工装时必看）：
-
-1. **ReShade 必须是 6.8.0**（`dxgi.dll`）—— add-on 的 API/ABI 与宿主对齐，换大版本要重编；
-2. **至少启用一个效果** —— add-on 每帧逻辑跑在 `reshade_begin_effects` 里，没有启用效果
-   ReShade 就不调它（部署包的 `MGPU_DepthTap` 空转效果就是干这个的）；
-3. **游戏自带帧生成必须关，超分选 DLSS / FSR / XeSS**（TSR / FSR1 / 原生 TAA 拿不到 MV）。
-
-完整占位符与环境变量（`MGPU_STAGE`、`RESHADE_SRC`…）见 `docs/ops/CONFIG.md`。
-
-## 已经确认的事（省你几天）
-
-- XeFG **确实消费运动矢量**（早期"死输入"的结论是错的）；
-- **深度和投影/FOV 对画质没有可测量的影响**，别在这上面花时间；
-- 3x 的闪烁来自"MFG 补丁把 2x 模型跑多遍"，不是你的配对写错了 ⇒ **固定** 3x 用光流；
-- **开 MV 会 drop，根源是渲染卡每帧的 63 MB 跨卡流量**（不是插帧算法）：add-on 现在默认把
-  MV/深度压到 1440p（28 MB/帧），实测 drop 消失 ⇒ 动态逐帧也能用游戏 MV；
-- **节拍是 vblank 算术**：`--fg-rt-mode quant` 把实测输入间隔吸附到整 vblank
-  （2x@60 → 16.67 ms、3x@40 → 33.3 ms），输出正好 1.00 vblank/帧，不做这件事就会有周期性丢帧。
-
-完整变量表与实测数据：`docs/findings/QUALITY_VARIABLES.md`、
-`docs/findings/CONCLUSIONS.md`。
-
-## 已知限制
-
-| 限制 | 说明 |
+| 做不到 | 原因 |
 |---|---|
-| 游戏自带的帧生成必须关 | 三层插值没人想要 |
-| TSR / FSR1 / 原生 TAA | 不支持，优雅降级（画面正常、无 MV/深度，日志 15 s 内提示） |
-| 消费者侧锁帧 | 不生效，必须用外部限帧器 |
-| 5K 原生输出 | 只能 2x@30 ≈ 60 fps；`--scale 0.75` 是推荐折衷 |
-| `--unlock-mfg` | 二进制补丁，可能违反 XeSS EULA，仅供个人研究 —— `docs/ops/LEGAL.md` |
-| 组合 4（A 卡渲染 + N 卡上屏） | 本机未跑通，正解在 `ROADMAP.md` |
+| 游戏自带帧生成 + 本工具同时开 | 三层插值，画面必炸 |
+| TSR / FSR1 / 原生 TAA | 拿不到运动矢量，质量不可接受（会优雅降级并在日志提示） |
+| 在消费者侧锁帧 | 无效；必须用外部限帧器 |
+| 5K 原生高倍率 | 只有 2x@30 ≈ 60 fps 跑得动 |
+| A 卡渲染 + N 卡输出的完整组合 | 本机未跑通；`--overlay-monitor` 要求两块屏都接同一块卡（见 `ROADMAP.md`） |
+| 零延迟 | 实测端到端 ~40–70 ms，随倍率/配置变化 |
+
+**这些已经试过并确定没用**（别再走一遍）：`--cadence-hold`（拿丢帧换稳定）、
+`--fg-cad-rt`（pacer 自激）、动态逐帧加 `--fg-of`（同卡多一个 pass）、`--no-depth`（渗色）、
+固定 3x 配 44–45 fps 输入（45×3 > 120，必然超额）。理由与数字见 `CHANGELOG.md` 和
+`docs/findings/PERF_BASELINE.md`。
+
+---
+
+## 欢迎参与
+
+这个项目是从"能不能把插帧拆到副卡上"一路试出来的，**大部分结论来自失败的实验**，
+所以特别欢迎：
+
+- **换游戏验证**：UE5 / 自研引擎的 MV 单位与深度来源各不相同，
+  `docs/design/INPUT_SOURCES.md` 写了怎么加一个输入源；跑通了请带 `--dump` 出来的成对帧和日志；
+- **换硬件验证**：A 卡渲染 + N 卡输出、Intel Arc、核显、双 A 卡……任何组合的实测都值钱
+  （`docs/findings/ENV_REPORT.md` 是登记处）；
+- **打包 / 前端 / 文档**：UI 是纯 Win32 + GDI（无第三方库），加一行开关很容易；
+- **提 bug 请带三样**：`bridge` 日志（含 `breakdown` 与 `bus:` 行）、`game_capture.ini` 内容、
+  游戏内的超分设置。有这三样基本能复现。
+
+不要提交：`libxess_fg.dll` / `libxell.dll`（Intel 的，见 `docs/ops/LEGAL.md` §3）、
+被 `--unlock-mfg` 改过的二进制、任何游戏资源。
+
+**文档从 `docs/README.md` 进**：结论先行 `findings/CONCLUSIONS.md`、
+性能基线 `findings/PERF_BASELINE.md`、踩坑清单 `findings/FINAL_CONFIG.md` §5。
+
+---
 
 ## 许可
 
-**GPL-3.0-or-later**（`LICENSE`），Copyright (C) 2026 bilibili夕阳虹舞。
-第三方组件逐项署名见 `NOTICE`。
-两条必须先读的：`docs/ops/LEGAL.md`（GPL 由来、`--unlock-mfg` 声明、XeSS SDK
-不可再分发）。
+**GPL-3.0-or-later**（`LICENSE`），Copyright (C) 2026 bilibili夕阳虹舞。第三方组件逐项署名见 `NOTICE`。
+
+两条务必先读（`docs/ops/LEGAL.md`）：
+
+1. 本项目**不分发** XeSS 运行时的 `libxess_fg.dll` / `libxell.dll`（Intel 的许可），
+   公开版包里不带，请自行从 XeSS SDK 获取；
+2. `--unlock-mfg` 是在**内存里**修改这些库的 6 处判断以打开 3x–6x，
+   **可能违反 Intel EULA，仅供个人研究**，风险自负。
+
+---
 
 ## 目录
 
 | 路径 | 内容 |
 |---|---|
+| `CHANGELOG.md` | **每个版本的变化 + 实测依据** |
 | `docs/README.md` | **文档索引 —— 从这进** |
-| `CHANGELOG.md` | **变更记录**（每个版本的变化与实测依据） |
-| `docs/ops/USAGE.md` | **完整使用说明**（安装 / 游戏内设置 / 配方 / 判读 / 排障 / 卸载），也是发布包里的 `README.md` |
+| `docs/ops/USAGE.md` | 完整使用说明（安装 / 游戏内设置 / 配方 / 判读 / 排障 / 卸载），也是发布包里的 `README.md` |
 | `docs/design/` | 架构、协议 v10、输入源、厂商兼容计划 |
-| `docs/ops/` | 构建、部署、配置（占位符/ini）、UI、依赖、合规 |
-| `docs/findings/` | **结论先行**、画质变量表、性能基线、踩坑清单、实验档案、里程碑 |
+| `docs/ops/` | 构建、部署、配置（占位符 / ini）、UI、依赖、合规 |
+| `docs/findings/` | 结论先行、画质变量、性能基线、踩坑清单、实验档案、里程碑 |
 | `src/game_capture/` | add-on：钩超分 API，写共享槽 |
 | `src/bridge/` | 消费端：XeFG + XeLL + WGC + 覆盖窗口 |
 | `src/mgpu_ui/` | 前端（Win32 + GDI，无第三方库） |
-| `scripts/recipes/` | 六份能直接跑的配方脚本 |
-| `docs/findings/ARCHIVED_EXPERIMENTS.md` | 已移除的历史实验脚本：参数 + 结论（可追溯"哪次测出来的"） |
-| `docs/findings/PERF_BASELINE.md` | 性能基线 + 优化候选（**调性能前先读**，免得重测一遍） |
+| `scripts/recipes/` | 能直接跑的配方脚本 |
+| `packaging/` | 部署包源文件（安装器 / 卸载器 / 预设） |
 | `tests/` | 各里程碑的验证程序（不参与正式构建） |
-| `packaging/` | 部署包源文件（安装器/卸载器/预设） |
 
-> 命令必须**单行**（换行会丢 shell 结束标记），长命令用 `./scripts/rcmd.sh`，
-> 详见 `docs/findings/TOOLING_NOTES.md`。
+> 贡献前建议先读 `docs/findings/TOOLING_NOTES.md`（本仓库的命令行约定）和
+> `docs/ops/BUILD.md`（三件产物怎么编）。
+
