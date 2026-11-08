@@ -7067,6 +7067,23 @@ int main()
               " input cadence so the output stays on whole vblanks\n",
               g_interp_auto_round ? "round" : "floor");
     }
+    // Cadence + motion vectors are not a good pair on this DLL, and the two are easy to
+    // combine by accident (the UI's MV dropdown sits right above the mode split).
+    // Per FINAL_CONFIG 5.17 a 3x/4x count is "the 2x model run twice", and the second
+    // generated frame reprojects with the same vectors for a different time fraction - the
+    // result is self-inconsistent and shows as flicker/ghosting. Cadence makes it worse:
+    // it changes the count *between* batches, so the fractions change per frame and XeFG's
+    // per-count state is re-entered 20-30 times a second (measured switches/window: 29 raw,
+    // 12 with --cadence-smooth). A constant count (fixed mode) does not do this - users
+    // report MV fine there, cadence + MV not smooth at all.
+    if (g_interp_cadence && (!g_no_mv || g_fg_of)) {
+        logf_("[bridge] NOTE: --interp-cadence with motion vectors (%s). This DLL's 3x/4x"
+              " path reuses one MV set for several time fractions, and cadence changes the"
+              " count between batches, so expect flicker/ghosting that --no-mv does not show."
+              " Either use --no-mv, or keep the count steady with --cadence-hold N, or run a"
+              " fixed multiplier for MV (docs/findings/FINAL_CONFIG.md 5.17)\n",
+              g_fg_of ? "AMD optical flow" : "the game's vectors");
+    }
     if (g_lock_auto) {
         logf_("[bridge] --lock-auto: solving (input lock, multiplier) so that"
               " input*(interp+1) divides the refresh - no RTSS, no VRR needed\n");
