@@ -622,25 +622,32 @@ show = 1000 / g_frame_ms_ema * ps.framesPresented      // 循环墙钟间隔 * �
 | **动态/跑不满** | `--interp 5 --interp-cadence --fg-rt-mode raw`（0.7%） |
 | 想要省 GPU（接受 1.33 vblank 的抖动） | `--dyn-mfg` |
 
-### 3.20 `--fg-rt-mode auto`：判定生效，但只值 0.3 个百分点
+### 3.20 `--fg-rt-mode auto`：判定要"按窗口"做，否则会来回翻
 
-自动判断（快/慢两条 EMA 的差 > 0.15 vblank 且连续 12 帧一致 ⇒ 用 `raw`，否则 `quant`）：
+目的：锁帧时用 `quant`（中位数吸附整 vblank），帧率真的在漂时用 `raw`（真实间隔）。
+两版判据的实测（同一台机器，未锁帧、游戏稳定在 ~40 fps 的状态）：
+
+| 版本 | 判据 | 结果 |
+|---|---|---|
+| v1 | 快/慢 **EMA** 差 > 0.15 vb，逐帧判 | ❌ 把"锁 40 fps 的 ±1 vblank 抖动"当成帧率在动 |
+| v2 | 16 样本中位数 vs EMA，逐帧判 | ❌ **来回翻**：`moving(33.3 vs 25.0) → raw` / `steady(25.0) → quant`，18 s 内翻 4 次 |
+| **v3** | 短中位数（16 样本）vs 长中位数（64 样本），差 ≥ 0.6 vb，**每个统计窗口判一次 + 连续 3 个窗口一致才翻** | ✅ 60 s 内 `flips=0`，稳定停在 `quant` |
+
+v3 的实测（未锁帧、帧率稳定在 40 fps 附近）：
 
 ```
-[bridge] --fg-rt-mode auto: input rate is moving (fast 21.6 vs slow 24.1 ms, 0.29 vblanks apart) -> feeding raw
-[bridge]   rt auto: fast=25.6 slow=24.9 (0.09 vblanks apart) -> raw  flips=1
+[bridge]   rt auto: median 25.0 vs 25.0 (0.00 vblanks apart) -> quant  flips=0
+[bridge]   rt auto: median 33.3 vs 25.0 (1.00 vblanks apart) -> quant  flips=0   ← 单个窗口不翻
 ```
 
-同一动态场景、各 60 s：
-
-| 组 | 空刷新（全窗口） | 空刷新（steady） | `max empty` | 判定 |
+| 组（同一状态） | 空刷新（全窗口） | 空刷新（steady） | `max empty` | 判定 |
 |---|---|---|---|---|
 | `quant` | 1.1% | 1.0% | 13 | — |
 | `raw` | **0.8%** | **0.7%** | **5** | — |
-| **`auto`** | 1.6% | 0.9% | 31 | 翻 1 次，稳定在 raw ✅ |
+| `auto`(v3) | 1.2% | 0.9% | 13 | 稳定停在 quant，`flips=0` |
 
-⇒ 判定方向正确、不抖动（`flips=1`），但 `quant` 在这个场景也只差 0.2–0.3 个百分点。
-**真正决定平滑度的是 `--interp 5` + `--interp-cadence`，`auto` 只是收尾。**
+**结论**：v3 判据安全（不会再误翻），但**保守**：在这种"未锁帧但帧率其实很稳"的状态里它选 `quant`，
+比手动 `raw` 差 0.3 个百分点。想要那 0.3 pt 就手动 `--fg-rt-mode raw`；想要"绝不抖"就用 `auto`/`quant`。
 
 ### 3.21 定稿：120 Hz 面板上的四档设置（4K 捕获，`--den 2` 输出）
 
