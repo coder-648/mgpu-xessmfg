@@ -8,6 +8,7 @@
 |---|---|
 | [`../README.md`](../README.md) | **项目亮点**、三个组件与参数、按场景选配置、5 分钟上手、已知限制、如何参与 |
 | [`../CHANGELOG.md`](../CHANGELOG.md) | **变更记录**：每个版本用户能感知的变化 + 对应实测依据 |
+| [`RELEASE_NOTES.md`](RELEASE_NOTES.md) | **可直接粘到 GitHub Releases 的版本说明**（含下载与校验值） |
 | [`findings/CONCLUSIONS.md`](findings/CONCLUSIONS.md) | **结论先行**：这个 FG 消费什么、三条硬约束、倍率的真相 |
 | [`design/ARCHITECTURE.md`](design/ARCHITECTURE.md) | 为什么是两个进程、一帧的生命周期、关键取舍 |
 
