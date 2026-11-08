@@ -1729,9 +1729,14 @@ static bool init_fg()
         }
     }
 
-    if (g_unlock_mfg && g_fg_interp_max <= 1) {
-        logf_("[bridge] WARNING: --unlock-mfg is on but the DLL still reports 1."
-              " The patch did not take - do not expect MFG.\n");
+    // Only a *request* above what the DLL allows means the patch failed. With --interp 1
+    // (2x) the patch code deliberately does nothing ("nothing to patch"), so warning here
+    // was a false alarm - it fired on every plain 2x run and made people distrust the log.
+    if (g_unlock_mfg && g_fg_interp_max <= 1 &&
+        (g_fg_interp > 1 || g_interp_cadence || g_interp_auto || g_dyn_mfg)) {
+        logf_("[bridge] WARNING: --unlock-mfg is on and more than 2x was requested, but the"
+              " DLL still reports 1 interpolated frame. The patch did not take - do not"
+              " expect MFG.\n");
     }
 
     UINT want_interp = (g_fg_interp > 0) ? static_cast<UINT>(g_fg_interp) : g_fg_interp_max;
@@ -5973,6 +5978,49 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
                   need, need * refresh_ms(), static_cast<unsigned long long>(g_frames),
                   arr_median_ms(), arr_wc_median_ms());
             for (int k = 1; k <= 8; ++k) { g_arr_hist[k] = 0; }
+        }
+        // ---- output side: are the generated frames actually reaching the display? -----
+        // Nothing above can see this: `xN` is XeFG's own accounting and `cadence` is derived
+        // from the input median. Only the swap chain knows what it really handed to the
+        // compositor, so count it. `expected` = frames this window * (interp+1) and `vblanks`
+        // = refresh periods actually elapsed; presents << expected means XeFG is not
+        // emitting the frames it charges us for (the picture judders while every other
+        // counter looks perfect), presents > vblanks means they go out in bursts.
+        {
+            UINT last = 0;
+            static UINT s_prev_last = 0;
+            if (g_swapchain && SUCCEEDED(g_swapchain->GetLastPresentCount(&last))) {
+                const UINT d = (s_prev_last && last >= s_prev_last) ? (last - s_prev_last) : 0;
+                s_prev_last = last;
+                const double vbs = (win > 0.0) ? win * static_cast<double>(g_refresh_hz) : 0.0;
+                const double expect = static_cast<double>(g_report_every) *
+                                      static_cast<double>(g_fg_interp_actual + 1);
+                logf_("[bridge]   out: presents=%u  expected=%.0f  vblanks=%.0f%s\n",
+                      d, expect, vbs,
+                      (d > 0 && static_cast<double>(d) + 0.5 < expect)
+                          ? "  <== OUTPUT FRAMES MISSING" : "");
+            }
+            static bool s_stats_failed = false;
+            DXGI_FRAME_STATISTICS fs{};
+            if (!s_stats_failed) {
+                if (g_swapchain && SUCCEEDED(g_swapchain->GetFrameStatistics(&fs))) {
+                    static UINT s_pc = 0, s_prc = 0, s_src = 0;
+                    const UINT pc  = (fs.PresentCount >= s_pc) ? fs.PresentCount - s_pc : 0;
+                    const UINT prc = (fs.PresentRefreshCount >= s_prc)
+                                   ? fs.PresentRefreshCount - s_prc : 0;
+                    const UINT src = (fs.SyncRefreshCount >= s_src)
+                                   ? fs.SyncRefreshCount - s_src : 0;
+                    s_pc = fs.PresentCount; s_prc = fs.PresentRefreshCount;
+                    s_src = fs.SyncRefreshCount;
+                    // presentRefresh lags syncRefresh when the compositor had to skip a
+                    // vblank: a *displayed* drop, invisible to every other counter.
+                    logf_("[bridge]   out2: count+%u  presentRefresh+%u  syncRefresh+%u%s\n",
+                          pc, prc, src, (src > prc + 1) ? "  <== VBLANK MISSED" : "");
+                } else {
+                    s_stats_failed = true;
+                    logf_("[bridge]   out2: GetFrameStatistics unsupported on this swap chain\n");
+                }
+            }
         }
         logf_("[bridge]   breakdown: capture=%.1fms work=%.1fms present=%.1fms gpu=%.1fms"
               " wait=%.1fms copy=%.1fms colour=%.1fms mvs=%.1fms of=%.1fms age=%.1fms"

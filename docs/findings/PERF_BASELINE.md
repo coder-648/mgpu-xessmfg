@@ -48,6 +48,21 @@
 尺寸取生产端发布的流尺寸。它就是 `StreamPercent` / `--no-depth` 改变的量 ——
 当目标是"降总线"时看这一行，不要看 `total`。
 
+另外三行是**输入/输出侧**的真相，判"掉帧"只能看它们：
+
+```
+[bridge]   arr(vb): 2x=38 3x=1 4x=1  n=40  need 2x (25.0 ms)  frames=1401  med dwm=25.0 wc=25.0
+[bridge]   out:  presents=80  expected=80  vblanks=81
+[bridge]   out2: GetFrameStatistics unsupported on this swap chain
+```
+
+| 行 | 含义 |
+|---|---|
+| `arr(vb)` | 每个输入到达间隔落在第几个 vblank（用帧自带的 `SystemRelativeTime`）。`n` = 这一窗口到达帧数：`n == frames` 就说明**一帧没丢**；桶比 `need` 大就是"晚到了" |
+| `out:` | 交换链真实 Present 数 vs 期望（`frames × (interp+1)`）vs 这窗口实际过了几个 vblank。`presents < expected` ⇒ XeFG 少发帧；`vblanks > presents` ⇒ **有空刷新周期**（画面停住一拍），这是眼睛看到的"掉帧" |
+| `out2:` | `GetFrameStatistics`；flip-model 交换链在 Windows 上通常不支持，支持时能给出"跳过了哪个 vblank" |
+
+
 **判据优先级（从上往下，前一条不满足就别看后面）：**
 
 1. 状态行的 `... %.1f fps out = %.2f vblank/frame` 应当是 **1.00**（默认值
@@ -266,6 +281,39 @@ A 与 B 只差 `--no-depth`：
    那是 RTSS/合成器抖动，被 XeFG 的插帧吸收，输出仍是 1.00 vblank/帧。
 4. **2x 下开不开 MV 对性能没有可测差异**（`present` 3.7 vs 5.7 在噪声内），
    所以按画质选：**2x 用游戏 MV**（`SkipMv=0`，不加 `--no-mv`），与本项目既有结论一致。
+
+### 3.10 用户报"看到很多掉帧" —— 输出侧量出来的确是空的（2x@60，同一场景，各 60 s）
+
+前面所有计数器都只看**输入**：`cadence = 1.00`、`slow = 0`、`arr(vb)` 的 `n == frames`。
+它们都健康，但眼睛看到的掉帧在**输出侧**。新增 `out:` 行（交换链 `GetLastPresentCount`
++ 窗口时长 × 刷新率）之后：
+
+| 配置 | 空 vblank 率 | 有 ≥3 个空 vblank 的窗口 | 每窗最差 present 间隔（中位/最大） |
+|---|---|---|---|
+| 纯 2x（`--interp 1`） | **4.9%**（350/7149） | 30/86 | 24.3 / 45.8 ms |
+| `--interp 1 --jbuf 1` | **8.1%**（576/7135） | 52/83 | 32.3 / 242.5 ms |
+| `--interp 2 --interp-cadence` | **2.0%**（143/7102） | 21/84 | 27.4 / 220.6 ms |
+
+读法：
+
+1. **`presents` 始终等于 80**（40 帧 × 2）⇒ XeFG 没少发帧，问题不在它，也不在我们
+   的提交。`vblanks` 却经常是 81–109 ⇒ **每 100 个刷新周期里有 5 个没有新画面**，
+   最差的一窗有 29 个空 vblank（= 240 ms 画面停住）。这就是"很多掉帧"。
+2. 空 vblank 与 `arr(vb)` 里的 **4x/5x 桶一一对应**：输入帧晚到 1–2 个 vblank
+   （33–41 ms 而不是 16.7），插帧只能补一帧，于是留一个空 vblank。
+   **根因在输入侧**：游戏/RTSS 没稳住 60 fps（每窗口 6–14/40 帧晚到）。
+3. **`--interp-cadence` 是目前唯一有效的补救**（4.9% → 2.0%）：它按"这一帧实际过了几个
+   vblank"决定插几帧，晚到的帧会多要一帧。注意它必须配 `--interp 2` 才会打补丁 ——
+   `--interp 1 --unlock-mfg` 时补丁代码直接跳过（日志会说 `2x requested ... nothing to patch`），
+   `maxSupportedInterpolations` 停在 1，cadence 模式就升不上去（这一轮实测 `switches=0`）。
+4. **`--jbuf 1` 更差**（8.1%）：它是"延迟一帧吸收抖动"，只会把延迟加上去，不解决输入的空洞。
+5. 三个配置里最大的单次间隔 220 ms 都出现在 `arr(vb)` 有 `8x` 桶的窗口
+   （`jitter=16.6..116.7ms`、`worst colour 16.9ms`）⇒ 那是**游戏自己的卡顿**
+   （资产流送/着色器编译），任何插帧参数都救不了。
+
+顺带修掉一个一直误导人的日志：`--unlock-mfg` 的 "The patch did not take" 现在只在
+**真的请求了 >2x** 时才打印（原来 `--interp 1` 也会报，因为 2x 时补丁本来就"nothing to patch"）。
+
 
 
 
