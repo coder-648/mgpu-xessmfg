@@ -823,10 +823,14 @@ static HWND create_bridge_window(UINT w, UINT h)
     // worked on a plain, hidden, exactly sized window). The overlay is turned into
     // a visible borderless topmost window by make_borderless() once the swap chain
     // exists.
+    //
+    // WS_EX_TOOLWINDOW is set *here*, at creation, so the shell never registers this as an
+    // application window in the first place - that is what kept it out of Alt+Tab/Win+Tab
+    // without needing an owner relationship (which broke the game's mouse input).
     RECT r{0, 0, static_cast<LONG>(w), static_cast<LONG>(h)};
     AdjustWindowRectEx(&r, WS_OVERLAPPEDWINDOW, FALSE, 0);
 
-    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"MGPU Bridge",
+    HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"MGPU Bridge",
                                 WS_OVERLAPPEDWINDOW, 0, 0,
                                 r.right - r.left, r.bottom - r.top,
                                 nullptr, nullptr, wc.hInstance, nullptr);
@@ -872,17 +876,17 @@ static void focus_game()
 
 // Keeps the overlay out of Alt+Tab, Task View (Win+Tab), Aero Peek and the taskbar.
 //
-// Why this needs three things and not just WS_EX_TOOLWINDOW: our window is created *plain*
-// on purpose (CreateSwapChainForHwnd returns E_ACCESSDENIED for a topmost/visible window on
-// this machine), so by the time the ex-style becomes WS_EX_TOOLWINDOW the shell has already
-// registered it as an application window. Result: Win+Tab showed two pictures - the raw
-// game in one thumbnail and our processed one in the other.
+// Why this is not just WS_EX_TOOLWINDOW: the window is created hidden and *plain* on
+// purpose (CreateSwapChainForHwnd rejects a topmost/visible window on this machine), so a
+// style applied afterwards can arrive after the shell already registered the entry. Hence:
+//   * WS_EX_TOOLWINDOW at creation (see create_bridge_window) - never registered as an app
+//   * DWMWA_EXCLUDED_FROM_PEEK / DWMWA_DISALLOW_PEEK - out of peek/thumbnail previews
+//   * ITaskbarList::DeleteTab - drops an entry that already exists
 //
-//   * GWLP_HWNDPARENT = game window -> an *owned* window is not listed separately; Task
-//     View groups it under its owner and it follows the owner's show/hide/minimise, so the
-//     pair behaves like one application
-//   * DWMWA_EXCLUDED_FROM_PEEK / DWMWA_DISALLOW_PEEK -> keep it out of peek thumbnails
-//   * ITaskbarList::DeleteTab -> the only way to drop an entry that already exists
+// Deliberately NOT used: SetWindowLongPtr(GWLP_HWNDPARENT, game_wnd). Making the overlay an
+// owned window of the game does group it in Task View, but it also changed how input
+// reached the game: the mouse stopped responding while the keyboard kept working (measured
+// by the user right after it was added). A mirror window must stay a plain top-level window.
 static void overlay_hide_from_switcher(HWND hwnd)
 {
     if (!hwnd) { return; }
@@ -893,16 +897,6 @@ static void overlay_hide_from_switcher(HWND hwnd)
     const HRESULT h_dp = DwmSetWindowAttribute(hwnd, DWMWA_DISALLOW_PEEK, &peek,
                                                sizeof(peek));
 
-    LONG_PTR owner_prev = 0;
-    if (g_game_wnd && g_game_wnd != hwnd) {
-        SetLastError(0);
-        owner_prev = SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT,
-                                      reinterpret_cast<LONG_PTR>(g_game_wnd));
-        logf_("[bridge] overlay owner -> game window %p (prev=%p err=%lu)\n",
-              reinterpret_cast<void*>(g_game_wnd), reinterpret_cast<void*>(owner_prev),
-              GetLastError());
-    }
-
     HRESULT h_tab = E_NOINTERFACE;
     ComPtr<ITaskbarList> bar;
     if (SUCCEEDED(CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER,
@@ -910,10 +904,12 @@ static void overlay_hide_from_switcher(HWND hwnd)
         if (SUCCEEDED(bar->HrInit())) { h_tab = bar->DeleteTab(hwnd); }
     }
 
-    logf_("[bridge] switcher: peek excl hr=0x%08lX/0x%08lX, DeleteTab hr=0x%08lX"
-          " (the overlay must not appear as a second picture in Win+Tab)\n",
+    const LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    logf_("[bridge] switcher: peek excl hr=0x%08lX/0x%08lX, DeleteTab hr=0x%08lX,"
+          " exstyle=0x%08lX (no owner - see the comment; owner broke mouse input)\n",
           static_cast<unsigned long>(h_ex), static_cast<unsigned long>(h_dp),
-          static_cast<unsigned long>(h_tab));
+          static_cast<unsigned long>(h_tab),
+          static_cast<unsigned long>(ex));
 }
 
 static void make_borderless(HWND hwnd, int x, int y, UINT w, UINT h)
@@ -3747,7 +3743,11 @@ static void assert_topmost()
     // exactly the question "where would this click land?". If the answer is not the
     // game, our overlay (or a helper window of ours) is eating the input no matter
     // what the ex-styles claim, and the log tells us which one.
-    if (g_game_wnd && g_click_probe < 12 && now - g_click_probe_ms > 3000) {
+    //
+    // It keeps sampling for the whole session (every 30 s after the first 12 probes): an
+    // input regression that only shows up after minutes of play is exactly the kind of bug
+    // that cannot be diagnosed from a 30 s test run.
+    if (g_game_wnd && (g_click_probe < 12 || now - g_click_probe_ms > 30000)) {
         POINT pt{};
         GetCursorPos(&pt);
         RECT gr{};
@@ -3759,10 +3759,15 @@ static void assert_topmost()
             if (under) { GetWindowThreadProcessId(under, &upid); }
             ++g_click_probe;
             g_click_probe_ms = now;
+            const char* verdict = "  <-- NOT the game";
+            if (root == g_game_wnd) { verdict = "  (ok)"; }
+            else if (root == ovl) { verdict = "  <== OUR OVERLAY eats this click"; }
+            else if (g_osd_wnd && root == g_osd_wnd) { verdict = "  <== the OSD window eats it"; }
             logf_("[bridge] click probe: cursor %ld,%ld under=%p pid=%lu root=%p game=%p%s\n",
                   pt.x, pt.y, reinterpret_cast<void*>(under), static_cast<unsigned long>(upid),
-                  reinterpret_cast<void*>(root), reinterpret_cast<void*>(g_game_wnd),
-                  (root == g_game_wnd) ? "  (ok)" : "  <-- NOT the game");
+                  reinterpret_cast<void*>(root), reinterpret_cast<void*>(g_game_wnd), verdict);
+        } else {
+            g_click_probe_ms = now;      // cursor is outside the game: say nothing
         }
     }
 
