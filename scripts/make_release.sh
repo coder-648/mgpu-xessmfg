@@ -122,6 +122,9 @@ cp "$REPO/scripts/recipes/run_3x_of.bat"      "$OUT/bin/1 - 3x optical flow.bat"
 cp "$REPO/scripts/recipes/run_2x_quality.bat" "$OUT/bin/2 - 2x quality.bat"
 cp "$REPO/scripts/recipes/run_3x_nomv.bat"    "$OUT/bin/3 - 3x lowest cost.bat"
 cp "$REPO/scripts/recipes/run_dump.bat"       "$OUT/bin/4 - dump frames.bat"
+# The smoothest profile: per-frame multiplier (--interp-cadence), one command for
+# 2x/3x/4x/dynamic (docs/findings/PERF_BASELINE.md 3.17-3.21).
+cp "$REPO/scripts/recipes/run_smooth.bat"     "$OUT/bin/5 - smoothest (cadence).bat"
 printf '@echo off\r\nrem Start the front-end (bridge.exe must be in this folder).\r\ncd /d "%%~dp0"\r\nstart "" "mgpu_ui.exe"\r\n' \
     > "$OUT/bin/0 - UI.bat"
 
