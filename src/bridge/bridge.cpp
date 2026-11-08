@@ -1523,6 +1523,11 @@ static bool   g_fg_rt_spike = true;
 static const double kSpikeRatio = 1.35;   // last interval this much longer than the plan
 static int    g_spike_logs_left = 8;      // log the first few, then stay quiet
 static UINT   g_spike_count = 0;          // spikes this report window
+// How often we processed two captured frames closer together than 0.6x the input interval.
+// That happens after a stall: WGC has several frames queued and the loop drains them back to
+// back (each one with its own Present). It is what made `show` read 148 fps on a 120 Hz panel,
+// so it is worth counting explicitly instead of guessing.
+static UINT   g_burst_count = 0;
 
 static const char* fg_rt_mode_name()
 {
@@ -5545,6 +5550,18 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     // requires. XeLL sleeps at simulation start and needs the markers to pace.
     const uint32_t present_id = static_cast<uint32_t>(++g_present_id);
     const double t_r0 = qpc_ms();
+    // Catch-up burst detector: after a stall, WGC hands over several queued frames and the
+    // loop processes them back to back (each with its own Present). This is the "the missing
+    // inputs get dumped into the next batch" effect - measurable instead of guessed.
+    {
+        static double s_prev_proc = 0.0;
+        if (s_prev_proc > 0.0) {
+            const double dt = t_r0 - s_prev_proc;
+            const double nom = input_interval_ms();
+            if (nom > 2.0 && dt < nom * 0.6) { ++g_burst_count; }
+        }
+        s_prev_proc = t_r0;
+    }
     // Protocol v7: tell the add-on whether its motion-vector stream is wanted. It is
     // ~14 MB/frame across PCIe, so it is produced only when we will tag it.
     if (g_ctl) {
@@ -6086,10 +6103,17 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
             }
         }
     }
-    if (g_frame_ms_ema > 0.1) {
+    // `show` is what the OSD and the per-frame log line print as "output fps". It used to be
+    // loop_fps * framesPresented, i.e. the *loop* rate (measured with GetTickCount64!) times
+    // the last batch size. The moment the loop catches up after a stall - WGC hands us two or
+    // three queued frames back to back - that reads 148 or even 164 fps on a 120 Hz panel,
+    // which is a number the display can never show and which sent people hunting for a bug
+    // that does not exist. The swap chain is the only honest source: count what it really gave
+    // the compositor per second, in the report window below (see `out:`).
+    if (g_show_fps == 0 && g_frame_ms_ema > 0.1) {
         const double loop_fps = 1000.0 / g_frame_ms_ema;
         const double presented = (ps.framesPresented > 0) ? ps.framesPresented : 1;
-        g_show_fps = static_cast<int>(loop_fps * presented + 0.5);
+        g_show_fps = static_cast<int>(loop_fps * presented + 0.5);   // first window only
     }
 
     if (g_frames == 30 || g_frames == 200 || g_frames == 600) { dump_zorder(); }
@@ -6268,6 +6292,12 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
                       " window (--fg-rt-spike %d)\n", g_spike_count, g_fg_rt_spike ? 1 : 0);
                 g_spike_count = 0;
             }
+            if (g_burst_count) {
+                logf_("[bridge]   bursts: %u frame(s) processed faster than 0.6x the input"
+                      " interval this window (queued captures drained back to back)\n",
+                      g_burst_count);
+                g_burst_count = 0;
+            }
             // The same buckets for the interval the producer measured between the game's own
             // Present calls. If this is flat while `arr(vb)` is not, the game is presenting
             // evenly and the unevenness appears after it (composition / our overlay).
@@ -6300,6 +6330,11 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
                       d, expect, vbs,
                       (d > 0 && static_cast<double>(d) + 0.5 < expect)
                           ? "  <== OUTPUT FRAMES MISSING" : "");
+                // The honest output rate: what the swap chain actually handed to the
+                // compositor per second of this window. This is what `show=` reports now.
+                if (win > 0.05 && d > 0) {
+                    g_show_fps = static_cast<int>(static_cast<double>(d) / win + 0.5);
+                }
             }
             static bool s_stats_failed = false;
             DXGI_FRAME_STATISTICS fs{};
