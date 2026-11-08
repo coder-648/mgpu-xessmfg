@@ -32,6 +32,7 @@
 | `run_2x_quality.bat` | 2x 画质优先 |
 | `run_3x_nomv.bat` | 最低开销 |
 | `run_3x_of_nodepth.bat` | 推荐配方的 A/B 版：`--no-depth`，用来量跨卡总线省了多少（`PERF_BASELINE.md` §5） |
+| **`run_smooth.bat`** | **最平滑配方**：`--interp 3 --interp-cadence --unlock-mfg`，按实际经过的 vblank 逐帧定倍率，60/40/30 fps 输入自动跑 2x/3x/4x（空刷新 2.5% / 1.5% / 2.6%，见 `PERF_BASELINE.md` §3.17） |
 | `run_dump.bat` | 抓 colour/depth/MV 做离线对比 |
 
 ## 3. 怎么自己复测

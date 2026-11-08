@@ -181,7 +181,7 @@ ReShade 侧的三条硬要求（部署包已处理，手工装时必看）：
 | `src/game_capture/` | add-on：钩超分 API，写共享槽 |
 | `src/bridge/` | 消费端：XeFG + XeLL + WGC + 覆盖窗口 |
 | `src/mgpu_ui/` | 前端（Win32 + GDI，无第三方库） |
-| `scripts/recipes/` | 五份能直接跑的配方脚本 |
+| `scripts/recipes/` | 六份能直接跑的配方脚本 |
 | `docs/findings/ARCHIVED_EXPERIMENTS.md` | 已移除的历史实验脚本：参数 + 结论（可追溯"哪次测出来的"） |
 | `docs/findings/PERF_BASELINE.md` | 性能基线 + 优化候选（**调性能前先读**，免得重测一遍） |
 | `tests/` | 各里程碑的验证程序（不参与正式构建） |
