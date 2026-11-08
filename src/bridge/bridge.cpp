@@ -1541,10 +1541,13 @@ static double g_fg_out_hz = 0.0;
 // visible. Feeding k * vblank makes the two agree by construction - it is exactly the
 // interval those k frames have to cover.
 static UINT   g_cad_last_k = 0;
+static double g_cad_last_tin = 0.0;   // the smoothed input interval behind that batch
 // Measured in a heavily fluctuating scene (2..6 vblanks between inputs): feeding k*vblank
 // raised the empty-refresh rate from 1.0% to 2.6% and produced one 37-vblank hole, while the
 // median feed stayed at 1.0%. So this is OFF by default and exists only for A/B.
-static bool   g_fg_cad_rt = false;
+// ON by default: the batch length and the pacer's budget have to agree (see
+// fg_render_time_ms). --fg-cad-rt 0 restores the historical median feed for A/B.
+static bool   g_fg_cad_rt = true;
 static bool   g_cad_rt_logged = false;
 // --cadence-hold N (default 15 frames, 0/1 = off): how long to keep the interpolated-frame
 // count before the cadence logic is allowed to change it again.
@@ -1730,6 +1733,7 @@ static UINT cadence_next_slots()
     if (g_cad_phase < -1.5) { g_cad_phase = -1.5; }
     if (g_cad_phase > 1.5) { g_cad_phase = 1.5; }
     g_cad_last_k = static_cast<UINT>(k);      // frameRenderTime follows this (see fg_render_time_ms)
+    g_cad_last_tin = t_in;
     return static_cast<UINT>(k);
 }
 
@@ -1820,13 +1824,37 @@ static double rt_quant_value()
     return plan;
 }
 
+// What the pacer is actually being fed (the breakdown line prints this). In cadence mode
+// fg_render_time_ms() returns a batch-derived value, so the --fg-rt-mode name alone would
+// read "quant" while something else is what XeFG got.
+static const char* fg_rt_feed_name()
+{
+    if (g_interp_cadence && g_fg_cad_rt && g_cad_last_k >= 2) {
+        const bool capped = (g_fg_out_hz > 1.0)
+                         && (g_fg_out_hz < 0.999 * (1000.0 / refresh_ms()));
+        return capped ? "cad:gap" : "cad:batch";
+    }
+    return fg_rt_mode_name();
+}
+
 static double fg_render_time_ms()
 {
     if (g_fg_rt_zero) { return 0.0; }
     // In cadence mode the batch size and the length it covers have to agree, otherwise the
     // pacer fights the batch and the picture judders whenever the input rate moves.
     if (g_interp_cadence && g_fg_cad_rt && g_cad_last_k >= 2) {
-        const double rt = static_cast<double>(g_cad_last_k) * refresh_ms();
+        // The batch must be paced over the time it actually covers. Filling every vblank
+        // means k frames occupy k vblanks, so the budget is k * vblank - not the median
+        // input interval, which contradicts the batch whenever the count is not the one the
+        // median implies (a 4-frame batch told "25 ms" squeezes 4 frames into 3 vblanks and
+        // then idles for one, i.e. a visible hitch on every such batch).
+        //
+        // With --fg-out-hz the frames do *not* fill every vblank (fewer frames than there
+        // are vblanks), so the whole batch is spread over the real input gap instead.
+        const bool capped = (g_fg_out_hz > 1.0) && (g_fg_out_hz < 0.999 * (1000.0 / refresh_ms()));
+        const double rt = capped
+            ? ((g_cad_last_tin > 0.5) ? g_cad_last_tin : g_cad_last_k * refresh_ms())
+            : static_cast<double>(g_cad_last_k) * refresh_ms();
         if (!g_cad_rt_logged) {
             g_cad_rt_logged = true;
             logf_("[bridge] cadence: frameRenderTime = batch * vblank (%.1fms for %u frames);"
@@ -6343,7 +6371,7 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
             logf_("[bridge]   cadence: rt=%.1fms (%s) input=%.1fms = %.2f vblanks ->"
                   " interp=%u (avg %.2fx, %.1f fps out = %.2f vblank/frame%s)"
                   " refresh=%uHz lock=%.2f drops=%u%s\n",
-                  fg_render_time_ms(), fg_rt_mode_name(), t_in, t_in / vb,
+                  fg_render_time_ms(), fg_rt_feed_name(), t_in, t_in / vb,
                   g_fg_interp_actual, mul,
                   (out_ms > 0.0) ? 1000.0 / out_ms : 0.0, out_vb,
                   (frac > 0.06) ? " NOT-EXACT" : "", g_refresh_hz,
