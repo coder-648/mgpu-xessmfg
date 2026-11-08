@@ -104,13 +104,15 @@ struct Profile;
 struct State
 {
     // 帧生成
-    int  fg_mode = 0;          // 0 fixed, 1 dynamic (--dyn-mfg)
+    int  fg_mode = 0;          // 0 = 固定倍率, 1 = 动态逐帧 (--interp-cadence)
     int  interp = 3;           // 2..6  -> --interp N-1
-    // 逐帧倍率 (--interp-cadence, 2026-11-08): XeFG 每帧按"这一帧实际过了几个 vblank"要帧数,
+    // 模式 1 = 动态逐帧 (--interp-cadence): 每帧按"这一帧实际过了几个 vblank"要帧数,
     // 输出恒定 1 帧/vblank。实测 4K --den 2、空刷新: 60fps 0.8% / 40fps 0.4% / 30fps 0.6%
-    // (固定倍率同条件是 2.5%/1.5%/2.6%)。开启时倍数按 6x 上限解锁 (--interp 5),
+    // (固定倍率同条件是 2.5%/1.5%/2.6%)。此模式下倍数按 6x 上限解锁 (--interp 5),
     // 因为 40fps 的输入会抖到 4 vblank、30fps 会到 5-6 vblank, 上限不够就填不满。
     // 详见 docs/findings/PERF_BASELINE.md 3.17-3.21。
+    // (旧的 --dyn-mfg 实验档已从界面移除: 同场景空刷新 7.6%, 见 3.19。)
+    // cadence 只用于迁移旧 ini。
     bool cadence = true;
     // 输出帧率上限 (Hz)，直接手输：0 = 面板刷新（填满每个 vblank，不发 --fg-out-hz）；
     // 5..1000 = 上限（--fg-out-hz N）。只在"动态倍率"开启时有意义：它决定每帧要几张，
@@ -246,23 +248,28 @@ enum Id
     ID_FG_TYPE, ID_FG_MODE, ID_INTERP, ID_OUT, ID_PERF,
     ID_CAP_API, ID_POOL, ID_LAT,
     ID_NOMV, ID_JITZ, ID_PROJRZ, ID_FOV, ID_NODEPTH, ID_UI, ID_RT, ID_UNLOCK, ID_SLACK, ID_IVL,
-    ID_MV, ID_CADENCE, ID_OUTFPS,
+    ID_MV, ID_CADENCE, ID_OUTFPS, ID_HEAD_FIXED, ID_HEAD_DYN,
     ID_TEAR, ID_SDR, ID_LAYERED, ID_RELAY, ID_OSD,
     ID_GPU, ID_GPUSEL, ID_DISPLAY,
     ID_TMODE, ID_TARGET, ID_HOTKEY, ID_LOCK, ID_CMD,
     ID_MIN, ID_CLOSE, ID_START, ID_ADD, ID_DEL,
 };
 
-enum RowKind { RK_INFO = 0, RK_DD, RK_SPIN, RK_TOG, RK_SLIDER, RK_CMDLINE, RK_EDIT };
+enum RowKind { RK_INFO = 0, RK_DD, RK_SPIN, RK_TOG, RK_SLIDER, RK_CMDLINE, RK_EDIT, RK_HEAD };
 
 struct RowDef { Id id; const wchar_t* label; RowKind kind; };
 struct CardDef { const wchar_t* title; const RowDef* rows; int n; int col; };
 
+// 两种模式互斥，各自一块：
+//   固定     -> 倍数写死（2x/3x/4x…），节拍恒定
+//   动态逐帧 -> 每帧按实际经过的 vblank 决定插几张，只受"输出帧率"上限约束
+// RK_HEAD 只是分区标题（不可点），模式外的行会被灰掉并且点不动。
 static const RowDef kRowsFg[] = {
     { ID_FG_TYPE, L"类型",            RK_INFO },
     { ID_FG_MODE, L"模式",            RK_DD   },
+    { ID_HEAD_FIXED, L"固定倍率（写死倍数）", RK_HEAD },
     { ID_INTERP,  L"倍数",            RK_SPIN },
-    { ID_CADENCE, L"动态倍率 (逐帧)",  RK_TOG },
+    { ID_HEAD_DYN,   L"动态逐帧（每帧按 vblank 数决定）", RK_HEAD },
     { ID_OUTFPS,  L"输出帧率 (Hz, 0=面板)", RK_EDIT },
     { ID_OUT,     L"输出",            RK_DD   },
     { ID_MV,      L"运动矢量",        RK_DD   },
@@ -289,7 +296,7 @@ static const RowDef kRowsOverlay[] = {
 };
 
 static const CardDef kCards[] = {
-    { L"帧生成",       kRowsFg,     7, 0 },
+    { L"帧生成",       kRowsFg,     8, 0 },
     { L"捕获",         kRowsCap,    3, 1 },
     { L"启动",         kRowsLaunch, 3, 0 },
     { L"GPU / 显示器", kRowsDev,    2, 1 },
@@ -301,7 +308,7 @@ static const CardDef kCards[] = {
 static const int kCardCount = (int)(sizeof(kCards) / sizeof(kCards[0]));
 
 // ------------------------------------------------------------------ options
-static const wchar_t* kOptFgMode[] = { L"固定", L"动态 (实验)" };
+static const wchar_t* kOptFgMode[] = { L"固定", L"动态逐帧" };
 static const wchar_t* kOptOut[]    = { L"1:1 原生", L"5K -> 4K (0.75x)", L"半分辨率" };
 static const wchar_t* kOptMv[]     = { L"关闭", L"游戏 MV", L"游戏 MV (反向)", L"AMD 光流" };
 static const wchar_t* kOptFov[]    = { L"55.0", L"58.7", L"60.0", L"65.0" };
@@ -367,6 +374,14 @@ static const wchar_t* opt_text(Id id, int i)
     }
 }
 
+// 互斥：模式外的控件灰显并且点不动（固定模式看不到"输出帧率"，动态模式看不到"倍数"）。
+static bool row_enabled(Id id)
+{
+    if (id == ID_INTERP) { return S().fg_mode != 1; }    // 固定 only
+    if (id == ID_OUTFPS) { return S().fg_mode == 1; }    // 动态逐帧 only
+    return true;
+}
+
 static int opt_get(Id id)
 {
     switch (id) {
@@ -416,6 +431,14 @@ static std::wstring row_value(Id id)
     case ID_LAT:    _snwprintf_s(buf, _TRUNCATE, L"%d", S().latency); return buf;
     case ID_HOTKEY: return g_capture_hotkey ? std::wstring(L"按下新组合键...") : hotkey_name();
     case ID_LOCK: {
+        if (S().fg_mode == 1) {
+            // 动态逐帧：输出被钉在 1 帧/vblank，所以输入锁多少就自动是多少倍。
+            const int hz = g_refresh > 0 ? g_refresh : 120;
+            _snwprintf_s(buf, _TRUNCATE,
+                         L"动态：锁 %d/%d/%d fps -> %dx/%dx/%dx 自动（输出 %d Hz）",
+                         hz / 4, hz / 3, hz / 2, 4, 3, 2, hz);
+            return buf;
+        }
         // Read-only advice: lock the game where refresh / multiplier lands exactly.
         const double lf = (S().interp > 0) ? (g_refresh / (double)S().interp) : 0.0;
         _snwprintf_s(buf, _TRUNCATE, L"%.0f fps  ->  %d x %.0f = %.0f fps 输出",
@@ -569,7 +592,7 @@ static void save_profile(int i)
     ini_w(sec, L"relay_input", s.relay_input ? 1 : 0);
     ini_w(sec, L"osd", s.osd ? 1 : 0);
     ini_w(sec, L"perf", s.perf_no_throttle ? 1 : 0);
-    ini_w(sec, L"cadence", s.cadence ? 1 : 0);
+    ini_w(sec, L"cadence", s.fg_mode == 1 ? 1 : 0);   // legacy mirror of the mode
     ini_w(sec, L"outfps", s.out_fps);
     ini_ws(sec, L"win_title", s.win_title);
 }
@@ -608,7 +631,9 @@ static void load_profile(int i)
     s.relay_input = ini_r(sec, L"relay_input", s.relay_input ? 1 : 0) != 0;
     s.osd = ini_r(sec, L"osd", s.osd ? 1 : 0) != 0;
     s.perf_no_throttle = ini_r(sec, L"perf", s.perf_no_throttle ? 1 : 0) != 0;
-    s.cadence     = ini_r(sec, L"cadence", s.cadence ? 1 : 0) != 0;
+    // 旧的 cadence 开关迁移到"模式": 老 ini 里 cadence=1 就当作 动态逐帧。
+    if (s.fg_mode == 0 && ini_r(sec, L"cadence", 0) != 0) { s.fg_mode = 1; }
+    s.cadence     = (s.fg_mode == 1);
     s.out_fps     = ini_r(sec, L"outfps", s.out_fps);
     if (s.out_fps != 0 && (s.out_fps < 5 || s.out_fps > 1000)) { s.out_fps = 0; }
     s.win_title   = ini_rs(sec, L"win_title", L"");
@@ -721,14 +746,15 @@ static std::wstring build_cmdline(HWND target, bool display)
     cmd += kOut[(S().out_mode >= 0 && S().out_mode <= 2) ? S().out_mode : 0];
 
     wchar_t b[256]{};
-    // 逐帧倍率开启时，倍数只当作"解锁上限"：--interp 5 = 6x 容量，让 40fps 的 4-vblank、
+    // 模式 1（动态逐帧）时倍数只当作"解锁上限"：--interp 5 = 6x 容量，让 40fps 的 4-vblank、
     // 30fps 的 5-6-vblank 抖动帧也能被填满（实测 3.17/3.18：上限给 3x 时 40fps 空刷新 10.8%，
-    // 给 6x 是 1.5%）。关闭时按用户选的固定倍数。
-    const int interp_req = S().cadence ? 5 : (S().interp - 1);
+    // 给 6x 是 1.5%）。模式 0（固定）按用户选的固定倍数。
+    const bool dynamic_mode = (S().fg_mode == 1);
+    const int interp_req = dynamic_mode ? 5 : (S().interp - 1);
     _snwprintf_s(b, _TRUNCATE, L" --pool %d --latency %d --interp %d",
                  S().pool, S().latency, interp_req);
     cmd += b;
-    if (S().cadence) {
+    if (dynamic_mode) {
         cmd += L" --interp-cadence";
         // 输出帧率上限（0 = 面板刷新，不发送）：把"120Hz 面板但只要 60fps"变成
         // --fg-out-hz 60，输入 30 时就是 2x。最低仍是 2x（libxess_fg 不能生成 0 帧，
@@ -739,7 +765,6 @@ static std::wstring build_cmdline(HWND target, bool display)
             cmd += oh;
         }
     }
-    if (S().fg_mode == 1) { cmd += L" --dyn-mfg"; }
     // Which GPU runs the frame generation (A card rendering + N card output, or the
     // other way round). 0 = let bridge decide from the window monitor / producer LUID.
     if (S().gpu_sel > 0 && S().gpu_sel <= (int)g_adapters.size()) {
@@ -1451,9 +1476,25 @@ static void paint(HWND hwnd)
         if (hover && it.kind == RK_TOG) { draw_toggle(dc, rc, it.on, true); }
         else if (it.kind == RK_TOG)     { draw_toggle(dc, rc, it.on, false); }
 
+        if (it.kind == RK_HEAD) {
+            // 分区标题：小字、暗色、不画控件。
+            RECT hr{ rc.left + 2, rc.top + 6, rc.right, rc.bottom };
+            HGDIOBJ old = SelectObject(dc, g_f_small);
+            txt(dc, g_f_small, hr, def->label, C_DIM, DT_LEFT | DT_VCENTER);
+            SelectObject(dc, old);
+            continue;
+        }
+        const bool enabled = row_enabled(it.id);
         if (it.kind != RK_CMDLINE) {
             txt(dc, g_f_ui, RECT{ rc.left, rc.top, rc.left + 200, rc.bottom },
-                def->label, hover ? C_TEXT : C_LABEL, DT_LEFT | DT_VCENTER);
+                def->label, (!enabled) ? C_DIM : (hover ? C_TEXT : C_LABEL),
+                DT_LEFT | DT_VCENTER);
+        }
+        if (!enabled && it.kind != RK_CMDLINE) {
+            // 灰掉的控件：直接画成只读文本，视觉上明确"这一项当前不生效"。
+            txt(dc, g_f_ui, RECT{ rc.left + 210, rc.top, rc.right, rc.bottom },
+                row_value(it.id), C_DIM, DT_RIGHT | DT_VCENTER | DT_END_ELLIPSIS);
+            continue;
         }
 
         switch (it.kind) {
@@ -1637,7 +1678,7 @@ static void bump_spin(Id id, int dir)
 static void set_opt(Id id, int idx)
 {
     switch (id) {
-    case ID_FG_MODE: S().fg_mode = idx % 2; break;
+    case ID_FG_MODE: S().fg_mode = idx % 2; S().cadence = (S().fg_mode == 1); break;
     case ID_OUT:     S().out_mode = idx % 3; break;
     case ID_MV:      S().mv_mode = idx % 4; break;
     case ID_FOV:     S().fov_sel = idx % 4; break;
@@ -1771,10 +1812,12 @@ static void on_click(int mx, int my)
         if (!it.is_row) { continue; }
         RECT rc = it.rc;
         OffsetRect(&rc, 0, -g_scroll);
+        if (it.kind == RK_HEAD) { continue; }            // 分区标题不可点
         // 命中必须同时看 x：只比 y 的话，左列那条 106px 高的"启动命令"行会把
         // 右列同一 y 区间的点击全吃掉（叠加层两个开关点不动就是这个原因）。
         if (my < rc.top || my >= rc.bottom) { continue; }
         if (mx < rc.left || mx >= rc.right) { continue; }
+        if (!row_enabled(it.id)) { return; }              // 模式外的控件点不动
 
         switch (it.kind) {
         case RK_TOG: {
