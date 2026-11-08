@@ -1525,6 +1525,30 @@ static double g_rt_ema_slow = 0.0;
 static int    g_rt_auto_state = 0;      // 0 = rate is steady (quant), 1 = rate is moving (raw)
 static int    g_rt_auto_agree = 0;      // consecutive frames agreeing to flip (hysteresis)
 static UINT   g_rt_auto_flips = 0;
+// A longer ring for the "slow" rate. Per-sample EMAs could not tell a locked 40 fps (which
+// arrives as 2/3/4 vblanks) from a rate that is actually moving: the +-1 vblank jitter of a
+// locked input drives a fast EMA just as much as a real step does - measured, it flipped a
+// locked 40 fps to "raw". Medians are immune to that jitter (it is exactly why quant uses
+// one), so the decision compares a short median against a long one.
+#define kArrSlowRing 64
+static double g_arr_slow_ring[kArrSlowRing] = {};
+static UINT   g_arr_slow_n = 0;
+static UINT   g_arr_slow_i = 0;
+
+static double arr_slow_median_ms()
+{
+    if (g_arr_slow_n == 0) { return 0.0; }
+    static double v[kArrSlowRing];
+    const UINT n = g_arr_slow_n;
+    for (UINT i = 0; i < n; ++i) { v[i] = g_arr_slow_ring[i]; }
+    for (UINT i = 1; i < n; ++i) {
+        const double key = v[i];
+        int j = static_cast<int>(i) - 1;
+        while (j >= 0 && v[j] > key) { v[j + 1] = v[j]; --j; }
+        v[j + 1] = key;
+    }
+    return v[n / 2];
+}
 
 // --fg-rt-spike 0/1 (default 1): when ONE input frame arrives much later than the plan
 // (a fast camera turn, a streamed asset), report the real length to XeFG for that frame so
@@ -6320,9 +6344,27 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
             for (int k = 1; k <= 8; ++k) { g_arr_hist[k] = 0; }
             if (g_fg_rt_mode == kFgRtAuto) {
                 const double vb = refresh_ms();
-                logf_("[bridge]   rt auto: fast=%.1f slow=%.1f (%.2f vblanks apart) -> %s"
+                const double diff = dabs_(g_rt_ema_fast - g_rt_ema_slow);
+                const bool moving = diff >= vb * 0.60;
+                const int want = moving ? 1 : 0;
+                // Decide once per report window (~1 s) and require three windows in a row:
+                // the per-frame version flapped the pacer's input 4 times in 18 s.
+                if (want != g_rt_auto_state) {
+                    if (++g_rt_auto_agree >= 3) {
+                        g_rt_auto_state = want;
+                        g_rt_auto_agree = 0;
+                        ++g_rt_auto_flips;
+                        logf_("[bridge] --fg-rt-mode auto: input rate is %s (median %.1f vs"
+                              " %.1f ms, %.2f vblanks apart) -> feeding %s\n",
+                              moving ? "moving" : "steady", g_rt_ema_fast, g_rt_ema_slow,
+                              (vb > 0.5) ? diff / vb : 0.0, moving ? "raw" : "quant");
+                    }
+                } else {
+                    g_rt_auto_agree = 0;
+                }
+                logf_("[bridge]   rt auto: median %.1f vs %.1f (%.2f vblanks apart) -> %s"
                       "  flips=%u\n", g_rt_ema_fast, g_rt_ema_slow,
-                      (vb > 0.5) ? dabs_(g_rt_ema_fast - g_rt_ema_slow) / vb : 0.0,
+                      (vb > 0.5) ? diff / vb : 0.0,
                       (g_rt_auto_state == 1) ? "raw" : "quant", g_rt_auto_flips);
             }
             if (g_spike_count) {
@@ -7358,31 +7400,15 @@ int main()
             g_arr_wc_i = (g_arr_wc_i + 1) % kArrRing;
             if (g_arr_wc_n < kArrRing) { ++g_arr_wc_n; }
 
-            // --fg-rt-mode auto: is the *rate* moving? Fast vs slow EMA of the same interval.
-            if (g_rt_ema_fast <= 0.0) { g_rt_ema_fast = g_rt_ema_slow = dt_arr; }
-            g_rt_ema_fast = g_rt_ema_fast * 0.65 + dt_arr * 0.35;
-            g_rt_ema_slow = g_rt_ema_slow * 0.95 + dt_arr * 0.05;
-            if (g_fg_rt_mode == kFgRtAuto) {
-                const double vb = refresh_ms();
-                const bool moving = dabs_(g_rt_ema_fast - g_rt_ema_slow) > vb * 0.15;
-                const int want = moving ? 1 : 0;
-                if (want != g_rt_auto_state) {
-                    // 12 frames of agreement (~0.2-0.4 s) before flipping, so a single hiccup
-                    // cannot make the pacer's input flip back and forth.
-                    if (++g_rt_auto_agree >= 12) {
-                        g_rt_auto_state = want;
-                        g_rt_auto_agree = 0;
-                        ++g_rt_auto_flips;
-                        logf_("[bridge] --fg-rt-mode auto: input rate is %s (fast %.1f vs slow"
-                              " %.1f ms, %.2f vblanks apart) -> feeding %s\n",
-                              moving ? "moving" : "steady", g_rt_ema_fast, g_rt_ema_slow,
-                              dabs_(g_rt_ema_fast - g_rt_ema_slow) / vb,
-                              moving ? "raw" : "quant");
-                    }
-                } else {
-                    g_rt_auto_agree = 0;
-                }
-            }
+            // --fg-rt-mode auto: only collect here. The decision itself is taken once per
+            // report window (see the report block): a 16-sample median jumps between the
+            // quantised values 25.0 / 33.3 while an unlocked rate wobbles, so deciding per
+            // frame made the pacer's input flap (measured: 4 flips in 18 s).
+            g_arr_slow_ring[g_arr_slow_i] = dt_arr;
+            g_arr_slow_i = (g_arr_slow_i + 1) % kArrSlowRing;
+            if (g_arr_slow_n < kArrSlowRing) { ++g_arr_slow_n; }
+            g_rt_ema_fast = arr_median_ms();          // short median (16 samples)
+            g_rt_ema_slow = (g_arr_slow_n >= 32) ? arr_slow_median_ms() : g_rt_ema_fast;
         }
     };
 
