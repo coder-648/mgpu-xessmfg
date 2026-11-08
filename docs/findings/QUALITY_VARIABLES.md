@@ -31,6 +31,7 @@
 | `run_3x_of.bat` | 3x 满帧 + 光流（推荐） |
 | `run_2x_quality.bat` | 2x 画质优先 |
 | `run_3x_nomv.bat` | 最低开销 |
+| `run_3x_of_nodepth.bat` | 推荐配方的 A/B 版：`--no-depth`，用来量跨卡总线省了多少（`PERF_BASELINE.md` §5） |
 | `run_dump.bat` | 抓 colour/depth/MV 做离线对比 |
 
 ## 3. 怎么自己复测

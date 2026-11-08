@@ -93,13 +93,38 @@ static void hard_exit(const char* why);
 // Every exit path goes through hard_exit(), so the z-order repair lives there too.
 static void restore_game_zorder(const char* why);
 
+// Line output. Every logf_ used to fflush(stdout), which is one write syscall per line and
+// shows up in CPU time as soon as a diagnostic mode prints per frame (--dump, --fg-probe,
+// --mv-shadow). A log line is worth a few hundred milliseconds at most, so the flush is
+// paced instead: flush at most every 200 ms, and always for a line that looks like bad
+// news or for anything that is about to exit. `--log-flush` restores per-line flushing
+// for debugging, where the last few lines before a hard_exit are the interesting ones.
+static int    g_log_flush_each = 0;      // --log-flush: fflush every line
+static DWORD  g_log_last_flush = 0;
+
+static bool log_needs_flush(const char* fmt)
+{
+    if (g_log_flush_each) { return true; }
+    // Durability where it matters: a warning is the line someone is looking for, and it
+    // is never in a hot loop.
+    static const char* const kAlways[] = {
+        "WARNING", "FAILED", "FAIL", "error", "ERROR", "note:", "note(", "exiting", "MISMATCH",
+    };
+    for (size_t i = 0; i < sizeof(kAlways) / sizeof(kAlways[0]); ++i) {
+        if (strstr(fmt, kAlways[i])) { return true; }
+    }
+    const DWORD now = GetTickCount();
+    if (now - g_log_last_flush >= 200) { g_log_last_flush = now; return true; }
+    return false;
+}
+
 static void logf_(const char* fmt, ...)
 {
     va_list a;
     va_start(a, fmt);
     vprintf(fmt, a);
     va_end(a);
-    fflush(stdout);
+    if (log_needs_flush(fmt)) { fflush(stdout); }
 }
 
 static void hard_exit(const char* why)
@@ -557,6 +582,12 @@ static ComPtr<ID3D12Resource> g_depth[mgpu::kMaxSlots];
 // rebuilds its slot layout (upscaler preset/mode switch).
 static ComPtr<ID3D12Heap> g_shared_heap;
 static uint32_t g_seen_generation = 0;
+// Separate copy for the geometry cache: the "release local copies" path and the
+// "re-read stream geometry" path both key off generation, but they must be able to
+// disagree (e.g. geometry unknown while generation is already current).
+static uint32_t g_seen_geo_generation = 0xFFFFFFFFu;
+
+static void refresh_input_geo();   // defined next to the stream-copy helpers below
 static bool     g_layout_pending = false;
 static ComPtr<ID3D12Fence>    g_fwd[mgpu::kMaxSlots];
 static UINT64                 g_fwd_last[mgpu::kMaxSlots] = {};
@@ -2328,7 +2359,13 @@ static bool open_shared()
     }
 
     if (!place_shared_views()) { return false; }
+    // Read the published stream geometry once here: service_shared_layout() only re-reads
+    // it when `generation` changes, so this is the first and possibly only time. If the
+    // producer has not published a size yet, that path keeps retrying (mv_w == 0).
     g_seen_generation = g_ctl->generation;
+    g_seen_geo_generation = 0xFFFFFFFFu;    // force the geometry read below
+    refresh_input_geo();
+    g_seen_geo_generation = g_ctl->generation;
 
     HANDLE producer = OpenProcess(PROCESS_DUP_HANDLE, FALSE, g_ctl->producer_pid);
     if (!producer) { logf_("[bridge] OpenProcess FAILED\n"); return false; }
@@ -2370,6 +2407,27 @@ static ComPtr<ID3D12PipelineState> g_conv_pso;
 static ComPtr<ID3D12DescriptorHeap> g_srv_heap;
 static ComPtr<ID3D12DescriptorHeap> g_rtv_heap;
 static ComPtr<ID3D12Resource>       g_rtv_res[4];
+
+// XeSS-FG's swap chain is created once at a fixed size - nothing in here calls
+// ResizeBuffers - so the buffers behind it never change identity. GetBuffer() per frame is
+// a QueryInterface plus an AddRef/Release round trip for nothing; cache them. One COM
+// reference per buffer is held for the life of the process, which is exactly what a
+// FLIP_DISCARD swap chain allows.
+static ComPtr<ID3D12Resource>       g_bb_cache[4];
+
+static bool back_buffer(UINT index, ID3D12Resource** out)
+{
+    if (out) { *out = nullptr; }
+    if (index > 3 || !g_swapchain || !g_device) { return false; }
+    if (!g_bb_cache[index]) {
+        if (FAILED(g_swapchain->GetBuffer(index, IID_PPV_ARGS(&g_bb_cache[index])))) {
+            logf_("[bridge] swap chain GetBuffer(%u) FAILED\n", index);
+            return false;
+        }
+    }
+    if (out) { *out = g_bb_cache[index].Get(); }
+    return true;
+}
 static UINT g_rtv_stride = 0;
 
 static const char* k_conv_hlsl = R"HLSL(
@@ -2695,6 +2753,11 @@ static double g_ms_wait = 0.0;            // waiting for the producer's MV/depth
 static double g_max_wait = 0.0;           // worst such wait in this report window
 static double g_ms_copywait = 0.0;        // waiting for the 118 MB colour copy
 static double g_max_copywait = 0.0;
+// The D3D11 side of the same hop (keyed-mutex acquire + CopyResource). Separate from
+// `copy` because they measure different halves: `colour` is CPU + this card's copy
+// submission, `copy` is the D3D12 queue waiting for it to land.
+static double g_ms_colour = 0.0;
+static double g_max_colour = 0.0;
 static double g_ms_total = 0.0;           // whole run_frame() duration
 static double g_max_total = 0.0;
 static double g_ms_inputs = 0.0;          // recording the cross-adapter MV/depth copies
@@ -2768,6 +2831,47 @@ static void enable_fine_timer()
 // is already past the value we ask for.
 static UINT64 g_fwd_expect[mgpu::kMaxSlots] = { 1, 1, 1, 1 };
 
+// ---- waiting for a *local* fence without allocating a kernel object every frame ------
+// gpu_throttle() runs once per real frame, so CreateEventW + CloseHandle there was 60-120
+// object creations per second for no reason. One auto-reset event is reused forever; that
+// is safe only because every wait here is on a fence whose GetCompletedValue() is
+// meaningful, which lets the loop tell "the event fired" from "the event was still set
+// from an earlier timeout":
+//   * the fence value is re-checked after every wait, so a late signal can cost one extra
+//     iteration but can never make us skip a wait that has not retired yet;
+//   * the remaining timeout is recomputed each round, so a spurious wakeup does not turn
+//     into a shorter timeout than the caller asked for.
+// Everything calling this runs on the frame thread, so one event is shared.
+//
+// wait_slot() deliberately does NOT use it: its fences are SHARED_CROSS_ADAPTER, where
+// GetCompletedValue() reads back UINT64_MAX on this node, so the check that makes the
+// reused event safe is unavailable - and a stale signal there would advance
+// g_fwd_expect[] past a publication we never saw, i.e. read one slot too old.
+static bool wait_fence_value(ID3D12Fence* fence, UINT64 value, DWORD timeout_ms)
+{
+    if (!fence) { return false; }
+    if (fence->GetCompletedValue() >= value) { return true; }
+    static HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!ev) {
+        // No event: bounded spin. Should never happen, but never wait forever either.
+        const ULONGLONG t0 = GetTickCount64();
+        while (fence->GetCompletedValue() < value) {
+            if (GetTickCount64() - t0 >= timeout_ms) { return false; }
+            SwitchToThread();
+        }
+        return true;
+    }
+    const ULONGLONG t0 = GetTickCount64();
+    for (;;) {
+        if (FAILED(fence->SetEventOnCompletion(value, ev))) { return false; }
+        const ULONGLONG spent = GetTickCount64() - t0;
+        if (spent >= timeout_ms) { return fence->GetCompletedValue() >= value; }
+        WaitForSingleObject(ev, static_cast<DWORD>(timeout_ms - spent));
+        if (fence->GetCompletedValue() >= value) { return true; }
+        if (GetTickCount64() - t0 >= timeout_ms) { return false; }
+    }
+}
+
 // Slot selection lives further down (round-robin, see run_frame_ex step 3). Protocol v5
 // here used to add a "is this slot GPU-complete?" query on frames[].ready plus
 // --mv-newest; both are gone, because publishing `ready` requires polling a
@@ -2789,6 +2893,11 @@ static void wait_slot(UINT slot)
 {
     if (slot >= mgpu::kMaxSlots || !g_fwd[slot]) { return; }
     {
+        // One event per call, on purpose: this fence is SHARED_CROSS_ADAPTER, so the
+        // GetCompletedValue() re-check that makes a reused event safe is not available
+        // here (it reads UINT64_MAX on this node) - see wait_fence_value(). A stale
+        // signal would advance g_fwd_expect[] without a publication and make us read a
+        // slot one frame too old, which is worse than the ~1 us this costs.
         HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         g_fwd[slot]->SetEventOnCompletion(g_fwd_expect[slot], ev);
         // Blocking here shows up as a gap between presents that nothing else explains,
@@ -3453,12 +3562,12 @@ static void gpu_throttle()
     const UINT64 target = g_frame_fence_value;
     if (target == 0 || g_frame_fence->GetCompletedValue() >= target) { return; }
 
-    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    g_frame_fence->SetEventOnCompletion(target, ev);
-    const ULONGLONG t0 = GetTickCount64();
-    WaitForSingleObject(ev, 200);
-    CloseHandle(ev);
-    g_ms_throttle = g_ms_throttle * 0.9 + static_cast<double>(GetTickCount64() - t0) * 0.1;
+    // No per-frame event: see wait_fence_value(). QPC, not GetTickCount64, because this
+    // number is reported as `gpu` and feeds `load` - a 15.6 ms clock quantised it to
+    // 0/16 ms and made both look like noise.
+    const double t0 = qpc_ms();
+    wait_fence_value(g_frame_fence.Get(), target, 200);
+    g_ms_throttle = g_ms_throttle * 0.9 + (qpc_ms() - t0) * 0.1;
 }
 
 // ------------------------- our own interpolator (--fg warp) -------------------
@@ -3850,7 +3959,7 @@ static void run_frame_warp(ID3D11Texture2D* colour11)
     if (!service_shared_layout()) { return; }
     ++g_present_id;
     if (g_no_throttle) { g_ms_throttle = 0.0; } else { gpu_throttle(); }
-    const ULONGLONG t_work0 = GetTickCount64();
+    const double t_work0 = qpc_ms();
 
     if (g_colour_mutex) { g_colour_mutex->AcquireSync(0, 20); }
     g_ctx11->CopyResource(g_shared11.Get(), colour11);
@@ -3896,7 +4005,7 @@ static void run_frame_warp(ID3D11Texture2D* colour11)
     barrier_to(g_hist[wi].Get(), g_hist_state[wi], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     barrier_to(g_shared12.Get(), shared_state, D3D12_RESOURCE_STATE_COMMON);
 
-    ComPtr<ID3D12Resource> bb1;
+    ID3D12Resource* bb1 = nullptr;
     UINT bbi1 = 0;
     bool have_bb1 = false;
 
@@ -3938,11 +4047,11 @@ static void run_frame_warp(ID3D11Texture2D* colour11)
 
         // Present the midpoint first so the display order is prev -> mid -> current.
         bbi1 = g_swapchain->GetCurrentBackBufferIndex();
-        have_bb1 = SUCCEEDED(g_swapchain->GetBuffer(bbi1, IID_PPV_ARGS(&bb1)));
+        have_bb1 = back_buffer(bbi1, &bb1);
         if (have_bb1) {
-            barrier_to(bb1.Get(), g_bb_state[bbi1 & 3], D3D12_RESOURCE_STATE_RENDER_TARGET);
-            warp_convert(bb1.Get(), bbi1, g_srv_interp.Get());
-            barrier_to(bb1.Get(), g_bb_state[bbi1 & 3], D3D12_RESOURCE_STATE_PRESENT);
+            barrier_to(bb1, g_bb_state[bbi1 & 3], D3D12_RESOURCE_STATE_RENDER_TARGET);
+            warp_convert(bb1, bbi1, g_srv_interp.Get());
+            barrier_to(bb1, g_bb_state[bbi1 & 3], D3D12_RESOURCE_STATE_PRESENT);
         }
     }
 
@@ -3954,10 +4063,13 @@ static void run_frame_warp(ID3D11Texture2D* colour11)
     }
 
     if (have_bb1) {
-        const ULONGLONG t_p = GetTickCount64();
+        // QPC here: g_present_ms is reported and used by the "display paces the loop"
+        // warning, and GetTickCount64's 15.6 ms granularity made it read 0 or 16.
+        const double t_p = qpc_ms();
         g_swapchain->Present(0, g_present_flags());
-        g_present_ms = static_cast<DWORD>(GetTickCount64() - t_p);
-        g_ms_present = g_ms_present * 0.9 + static_cast<double>(g_present_ms) * 0.1;
+        const double pres_ms = qpc_ms() - t_p;
+        g_present_ms = static_cast<DWORD>(pres_ms + 0.5);
+        g_ms_present = g_ms_present * 0.9 + pres_ms * 0.1;
 
         // Half a tick later the real frame goes out. XeSS-FG decides this timing
         // internally for its own path (and gets it wrong on non-Intel GPUs), but here
@@ -3973,13 +4085,13 @@ static void run_frame_warp(ID3D11Texture2D* colour11)
         g_list->Reset(g_alloc.Get(), nullptr);
     }
 
-    ComPtr<ID3D12Resource> bb2;
     const UINT bbi2 = g_swapchain->GetCurrentBackBufferIndex();
-    const bool have_bb2 = SUCCEEDED(g_swapchain->GetBuffer(bbi2, IID_PPV_ARGS(&bb2)));
+    ID3D12Resource* bb2 = nullptr;
+    const bool have_bb2 = back_buffer(bbi2, &bb2);
     if (have_bb2) {
-        barrier_to(bb2.Get(), g_bb_state[bbi2 & 3], D3D12_RESOURCE_STATE_RENDER_TARGET);
-        warp_convert(bb2.Get(), bbi2, g_srv_heap.Get());
-        barrier_to(bb2.Get(), g_bb_state[bbi2 & 3], D3D12_RESOURCE_STATE_PRESENT);
+        barrier_to(bb2, g_bb_state[bbi2 & 3], D3D12_RESOURCE_STATE_RENDER_TARGET);
+        warp_convert(bb2, bbi2, g_srv_heap.Get());
+        barrier_to(bb2, g_bb_state[bbi2 & 3], D3D12_RESOURCE_STATE_PRESENT);
     }
     g_list->Close();
     {
@@ -3988,17 +4100,18 @@ static void run_frame_warp(ID3D11Texture2D* colour11)
         g_queue->Signal(g_frame_fence.Get(), ++g_frame_fence_value);
     }
     if (have_bb2) {
-        const ULONGLONG t_p = GetTickCount64();
+        const double t_p = qpc_ms();
         g_swapchain->Present(0, g_present_flags());
-        g_present_ms = static_cast<DWORD>(GetTickCount64() - t_p);
-        g_ms_present = g_ms_present * 0.9 + static_cast<double>(g_present_ms) * 0.1;
+        const double pres_ms = qpc_ms() - t_p;
+        g_present_ms = static_cast<DWORD>(pres_ms + 0.5);
+        g_ms_present = g_ms_present * 0.9 + pres_ms * 0.1;
     }
 
     g_hist_write = pi;
     g_hist_valid = true;
     g_mv_slot = (g_mv_slot + 1) % slots;
     ++g_frames;
-    g_ms_work = g_ms_work * 0.9 + static_cast<double>(GetTickCount64() - t_work0) * 0.1;
+    g_ms_work = g_ms_work * 0.9 + (qpc_ms() - t_work0) * 0.1;
 
     if ((g_frames % g_report_every) == 1) {
         const ULONGLONG now_ms = GetTickCount64();
@@ -4282,10 +4395,7 @@ static void probe_colour_black()
     g_queue->ExecuteCommandLists(1, lists);
     const UINT64 v = ++g_probe_value;
     if (FAILED(g_queue->Signal(g_probe_fence.Get(), v))) { return; }
-    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    g_probe_fence->SetEventOnCompletion(v, ev);
-    WaitForSingleObject(ev, 200);
-    CloseHandle(ev);
+    wait_fence_value(g_probe_fence.Get(), v, 200);
 
     void* mapped = nullptr;
     if (FAILED(g_probe_rb->Map(0, nullptr, &mapped)) || !mapped) { return; }
@@ -4342,10 +4452,7 @@ static void dump_flush()
     g_dump_flushed = true;
 
     if (g_frame_fence) {
-        HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        g_frame_fence->SetEventOnCompletion(g_frame_fence_value, ev);
-        WaitForSingleObject(ev, 5000);
-        CloseHandle(ev);
+        wait_fence_value(g_frame_fence.Get(), g_frame_fence_value, 5000);
     }
 
     for (size_t i = 0; i < g_dump_entries.size(); ++i) {
@@ -4835,10 +4942,7 @@ static bool of_selftest()
         ID3D12CommandList* lists[] = { list.Get() };
         g_queue->ExecuteCommandLists(1, lists);
         g_queue->Signal(fence.Get(), ++fv);
-        HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        fence->SetEventOnCompletion(fv, ev);
-        WaitForSingleObject(ev, 5000);
-        CloseHandle(ev);
+        wait_fence_value(fence.Get(), fv, 5000);
     }
     logf_("[bridge] --fg-of-selftest: 3 dispatches + convert OK\n");
     return true;
@@ -5112,7 +5216,17 @@ static bool service_shared_layout()
               g_ctl->streams[2].width, g_ctl->streams[2].height,
               mgpu::kStreamMaxW, mgpu::kStreamMaxH);
     }
-    refresh_input_geo();
+    // The geometry fields only change together with `generation` (the producer bumps it
+    // from update_content_size() on every width/height change), so re-reading the seqlock
+    // every frame was a handful of uncached PCIe reads for nothing. The seqlock still
+    // makes a *concurrent* change safe - it just no longer runs when nothing changed.
+    // The `== 0` half keeps one edge case honest: if we attached before the producer
+    // published any size, we keep looking until it does.
+    if (g_ctl->generation != g_seen_geo_generation ||
+        g_geo.mv_w == 0 || g_geo.depth_w == 0) {
+        g_seen_geo_generation = g_ctl->generation;
+        refresh_input_geo();
+    }
     return true;
 }
 
@@ -5161,7 +5275,7 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     // v10: the previous frame's GPU work (which read its MV/depth slot) has completed, so
     // hand that slot back to the producer.
     ack_previous_slot();
-    const ULONGLONG t_work0 = GetTickCount64();
+    const double t_work0 = qpc_ms();
 
     // Real frame interval for XeSS-FG's pacing model.
     const ULONGLONG now_tick = GetTickCount64();
@@ -5183,8 +5297,8 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
         xellAddMarkerData(g_xell, fid, XELL_SIMULATION_END);
     }
 
-    if (g_colour_mutex) { g_colour_mutex->AcquireSync(0, 20); }
     const double t_c0 = qpc_ms();
+    if (g_colour_mutex) { g_colour_mutex->AcquireSync(0, 20); }
     if (!g_reuse_frame) {
         // CopyResource is silent about mismatches and a failed copy leaves the sink at its
         // initial (black) content - which looks exactly like "the pipeline runs but the
@@ -5210,6 +5324,15 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
         if (colour11) { g_ctx11->CopyResource(g_shared11.Get(), colour11); }
     }
     if (g_colour_mutex) { g_colour_mutex->ReleaseSync(0); }
+    // The D3D11 half of the colour hop: keyed-mutex acquire + the full-frame CopyResource
+    // (66 MB at 4K, 118 MB at 5K, both on this card). It used to be invisible - `work`
+    // only starts after it and `copy` only covers the D3D12 wait - so the largest single
+    // per-frame transfer had no line of its own in the breakdown.
+    {
+        const double c1 = qpc_ms();
+        g_ms_colour = g_ms_colour * 0.9 + (c1 - t_c0) * 0.1;
+        if (c1 - t_c0 > g_max_colour) { g_max_colour = c1 - t_c0; }
+    }
 
     if (!g_reuse_frame) {
         const UINT64 fv = ++g_fence11_value;
@@ -5222,7 +5345,6 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
         g_ms_copywait = g_ms_copywait * 0.9 + (f1 - f0) * 0.1;
         if (f1 - f0 > g_max_copywait) { g_max_copywait = f1 - f0; }
     }
-    (void)t_c0;
 
     // 3. MV/depth slot paired with this colour: one frame behind, because WGC
     //    only delivers a frame after it has been presented. On a re-presented frame
@@ -5244,9 +5366,11 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     }
     g_ack_slot = slot;          // v10: ACKed once this frame's GPU work is done
 
-    ComPtr<ID3D12Resource> backbuffer;
+    // Cached: see back_buffer(). The buffer identity is fixed for the life of the swap
+    // chain, so this also removes the per-frame QueryInterface/refcount traffic.
+    ID3D12Resource* bbres = nullptr;
     const UINT bbi = g_swapchain->GetCurrentBackBufferIndex();
-    if (FAILED(g_swapchain->GetBuffer(bbi, IID_PPV_ARGS(&backbuffer)))) { return; }
+    if (!back_buffer(bbi, &bbres)) { return; }
     D3D12_RESOURCE_STATES& bb_state = g_bb_state[bbi & 3];
 
     g_alloc->Reset();
@@ -5254,7 +5378,7 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
 
     D3D12_RESOURCE_BARRIER bb[2]{};
     bb[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    bb[0].Transition.pResource = backbuffer.Get();
+    bb[0].Transition.pResource = bbres;
     bb[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     bb[0].Transition.StateBefore = bb_state;
     bb[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -5288,14 +5412,14 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
         D3D12_RENDER_TARGET_VIEW_DESC rtv_desc{};
         rtv_desc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
         rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-        g_device->CreateRenderTargetView(backbuffer.Get(), &rtv_desc, rtv);
-        g_rtv_res[bbi & 3] = backbuffer;
+        g_device->CreateRenderTargetView(bbres, &rtv_desc, rtv);
+        g_rtv_res[bbi & 3] = bbres;
     }
 
     // Draw to the real back buffer size. XeSS-FG creates the native swap chain
     // itself, so its size need not equal the captured size; a viewport that is too
     // small leaves an uncovered border of uninitialised pixels around the picture.
-    const D3D12_RESOURCE_DESC bb_desc = backbuffer->GetDesc();
+    const D3D12_RESOURCE_DESC bb_desc = bbres->GetDesc();
     const UINT draw_w = static_cast<UINT>(bb_desc.Width);
     const UINT draw_h = bb_desc.Height;
 
@@ -5412,7 +5536,7 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     g_queue->ExecuteCommandLists(1, lists);
     if (g_xell) { xellAddMarkerData(g_xell, present_id,
                                     XELL_RENDERSUBMIT_END); }
-    g_ms_work = g_ms_work * 0.9 + static_cast<double>(GetTickCount64() - t_work0) * 0.1;
+    g_ms_work = g_ms_work * 0.9 + (qpc_ms() - t_work0) * 0.1;
 
     // 5. frame constants: jitter from the producer, approximate matrices
     xefg_swapchain_frame_constant_data_t cd{};
@@ -5537,13 +5661,14 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     if (fg1 - fg0 > g_max_fg) { g_max_fg = fg1 - fg0; }
     if (g_xell) { xellAddMarkerData(g_xell, present_id,
                                     XELL_PRESENT_START); }
-    const ULONGLONG t_present = GetTickCount64();
+    const double t_present = qpc_ms();
     // Present(1,0) blocked for ~31 ms here, capping the whole loop at ~31 fps and
     // competing with the game's own presents. The guide uses sync interval 0, and
     // XeSS-FG does its own pacing anyway.
     g_swapchain->Present(0, g_present_flags());
-    g_present_ms = static_cast<DWORD>(GetTickCount64() - t_present);
-    g_ms_present = g_ms_present * 0.9 + static_cast<double>(g_present_ms) * 0.1;
+    const double pres_ms = qpc_ms() - t_present;
+    g_present_ms = static_cast<DWORD>(pres_ms + 0.5);
+    g_ms_present = g_ms_present * 0.9 + pres_ms * 0.1;
     // Signal after Present so this also covers XeSS-FG's own submissions.
     g_queue->Signal(g_frame_fence.Get(), ++g_frame_fence_value);
     if (g_xell) { xellAddMarkerData(g_xell, present_id,
@@ -5741,7 +5866,15 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
         const double mx_wait = g_max_wait;
         const double mx_cw = g_max_copywait, mx_in = g_max_inputs, mx_tot = g_max_total;
         const double mx_xe = g_max_xell, mx_fg = g_max_fg;
+        const double mx_col = g_max_colour; g_max_colour = 0.0;
         const double mx_age = g_max_age; g_max_age = 0.0;
+        // Everything run_frame() spends that no other field accounts for: the slot walk,
+        // the descriptor/barrier setup, the present bookkeeping and this report itself.
+        // If this grows, the next thing to look at is ours, not XeSS-FG's.
+        const double accounted = g_ms_colour + g_ms_copywait + g_ms_work + g_ms_wait +
+                                 g_ms_inputs + g_ms_of + g_ms_xell + g_ms_fg +
+                                 g_ms_throttle + g_ms_present;
+        const double cpu_only = (g_ms_total > accounted) ? (g_ms_total - accounted) : 0.0;
         const UINT x2m = g_x2_miss;
         g_hitch_logged = 0;
         g_max_gpu = 0.0; g_max_present = 0.0; g_max_gap = 0.0; g_x2_miss = 0;
@@ -5775,17 +5908,39 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
             }
             logf_("\n");
         }
+        // Cross-adapter budget: the only per-frame traffic that leaves the render card.
+        // MV is R16G16 (4 B/px) and depth R32 (4 B/px), and XeSS-FG wants both at the
+        // stream size, so this line is exactly what StreamPercent / --no-depth change -
+        // it is the number to watch when the goal is "less bus traffic", not `total`.
+        {
+            const double mv_mb  = static_cast<double>(g_geo.mv_w) * g_geo.mv_h * 4.0 / (1024.0 * 1024.0);
+            const double dep_mb = static_cast<double>(g_geo.depth_w) * g_geo.depth_h * 4.0 / (1024.0 * 1024.0);
+            const bool send_mv  = !g_no_mv && !g_fg_of && !g_no_inputs;
+            const bool send_dep = !g_no_depth && !g_no_inputs;
+            const double per_frame = (send_mv ? mv_mb : 0.0) + (send_dep ? dep_mb : 0.0);
+            const double rate = (g_arrival_ms_ema > 0.1)
+                              ? per_frame * (1000.0 / g_arrival_ms_ema) : 0.0;
+            logf_("[bridge]   bus: mv %ux%u%s %.1fMB + depth %ux%u%s %.1fMB = %.1fMB/frame"
+                  " (%.1f GB/s at %.1f fps; StreamPercent and --no-depth are the levers)\n",
+                  g_geo.mv_w, g_geo.mv_h, send_mv ? "" : " (not sent)", send_mv ? mv_mb : 0.0,
+                  g_geo.depth_w, g_geo.depth_h, send_dep ? "" : " (not sent)",
+                  send_dep ? dep_mb : 0.0, per_frame, rate * 0.001,
+                  (g_arrival_ms_ema > 0.1) ? 1000.0 / g_arrival_ms_ema : 0.0);
+        }
         logf_("[bridge]   breakdown: capture=%.1fms work=%.1fms present=%.1fms gpu=%.1fms"
-              " wait=%.1fms copy=%.1fms mvs=%.1fms of=%.1fms age=%.1fms xell=%.1fms fg=%.1fms total=%.1fms timeouts=%u mode=%d  xN=%.2f"
+              " wait=%.1fms copy=%.1fms colour=%.1fms mvs=%.1fms of=%.1fms age=%.1fms"
+              " xell=%.1fms fg=%.1fms total=%.1fms cpu=%.1fms timeouts=%u mode=%d  xN=%.2f"
               "  game=%.1fms  jitter=%.1f..%.1fms  arr_gaps=%u  load=%.0f%%  slow=%u"
               "  pace=%.1fms repres=%u skip=%u"
-              "  worst(gpu %.1f/pres %.1f/wait %.1f/copy %.1f/mvs %.1f/of %.1f/age %.1f"
+              "  worst(gpu %.1f/pres %.1f/wait %.1f/copy %.1f/colour %.1f/mvs %.1f/of %.1f/age %.1f"
               "/xell %.1f/fg %.1f/total %.1f/gap %.1f) xNmiss=%u\n",
               g_ms_capture, g_ms_work, g_ms_present, g_ms_throttle, g_ms_wait,
-              g_ms_copywait, g_ms_inputs, g_ms_of, g_ms_age, g_ms_xell, g_ms_fg, g_ms_total,
+              g_ms_copywait, g_ms_colour, g_ms_inputs, g_ms_of, g_ms_age, g_ms_xell,
+              g_ms_fg, g_ms_total, cpu_only,
               g_slot_timeouts, g_colour_mode, xn, g_arrival_ms_ema, jit_min, jit_max,
               drops, budget, slow, g_pace_ms, pace_rep, pace_sk,
-              mx_gpu, mx_pres, mx_wait, mx_cw, mx_in, g_max_of, mx_age, mx_xe, mx_fg, mx_tot, mx_gap, x2m);
+              mx_gpu, mx_pres, mx_wait, mx_cw, mx_col, mx_in, g_max_of, mx_age, mx_xe,
+              mx_fg, mx_tot, mx_gap, x2m);
 
         // ---- end-to-end latency estimate, measured from inside the process -----
         //
@@ -6025,6 +6180,9 @@ int main()
     if (wcsstr(GetCommandLineW(), L"--no-depth")) { g_no_depth = true; }
     if (wcsstr(GetCommandLineW(), L"--no-mv")) { g_no_mv = true; }
     if (wcsstr(GetCommandLineW(), L"--mv-shadow")) { g_mv_shadow = true; }
+    // --log-flush: fflush after every line (pre-change behaviour). Useful when watching
+    // for a crash, where the last lines before the process dies are the interesting ones.
+    if (wcsstr(GetCommandLineW(), L"--log-flush")) { g_log_flush_each = 1; }
     if (wcsstr(GetCommandLineW(), L"--capture-monitor")) { g_capture_monitor = true; }
     // --pid N: target a process by id (the GUI knows the window's pid).
     if (const wchar_t* pp = wcsstr(GetCommandLineW(), L"--pid ")) {

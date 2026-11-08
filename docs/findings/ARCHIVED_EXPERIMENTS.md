@@ -4,9 +4,10 @@
 避免新读者被历史参数误导。本文保留**文件名、当时的参数与结论**，
 这样 `docs/findings/FINAL_CONFIG.md` §9 里的每条结论仍然能追到"是哪次实验测出来的"。
 
-**日常只用 `scripts/recipes/` 下那四份配方脚本**：
-`run_3x_of.bat`（3x 光流，推荐）/ `run_2x_quality.bat`（2x 画质）/ 
-`run_3x_nomv.bat`（最低开销）/ `run_dump.bat`（抓帧对比）。
+**日常只用 `scripts/recipes/` 下那几份配方脚本**：
+`run_3x_of.bat`（3x 光流，推荐）/ `run_2x_quality.bat`（2x 画质）/
+`run_3x_nomv.bat`（最低开销）/ `run_3x_of_nodepth.bat`（省一半总线的 A/B）/
+`run_dump.bat`（抓帧对比）。
 
 > ⚠️ 下表里的 `--no-mv` 与注释中的"MV 是死输入"来自 2026-11-07 之前的结论，
 > **已被推翻**（XeFG 确实消费 MV，见 `CONCLUSIONS.md` §2）。

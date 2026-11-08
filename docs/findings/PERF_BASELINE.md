@@ -1,7 +1,7 @@
 # 性能基线与优化清单
 
 > 这一页把**已经测过的**和**还没测的**分开：§2 是基线（**不要再测一遍**，直接引用），
-> §3 是候选（都要实测确认后才改代码）。画质相关的变量看
+> §3 是候选与**本轮已做的事**（每条都标了结论）。画质相关的变量看
 > [`QUALITY_VARIABLES.md`](QUALITY_VARIABLES.md)，结论摘要看
 > [`CONCLUSIONS.md`](CONCLUSIONS.md) §7。
 
@@ -11,39 +11,47 @@
 
 ## 1. 怎么量（固定跑法 + 判据）
 
-固定场景 + 固定外部锁帧 + 同一段 40 帧窗口做 A/B，只看 `--report` 输出的这一行
-（`src/bridge/bridge.cpp` 的 `run_frame` 尾部）：
+固定场景 + 固定外部锁帧 + 同一段 40 帧窗口做 A/B，只看 `--report` 输出的这几行
+（`src/bridge/bridge.cpp` 的 `run_frame_ex` 尾部）：
 
 ```
-[bridge]   breakdown: capture= work= present= gpu= wait= copy= mvs= of= age= xell= fg= total=
-           timeouts= mode=  xN=  game=  jitter=..  arr_gaps=  load=  slow=  pace= repres= skip=
-           worst(gpu/pres/wait/copy/mvs/of/age/xell/fg/total/gap) xNmiss=
+[bridge]   breakdown: capture= work= present= gpu= wait= copy= colour= mvs= of= age= xell=
+           fg= total= cpu= timeouts= mode=  xN=  game=  jitter=..  arr_gaps=  load=  slow=
+           pace= repres= skip=  worst(gpu/pres/wait/copy/colour/mvs/of/age/xell/fg/total/gap)
+           xNmiss=
+[bridge]   bus: mv 2560x1440 14.1MB + depth 2560x1440 14.1MB = 28.1MB/frame (3.4 GB/s at 120.0 fps)
 ```
 
-| 字段 | 含义（都在 `run_frame` 里量） |
+| 字段 | 含义（都在 `run_frame` 里量，QPC 时钟） |
 |---|---|
-| `capture` | 等下一帧 WGC 帧（`TryGetNextFrame` 的阻塞） |
+| `capture` | 等下一帧 WGC 帧（`TryGetNextFrame` 的阻塞，在外层循环量） |
 | `work` | 从取到帧到提交命令列表之间，我们自己的 CPU 开销 |
 | `present` | `Present()` 的阻塞时长 —— **XeFG 的放行点** |
 | `gpu` | 等上一帧 GPU 完成（`gpu_throttle()`，深度 1 帧；`--no-throttle` 时为 0） |
 | `wait` | 等槽位 fence（`wait_slot()`），超时计入 `timeouts` |
-| `copy` | 等"WGC 帧 → 我们的 D3D11 承接纹理"这次同卡拷贝在 D3D12 队列上完成（4K 66 MB / 5K 118 MB） |
-| `mvs` | 录 MV/深度**本地**拷贝的时间（这些拷贝会把物理上在渲染卡的数据拉到插帧卡） |
+| `copy` | 等"WGC 帧 → 我们的 D3D11 承接纹理"这次同卡拷贝在 D3D12 队列上完成 |
+| `colour` | 那半边的 D3D11 侧：keyed-mutex 获取 + 全帧 `CopyResource`（4K 66 MB / 5K 118 MB） |
+| `mvs` | 录 MV/深度**本地**拷贝的时间（这些拷贝把物理上在渲染卡的数据拉到插帧卡） |
 | `of` | 本地光流（`--fg-of`） |
 | `age` | WGC `SystemRelativeTime` → 我们取到手 = 游戏合成 → 本进程这一跳 |
 | `xell` | `xellSleep()` 的阻塞时长 |
 | `fg` | `xefgSwapChain` 的标注（tagging）调用 |
 | `total` | 整个 `run_frame` |
+| `cpu` | `total` 减掉上面所有已计时的阶段 = **没有归处的部分**（选槽、描述符/屏障设置、报告本身）。它涨了，问题在我们；它掉了，问题在 GPU/PCIe |
 | `game` / `jitter` | 生产端帧时间 EMA / 到达间隔的 min..max |
 | `arr_gaps` / `xNmiss` | 到达间隔例外（丢帧）计数 / 倍率判定缺失数 |
 | `load` | `(gpu + present) / 输入间隔` —— paced loop 的占空比 |
 | `slow` | 超过输入间隔的帧数 |
 | `pace` / `repres` / `skip` | `--pace` 的补偿量 / 重播帧 / 跳过的帧 |
 
+`bus:` 行是**唯一会离开渲染卡的逐帧流量**：MV（R16G16，4 B/px）+ 深度（R32，4 B/px），
+尺寸取生产端发布的流尺寸。它就是 `StreamPercent` / `--no-depth` 改变的量 ——
+当目标是"降总线"时看这一行，不要看 `total`。
+
 **判据优先级（从上往下，前一条不满足就别看后面）：**
 
-1. 状态行的 `... %.1f fps out = %.2f vblank/frame` 应当是 **1.00**（现在是默认值
-   `--fg-rt-mode quant` 的功劳）；`= 1.00` 之外的 `NOT-EXACT` 标记就是周期性丢帧的来源；
+1. 状态行的 `... %.1f fps out = %.2f vblank/frame` 应当是 **1.00**（默认值
+   `--fg-rt-mode quant` 的功劳）；`NOT-EXACT` 标记就是周期性丢帧的来源；
 2. `slow` = 0；`load` 95–100% 是 paced loop 的**正常值**，不是告警；
 3. `gpu` + `present` ≈ 输入间隔（这两项就是"节拍在哪等"）；
 4. `of` ≈ 0.3 ms、`copy` ≈ 0.1 ms、`mvs` ≈ 0 → 这些不是瓶颈，别再查；
@@ -52,8 +60,8 @@
 > `worst(...)` 是历史最大值，只看量级，**不当均值用**。
 
 可用工具：`--report N`、`--list-modes`、`--fg-probe`、`--dump` +
-`scripts/analyse_dump.py`、`--probe-colour`、`--mv-shadow`。命令写法见
-[`TOOLING_NOTES.md`](TOOLING_NOTES.md)。
+`scripts/analyse_dump.py`、`--probe-colour`、`--mv-shadow`、`--log-flush`（每行立即
+flush，排查崩溃时用；默认按 200 ms 节流）。命令写法见 [`TOOLING_NOTES.md`](TOOLING_NOTES.md)。
 
 ## 2. 基线（已实测，别重测）
 
@@ -73,42 +81,75 @@
 的真实空间只有三块：① 我们自己的 CPU/同步开销 ② 显存与总线流量 ③ 抖动/稳定性
 （第三块已经吃了一大口）。
 
-## 3. 候选清单（按性价比排序，全部需要实测确认）
+## 3. 候选清单 → 本轮结论
 
-| # | 点 | 位置 | 预期收益 | 风险 | 怎么验 |
-|---|---|---|---|---|---|
-| **1** | 每帧两次 `CreateEventW` + `CloseHandle` | `bridge.cpp` `wait_slot()` / `gpu_throttle()` | 小（µs 级）但白给；60–120 fps 下每秒 120–240 次内核对象创建 | 低 | 改前后比 `total` / `wait` 均值 |
-| **2** | WGC 颜色链路的显存流量 | 每帧 `CopyResource`（4K FP16 66 MB）+ FP16→R10G10B10A2 全屏转换（读 66 + 写 33）≈ **165 MB/帧**，@120 fps ≈ 20 GB/s 显存带宽 | 省一次中转可降显存压力/功耗 | 中（跨 D3D11/D3D12 必须走 shared handle） | 先量 `total - gpu - present` 在 4K vs 1440p 的差 |
-| **3** | add-on 每帧的全屏 pass（MV downsample + depth convert） | `game_capture.cpp` 的 `record_downsample()` / `record_depth_convert()` | 省一次 pass ≈ 渲染卡每帧几 ms | 中（格式不同，合并要改 shader） | `StreamPercent` 对照 + 渲染卡 GPU 占用 |
-| **4** | `bridge.cpp` 单 TU（约 6.9k 行） | 帧循环 / OSD / 5 个诊断工具混在一起 | 可维护性、编译时间；**不解性能** | 低 | 纯重构，编译通过即可 |
-| **5** | `gpu_throttle` 深度 vs 吞吐 | 现为 1 帧在飞（最低延迟），`--no-throttle` 换吞吐 | 二者互斥，需先定优化目标 | 低 | 同场景 A/B `total` 与 `compose → photons` |
-| **6** | `logf_` 每行 `fflush(stdout)` | `bridge.cpp` 顶部的 `logf_()` | 只在 `--dump` / 诊断时明显 | 极低 | 大 dump 时的 CPU 占用 |
+### 3.1 已做（2026-11-08，`bridge.exe` 见 §3.4）
 
-### 3.1 候选 1 的注意点（复用事件不能盲改）
+| 改动 | 位置 | 收益 | 为什么安全 |
+|---|---|---|---|
+| `gpu_throttle()` 与 3 个诊断等待复用**一个** fence 事件 | `wait_fence_value()` | 每帧少一次 `CreateEventW`+`CloseHandle`（60–120 次/秒 → 0） | 只在 `GetCompletedValue()` 可信的**本地** fence 上用；等待前后都重查 fence 值，剩余超时重算，迟到信号最多多转一圈 |
+| 不再每帧 `GetBuffer()` 拿交换链缓冲 | `back_buffer()` | 每帧两次 `QueryInterface`+引用计数 → 0 | 交换链从不 `ResizeBuffers`，缓冲身份终生不变 |
+| 流几何（MV/深度尺寸）只在 `generation` 变化时读 | `service_shared_layout()` | 每帧少一组**非缓存 PCIe 读**（seqlock + 4 个字段） | 生产端每次改尺寸都会 bump `generation`；另外 `mv_w==0` 时继续每帧重读，避免"先 attach 后发布"漏读 |
+| `logf_` 改成按 200 ms 节流 flush（`--log-flush` 恢复逐行） | 文件顶部 | 每行一次 write 系统调用 → 每秒 ≤5 次 | 含 `WARNING`/`FAILED`/`note:` 等字样、以及 `hard_exit` 路径仍然立即 flush |
+| 统计改用 QPC | `work` / `gpu` / `present` / `colour` | 这三项原来用 `GetTickCount64`，量化到 15.6 ms（`timeBeginPeriod(1)` 失效时会读成 0/16），`load` 和 `present` 告警跟着抖 | 纯统计，不参与任何控制流 |
+| 新增 `colour=` 与 `cpu=` 两个字段 | breakdown | 颜色 hop（66/118 MB 同卡拷贝）和"没归处的时间"终于各有一行 | 只加日志 |
+| 新增 `bus:` 行 | breakdown | 逐帧 PCIe 字节数与 GB/s 直接可读 | 只加日志 |
 
-`wait_slot()` 与 `gpu_throttle()` 现在每帧新建一个自动重置事件。改成常驻事件时，
-**迟到的信号会污染下一次等待**：上一帧的 fence 值如果在超时之后才 retire，事件会被
-置位，下一帧的 `WaitForSingleObject` 立刻返回并记一次假的 `WAIT_OBJECT_0`
-（顺带把 `g_fwd_expect` 推错）。可行的做法是复用事件 + 在等待前确认
-`GetCompletedValue() >= 目标值`，否则先把事件消费掉；或者只在 `--wait-ms` 足够大
-（实际不超时）的路径上复用。`dump_flush()` / `--probe-colour` / `--fg-of-selftest`
-里的那三处是**一次性**的，不用动。
+> 这一轮**没有**动帧循环结构、没有动 XeFG 接线、没有动 add-on。上面每条都是
+> "少一次系统调用/少一次 PCIe 读/多一行可测量"，CPU 侧合计约几十 µs/帧 ——
+> 在 paced loop 里（`gpu + present` 占满输入间隔）**不会体现在 fps 上**，
+> 它体现为 `cpu` 字段更小、`load`/`present` 告警不再误报。真正的收益在下面 §3.2。
 
-另外：MV 的 downsample pass 只在消费端真的要 MV 时才录
-（`g_mv_active`），所以候选 3 的"每帧两个 pass"只发生在 MV 开启的配方里；
-`--no-mv` / `--fg-of` 配方下这一项本来就不花时间。
+### 3.2 分析后判定"不做"的（带算术）
+
+| 原候选 | 判定 | 依据 |
+|---|---|---|
+| **颜色链路省一次中转**（原 #2） | ❌ **零收益**，别做 | 现状每帧：WGC 帧 FP16 →(D3D11 拷贝)→ 承接纹理 FP16 →(D3D12 conv draw)→ 交换链 R10G10B10A2，即 66 W + 66 R + 33 W = **165 MB**。把 PQ 编码挪到 D3D11 先写 R10G10B10A2（66 R + 33 W），D3D12 再拷进交换链（33 R + 33 W）合计还是 **165 MB**。XeFG 的输入必须是交换链后备缓冲，这一跳省不掉 |
+| **add-on 每帧两个全屏 pass**（原 #3） | ❌ 不是几 ms，是 0.1 ms 量级 | pass 只做"本地 RT → 本地 RT"，4K 一次 132 MB **本地**显存流量，3080 Ti 本地带宽 ~900 GB/s ⇒ ~0.15 ms。贵的是**跨卡**那 33 MB（见 §3.3） |
+| **`wait_slot` 也复用事件**（原 #1 的另一半） | ❌ 故意保留每帧新建 | 跨卡 fence 在本节点 `GetCompletedValue()` 恒为 `UINT64_MAX`，无法区分"迟到信号"；复用会让 `g_fwd_expect[]` 虚增、读到**旧一帧**的槽（§2 第 2 条硬约束）。代价 ~1 µs |
+| **`bridge.cpp` 拆 TU**（原 #4） | ⏳ 仍未做 | 纯可维护性；6.9k 行单 TU 编译约 20 s |
+
+### 3.3 还剩下的真实空间（按性价比）
+
+| # | 点 | 量级 | 怎么验 | 风险 |
+|---|---|---|---|---|
+| **1** | **跨卡流量本身**：`[capture] StreamPercent=150`（MV+深度都降到 ~1440p）或 `--no-depth`（只发 MV） | 已实测 `--no-inputs` 让 4K/DLAA 的 `gpu` **25.2 → 21.6 ms**，即跨卡搬运占 **3.6 ms/帧**；深度是其中一半 ⇒ `--no-depth` ≈ **-1.8 ms/帧**；`StreamPercent=150` 让两者都 ×1/2.25 | `bus:` 行 + `gpu` 字段 A/B | 低（`--no-depth` 画质"无可测差别"已有对照，但 `FINAL_CONFIG` §4.5 仍标为"掉质量开关"，见 §6） |
+| **2** | `gpu_throttle` 深度 vs 吞吐（`--no-throttle`） | 互斥，需先定目标 | 同场景 A/B `total` 与 `compose → photons` | 低（实测更差，仅作对照） |
+| **3** | `bridge.cpp` 拆 TU | 编译时间 | 编译通过 | 低 |
+
+### 3.4 本轮产物
+
+- `build/bridge.exe` md5 **`43f263f5…`**（构建：`./scripts/build_bridge.sh`，MSVC 14.44，
+  `/W3` 零警告）。**尚未在目标机上跑过** —— 下一轮第一件事是跑 §5 的 A/B 清单，
+  确认 `cadence = 1.00 vblank/frame`、`timeouts` = 0、`cpu` 字段为个位数毫秒。
 
 ## 4. 明确不要碰
 
 - 深度延迟 / 投影 / FOV —— 实测无差别（`CONCLUSIONS.md` §1）；
 - 颜色拷贝（`Color=1`）—— 除非先补消费端通路，否则纯亏（`ROADMAP.md` §6）；
 - 消费者侧锁帧、跨卡 fence 轮询 —— 都已证伪（`CONCLUSIONS.md` §3）；
-- XeFG 内部参数调优 —— 闭源，只有 `--fg-*` 那几个胶水开关。
+- XeFG 内部参数调优 —— 闭源，只有 `--fg-*` 那几个胶水开关；
+- 复用 `wait_slot` 的等待事件（见 §3.2）。
 
-## 5. 未做的小尾巴（不影响性能，但会误导排查）
+## 5. 下一轮怎么测（一次跑完，20 分钟）
+
+同一场景、同一锁帧，四组，每组只看 `breakdown` + `bus` 两行：
+
+| 组 | 配置 | 看什么 |
+|---|---|---|
+| A | `run_3x_of.bat`（现状） | 基线：`gpu` / `total` / `cpu` / `bus` |
+| B | A + `--no-depth` | `gpu` 应降 ~1.8 ms（4K/DLAA）或 ~0.5 ms（1440p 渲染），`bus:` 少一半；确认 `gen N/N` 不掉、画质无可见差别 |
+| C | A + `[capture] StreamPercent=150` | `bus:` 应降到 ~44%，`gpu` 降；确认 MV 仍被消费（`--mv-shadow` 对照不变） |
+| D | A + `--log-flush` | 只用来确认日志节流没有掩盖问题 |
+
+判定：**只要 A 的 `cadence` 是 1.00、`slow` = 0、`cpu` < 2 ms，本轮改动就是安全的**；
+B/C 的收益按 `gpu` 与 `bus:` 的下降量记账，不看 fps（paced loop 里 fps 由锁帧决定）。
+
+## 6. 未做的小尾巴（不影响性能，但会误导排查）
 
 | 现象 | 位置 | 说明 |
 |---|---|---|
 | `--unlock-mfg` 在 2x 时打印 "The patch did not take" | `bridge.cpp` 的补丁校验 | **虚警**：2x 本来就不需要改数量上限 |
 | 注释说 `--input-ms` 决定 `frameRenderTime` | `bridge.cpp` 的帧时间注释 | 只在 EMA 模式成立；`quant`（默认）用实测中位数 |
+| `--no-depth` 的画质结论在文档里自相矛盾 | `FINAL_CONFIG.md` §4.5 说"掉质量"、§9 两组对照说"画质不变" | 需要一次明确的 A/B 定论，否则没人敢用它省带宽 |
 | `frame_id ↔ WGC SystemRelativeTime` 严格配对 | —— | 零带宽、几十行，改善**可观测性**；做法见 `ROADMAP.md` §5 |
