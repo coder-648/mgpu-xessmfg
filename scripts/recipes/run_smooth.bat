@@ -15,9 +15,14 @@ rem
 rem  One command covers all three: --interp-cadence asks XeFG for as many frames as
 rem  the vblanks that actually elapsed, so the multiplier follows the input by itself.
 rem
-rem  --interp 3 matters: the MFG patch only lifts the DLL as far as you ASK for
-rem  (--interp 2 -> 3x max, --interp 3 -> 4x max). 40 fps input jitters between 3 and
-rem  4 vblanks and needs the 4x headroom - the same run measured 10.8% with --interp 2.
+rem  --interp matters twice: the MFG patch only lifts the DLL as far as you ASK for, and
+rem  --interp-cadence can only ask for as many frames as that ceiling allows (kmax =
+rem  interp + 1). Measured empty refresh periods, 4K --den 2, same scene:
+rem      --interp 2 (kmax 3): 60fps 2.5%   40fps 10.8%
+rem      --interp 3 (kmax 4): 60fps 2.5%   40fps  1.5%   30fps 2.6%
+rem      --interp 5 (kmax 6): 60fps 0.8%   40fps  0.4%   30fps 0.6%   <- default here
+rem  --interp 5 costs load 81-85% (vs 19-51% at interp 3). If load sits above 100% in the
+rem  log, drop to --interp 3 (30/40 fps) or --interp 2 (60 fps).
 rem
 rem  Before starting: game in-world, in-game frame generation OFF, upscaler
 rem  DLSS / FSR / XeSS, and an external limiter (RTSS) at 60 / 40 / 30 fps for
@@ -39,7 +44,7 @@ if not exist bridge.exe (
   exit /b 1
 )
 
-bridge.exe %GAMEOPT% --den 2 --pool 4 --interp 3 --interp-cadence --unlock-mfg ^
+bridge.exe %GAMEOPT% --den 2 --pool 4 --interp 5 --interp-cadence --unlock-mfg ^
            --fg-ui none --fg-rt-mode quant > bridge_smooth.txt 2>&1
 type bridge_smooth.txt
 pause
