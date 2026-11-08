@@ -169,6 +169,11 @@ bridge.exe --den 1 --pool 4 --interp 2 --no-mv ^
 | 2x 画质优先 | `--interp 1`（+ 游戏 MV） | 60 → 120 fps | 边缘伪影最少 |
 | 最低开销 | `--interp 2 --no-mv` | 40 → 120 fps | 快转时边缘更脏 |
 
+> **UE5 游戏**（影之刃零 / 黑神话 等）：**用 `--no-mv`**（运动矢量 = 关闭）。UE5 的 MV 是在抖动后的
+> 画面上算的，且常混用像素/UV 单位与反向矢量，3x/4x 下容易闪和拖影；关掉还少一个全屏 pass 和一半
+> 跨卡流量。另外**必须开着「分层窗口」**（`--overlay-layered`，默认已开）：UE5 自认为"未激活"时会
+> 丢掉菜单点击（攻击照旧有反应），只有分层窗口下菜单才收得到鼠标。
+
 为什么这样配、哪些思路已经排除（`--cadence-hold`/`--no-depth`/动态逐帧加光流…）的实测数据见
 `docs/findings/QUALITY_VARIABLES.md` 与 `docs/findings/CONCLUSIONS.md`。
 
