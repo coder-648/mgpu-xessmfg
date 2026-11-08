@@ -1555,7 +1555,18 @@ static bool   g_cad_rt_logged = false;
 // exactly the "stutters even though no vblank is empty" the ear sees. Holding the count for
 // ~15 frames and then stepping by at most one keeps the long-run average (the phase keeps
 // accumulating) while making the picture's rhythm steady.
-static int    g_cad_hold_frames = 15;
+// --cadence-smooth N (default 8 frames, 1 = raw): smooth the arrival interval feeding the
+// phase accumulator over ~N frames.
+//
+// Why: feeding the *raw* per-frame interval makes the batch size follow the jitter 1:1 - one
+// late frame asks for 4-5 generated frames, the next fast one asks for 2. The long-run average
+// stays right, but the picture's rhythm changes on almost every frame (measured 17-32 count
+// switches per 1 s window while the input fluctuates 2..6 vblanks), and that is what reads as
+// "一卡一卡". A short EMA gives the same average with a steady count; only a real rate change
+// moves it.
+static int    g_cad_smooth = 8;
+static double g_cad_arr_s = 0.0;
+static int    g_cad_hold_frames = 0;
 static int    g_cad_hold = 0;
 static bool   g_out_hz_floor_warned = false;
 static bool   g_out_hz_max_warned = false;
@@ -1671,7 +1682,18 @@ static UINT cadence_next_slots()
     const double vb = refresh_ms();
     // Track the raw last interval (reacts immediately) but fall back to the EMA while
     // it warms up; a median would lag behind the very transitions we are following.
-    const double t_in = (g_arr_last_raw > 0.5) ? g_arr_last_raw : g_arrival_ms_ema;
+    double t_in = (g_arr_last_raw > 0.5) ? g_arr_last_raw : g_arrival_ms_ema;
+    // Smoothed input interval (see g_cad_smooth). The phase accumulator below wants the rate
+    // the input is *running at*, not the timing of the single frame that just landed.
+    if (g_cad_smooth > 1) {
+        if (g_cad_arr_s <= 0.5) {
+            g_cad_arr_s = t_in;
+        } else {
+            const double a = 2.0 / (static_cast<double>(g_cad_smooth) + 1.0);
+            g_cad_arr_s += (t_in - g_cad_arr_s) * a;
+        }
+        t_in = g_cad_arr_s;
+    }
     // Target output rate. Without --fg-out-hz this is the panel refresh, i.e. "fill every
     // vblank" (the historical behaviour). With it the same Bresenham accumulator produces
     // as many frames as the *target* rate needs for this input interval, so "120 Hz panel,
@@ -6942,6 +6964,11 @@ int main()
     if (const wchar_t* sp = wcsstr(GetCommandLineW(), L"--fg-rt-spike ")) {
         g_fg_rt_spike = (_wtoi(sp + 14) != 0);
     }
+    // --cadence-smooth N: EMA window (frames) for the interval that drives the cadence math.
+    if (const wchar_t* cs = wcsstr(GetCommandLineW(), L"--cadence-smooth ")) {
+        const int n = _wtoi(cs + 17);
+        if (n >= 1 && n <= 240) { g_cad_smooth = n; }
+    }
     // --cadence-hold N: frames to hold the interpolated count (0/1 = change every frame).
     if (const wchar_t* ch = wcsstr(GetCommandLineW(), L"--cadence-hold ")) {
         const int n = _wtoi(ch + 15);
@@ -7021,12 +7048,13 @@ int main()
         logf_("[bridge] --interp-cadence: variable-rate generation - the multiplier follows"
               " the vblanks between real frames (output runs at the panel refresh, no lock"
               " needed; the refresh is detected during FG init)\n");
-        // Measured 2026-11-07 (bridge_pbz_cadence.txt): this made things *worse*
-        // (input collapsed 26 -> 63-78 ms, output 63-79 fps) because the arrival
-        // interval it consumes is our own throttle, not the game's frame time, and the
-        // per-frame count change defeats the pacer's history. Kept for reference.
-        logf_("[bridge]   WARNING: measured worse than a constant multiplier on this DLL"
-              " - see docs/findings/FINAL_CONFIG.md 9.18 before relying on it\n");
+        // The 2026-11-07 "cadence is worse" result (FINAL_CONFIG 9.18) was retracted: it
+        // was the arrival-interval bug (GetTickCount64 truncated the 0 ms samples, so the
+        // median read 31 ms instead of 25 ms and the count snapped to 4). With the WGC
+        // SystemRelativeTime timestamp cadence measured 1.0-1.5% empty vblanks.
+        logf_("[bridge]   cadence: arrival smoothing %d frame(s), count hold %d,"
+              " frameRenderTime %s\n",
+              g_cad_smooth, g_cad_hold_frames, g_fg_cad_rt ? "batch*vblank" : "median");
     }
 #if MGPU_FG_OF
     if (wcsstr(GetCommandLineW(), L"--fg-of")) { g_fg_of = true; }

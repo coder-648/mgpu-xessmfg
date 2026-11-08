@@ -405,7 +405,10 @@ bridge.exe --game PBZ.exe --den 1 --pool 4 --interp 2 --unlock-mfg --fg-ui none 
 | `--fg-round 0/1/2` | `1` | — | `--dyn-mfg` 的取整：`0` at most（不超目标）、`1` nearest、`2` at least | 与上游 `RoundingDMFG` 同义 |
 | `--fg-allow-1x off` | 允许 | — | 禁止 `--dyn-mfg` 关掉帧生成（最低 2x） | 与上游 `DynamicAllow1X=false` 同义 |
 | `--interp-cadence` | 关 | — | **变倍率生成**：按两个真实帧之间经过的 vblank 数逐帧设 `SetNumInterpolatedFrames` | ✅ **2026-11-08 复测有效**（空刷新 2.8–3.1% vs 纯 2x 的 5.0–6.7%）。⚠️ 2026-11-07 的"失败"结论是**到达间隔被墙钟偏差高估 20%** 造成的（见 `PERF_BASELINE.md` §3.7/§3.14），已撤回。必须配 `--interp 2` 才会打 MFG 补丁（`--interp 1` 时补丁跳过，倍率上限停在 1） |
-| `--report N` | `40` | 5–400 | 统计窗口长度（帧） | 调小=更细，调大=更稳 |
+| `--cadence-smooth N` | `8` | 1–240 | 决定倍率前，先对"到达间隔"做 N 帧 EMA | **波动输入下必用**（默认开）：逐帧原始间隔让倍率跟着抖 1:1，画面"一卡一卡"；填 1 可复现旧行为。档位切换 29→12 次/窗口，空刷新 3.9%→1.3%（`PERF_BASELINE.md` §3.22） |
+| `--cadence-hold N` | `0` | 0–240 | 倍率保持 N 帧不变，之后每次只允许 ±1 | 实测**无收益**（`gpu` 不变、空刷新 7.5%→15.1%），默认关，仅 A/B 用 |
+| `--fg-cad-rt 0/1` | `0` | — | `--interp-cadence` 下把 `frameRenderTime` 改成"批次 × vblank"（默认仍喂中位数） | 实测**更差**（空刷新 1.0%→2.6%，出现 37 vblank 空洞），默认关 |
+ | `40` | 5–400 | 统计窗口长度（帧） | 调小=更细，调大=更稳 || `--report N` | `40` | 5–400 | 统计窗口长度（帧） | 调小=更细，调大=更稳 |
 
 ### 4.3 XeLL（低延迟库）
 
