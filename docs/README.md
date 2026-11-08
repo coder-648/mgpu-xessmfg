@@ -30,6 +30,7 @@
 | [`design/INPUT_SOURCES.md`](design/INPUT_SOURCES.md) | DLSS / FSR / XeSS 三个输入源的能力差异与扩展方法 |
 | [`design/VENDOR_COMPAT_PLAN.md`](design/VENDOR_COMPAT_PLAN.md) | 厂商兼容计划（输入源抽象 + 副卡泛化，M6.x） |
 | [`findings/QUALITY_VARIABLES.md`](findings/QUALITY_VARIABLES.md) | **画质/预算变量作用表** + 怎么自己复测 |
+| [`findings/PERF_BASELINE.md`](findings/PERF_BASELINE.md) | **性能基线（别重测）+ 优化候选清单** + 怎么看 `breakdown` |
 | [`findings/FINAL_CONFIG.md`](findings/FINAL_CONFIG.md) | 踩坑清单 §5 + 实验档案 §9（**历史附录，结论看 CONCLUSIONS**） |
 | [`findings/HANDOFF.md`](findings/HANDOFF.md) | 里程碑历史 + §8.6 十轮实验档案 |
 | [`findings/MFG.md`](findings/MFG.md) | 多帧生成（`--unlock-mfg`）的原理与字节补丁说明 |

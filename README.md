@@ -177,12 +177,13 @@ ReShade 侧的三条硬要求（部署包已处理，手工装时必看）：
 | `docs/ops/USAGE.md` | **完整使用说明**（安装 / 游戏内设置 / 三份配方 / 判读 / 排障 / 卸载），也是发布包里的 `README.md` |
 | `docs/design/` | 架构、协议 v10、输入源、厂商兼容计划 |
 | `docs/ops/` | 构建、部署、配置（占位符/ini）、UI、依赖、合规 |
-| `docs/findings/` | **结论先行**、画质变量表、踩坑清单、实验档案、里程碑 |
+| `docs/findings/` | **结论先行**、画质变量表、性能基线、踩坑清单、实验档案、里程碑 |
 | `src/game_capture/` | add-on：钩超分 API，写共享槽 |
 | `src/bridge/` | 消费端：XeFG + XeLL + WGC + 覆盖窗口 |
 | `src/mgpu_ui/` | 前端（Win32 + GDI，无第三方库） |
 | `scripts/recipes/` | 四份能直接跑的配方脚本 |
 | `docs/findings/ARCHIVED_EXPERIMENTS.md` | 已移除的历史实验脚本：参数 + 结论（可追溯"哪次测出来的"） |
+| `docs/findings/PERF_BASELINE.md` | 性能基线 + 优化候选（**调性能前先读**，免得重测一遍） |
 | `tests/` | 各里程碑的验证程序（不参与正式构建） |
 | `packaging/` | 部署包源文件（安装器/卸载器/预设） |
 

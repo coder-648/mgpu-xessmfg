@@ -77,6 +77,9 @@
 
 ## 工程债
 
+性能相关的基线数据与候选优化（含"怎么验"）见
+`docs/findings/PERF_BASELINE.md` §3，这里不重复。
+
 | 项 | 说明 |
 |---|---|
 | `bridge.cpp` 6.9k 行 | 里面混着 OSD、XeFG 接线、五个诊断工具（`--dump`/`--mv-shadow`/`--probe-colour`/`--fg-probe`/`--list-modes`）。值得按"帧循环 / 诊断 / 输出"拆三个 TU |
