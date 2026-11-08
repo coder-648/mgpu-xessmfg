@@ -1,5 +1,5 @@
 ﻿# =============================================================================
-#  mgpu ReShade add-on 安装器
+#  mgpu ReShade add-on 安装器（强制覆盖版）
 #
 #  用法（三种都行）：
 #    1. 把游戏的 .exe 拖到 install.bat 上
@@ -10,17 +10,31 @@
 #    install.bat "D:\Games\XXX" d3d11
 #    可选：dxgi | d3d11 | d3d12 | opengl32 | version
 #
-#  只做四件事，全部可逆（uninstall.bat 还原）：
-#    - 把 ReShade 6.8 作为代理 DLL 放进游戏目录（同名文件先备份为 *.mgpu_bak）
-#    - 放 game_capture.addon64（+ 它旁边的 game_capture.ini）
-#    - 放 MGPU_DepthTap 这个空转效果并写进预设（没有启用的效果，ReShade 不会调
-#      add-on 的 begin_effects，add-on 就不会工作）
-#    - 写/补 ReShade.ini 里的 EffectSearchPaths 与 PresetPath
+#  ---------------------------------------------------------------------------
+#  这一版的行为：**所有文件一律覆盖成本包里的版本**
+#
+#  为什么：上一版装过的旧 add-on / 旧 game_capture.ini / 旧预设，会让游戏"看起来
+#  装好了但跑不起来"—— 最常见的是 add-on 与 bridge 协议对不上（拒绝通信），或者
+#  ini 里留着旧参数（SkipMv=1、没有 StreamHeight）导致行为不是文档里写的那个。
+#  所以这里不再"存在就跳过"，全部强制覆盖。
+#
+#  覆盖前会把原文件改名备份（不会丢，也不会覆盖掉更早的那份原件）：
+#       xxx.dll        -> xxx.dll.mgpu_bak   （已存在则 .mgpu_bak2 … 最多到 9）
+#       game_capture.ini -> game_capture.ini.mgpu_bak2 …
+#  uninstall.bat 会用这些备份还原。
+#
+#  开关：
+#    -KeepReShadeIni   保留游戏里已有的 ReShade.ini（只补 EffectSearchPaths /
+#                      PresetPath 两个键）。你在 ReShade 面板里调过参数的场合用这个，
+#                      否则默认会用本包的 ReShade.ini 覆盖（ReShade 面板设置会重置）
+#    -Force            游戏还在运行时也强行继续（默认拒绝：DLL 被占用时写入必失败）
+#    -NoPause          结束时不停顿（脚本调用时用）
 # =============================================================================
 
 param(
     [Parameter(Position = 0)][string] $GameDir = '',
     [Parameter(Position = 1)][string] $Proxy   = 'dxgi',
+    [switch] $KeepReShadeIni,
     [switch] $Force,
     [switch] $NoPause
 )
@@ -47,7 +61,7 @@ function Get-Sha($path) {
 
 # ---------------------------------------------------------------- 参数检查
 if (-not (Test-Path -LiteralPath $files -PathType Container)) {
-    Fail "缺 files 目录，部署包不完整（请从解压后的根目录运行）"
+    Fail "缺 files 目录，部署包不完整（请运行解压后根目录里的 install.bat）"
 }
 
 $proxyList = @('dxgi', 'd3d11', 'd3d12', 'opengl32', 'version')
@@ -83,8 +97,7 @@ if ($exes.Count -eq 0) {
     Warn "这个目录里没有 .exe —— 确认选的是游戏 exe 所在目录（不是上一级）"
 }
 
-Step "目标：$GameDir  (代理: $Proxy.dll)"
-
+Step "目标：$GameDir  (代理: $Proxy.dll，全部强制覆盖)"
 
 # ---------------------------------------------------------------- 游戏是否在跑
 $running = @()
@@ -98,171 +111,190 @@ foreach ($p in @(Get-Process -ErrorAction SilentlyContinue)) {
 if ($running.Count -gt 0) {
     $names = ($running | Sort-Object -Unique) -join ', '
     if (-not $Force) {
-        Fail "游戏还在运行（$names）。先关掉游戏再装：DLL 被占用时写入会失败。"
+        Fail "游戏（或本目录里的进程）还在运行：$names`n先关掉再装 —— DLL 被占用时写入会失败。"
     }
-    Warn "游戏在运行（$names），-Force 已指定，继续（可能失败）"
+    Warn "有进程在运行（$names），-Force 已指定，继续（写入可能失败）"
+}
+
+# ---------------------------------------------------------------- 强制覆盖的核心
+$script:Report = New-Object System.Collections.ArrayList
+
+# 找一个还没被占用的备份名：x.mgpu_bak / x.mgpu_bak2 … x.mgpu_bak9
+function Get-FreeBackup([string]$dst) {
+    for ($i = 1; $i -le 9; $i++) {
+        $cand = if ($i -eq 1) { $dst + '.mgpu_bak' } else { $dst + '.mgpu_bak' + $i }
+        if (-not (Test-Path -LiteralPath $cand)) { return $cand }
+    }
+    return ''
+}
+
+# 把 $Src 覆盖到 $Dst：内容不同就先备份原文件，再写、再校验。
+function Install-One {
+    param([string]$Src, [string]$Dst, [string]$Label)
+    if (-not (Test-Path -LiteralPath $Src -PathType Leaf)) {
+        Fail "缺文件: $Src（部署包不完整，请重新解压）"
+    }
+    $srcSha = Get-Sha $Src
+    $bak = ''
+    $state = '新建'
+
+    if (Test-Path -LiteralPath $Dst -PathType Leaf) {
+        if ((Get-Sha $Dst) -eq $srcSha) {
+            [void]$script:Report.Add([pscustomobject]@{ 文件 = $Label; 结果 = '已是最新'; 备份 = '' })
+            Info "$Label 内容已与本包一致（不重写）"
+            return
+        }
+        $state = '覆盖'
+        $bak = Get-FreeBackup $Dst
+        if ($bak -ne '') {
+            try {
+                Copy-Item -LiteralPath $Dst -Destination $bak -Force
+            } catch {
+                Fail "备份 $Label 失败：$($_.Exception.Message)`n先关掉游戏再装。"
+            }
+            Info "$Label 旧版本 -> $(Split-Path -Leaf $bak)"
+        } else {
+            Warn "$Label 的备份名额用尽（*.mgpu_bak1..9 都在），直接覆盖"
+        }
+    }
+
+    $dir = Split-Path -Parent $Dst
+    if ($dir -ne '' -and -not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    }
+    try {
+        Copy-Item -LiteralPath $Src -Destination $Dst -Force
+    } catch {
+        Fail "写入 $Label 失败：$($_.Exception.Message)`n（被占用 / 没有写权限 / 被杀软拦了）"
+    }
+    if ((Get-Sha $Dst) -ne $srcSha) {
+        Fail "$Label 写入后校验不一致 —— 可能被安全软件拦截，或磁盘写入失败。"
+    }
+    # 新建的文件没有旧版本可备份，$bak 是空串 —— 不能直接 Split-Path -Leaf（会抛"Path 为空字符串"）
+    $bakName = ''
+    if ($bak -ne '') { $bakName = Split-Path -Leaf $bak }
+    [void]$script:Report.Add([pscustomobject]@{ 文件 = $Label; 结果 = $state; 备份 = $bakName })
+    Info "$Label 已$state"
 }
 
 # ---------------------------------------------------------------- 1. 代理 DLL
+Step "1/5 ReShade 宿主（$Proxy.dll）"
 $reshade = Join-Path $files 'ReShade64.dll'
-if (-not (Test-Path -LiteralPath $reshade)) { Fail "缺 files\ReShade64.dll" }
 $reshadeSha = Get-Sha $reshade
+Install-One $reshade (Join-Path $GameDir ($Proxy + '.dll')) "$Proxy.dll"
 
-$target = Join-Path $GameDir ($Proxy + '.dll')
-$bak    = Join-Path $GameDir ($Proxy + '.dll.mgpu_bak')
-
-if (Test-Path -LiteralPath $target) {
-    $cur = Get-Sha $target
-    if ($cur -eq $reshadeSha) {
-        Info "$Proxy.dll 已经是本包里的 ReShade（无需改动）"
-    } else {
-        if (-not (Test-Path -LiteralPath $bak)) {
-            Copy-Item -LiteralPath $target -Destination $bak -Force
-            Info "原 $Proxy.dll 已备份为 $Proxy.dll.mgpu_bak"
-        } else {
-            Warn "$Proxy.dll.mgpu_bak 已存在（保留更早那份备份，不覆盖）"
-        }
-        Copy-Item -LiteralPath $reshade -Destination $target -Force
-        Info "ReShade -> $Proxy.dll"
-    }
-} else {
-    Copy-Item -LiteralPath $reshade -Destination $target -Force
-    Info "ReShade -> $Proxy.dll（新建）"
-}
-
-# ---------------------------------------------------------------- 2. add-on + ini
+# ---------------------------------------------------------------- 2. add-on
+Step "2/5 add-on"
 $addonSrc = Join-Path $files 'game_capture.addon64'
-if (-not (Test-Path -LiteralPath $addonSrc)) {
-    Fail "缺 files\game_capture.addon64（先跑 scripts/build_addon.sh src/game_capture game_capture）"
-}
-$addonDst = Join-Path $GameDir 'game_capture.addon64'
-$addonBak = Join-Path $GameDir 'game_capture.addon64.mgpu_bak'
-if ((Test-Path -LiteralPath $addonDst) -and ((Get-Sha $addonDst) -ne (Get-Sha $addonSrc))) {
-    Copy-Item -LiteralPath $addonDst -Destination $addonBak -Force
-    Info "旧 add-on 备份为 game_capture.addon64.mgpu_bak"
-}
-Copy-Item -LiteralPath $addonSrc -Destination $addonDst -Force
-Info "game_capture.addon64 已放入"
+Install-One $addonSrc (Join-Path $GameDir 'game_capture.addon64') 'game_capture.addon64'
 
-# add-on 读的是「自己旁边的同名 .ini」
-$iniSrc = Join-Path $files 'game_capture.ini'
-$iniDst = Join-Path $GameDir 'game_capture.ini'
-if (-not (Test-Path -LiteralPath $iniDst)) {
-    Copy-Item -LiteralPath $iniSrc -Destination $iniDst -Force
-    Info "game_capture.ini 已写入（Color=0, StreamPercent=100）"
-} elseif ($Force) {
-    Copy-Item -LiteralPath $iniSrc -Destination $iniDst -Force
-    Info "game_capture.ini 已被 -Force 覆盖"
-} else {
-    Info "game_capture.ini 已存在（保留；加 -Force 可覆盖）"
-}
+# ---------------------------------------------------------------- 3. add-on 的 ini
+#  key 名和默认值都会随版本变化（例如 StreamHeight=1440 是 v0.12 才有的），
+#  留着旧 ini 就会"参数看起来设了但没生效"，所以这里无条件覆盖。
+Step "3/5 add-on 配置"
+Install-One (Join-Path $files 'game_capture.ini') (Join-Path $GameDir 'game_capture.ini') 'game_capture.ini'
 
-# ---------------------------------------------------------------- 3. 效果 + 预设
+# ---------------------------------------------------------------- 4. 空转效果
+Step "4/5 空转效果（让 ReShade 绑定深度）"
 $fxDstDir = Join-Path $GameDir 'reshade-shaders\Shaders'
-New-Item -ItemType Directory -Force -Path $fxDstDir | Out-Null
-Copy-Item -LiteralPath (Join-Path $files 'reshade-shaders\Shaders\mgpu_depth_tap.fx') `
-          -Destination (Join-Path $fxDstDir 'mgpu_depth_tap.fx') -Force
-Info "mgpu_depth_tap.fx -> reshade-shaders\Shaders\"
+$fxSrc = Join-Path $files 'reshade-shaders\Shaders\mgpu_depth_tap.fx'
+$fxDst = Join-Path $fxDstDir 'mgpu_depth_tap.fx'
+Install-One $fxSrc $fxDst 'mgpu_depth_tap.fx'
 
-$presetDst  = Join-Path $GameDir 'ReShadePreset.ini'
-$presetSrc  = Join-Path $files 'ReShadePreset.ini'
-$needPreset = $true
-if (Test-Path -LiteralPath $presetDst) {
-    $txt = [System.IO.File]::ReadAllText($presetDst)
-    if ($txt -match 'MGPU_DepthTap') {
-        $needPreset = $false
-        Info "ReShadePreset.ini 里已经有 MGPU_DepthTap（保留）"
-    } else {
-        Copy-Item -LiteralPath $presetDst -Destination ($presetDst + '.mgpu_bak') -Force
-        Info "原 ReShadePreset.ini 备份为 .mgpu_bak"
-    }
-}
-if ($needPreset) {
-    Copy-Item -LiteralPath $presetSrc -Destination $presetDst -Force
-    Info "ReShadePreset.ini 已写入（启用 MGPU_DepthTap）"
-}
-
-# ---------------------------------------------------------------- 4. ReShade.ini
-#  ReShade 自己会重写这个文件，所以只保证两个键：
-#    [GENERAL] EffectSearchPaths 包含我们的 shader 目录
-#    [GENERAL] PresetPath 指向 ReShadePreset.ini
-function Set-IniKey {
-    param([string]$Path, [string]$Section, [string]$Key, [string]$Value)
-    $lines = @()
-    if (Test-Path -LiteralPath $Path) { $lines = [System.IO.File]::ReadAllLines($Path) }
-    $out = New-Object System.Collections.ArrayList
-    $inTarget = $false
-    $sectionSeen = $false
-    $keyDone = $false
-    foreach ($ln in $lines) {
-        $trim = $ln.Trim()
-        if ($trim -match '^\[(.+)\]$') {
-            if ($inTarget -and -not $keyDone) { [void]$out.Add("$Key=$Value"); $keyDone = $true }
-            $inTarget = ($Matches[1] -ieq $Section)
-            if ($inTarget) { $sectionSeen = $true }
-            [void]$out.Add($ln)
-            continue
-        }
-        if ($inTarget -and $trim -match ('^' + [Regex]::Escape($Key) + '=')) {
-            [void]$out.Add("$Key=$Value")
-            $keyDone = $true
-            continue
-        }
-        [void]$out.Add($ln)
-    }
-    if (-not $sectionSeen) {
-        if ($out.Count -gt 0) { [void]$out.Add('') }
-        [void]$out.Add("[$Section]")
-        [void]$out.Add("$Key=$Value")
-    } elseif (-not $keyDone) {
-        [void]$out.Add("$Key=$Value")
-    }
-    $utf8 = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllLines($Path, $out.ToArray(), $utf8)
-}
+# ---------------------------------------------------------------- 5. 预设 + ReShade.ini
+Step "5/5 预设与 ReShade.ini"
+Install-One (Join-Path $files 'ReShadePreset.ini') (Join-Path $GameDir 'ReShadePreset.ini') 'ReShadePreset.ini'
 
 $rini = Join-Path $GameDir 'ReShade.ini'
-if (-not (Test-Path -LiteralPath $rini)) {
-    Copy-Item -LiteralPath (Join-Path $files 'ReShade.ini') -Destination $rini -Force
-    Info "ReShade.ini 已写入（全新）"
-} else {
-    Copy-Item -LiteralPath $rini -Destination ($rini + '.mgpu_bak') -Force
-    $cur = [System.IO.File]::ReadAllText($rini)
-    $hasFx = $false
-    if ($cur -match '(?im)^EffectSearchPaths=(.*)$') {
-        if ($Matches[1] -match 'reshade-shaders') { $hasFx = $true }
-    }
-    if (-not $hasFx) {
-        $val = '.\reshade-shaders\Shaders\**'
-        if ($cur -match '(?im)^EffectSearchPaths=(.+)$') {
-            $val = $Matches[1].TrimEnd() + ',.\reshade-shaders\Shaders\**'
+if ($KeepReShadeIni) {
+    # 只补两个键：你已经在 ReShade 面板里调过的设置保持不动
+    function Set-IniKey {
+        param([string]$Path, [string]$Section, [string]$Key, [string]$Value)
+        $lines = @()
+        if (Test-Path -LiteralPath $Path) { $lines = [System.IO.File]::ReadAllLines($Path) }
+        $out = New-Object System.Collections.ArrayList
+        $inTarget = $false
+        $sectionSeen = $false
+        $keyDone = $false
+        foreach ($ln in $lines) {
+            $trim = $ln.Trim()
+            if ($trim -match '^\[(.+)\]$') {
+                if ($inTarget -and -not $keyDone) { [void]$out.Add("$Key=$Value"); $keyDone = $true }
+                $inTarget = ($Matches[1] -ieq $Section)
+                if ($inTarget) { $sectionSeen = $true }
+                [void]$out.Add($ln)
+                continue
+            }
+            if ($inTarget -and $trim -match ('^' + [Regex]::Escape($Key) + '=')) {
+                [void]$out.Add("$Key=$Value")
+                $keyDone = $true
+                continue
+            }
+            [void]$out.Add($ln)
         }
-        Set-IniKey -Path $rini -Section 'GENERAL' -Key 'EffectSearchPaths' -Value $val
-        Info "ReShade.ini: EffectSearchPaths 已补上 shader 目录"
+        if (-not $sectionSeen) {
+            if ($out.Count -gt 0) { [void]$out.Add('') }
+            [void]$out.Add("[$Section]")
+            [void]$out.Add("$Key=$Value")
+        } elseif (-not $keyDone) {
+            [void]$out.Add("$Key=$Value")
+        }
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllLines($Path, $out.ToArray(), $utf8)
     }
-    if ($cur -notmatch '(?im)^PresetPath=') {
+    if (Test-Path -LiteralPath $rini) {
+        $rbak = Get-FreeBackup $rini
+        if ($rbak -ne '') { Copy-Item -LiteralPath $rini -Destination $rbak -Force }
+        Set-IniKey -Path $rini -Section 'GENERAL' -Key 'EffectSearchPaths' -Value '.\reshade-shaders\Shaders\**'
         Set-IniKey -Path $rini -Section 'GENERAL' -Key 'PresetPath' -Value '.\ReShadePreset.ini'
-        Info "ReShade.ini: PresetPath 已补上"
+        [void]$script:Report.Add([pscustomobject]@{ 文件 = 'ReShade.ini'; 结果 = '保留（只补 2 个键）'; 备份 = 'ReShade.ini.mgpu_bak*' })
+        Info "ReShade.ini 已保留（-KeepReShadeIni）：只保证 EffectSearchPaths / PresetPath"
+    } else {
+        Install-One (Join-Path $files 'ReShade.ini') $rini 'ReShade.ini'
     }
-    Info "ReShade.ini 已检查（原文件备份为 ReShade.ini.mgpu_bak）"
+} else {
+    # 默认：连 ReShade.ini 一起覆盖，确保 EffectSearchPaths / PresetPath / 效果列表
+    # 都是本包这份。ReShade 面板里的设置会被重置（原件在 *.mgpu_bak 里）。
+    Install-One (Join-Path $files 'ReShade.ini') $rini 'ReShade.ini'
 }
 
-# ---------------------------------------------------------------- 校验 + 收尾
-Step "校验"
-$bad = 0
-if ((Get-Sha $target) -ne $reshadeSha) { Warn "代理 DLL 校验不一致（写盘被拦？）"; $bad++ }
-if ((Get-Sha $addonDst) -ne (Get-Sha $addonSrc)) { Warn "add-on 校验不一致"; $bad++ }
-if (-not (Test-Path -LiteralPath (Join-Path $fxDstDir 'mgpu_depth_tap.fx'))) { Warn "shader 没落地"; $bad++ }
-if ($bad -eq 0) { Info "文件全部就位" }
+# ---------------------------------------------------------------- 残留扫描
+Step "残留检查"
+$left = New-Object System.Collections.ArrayList
+$ours = @("$Proxy.dll", 'game_capture.addon64', 'game_capture.ini', 'ReShade.ini',
+          'ReShadePreset.ini', 'mgpu_depth_tap.fx')
+foreach ($f in @(Get-ChildItem -LiteralPath $GameDir -File -ErrorAction SilentlyContinue)) {
+    if ($ours -contains $f.Name) { continue }
+    if ($f.Name -like 'game_capture.*' -or $f.Name -like '*.addon64*' -or
+        $f.Name -like 'ReShadePreset.ini.*' -or $f.Name -like 'MGPU_*') {
+        [void]$left.Add($f.Name)
+    }
+}
+# 同一个目录里如果有两份本包的 ReShade（换了代理名装过两次），只会有害无益
+foreach ($n in $proxyList) {
+    if ($n -eq 'version' -or $n -eq $Proxy) { continue }
+    $other = Join-Path $GameDir ($n + '.dll')
+    if ((Get-Sha $other) -eq $reshadeSha) { [void]$left.Add("$n.dll（也是本包的 ReShade）") }
+}
+if ($left.Count -gt 0) {
+    Warn "发现其它 mgpu/ReShade 相关文件（不影响使用，但清理掉更干净）："
+    foreach ($l in $left) { Write-Host "        $l" -ForegroundColor DarkGray }
+    Warn "要删就自己删；uninstall.bat 只处理本包装的那几个。"
+} else {
+    Info "没有发现残留文件"
+}
 
+# ---------------------------------------------------------------- 汇总
+Step "结果"
+$script:Report | Format-Table -AutoSize | Out-String | Write-Host
+
+Write-Host "装好了（全部按本包版本覆盖）。接下来：" -ForegroundColor Green
+Write-Host "  1. 启动游戏（第一次 ReShade 会在左上角显示加载信息，按 Home 打开面板）"
+Write-Host "  2. 游戏里关掉自带的帧生成，抗锯齿/超分选 DLSS / FSR2+ / XeSS（不要 TSR / FSR1 / TAA）"
+Write-Host "  3. 打开 mgpu_ui.exe 选这个游戏窗口按热键开始（或 bridge.exe --game <exe>）"
 Write-Host ""
-Write-Host "装好了。接下来：" -ForegroundColor Green
-Write-Host "  1. 启动游戏（第一次 ReShade 会弹一个加载提示条，按 Home 打开面板）"
-Write-Host "  2. 游戏里关掉帧生成，抗锯齿选 DLSS（不要 TSR / FSR）"
-Write-Host "  3. 打开 mgpu_ui.exe 选这个游戏窗口，按热键开始（或用 bridge.exe --game <exe>）"
-Write-Host ""
-Write-Host ("  ReShade / add-on 日志: {0}\ReShade.log" -f $GameDir)
-Write-Host ("  还原: 运行 uninstall.bat `"{0}`"" -f $GameDir)
+Write-Host ("  日志: {0}\ReShade.log（add-on 自己的日志要 game_capture.ini 里 Log=1）" -f $GameDir)
+Write-Host ("  还原: uninstall.bat `"{0}`"" -f $GameDir)
 Write-Host ""
 if (-not $NoPause) { [void](Read-Host "按回车关闭") }
 

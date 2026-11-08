@@ -7,7 +7,7 @@
 
     ReShade 6.8 (dxgi.dll)  ->  宿主，负责把 add-on 加载进游戏进程
     game_capture.addon64    ->  真正做抓取的那一半（共享内存 producer）
-    game_capture.ini        ->  它的配置（Color=0 / StreamPercent=100 / SkipMv=1）
+    game_capture.ini        ->  它的配置（Color=0 / StreamHeight=1440 / SkipMv=0 / DepthConvert=1）
     mgpu_depth_tap.fx       ->  一个空转效果，唯一作用是让 ReShade 绑定游戏深度
     ReShadePreset.ini       ->  启用上面那个效果
     ReShade.ini             ->  shader 搜索路径 + 预设路径
@@ -29,7 +29,22 @@
         install.bat "D:\Games\XXX" d3d11
         可选：dxgi（默认）| d3d11 | d3d12 | opengl32 | version
 
-  目标 DLL 已存在时会先备份成 <名字>.dll.mgpu_bak，不会直接覆盖丢东西。
+  安装器会**把所有文件强制覆盖成本包里的版本**（不会"存在就跳过"）。
+  为什么：上一版残留很常见 —— 旧 add-on 与 bridge 协议对不上（直接拒绝通信）、
+  旧 game_capture.ini 缺新键（例如 v0.12 的 StreamHeight=1440）导致"参数设了却没生效"。
+
+  覆盖前会把原文件改名备份，绝不丢东西，也不会覆盖掉更早那份原件：
+      dxgi.dll          -> dxgi.dll.mgpu_bak（已存在则 .mgpu_bak2 … 最多 .mgpu_bak9）
+      game_capture.ini  -> game_capture.ini.mgpu_bak
+      ReShade.ini       -> ReShade.ini.mgpu_bak
+  uninstall.bat 会用这些备份还原。
+
+  想保留自己在 ReShade 面板里调过的设置（不想让 ReShade.ini 被覆盖）：
+      install.bat "D:\Games\XXX" dxgi -KeepReShadeIni
+
+  重复运行是安全的：内容已一致的文件会显示"已是最新"，不会产生新备份。
+  装完会打印一张结果表（每个文件是 新建 / 覆盖 / 已是最新，以及备份名），
+  并扫描目录里其它 mgpu/ReShade 相关残留文件（只提示，不删）。
 
 ------------------------------------------------------------------------------
  装完之后

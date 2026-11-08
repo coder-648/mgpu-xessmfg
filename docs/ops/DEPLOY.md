@@ -37,11 +37,21 @@ install.bat "D:\Games\XXX" d3d11            ← 换代理 DLL 名
 
 安装器做的事（全部可逆）：
 
-1. 目标目录已有 `dxgi.dll` 且不是我们这份 → 备份成 `dxgi.dll.mgpu_bak` 再写 ReShade；
-2. 放 add-on、`game_capture.ini`、shader、预设（旧的一律先 `.mgpu_bak`）；
-3. `ReShade.ini` 存在则只补 `EffectSearchPaths` / `PresetPath`（`ReShade.ini.mgpu_bak` 留底），
-   不存在则写一份完整的（`[OVERLAY] TutorialProgress=4`，跳过首次弹窗）；
-4. 装完做 SHA256 校验，不一致会明确告警（Steam 库走 9p/NTFS 时 `cp` 有时"报告成功但没落盘"）。
+1. **所有文件一律强制覆盖成本包里的版本**（不再"存在就跳过"）。原因是残留很常见：旧 add-on
+   与 bridge 协议对不上会直接拒绝通信，旧 `game_capture.ini` 缺新键（如 v0.12 的
+   `StreamHeight=1440`）会让"参数设了却没生效"；
+2. 覆盖前把原文件改名备份，不丢东西、也不覆盖更早那份原件：`x.mgpu_bak` → `.mgpu_bak2` …
+   最多 `.mgpu_bak9`。涉及 `dxgi.dll` / `game_capture.addon64` / `game_capture.ini` /
+   `ReShadePreset.ini` / `ReShade.ini` / `mgpu_depth_tap.fx`；
+3. 每个文件写完立刻做 SHA256 校验，不一致直接失败（Steam 库走 9p/NTFS 时 `cp` 偶尔"报告
+   成功但没落盘"）；
+4. 装完打印结果表（新建 / 覆盖 / 已是最新 + 备份名），并扫描目录里其它 mgpu/ReShade 相关
+   残留文件（只提示不删，例如换过代理名留下的第二份 ReShade）；
+5. 重复运行安全：内容一致的文件显示"已是最新"，不产生新备份。
+
+```
+install.bat "D:\Games\XXX" dxgi -KeepReShadeIni   ← 保留你自己的 ReShade.ini（只补 2 个键）
+```
 
 游戏开着会直接拒绝安装（DLL 被占用，写盘必然失败），`-Force` 可强行继续。
 

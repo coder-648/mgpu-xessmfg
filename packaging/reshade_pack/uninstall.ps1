@@ -26,6 +26,16 @@ function Get-Sha($path) {
     return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
 }
 
+# 安装器会轮转备份名（x.mgpu_bak / x.mgpu_bak2 … x.mgpu_bak9）。还原时取**编号最小**
+# 的那个 —— 那是第一次安装之前的原件。没有备份时返回空串（调用方要先判空）。
+function Find-Backup([string]$path) {
+    for ($i = 1; $i -le 9; $i++) {
+        $cand = if ($i -eq 1) { $path + '.mgpu_bak' } else { $path + '.mgpu_bak' + $i }
+        if (Test-Path -LiteralPath $cand) { return $cand }
+    }
+    return ''
+}
+
 $Proxy = $Proxy.ToLower().Trim()
 if ($GameDir -ne '') {
     $GameDir = $GameDir.Trim().Trim('"').Trim("'")
@@ -59,9 +69,8 @@ $pairs = @(
 )
 foreach ($pair in $pairs) {
     $dst = Join-Path $GameDir $pair[0]
-    $bak = ''
-    if ($pair[1] -ne '') { $bak = Join-Path $GameDir $pair[1] }
-    if ($bak -ne '' -and (Test-Path -LiteralPath $bak)) {
+    $bak = Find-Backup $dst
+    if ($bak -ne '') {
         Move-Item -LiteralPath $bak -Destination $dst -Force
         Info "$($pair[0]) 已从备份还原"
     } elseif (Test-Path -LiteralPath $dst) {
@@ -81,8 +90,8 @@ foreach ($d in @((Join-Path $GameDir 'reshade-shaders\Shaders'), (Join-Path $Gam
 }
 
 $preset = Join-Path $GameDir 'ReShadePreset.ini'
-$presetBak = $preset + '.mgpu_bak'
-if (Test-Path -LiteralPath $presetBak) {
+$presetBak = Find-Backup $preset
+if ($presetBak -ne '' -and (Test-Path -LiteralPath $presetBak)) {
     Move-Item -LiteralPath $presetBak -Destination $preset -Force
     Info "ReShadePreset.ini 已从备份还原"
 } elseif (Test-Path -LiteralPath $preset) {
@@ -91,8 +100,9 @@ if (Test-Path -LiteralPath $presetBak) {
 }
 
 $rini = Join-Path $GameDir 'ReShade.ini'
-if (Test-Path -LiteralPath ($rini + '.mgpu_bak')) {
-    Move-Item -LiteralPath ($rini + '.mgpu_bak') -Destination $rini -Force
+$rbak = Find-Backup $rini
+if ($rbak -ne '') {
+    Move-Item -LiteralPath $rbak -Destination $rini -Force
     Info "ReShade.ini 已从备份还原"
 } elseif (Test-Path -LiteralPath $rini) {
     # 没有备份 = 这个文件是我们新建的（装之前游戏目录里没有 ReShade）
@@ -107,9 +117,9 @@ if (Test-Path -LiteralPath ($rini + '.mgpu_bak')) {
 
 # --- 代理 DLL：优先还原备份，否则只在确认是我们放的那份时删除
 $target = Join-Path $GameDir ($Proxy + '.dll')
-$bak    = Join-Path $GameDir ($Proxy + '.dll.mgpu_bak')
+$bak    = Find-Backup (Join-Path $GameDir ($Proxy + '.dll'))
 $ours   = Get-Sha (Join-Path $files 'ReShade64.dll')
-if (Test-Path -LiteralPath $bak) {
+if ($bak -ne '' -and (Test-Path -LiteralPath $bak)) {
     Move-Item -LiteralPath $bak -Destination $target -Force
     Info "$Proxy.dll 已从备份还原"
 } elseif (Test-Path -LiteralPath $target) {
