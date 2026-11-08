@@ -1322,6 +1322,17 @@ static std::wstring dd_caption(Id id)
             return b;
         }
     }
+    // Cadence + motion vectors, measured 2026-11-09:
+    //   --fg-of  = one more full GPU pass on the card that also generates. A 30 s segment
+    //              looked clean, sustained play drops clearly more often (the user caught
+    //              this after the matrix) - so warn instead of recommending it.
+    //   game MV  = no extra cost, but the 3x/4x path reuses one MV set per time fraction
+    //              (FINAL_CONFIG 5.17) -> flicker.
+    //   off      = cheapest and the smoothest of the three per the same test.
+    if (id == ID_MV && S().fg_mode == 1) {
+        if (S().mv_mode == 3) { return L"AMD 光流（动态逐帧更易 drop）"; }
+        if (S().mv_mode == 1) { return L"游戏 MV（动态逐帧可能闪烁）"; }
+    }
     return opt_text(id, opt_get(id));
 }
 

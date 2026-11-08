@@ -1,6 +1,7 @@
 @echo off
 rem ===========================================================================
 rem  run_smooth.bat  -  smoothest profile: per-frame multiplier (--interp-cadence)
+rem                      (game motion vectors; no optical flow - see below)
 rem
 rem  Deploy to: <TOOLS_DIR>\run_smooth.bat   (next to bridge.exe + the two DLLs)
 rem  Usage:     run_smooth.bat [game-exe-name]
@@ -47,6 +48,13 @@ if not exist bridge.exe (
   exit /b 1
 )
 
+rem  Do NOT add --fg-of (AMD optical flow) here. Optical flow is one more full GPU pass
+rem  on the card that also runs the generation, and cadence already keeps it at 84-90%
+rem  load: measured 2026-11-09, drops become clearly more frequent with --fg-of and
+rem  almost disappear without it. A 30 s segment had looked clean with optical flow, but
+rem  sustained play does not (the segment happened to sit at a light 46 fps input).
+rem  For fewer drops: no --fg-of, and if the 3x/4x vector flicker bothers you, use
+rem  --no-mv (FINAL_CONFIG 5.17).
 bridge.exe %GAMEOPT% --den 2 --pool 4 --interp 5 --interp-cadence --unlock-mfg ^
            --fg-ui none --fg-rt-mode auto > bridge_smooth.txt 2>&1
 type bridge_smooth.txt

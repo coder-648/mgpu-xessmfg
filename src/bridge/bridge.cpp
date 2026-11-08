@@ -7077,12 +7077,19 @@ int main()
     // 12 with --cadence-smooth). A constant count (fixed mode) does not do this - users
     // report MV fine there, cadence + MV not smooth at all.
     if (g_interp_cadence && (!g_no_mv || g_fg_of)) {
-        logf_("[bridge] NOTE: --interp-cadence with motion vectors (%s). This DLL's 3x/4x"
-              " path reuses one MV set for several time fractions, and cadence changes the"
-              " count between batches, so expect flicker/ghosting that --no-mv does not show."
-              " Either use --no-mv, or keep the count steady with --cadence-hold N, or run a"
-              " fixed multiplier for MV (docs/findings/FINAL_CONFIG.md 5.17)\n",
-              g_fg_of ? "AMD optical flow" : "the game's vectors");
+        if (g_fg_of) {
+            logf_("[bridge] NOTE: --interp-cadence with --fg-of. Optical flow is one more full"
+                  " GPU pass on the same card that runs the generation, and cadence already"
+                  " keeps it at 84-90%% load - measured 2026-11-09: drops become clearly more"
+                  " frequent with it and almost disappear without it. Prefer --no-mv (smoothest)"
+                  " or the game's vectors (cheaper, but flickers at 3x/4x - FINAL_CONFIG 5.17)\n");
+        } else {
+            logf_("[bridge] NOTE: --interp-cadence with the game's motion vectors. This DLL's"
+                  " 3x/4x path reuses one MV set for several time fractions and cadence changes"
+                  " the count between batches, so expect flicker/ghosting that --no-mv does not"
+                  " show. --no-mv is the smoothest of the three (FINAL_CONFIG 5.17.1);"
+                  " --cadence-hold is measured worse, do not use it\n");
+        }
     }
     if (g_lock_auto) {
         logf_("[bridge] --lock-auto: solving (input lock, multiplier) so that"
