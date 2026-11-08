@@ -1545,9 +1545,14 @@ static double g_cad_last_tin = 0.0;   // the smoothed input interval behind that
 // Measured in a heavily fluctuating scene (2..6 vblanks between inputs): feeding k*vblank
 // raised the empty-refresh rate from 1.0% to 2.6% and produced one 37-vblank hole, while the
 // median feed stayed at 1.0%. So this is OFF by default and exists only for A/B.
-// ON by default: the batch length and the pacer's budget have to agree (see
-// fg_render_time_ms). --fg-cad-rt 0 restores the historical median feed for A/B.
-static bool   g_fg_cad_rt = true;
+// OFF by default (2026-11-09 eye test): feeding k * vblank looks right on paper - the budget
+// then matches the batch - but Present() blocks on the pacer's budget, and we measure the
+// input interval at the *next* WGC arrival, so a longer budget inflates the very measurement
+// that chooses k. With queue depth 1 the input rate is our own throttle, i.e. the loop has no
+// fixed point. Measured: xN drifted 3.00 -> 3.05/3.38 while the input median stayed at
+// 25.0 ms, and the picture surged. The median feed holds xN at exactly 3.00. Keep this as an
+// A/B switch only (bin/6 - cadence batch feed (A-B).bat).
+static bool   g_fg_cad_rt = false;
 static bool   g_cad_rt_logged = false;
 // --cadence-hold N (default 15 frames, 0/1 = off): how long to keep the interpolated-frame
 // count before the cadence logic is allowed to change it again.
