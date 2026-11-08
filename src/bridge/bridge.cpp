@@ -2711,10 +2711,29 @@ static bool open_shared()
     // The colour stream is a placeholder (the add-on does not allocate it with Color=0);
     // MV and depth are the ones that actually matter. Their size follows the game's
     // render resolution - DLSS Quality at 4K is 1440p, DLAA is 2160p - unless the add-on
-    // downsamples them ([capture] StreamPercent), which also halves the transfer.
+    // downsamples them ([capture] StreamHeight / StreamPercent), which is also what halves
+    // the transfer.
     logf_("[bridge] MV %ux%u, depth %ux%u (stream size)\n",
           g_ctl->streams[1].width, g_ctl->streams[1].height,
           g_ctl->streams[2].width, g_ctl->streams[2].height);
+    // Read-only advice for the add-on's side of the bus. The add-on and the bridge are
+    // separate deployments (the add-on lives in the game folder, possibly for several games,
+    // and reads its ini only at load), so the bridge must not touch that file - but it can
+    // see the stream size, so it can say whether the add-on's default (StreamHeight=1440)
+    // is in effect. Above that the per-frame traffic grows with the square of the height.
+    {
+        const UINT sh = g_ctl->streams[1].height;
+        if (sh > 1440u) {
+            const double mb = static_cast<double>(g_ctl->streams[1].width) * sh * 4.0 / (1024.0 * 1024.0) * 2.0;
+            const double capped = mb * static_cast<double>(1440u) * static_cast<double>(1440u)
+                                / (static_cast<double>(sh) * static_cast<double>(sh));
+            logf_("[bridge] NOTE: the stream is %ux%u (%.0f MB/frame with depth). An add-on built"
+                  " with [capture] StreamHeight=1440 (the current default) would send ~%.0f"
+                  " MB/frame instead - check that the game folder has the current"
+                  " game_capture.addon64 and that StreamHeight is not 0\n",
+                  g_ctl->streams[1].width, sh, mb, capped);
+        }
+    }
 
     g_full_w = g_width;
     g_full_h = g_height;
