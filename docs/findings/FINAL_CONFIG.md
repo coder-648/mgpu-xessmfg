@@ -394,7 +394,8 @@ bridge.exe --game PBZ.exe --den 1 --pool 4 --interp 2 --unlock-mfg --fg-ui none 
 | `--no-throttle` | off | — | 不等上一帧 GPU 完成（队列深度 >1） | ❌ 实测更差，别用 |
 | `--pace HZ` / `--pace auto` | 关闭 | 10–240 Hz | 定点呈现 | ❌ **不要用**（§5.3） |
 | `--slack N` | `0` | 0–3 | 最多扣住 N+1 个抓取帧、**处理最旧的**：把"晚一帧就丢"换成"晚一帧就多等一帧"。`0` = 排空取最新（零延迟） | 只在"尾部超预算"时有用（判据见 §9.8）；代价最多 +N 个输入间隔的延迟 |
-| `--fg-rt-mode ema\|raw\|median\|quant` | `ema` | — | 喂给 XeFG 的 `frameRenderTime` 用哪种估计：指数平均 / 上一帧原始值 / 16 帧中位数 / 中位数吸附到整数 vblank。动态帧率下 `ema`（≈330 ms 尾巴）会说谎 | **动态帧率时用 `median`（先试）或 `quant`**，见 §9.14 |
+| `--fg-rt-mode ema\|raw\|median\|quant` | `quant` | — | 喂给 XeFG 的 `frameRenderTime` 用哪种估计：指数平均 / 上一帧原始值 / 16 帧中位数 / 中位数吸附到整数 vblank。动态帧率下 `ema`（≈330 ms 尾巴）会说谎 | **默认 `quant`**（整拍）；动态帧率另见 §9.14 |
+| `--fg-rt-spike 0\|1` | **`1`** | — | **单帧输入尖峰**处理：上一帧间隔 > 1.35× 计划（快速转视角、流送卡顿）时，把这一帧的**真实长度**（吸附整 vblank，封顶 3× 计划）喂给 XeFG，让它把 2 帧摊在更长的间隔里，而不是排在 2 个 vblank 里留 2 个空刷新。日志 `rt spike:` / `rt spikes: N`。`0` = 关闭（A/B 用）。见 `PERF_BASELINE.md` §3.13 |
 | `--interp-auto [floor\|round]` | 关 | — | 每 40 帧按中位数算 `N+1 ≈ T_in/vblank`，运行时调 `SetNumInterpolatedFrames`，让输出回到整数 vblank 上（连续两个窗口稳定才改，改一次≈2.7 s） | 动态帧率、或想让输出"永远贴 refresh"时用；**会换模型 ⇒ 改档时有一次顿挫**（§9.14） |
 | `--lock N` | 关 | 5–1000 | 在 bridge 里按周期**丢弃**抓取帧，使转发给 XeFG 的输入严格为 N fps（不需要 RTSS） | 只在「游戏 fps / N」是**整数**时才均匀（§9.16）；否则会出现 2T 空档，比不锁更差 |
 | `--lock-auto` | 关 | — | 每窗口求解 `(N, 倍数)`：`N*(interp+1)` 整除刷新率且游戏能维持 N，然后自动锁 + 改倍数（2 窗口迟滞） | 游戏比目标快整数倍时最有用；26 fps@120 Hz 会明确拒绝（§9.16） |
