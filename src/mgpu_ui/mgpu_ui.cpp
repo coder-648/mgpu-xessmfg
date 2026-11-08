@@ -106,6 +106,12 @@ struct State
     // 帧生成
     int  fg_mode = 0;          // 0 fixed, 1 dynamic (--dyn-mfg)
     int  interp = 3;           // 2..6  -> --interp N-1
+    // 逐帧倍率 (--interp-cadence, 2026-11-08): XeFG 每帧按"这一帧实际过了几个 vblank"要帧数,
+    // 输出恒定 1 帧/vblank。实测 4K --den 2、空刷新: 60fps 0.8% / 40fps 0.4% / 30fps 0.6%
+    // (固定倍率同条件是 2.5%/1.5%/2.6%)。开启时倍数按 6x 上限解锁 (--interp 5),
+    // 因为 40fps 的输入会抖到 4 vblank、30fps 会到 5-6 vblank, 上限不够就填不满。
+    // 详见 docs/findings/PERF_BASELINE.md 3.17-3.21。
+    bool cadence = true;
     int  out_mode = 0;         // 0 1:1, 1 scale 0.75, 2 den 2
     bool perf_no_throttle = false;
     // 捕获
@@ -235,7 +241,7 @@ enum Id
     ID_FG_TYPE, ID_FG_MODE, ID_INTERP, ID_OUT, ID_PERF,
     ID_CAP_API, ID_POOL, ID_LAT,
     ID_NOMV, ID_JITZ, ID_PROJRZ, ID_FOV, ID_NODEPTH, ID_UI, ID_RT, ID_UNLOCK, ID_SLACK, ID_IVL,
-    ID_MV,
+    ID_MV, ID_CADENCE,
     ID_TEAR, ID_SDR, ID_LAYERED, ID_RELAY, ID_OSD,
     ID_GPU, ID_GPUSEL, ID_DISPLAY,
     ID_TMODE, ID_TARGET, ID_HOTKEY, ID_LOCK, ID_CMD,
@@ -251,6 +257,7 @@ static const RowDef kRowsFg[] = {
     { ID_FG_TYPE, L"类型",            RK_INFO },
     { ID_FG_MODE, L"模式",            RK_DD   },
     { ID_INTERP,  L"倍数",            RK_SPIN },
+    { ID_CADENCE, L"动态倍率 (逐帧)",  RK_TOG },
     { ID_OUT,     L"输出",            RK_DD   },
     { ID_MV,      L"运动矢量",        RK_DD   },
 };
@@ -276,7 +283,7 @@ static const RowDef kRowsOverlay[] = {
 };
 
 static const CardDef kCards[] = {
-    { L"帧生成",       kRowsFg,     5, 0 },
+    { L"帧生成",       kRowsFg,     6, 0 },
     { L"捕获",         kRowsCap,    3, 1 },
     { L"启动",         kRowsLaunch, 3, 0 },
     { L"GPU / 显示器", kRowsDev,    2, 1 },
@@ -551,6 +558,7 @@ static void save_profile(int i)
     ini_w(sec, L"relay_input", s.relay_input ? 1 : 0);
     ini_w(sec, L"osd", s.osd ? 1 : 0);
     ini_w(sec, L"perf", s.perf_no_throttle ? 1 : 0);
+    ini_w(sec, L"cadence", s.cadence ? 1 : 0);
     ini_ws(sec, L"win_title", s.win_title);
 }
 
@@ -588,6 +596,7 @@ static void load_profile(int i)
     s.relay_input = ini_r(sec, L"relay_input", s.relay_input ? 1 : 0) != 0;
     s.osd = ini_r(sec, L"osd", s.osd ? 1 : 0) != 0;
     s.perf_no_throttle = ini_r(sec, L"perf", s.perf_no_throttle ? 1 : 0) != 0;
+    s.cadence     = ini_r(sec, L"cadence", s.cadence ? 1 : 0) != 0;
     s.win_title   = ini_rs(sec, L"win_title", L"");
     if (s.interp < 2) { s.interp = 2; }
     if (s.interp > 6) { s.interp = 6; }
@@ -698,9 +707,14 @@ static std::wstring build_cmdline(HWND target, bool display)
     cmd += kOut[(S().out_mode >= 0 && S().out_mode <= 2) ? S().out_mode : 0];
 
     wchar_t b[256]{};
+    // 逐帧倍率开启时，倍数只当作"解锁上限"：--interp 5 = 6x 容量，让 40fps 的 4-vblank、
+    // 30fps 的 5-6-vblank 抖动帧也能被填满（实测 3.17/3.18：上限给 3x 时 40fps 空刷新 10.8%，
+    // 给 6x 是 1.5%）。关闭时按用户选的固定倍数。
+    const int interp_req = S().cadence ? 5 : (S().interp - 1);
     _snwprintf_s(b, _TRUNCATE, L" --pool %d --latency %d --interp %d",
-                 S().pool, S().latency, S().interp - 1);
+                 S().pool, S().latency, interp_req);
     cmd += b;
+    if (S().cadence) { cmd += L" --interp-cadence"; }
     if (S().fg_mode == 1) { cmd += L" --dyn-mfg"; }
     // Which GPU runs the frame generation (A card rendering + N card output, or the
     // other way round). 0 = let bridge decide from the window monitor / producer LUID.
@@ -714,17 +728,14 @@ static std::wstring build_cmdline(HWND target, bool display)
     // Fixed part: reversed-Z projection, no UI texture, 3x..6x unlock, and the
     // vblank-snapped frame-time feed. jitter is NOT in the fixed part - see below.
     //
-    // --fg-rt-mode quant (2026-11-08): feed XeFG the *measured* input interval rounded
-    // to a whole number of vblanks. The raw median lands on 16.0 ms for a 60 fps game
-    // (a 1 ms-granularity limiter alternates 16/17 ms), and 16.0 ms makes 2x output
-    // 125 fps - 4% faster than a 120 Hz panel - so the compositor drops a frame every
-    // ~0.2 s. Snapping to 2 x 8.33 = 16.67 ms gives exactly 120.0 fps (1.00 vblank
-    // per output frame). Same reasoning at 3x/4x: 31 ms snaps to 33.3 ms, which is the
-    // "+1 vblank of slack" that docs FINAL_CONFIG 5.18.1 measured as necessary.
+    // --fg-rt-mode auto (2026-11-08): 锁帧时喂"中位数吸附整 vblank"（quant），帧率真的在移动时
+    // 喂真实间隔（raw）—— 判据是"短中位数(16 样本) vs 长中位数(64 样本) 差 ≥0.6 vblank，
+    // 连续 3 个统计窗口一致才切"。实测（PERF_BASELINE 3.20）：锁 60fps 全程 flips=0、
+    // 空刷新 0.8%（与纯 quant 相同）；未锁帧帧率漂移时才切 raw（0.8% vs quant 1.1%）。
     if (S().overlay_layered) { cmd += L" --overlay-layered"; }
     if (S().relay_input) { cmd += L" --relay-input"; }
     if (!S().osd) { cmd += L" --no-osd"; }
-    cmd += L" --unlock-mfg --fg-ui none --fg-proj-rz --fg-rt-mode quant";
+    cmd += L" --unlock-mfg --fg-ui none --fg-proj-rz --fg-rt-mode auto";
     // FOV and 输入间隔 are no longer exposed in the UI (2026-11-08): FOV only feeds the
     // synthetic projection, which the XeFG frame-generation path ignores (5.16), and
     // --input-ms no longer matters for pacing now that frameRenderTime is vblank-snapped.
@@ -1116,6 +1127,7 @@ static void layout_items(std::vector<Item>& out, int* content_h)
                   : (it.id == ID_RELAY) ? S().relay_input
                   : (it.id == ID_OSD) ? S().osd
                   : (it.id == ID_PERF) ? S().perf_no_throttle
+                  : (it.id == ID_CADENCE) ? S().cadence
                   : false;
             out.push_back(it);
         }
@@ -1542,6 +1554,7 @@ static void toggle_field(Id id)
         break;
     case ID_OSD:     S().osd = !S().osd; break;
     case ID_PERF:    S().perf_no_throttle = !S().perf_no_throttle; break;
+    case ID_CADENCE: S().cadence = !S().cadence; break;
     default: break;
     }
 }
