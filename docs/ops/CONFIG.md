@@ -75,6 +75,26 @@ RESHADE_SRC=/mnt/d/ReShade64.dll ./scripts/make_addon_package.sh
    XeFG 换到渲染卡（日志会出现 `note: same GPU as the producer`），此时插帧和游戏抢同一张 GPU，
    `gpu` 会从个位数涨到 60+ ms（实测）。正确形态是**两块屏都接帧生成卡**。
 
+### 4.2 覆盖窗口在 Alt+Tab / Win+Tab 里只算一个"游戏"
+
+覆盖窗口是**另一个进程里的另一个窗口**，一不小心就会在 Alt+Tab / Win+Tab 里变成第二个条目
+（而且那个缩略图是**成品画面**，游戏的缩略图是**原始画面**，看起来像"两张图"）。
+bridge 在窗口显示之后做四件事，日志里各占一行：
+
+| 手段 | 日志 | 作用 |
+|---|---|---|
+| `WS_EX_TOOLWINDOW` | 无（`make_borderless` 设置） | 不进任务栏 / Alt+Tab |
+| **owner = 游戏窗口**（`GWLP_HWNDPARENT`） | `overlay owner -> game window ...` | 被拥有的窗口**不单独列出**，Task View 把它归到游戏名下；并且跟随游戏的显示/最小化 |
+| `DWMWA_EXCLUDED_FROM_PEEK` / `DWMWA_DISALLOW_PEEK` | `switcher: peek excl hr=...` | 不进 Aero Peek / 缩略图预览 |
+| `ITaskbarList::DeleteTab` | `switcher: ... DeleteTab hr=0x00000000` | 删掉"样式设置之前就已经登记"的条目 |
+
+另外 **Task View / Alt+Tab / Win+D 不再算"焦点丢失"**：`explorer.exe` 的
+`XamlExplorerHostIslandWindow` / `Windows.UI.Core.CoreWindow` / `TaskSwitcherWnd` /
+`ForegroundStaging` / `Progman` / `WorkerW` / `Shell_TrayWnd` 这些窗口被显式排除，
+所以按 Win+Tab 待 8 秒 bridge 也不会退出（实测 `alive after 8 s in Task View: True`）。
+真正的其他应用（浏览器、另一个游戏）仍然会触发 `--exit-on-focus-loss`。
+
+
 | `--fg-jitter-zero` | **已弃用**：只打一行提示，不再生效。jitter 必须用游戏自己的 |
 
 限帧器（`<RTSS_DIR>`）：**必须用外部限帧器把游戏锁到目标输入帧率**，

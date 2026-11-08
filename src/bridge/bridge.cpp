@@ -29,9 +29,15 @@
 #include <dcomp.h>
 #include <d3dcompiler.h>
 #include <dxgi1_6.h>
+#include <dwmapi.h>      // DWMWA_*: keep the overlay out of Aero Peek / Task View thumbnails
+#include <shobjidl.h>    // ITaskbarList: remove a task-view entry that already exists
 #include <tlhelp32.h>
 #include <wrl/client.h>
 #include <roapi.h>
+
+#pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "uuid.lib")     // CLSID_TaskbarList
 
 #include <winrt/windows.graphics.capture.h>
 #include <winrt/windows.graphics.directx.h>
@@ -864,6 +870,52 @@ static void focus_game()
     if (attached) { AttachThreadInput(my_thread, fg_thread, FALSE); }
 }
 
+// Keeps the overlay out of Alt+Tab, Task View (Win+Tab), Aero Peek and the taskbar.
+//
+// Why this needs three things and not just WS_EX_TOOLWINDOW: our window is created *plain*
+// on purpose (CreateSwapChainForHwnd returns E_ACCESSDENIED for a topmost/visible window on
+// this machine), so by the time the ex-style becomes WS_EX_TOOLWINDOW the shell has already
+// registered it as an application window. Result: Win+Tab showed two pictures - the raw
+// game in one thumbnail and our processed one in the other.
+//
+//   * GWLP_HWNDPARENT = game window -> an *owned* window is not listed separately; Task
+//     View groups it under its owner and it follows the owner's show/hide/minimise, so the
+//     pair behaves like one application
+//   * DWMWA_EXCLUDED_FROM_PEEK / DWMWA_DISALLOW_PEEK -> keep it out of peek thumbnails
+//   * ITaskbarList::DeleteTab -> the only way to drop an entry that already exists
+static void overlay_hide_from_switcher(HWND hwnd)
+{
+    if (!hwnd) { return; }
+
+    BOOL peek = TRUE;
+    const HRESULT h_ex = DwmSetWindowAttribute(hwnd, DWMWA_EXCLUDED_FROM_PEEK, &peek,
+                                               sizeof(peek));
+    const HRESULT h_dp = DwmSetWindowAttribute(hwnd, DWMWA_DISALLOW_PEEK, &peek,
+                                               sizeof(peek));
+
+    LONG_PTR owner_prev = 0;
+    if (g_game_wnd && g_game_wnd != hwnd) {
+        SetLastError(0);
+        owner_prev = SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT,
+                                      reinterpret_cast<LONG_PTR>(g_game_wnd));
+        logf_("[bridge] overlay owner -> game window %p (prev=%p err=%lu)\n",
+              reinterpret_cast<void*>(g_game_wnd), reinterpret_cast<void*>(owner_prev),
+              GetLastError());
+    }
+
+    HRESULT h_tab = E_NOINTERFACE;
+    ComPtr<ITaskbarList> bar;
+    if (SUCCEEDED(CoCreateInstance(CLSID_TaskbarList, nullptr, CLSCTX_INPROC_SERVER,
+                                   IID_PPV_ARGS(&bar))) && bar) {
+        if (SUCCEEDED(bar->HrInit())) { h_tab = bar->DeleteTab(hwnd); }
+    }
+
+    logf_("[bridge] switcher: peek excl hr=0x%08lX/0x%08lX, DeleteTab hr=0x%08lX"
+          " (the overlay must not appear as a second picture in Win+Tab)\n",
+          static_cast<unsigned long>(h_ex), static_cast<unsigned long>(h_dp),
+          static_cast<unsigned long>(h_tab));
+}
+
 static void make_borderless(HWND hwnd, int x, int y, UINT w, UINT h)
 {
     // WS_EX_TRANSPARENT  - the window is skipped when the mouse is hit tested
@@ -902,6 +954,10 @@ static void make_borderless(HWND hwnd, int x, int y, UINT w, UINT h)
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
     focus_game();
+
+    // The window exists, is in the topmost band and has its ex-styles: strip it from the
+    // taskbar / Alt+Tab / Task View so the user only ever sees one picture (the game's).
+    overlay_hide_from_switcher(hwnd);
 
     RECT client{};
     GetClientRect(hwnd, &client);
@@ -3443,6 +3499,34 @@ static bool fg_is_ours(HWND fg)
     return pid == GetCurrentProcessId();
 }
 
+// Is that window part of the shell's own UI (Task View / Alt+Tab / the desktop)?
+//
+// These take the foreground while the user is still looking at the game. Counting them as
+// "the user left the game" made bridge quit after --exit-on-focus-loss seconds whenever
+// Win+Tab, Alt+Tab or Win+D was used - which is exactly how a mirror tool must NOT behave.
+// Real applications (another game, a browser, the desktop's own windows) are still
+// counted, so the "don't sit on the desktop forever" protection keeps working.
+static bool fg_is_shell_ui(HWND fg)
+{
+    if (!fg) { return false; }
+    wchar_t cls[64]{};
+    if (!GetClassNameW(fg, cls, 63)) { return false; }
+    static const wchar_t* const kShellClasses[] = {
+        L"Windows.UI.Core.CoreWindow",          // Task View (Win+Tab)
+        L"MultitaskingViewFrame",               // Task View, older builds
+        L"TaskSwitcherWnd",                     // Alt+Tab
+        L"ForegroundStaging",                   // the transient window Alt+Tab/Win+Tab uses
+        L"XamlExplorerHostIslandWindow",        // taskbar flyouts / Task View host
+        L"Progman",                             // Win+D: "show desktop"
+        L"WorkerW",                             // the desktop's wallpaper host
+        L"Shell_TrayWnd",                       // the taskbar itself
+    };
+    for (const wchar_t* c : kShellClasses) {
+        if (_wcsicmp(cls, c) == 0) { return true; }
+    }
+    return false;
+}
+
 // Is that window the launcher UI? Opening mgpu_ui.exe to change a setting must not
 // count as "the user left the game", otherwise frame generation dies every time.
 static bool fg_is_launcher(HWND fg)
@@ -3632,7 +3716,7 @@ static void assert_topmost()
         if (fg_is_ours(fg) && g_game_wnd) {
             focus_game();
             g_fg_lost_ms = 0;
-        } else if (fg && fg != g_game_wnd) {
+        } else if (fg && fg != g_game_wnd && !fg_is_shell_ui(fg)) {
             // The launcher is exempt (cached: this runs every 400 ms).
             static DWORD launcher_pid = 0;
             static ULONGLONG launcher_check = 0;
