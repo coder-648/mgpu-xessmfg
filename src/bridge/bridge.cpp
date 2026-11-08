@@ -1531,6 +1531,32 @@ static UINT   g_rt_auto_flips = 0;
 // instead of 4x. The floor is 2x (libxess_fg cannot generate zero frames); if the target
 // needs fewer, bridge warns once and says what rate it will actually run at.
 static double g_fg_out_hz = 0.0;
+// --fg-cad-rt 0|1 (default 1): in --interp-cadence mode derive frameRenderTime from the
+// batches themselves (k * vblank) instead of from the median interval.
+//
+// This is the fix for "the picture judders while the input rate fluctuates": cadence asks
+// XeFG for k frames because k vblanks actually elapsed, but the pacer was still being told
+// the *median* length. Whenever the two disagree (a 33.3 ms gap while the median is 25 ms)
+// the pacer budgets the wrong time for the batch and has to hold or rush a frame, which is
+// visible. Feeding k * vblank makes the two agree by construction - it is exactly the
+// interval those k frames have to cover.
+static UINT   g_cad_last_k = 0;
+// Measured in a heavily fluctuating scene (2..6 vblanks between inputs): feeding k*vblank
+// raised the empty-refresh rate from 1.0% to 2.6% and produced one 37-vblank hole, while the
+// median feed stayed at 1.0%. So this is OFF by default and exists only for A/B.
+static bool   g_fg_cad_rt = false;
+static bool   g_cad_rt_logged = false;
+// --cadence-hold N (default 15 frames, 0/1 = off): how long to keep the interpolated-frame
+// count before the cadence logic is allowed to change it again.
+//
+// Why: changing that count is expensive (the guide says it may reload the model / recompile
+// shaders), and with a fluctuating input the phase accumulator asks for a different count
+// almost every frame - measured 24-32 switches per 1 s window (40 fps input), which is
+// exactly the "stutters even though no vblank is empty" the ear sees. Holding the count for
+// ~15 frames and then stepping by at most one keeps the long-run average (the phase keeps
+// accumulating) while making the picture's rhythm steady.
+static int    g_cad_hold_frames = 15;
+static int    g_cad_hold = 0;
 static bool   g_out_hz_floor_warned = false;
 static bool   g_out_hz_max_warned = false;
 // A longer ring for the "slow" rate. Per-sample EMAs could not tell a locked 40 fps (which
@@ -1681,6 +1707,7 @@ static UINT cadence_next_slots()
     if (clamped) { g_cad_phase = 0.0; }              // do not accumulate a debt
     if (g_cad_phase < -1.5) { g_cad_phase = -1.5; }
     if (g_cad_phase > 1.5) { g_cad_phase = 1.5; }
+    g_cad_last_k = static_cast<UINT>(k);      // frameRenderTime follows this (see fg_render_time_ms)
     return static_cast<UINT>(k);
 }
 
@@ -1774,6 +1801,17 @@ static double rt_quant_value()
 static double fg_render_time_ms()
 {
     if (g_fg_rt_zero) { return 0.0; }
+    // In cadence mode the batch size and the length it covers have to agree, otherwise the
+    // pacer fights the batch and the picture judders whenever the input rate moves.
+    if (g_interp_cadence && g_fg_cad_rt && g_cad_last_k >= 2) {
+        const double rt = static_cast<double>(g_cad_last_k) * refresh_ms();
+        if (!g_cad_rt_logged) {
+            g_cad_rt_logged = true;
+            logf_("[bridge] cadence: frameRenderTime = batch * vblank (%.1fms for %u frames);"
+                  " --fg-cad-rt 0 restores the median feed\n", rt, g_cad_last_k);
+        }
+        return rt;
+    }
     switch (g_fg_rt_mode) {
     case kFgRtRaw:
         return rt_raw_value();
@@ -5670,13 +5708,26 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     // since the previous real frame (see cadence_next_slots). Done before anything is
     // tagged, so the count applies to this present.
     if (g_interp_cadence && g_refresh_hz > 0) {
-        const UINT slots = cadence_next_slots();
-        const UINT want = slots - 1;
+        const UINT slots = cadence_next_slots();     // what the phase accumulator wants
+        UINT want = slots - 1;
+        // Rate-limit the expensive part: see g_cad_hold_frames. While holding we tag the
+        // count the DLL is already configured for, so what we ask for and what it produces
+        // always agree; the phase accumulator keeps the long-run average correct anyway.
+        if (g_cad_hold > 0) {
+            --g_cad_hold;
+            want = g_fg_interp_actual;
+        } else if (want != g_fg_interp_actual) {
+            want = (want > g_fg_interp_actual) ? (g_fg_interp_actual + 1)
+                                              : (g_fg_interp_actual - 1);
+            if (want < 1) { want = 1; }
+            g_cad_hold = (g_cad_hold_frames > 0) ? g_cad_hold_frames : 0;
+        }
         const UINT before = g_fg_interp_actual;
         fg_set_interp(want, "interp-cadence", /*quiet=*/true);
         if (g_fg_interp_actual != before) { ++g_cad_switches; }
         if (g_fg_interp_actual != want) { ++g_cad_fail; }
         if (want < 8) { ++g_cad_hist[want]; }
+        g_cad_last_k = want + 1;      // frameRenderTime follows what we actually tagged
     }
     // Waiting for the previous frame keeps queue depth at 1: latency stays bounded and
     // "gpu" is a real measurement, but our submissions cannot overlap XeSS-FG's work.
@@ -6890,6 +6941,15 @@ int main()
     // XeFG for that frame (default on; --fg-rt-spike 0 disables it for A/B).
     if (const wchar_t* sp = wcsstr(GetCommandLineW(), L"--fg-rt-spike ")) {
         g_fg_rt_spike = (_wtoi(sp + 14) != 0);
+    }
+    // --cadence-hold N: frames to hold the interpolated count (0/1 = change every frame).
+    if (const wchar_t* ch = wcsstr(GetCommandLineW(), L"--cadence-hold ")) {
+        const int n = _wtoi(ch + 15);
+        if (n >= 0 && n <= 240) { g_cad_hold_frames = n; }
+    }
+    // --fg-cad-rt 0|1: see fg_render_time_ms(). Default 1 (batch-derived frameRenderTime).
+    if (const wchar_t* cr = wcsstr(GetCommandLineW(), L"--fg-cad-rt ")) {
+        g_fg_cad_rt = (_wtoi(cr + 12) != 0);
     }
     // --fg-out-hz N: cap the output frame rate (only with --interp-cadence). 0 = panel.
     if (const wchar_t* oh = wcsstr(GetCommandLineW(), L"--fg-out-hz ")) {
