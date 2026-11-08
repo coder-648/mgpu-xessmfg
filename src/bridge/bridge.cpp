@@ -6131,9 +6131,13 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
             // this window actually used instead of the last frame's count.
             double mul = static_cast<double>(g_fg_interp_actual + 1);
             if (g_interp_cadence) {
+                // g_cad_hist[k] counts the frames that asked for k *interpolated* frames, so
+                // the number of output frames per input frame is (k + 1). Forgetting the +1
+                // made this line print "avg 1.00x, 60.0 fps out" for a run that was actually
+                // doing 2.0x and 120 fps - the most misleading log in the program.
                 double sum = 0.0, cnt = 0.0;
                 for (int i = 0; i < 8; ++i) {
-                    sum += static_cast<double>(i) * g_cad_hist[i];
+                    sum += static_cast<double>(i + 1) * g_cad_hist[i];
                     cnt += static_cast<double>(g_cad_hist[i]);
                 }
                 if (cnt > 0.0) { mul = sum / cnt; }
