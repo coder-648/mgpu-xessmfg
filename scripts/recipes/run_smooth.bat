@@ -48,6 +48,12 @@ if not exist bridge.exe (
   exit /b 1
 )
 
+rem  PREREQUISITE: the game folder must have a current game_capture.addon64 with
+rem  [capture] StreamHeight=1440 (the default since 2026-11-09). With an older add-on
+rem  the cross-adapter stream is the full render size - 63 MB/frame at 4K - and the
+rem  conversion passes get starved on the saturated render card, which is what the eye
+rem  reported as drops. At 1440p it is 28 MB/frame and drops stop (user-verified).
+rem
 rem  Do NOT add --fg-of (AMD optical flow) here. Optical flow is one more full GPU pass
 rem  on the card that also runs the generation, and cadence already keeps it at 84-90%
 rem  load: measured 2026-11-09, drops become clearly more frequent with --fg-of and

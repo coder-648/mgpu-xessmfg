@@ -812,7 +812,12 @@ bridge.exe --fg-probe --producer-luid 0:10392
 - ⚠️ **`--lock N` 不算**：它在渲染完成后丢帧，GPU 负载一点没少。
 
 **诊断**：bridge 的 `bus:` 行给出每帧字节与 GB/s；当超过 48 MB/帧或 `inputs+copy` 占循环 ≥25%
-时会额外打一行 `headroom:` 建议。
+时会额外打一行 `headroom:` 建议；流尺寸 > 1440p 时还会提示 add-on 的 `StreamHeight=1440` 能省多少。
+
+> ✅ **2026-11-09 已落地并验证**：add-on 默认 `StreamHeight=1440`（100% = 2560x1440，宽度按
+> 宽高比），4K 渲染下 63.3 → 28.2 MB/帧。用户实测（CP2077 4K/120Hz、动态逐帧 + 游戏 MV）：
+> **不再 drop**。⇒ MV 可以用了；`--fg-of` 仍不要在动态逐帧下用（多一个 pass），`--no-depth`
+> 仍不要用（disocclusion 渗色）。
 
 ### 5.18 `--input-ms X`：把"输入间隔"当成 X ms（让节拍器别过度丢帧）
 
