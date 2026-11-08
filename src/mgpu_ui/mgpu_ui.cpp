@@ -112,6 +112,11 @@ struct State
     // 因为 40fps 的输入会抖到 4 vblank、30fps 会到 5-6 vblank, 上限不够就填不满。
     // 详见 docs/findings/PERF_BASELINE.md 3.17-3.21。
     bool cadence = true;
+    // 输出帧率上限 (Hz)，直接手输：0 = 面板刷新（填满每个 vblank，不发 --fg-out-hz）；
+    // 5..1000 = 上限（--fg-out-hz N）。只在"动态倍率"开启时有意义：它决定每帧要几张，
+    // 所以"120Hz 面板但只要 60fps"就是填 60（输入 30 时正好 2x）。最低仍是 2x，
+    // 做不到时 bridge 会打一行 warning 说明实际会跑到多少 Hz。
+    int  out_fps = 0;
     int  out_mode = 0;         // 0 1:1, 1 scale 0.75, 2 den 2
     bool perf_no_throttle = false;
     // 捕获
@@ -241,14 +246,14 @@ enum Id
     ID_FG_TYPE, ID_FG_MODE, ID_INTERP, ID_OUT, ID_PERF,
     ID_CAP_API, ID_POOL, ID_LAT,
     ID_NOMV, ID_JITZ, ID_PROJRZ, ID_FOV, ID_NODEPTH, ID_UI, ID_RT, ID_UNLOCK, ID_SLACK, ID_IVL,
-    ID_MV, ID_CADENCE,
+    ID_MV, ID_CADENCE, ID_OUTFPS,
     ID_TEAR, ID_SDR, ID_LAYERED, ID_RELAY, ID_OSD,
     ID_GPU, ID_GPUSEL, ID_DISPLAY,
     ID_TMODE, ID_TARGET, ID_HOTKEY, ID_LOCK, ID_CMD,
     ID_MIN, ID_CLOSE, ID_START, ID_ADD, ID_DEL,
 };
 
-enum RowKind { RK_INFO = 0, RK_DD, RK_SPIN, RK_TOG, RK_SLIDER, RK_CMDLINE };
+enum RowKind { RK_INFO = 0, RK_DD, RK_SPIN, RK_TOG, RK_SLIDER, RK_CMDLINE, RK_EDIT };
 
 struct RowDef { Id id; const wchar_t* label; RowKind kind; };
 struct CardDef { const wchar_t* title; const RowDef* rows; int n; int col; };
@@ -258,6 +263,7 @@ static const RowDef kRowsFg[] = {
     { ID_FG_MODE, L"模式",            RK_DD   },
     { ID_INTERP,  L"倍数",            RK_SPIN },
     { ID_CADENCE, L"动态倍率 (逐帧)",  RK_TOG },
+    { ID_OUTFPS,  L"输出帧率 (Hz, 0=面板)", RK_EDIT },
     { ID_OUT,     L"输出",            RK_DD   },
     { ID_MV,      L"运动矢量",        RK_DD   },
 };
@@ -283,7 +289,7 @@ static const RowDef kRowsOverlay[] = {
 };
 
 static const CardDef kCards[] = {
-    { L"帧生成",       kRowsFg,     6, 0 },
+    { L"帧生成",       kRowsFg,     7, 0 },
     { L"捕获",         kRowsCap,    3, 1 },
     { L"启动",         kRowsLaunch, 3, 0 },
     { L"GPU / 显示器", kRowsDev,    2, 1 },
@@ -401,6 +407,11 @@ static std::wstring row_value(Id id)
         return L"(未知)";
     }
     case ID_INTERP: _snwprintf_s(buf, _TRUNCATE, L"%dx", S().interp); return buf;
+    case ID_OUTFPS:
+        // 手输的数字框：0 表示"面板刷新"（不限制），其余是 Hz 上限。
+        if (S().out_fps == 0) { return L"面板刷新"; }
+        _snwprintf_s(buf, _TRUNCATE, L"%d Hz", S().out_fps);
+        return buf;
     case ID_POOL:   _snwprintf_s(buf, _TRUNCATE, L"%d", S().pool);    return buf;
     case ID_LAT:    _snwprintf_s(buf, _TRUNCATE, L"%d", S().latency); return buf;
     case ID_HOTKEY: return g_capture_hotkey ? std::wstring(L"按下新组合键...") : hotkey_name();
@@ -559,6 +570,7 @@ static void save_profile(int i)
     ini_w(sec, L"osd", s.osd ? 1 : 0);
     ini_w(sec, L"perf", s.perf_no_throttle ? 1 : 0);
     ini_w(sec, L"cadence", s.cadence ? 1 : 0);
+    ini_w(sec, L"outfps", s.out_fps);
     ini_ws(sec, L"win_title", s.win_title);
 }
 
@@ -597,6 +609,8 @@ static void load_profile(int i)
     s.osd = ini_r(sec, L"osd", s.osd ? 1 : 0) != 0;
     s.perf_no_throttle = ini_r(sec, L"perf", s.perf_no_throttle ? 1 : 0) != 0;
     s.cadence     = ini_r(sec, L"cadence", s.cadence ? 1 : 0) != 0;
+    s.out_fps     = ini_r(sec, L"outfps", s.out_fps);
+    if (s.out_fps != 0 && (s.out_fps < 5 || s.out_fps > 1000)) { s.out_fps = 0; }
     s.win_title   = ini_rs(sec, L"win_title", L"");
     if (s.interp < 2) { s.interp = 2; }
     if (s.interp > 6) { s.interp = 6; }
@@ -714,7 +728,17 @@ static std::wstring build_cmdline(HWND target, bool display)
     _snwprintf_s(b, _TRUNCATE, L" --pool %d --latency %d --interp %d",
                  S().pool, S().latency, interp_req);
     cmd += b;
-    if (S().cadence) { cmd += L" --interp-cadence"; }
+    if (S().cadence) {
+        cmd += L" --interp-cadence";
+        // 输出帧率上限（0 = 面板刷新，不发送）：把"120Hz 面板但只要 60fps"变成
+        // --fg-out-hz 60，输入 30 时就是 2x。最低仍是 2x（libxess_fg 不能生成 0 帧，
+        // 1:1 要用 --no-fg），bridge 做不到时会打一行 warning 说明实际跑到多少 Hz。
+        if (S().out_fps >= 5 && S().out_fps <= 1000) {
+            wchar_t oh[48]{};
+            _snwprintf_s(oh, _TRUNCATE, L" --fg-out-hz %d", S().out_fps);
+            cmd += oh;
+        }
+    }
     if (S().fg_mode == 1) { cmd += L" --dyn-mfg"; }
     // Which GPU runs the frame generation (A card rendering + N card output, or the
     // other way round). 0 = let bridge decide from the window monitor / producer LUID.
@@ -1079,6 +1103,7 @@ static int ctl_w(RowKind k)
 {
     switch (k) {
     case RK_DD:   return 210;
+    case RK_EDIT: return 210;
     case RK_SPIN: return 116;
     case RK_TOG:  return 46;
     default:      return 0;
@@ -1218,6 +1243,32 @@ static void draw_spin(HDC dc, const RECT& r, const std::wstring& value,
     const int cx = b.right - 13;
     draw_chevron(dc, cx, b.top + 9, -1, hoverup ? C_TEXT : C_DIM);
     draw_chevron(dc, cx, b.bottom - 9, +1, hoverdn ? C_TEXT : C_DIM);
+}
+
+// -- 手输数字框：输出帧率上限用。点一下开始编辑，只吃数字与退格，Enter/点击别处提交，
+// Esc 取消。没有单独的输入控件，所以状态都放在这两个全局里，由 wnd_proc 的 WM_CHAR 驱动。
+static Id          g_edit_id  = ID_NONE;
+static std::wstring g_edit_buf;
+
+static void draw_edit(HDC dc, const RECT& r, const std::wstring& value, bool hover,
+                      bool editing)
+{
+    RECT b{ r.right - 210, r.top + 4, r.right, r.bottom - 4 };
+    stroke_round(dc, b, 6, (hover || editing) ? C_CTL_HOVER : C_CTL,
+                 editing ? RGB(120, 170, 255) : C_BORDER);
+    RECT vt{ b.left + 10, b.top, b.right - 26, b.bottom };
+    txt(dc, g_f_ui, vt, value, editing ? C_TEXT : C_TEXT,
+        DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+    if (editing) {
+        // Caret after the text: measure it, then draw a 1px bar.
+        SIZE sz{};
+        HGDIOBJ old = SelectObject(dc, g_f_ui);
+        GetTextExtentPoint32W(dc, value.c_str(), (int)value.size(), &sz);
+        SelectObject(dc, old);
+        const int cx = b.left + 10 + sz.cx + 1;
+        RECT caret{ cx, b.top + 6, cx + 1, b.bottom - 6 };
+        fill_round(dc, caret, 0, RGB(220, 230, 255));
+    }
 }
 
 static void draw_dd(HDC dc, const RECT& r, const std::wstring& value, bool hover, bool open)
@@ -1395,7 +1446,8 @@ static void paint(HWND hwnd)
 
         const bool hover = (g_hover_y >= rc.top && g_hover_y < rc.bottom &&
                             g_hover_x >= rc.left && g_hover_x < rc.right &&
-                            (it.kind == RK_DD || it.kind == RK_TOG || it.kind == RK_SPIN));
+                            (it.kind == RK_DD || it.kind == RK_TOG || it.kind == RK_SPIN ||
+                             it.kind == RK_EDIT));
         if (hover && it.kind == RK_TOG) { draw_toggle(dc, rc, it.on, true); }
         else if (it.kind == RK_TOG)     { draw_toggle(dc, rc, it.on, false); }
 
@@ -1421,6 +1473,11 @@ static void paint(HWND hwnd)
         }
         case RK_DD:   draw_dd(dc, rc, dd_caption(it.id), hover,
                               g_popup_id == (int)it.id); break;
+        case RK_EDIT: {
+            const bool editing = (g_edit_id == it.id);
+            draw_edit(dc, rc, editing ? (g_edit_buf + L"_") : row_value(it.id), hover, editing);
+            break;
+        }
         case RK_SPIN: {
             const bool up = hover && (g_hover_x > rc.right - 26) && (g_hover_y < rc.top + 18);
             const bool dn = hover && (g_hover_x > rc.right - 26) && (g_hover_y >= rc.top + 18);
@@ -1626,6 +1683,18 @@ static int popup_hit(int mx, int my)      // -> option index or -1
 // ------------------------------------------------------------------- actions
 static void on_click(int mx, int my)
 {
+    // 0) 正在手输数字：点到别处就把当前内容提交（空 = 0 = 面板刷新）
+    if (g_edit_id != ID_NONE) {
+        const int v = g_edit_buf.empty() ? 0 : _wtoi(g_edit_buf.c_str());
+        if (g_edit_id == ID_OUTFPS) {
+            S().out_fps = (v >= 5 && v <= 1000) ? v : 0;
+            save_all();
+        }
+        g_edit_id = ID_NONE;
+        g_edit_buf.clear();
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+    }
+
     // 1) an open dropdown eats the click first
     if (g_popup_id) {
         const int idx = popup_hit(mx, my);
@@ -1728,6 +1797,15 @@ static void on_click(int mx, int my)
             if (mx < box.left || mx > box.right || my < box.top || my > box.bottom) { return; }
             const int mid = (box.top + box.bottom) / 2;
             bump_spin(it.id, (my < mid) ? +1 : -1);
+            break;
+        }
+        case RK_EDIT: {
+            RECT box{ rc.right - 210, rc.top + 4, rc.right, rc.bottom - 4 };
+            if (mx < box.left || mx > box.right || my < box.top || my > box.bottom) { return; }
+            // 点一下开始编辑：清空缓冲，让用户直接输数字（和"覆盖输入"的习惯一致）。
+            g_edit_id = it.id;
+            g_edit_buf.clear();
+            set_msg(L"输入数字，Enter 确认，Esc 取消");
             break;
         }
         case RK_INFO:
@@ -1851,6 +1929,44 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         }
         return r;
     }
+
+    case WM_CHAR:
+        // 手输数字框（输出帧率上限）。只吃 0-9 / 退格 / 回车 / Esc，其余丢掉，
+        // 免得一次误按把别的字母塞进去。
+        if (g_edit_id != ID_NONE) {
+            const wchar_t ch = (wchar_t)wp;
+            if (ch >= L'0' && ch <= L'9') {
+                if (g_edit_buf.size() < 4) { g_edit_buf.push_back(ch); }
+                InvalidateRect(h, nullptr, FALSE);
+                return 0;
+            }
+            if (ch == 8) {                       // backspace
+                if (!g_edit_buf.empty()) { g_edit_buf.pop_back(); }
+                InvalidateRect(h, nullptr, FALSE);
+                return 0;
+            }
+            if (ch == 13) {                      // enter: commit
+                const int v = g_edit_buf.empty() ? 0 : _wtoi(g_edit_buf.c_str());
+                if (g_edit_id == ID_OUTFPS) {
+                    S().out_fps = (v >= 5 && v <= 1000) ? v : 0;
+                    set_msg(S().out_fps ? L"输出帧率上限已设置" : L"输出帧率 = 面板刷新");
+                    save_all();
+                }
+                g_edit_id = ID_NONE;
+                g_edit_buf.clear();
+                InvalidateRect(h, nullptr, FALSE);
+                return 0;
+            }
+            if (ch == 27) {                      // esc: cancel
+                g_edit_id = ID_NONE;
+                g_edit_buf.clear();
+                set_msg(L"已取消");
+                InvalidateRect(h, nullptr, FALSE);
+                return 0;
+            }
+            return 0;
+        }
+        return 0;
 
     case WM_KEYDOWN:
         if (g_capture_hotkey) {

@@ -1525,6 +1525,14 @@ static double g_rt_ema_slow = 0.0;
 static int    g_rt_auto_state = 0;      // 0 = rate is steady (quant), 1 = rate is moving (raw)
 static int    g_rt_auto_agree = 0;      // consecutive frames agreeing to flip (hysteresis)
 static UINT   g_rt_auto_flips = 0;
+// --fg-out-hz N: cap the output rate (0 = the panel refresh, i.e. fill every vblank).
+// Only meaningful together with --interp-cadence, where the per-frame frame count is ours
+// to choose: "120 Hz panel but I only want 60 fps" then comes out as 2x for a 30 fps input
+// instead of 4x. The floor is 2x (libxess_fg cannot generate zero frames); if the target
+// needs fewer, bridge warns once and says what rate it will actually run at.
+static double g_fg_out_hz = 0.0;
+static bool   g_out_hz_floor_warned = false;
+static bool   g_out_hz_max_warned = false;
 // A longer ring for the "slow" rate. Per-sample EMAs could not tell a locked 40 fps (which
 // arrives as 2/3/4 vblanks) from a rate that is actually moving: the +-1 vblank jitter of a
 // locked input drives a fast EMA just as much as a real step does - measured, it flipped a
@@ -1638,12 +1646,37 @@ static UINT cadence_next_slots()
     // Track the raw last interval (reacts immediately) but fall back to the EMA while
     // it warms up; a median would lag behind the very transitions we are following.
     const double t_in = (g_arr_last_raw > 0.5) ? g_arr_last_raw : g_arrival_ms_ema;
-    g_cad_phase += t_in / vb;
+    // Target output rate. Without --fg-out-hz this is the panel refresh, i.e. "fill every
+    // vblank" (the historical behaviour). With it the same Bresenham accumulator produces
+    // as many frames as the *target* rate needs for this input interval, so "120 Hz panel,
+    // but I only want 60 fps" becomes 2x instead of 4x for a 30 fps input.
+    const double panel_hz = (vb > 0.5) ? 1000.0 / vb : 120.0;
+    const double out_hz = (g_fg_out_hz > 1.0) ? g_fg_out_hz : panel_hz;
+    g_cad_phase += t_in * out_hz / 1000.0;
     int k = static_cast<int>(g_cad_phase + 0.5);
-    if (k < 2) { k = 2; }
+    if (k < 2) {
+        // libxess_fg cannot generate zero frames (that is --no-fg), so the floor is 2x.
+        // Warn once: the target rate is unreachable and the output will run faster.
+        if (!g_out_hz_floor_warned) {
+            g_out_hz_floor_warned = true;
+            logf_("[bridge] --fg-out-hz %.0f: a %.1f ms input needs %u generated frame(s),"
+                  " but 2x is the minimum here - the output will run at ~%.0f Hz instead."
+                  " Use --no-fg for 1:1.\n",
+                  out_hz, t_in, (k < 1) ? 1u : static_cast<UINT>(k), 2000.0 / t_in);
+        }
+        k = 2;
+    }
     const int kmax = static_cast<int>(g_fg_interp_max) + 1;
     const bool clamped = (k > kmax);
-    if (k > kmax) { k = kmax; }
+    if (k > kmax) {
+        k = kmax;
+        if (!g_out_hz_max_warned && g_fg_out_hz > 1.0) {
+            g_out_hz_max_warned = true;
+            logf_("[bridge] --fg-out-hz %.0f needs %d generated frames for a %.1f ms input,"
+                  " but this DLL allows %d (--interp %d) - raise --interp.\n",
+                  out_hz, k, t_in, g_fg_interp_max, g_fg_interp_max);
+        }
+    }
     g_cad_phase -= static_cast<double>(k);
     if (clamped) { g_cad_phase = 0.0; }              // do not accumulate a debt
     if (g_cad_phase < -1.5) { g_cad_phase = -1.5; }
@@ -6229,12 +6262,13 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
             const double frac = dabs_(out_vb - whole);
             logf_("[bridge]   cadence: rt=%.1fms (%s) input=%.1fms = %.2f vblanks ->"
                   " interp=%u (avg %.2fx, %.1f fps out = %.2f vblank/frame%s)"
-                  " refresh=%uHz lock=%.2f drops=%u\n",
+                  " refresh=%uHz lock=%.2f drops=%u%s\n",
                   fg_render_time_ms(), fg_rt_mode_name(), t_in, t_in / vb,
                   g_fg_interp_actual, mul,
                   (out_ms > 0.0) ? 1000.0 / out_ms : 0.0, out_vb,
                   (frac > 0.06) ? " NOT-EXACT" : "", g_refresh_hz,
-                  g_lock_fps, g_lock_drops);
+                  g_lock_fps, g_lock_drops,
+                  (g_fg_out_hz > 1.0) ? " (out-hz cap)" : "");
             g_lock_drops = 0;
             if (g_interp_cadence) {
                 logf_("[bridge]   cadence hist:");
@@ -6856,6 +6890,11 @@ int main()
     // XeFG for that frame (default on; --fg-rt-spike 0 disables it for A/B).
     if (const wchar_t* sp = wcsstr(GetCommandLineW(), L"--fg-rt-spike ")) {
         g_fg_rt_spike = (_wtoi(sp + 14) != 0);
+    }
+    // --fg-out-hz N: cap the output frame rate (only with --interp-cadence). 0 = panel.
+    if (const wchar_t* oh = wcsstr(GetCommandLineW(), L"--fg-out-hz ")) {
+        const int n = _wtoi(oh + 12);
+        if (n >= 5 && n <= 1000) { g_fg_out_hz = n; }
     }
     // --interp-auto [floor|round]: pick the interpolation count from the measured
     // input cadence so the output stays on whole vblanks (dynamic frame times).
