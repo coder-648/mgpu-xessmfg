@@ -1514,6 +1514,16 @@ static void fg_solve_cadence(const char* why)
 //   --interp-auto [floor|round]         keep the output on a whole-vblank cadence
 enum { kFgRtEma = 0, kFgRtRaw = 1, kFgRtMedian = 2, kFgRtQuant = 3 };
 static int g_fg_rt_mode = kFgRtQuant;   // quant: median snapped to whole vblanks (see fg_render_time_ms)
+// --fg-rt-spike 0/1 (default 1): when ONE input frame arrives much later than the plan
+// (a fast camera turn, a streamed asset), report the real length to XeFG for that frame so
+// the pacer spreads its batch over the gap instead of laying it out too short and leaving an
+// empty refresh period. This is the difference between "the game dipped to 57 fps" and "the
+// picture juddered". See fg_render_time_ms().
+static bool   g_fg_rt_spike = true;
+static const double kSpikeRatio = 1.35;   // last interval this much longer than the plan
+static int    g_spike_logs_left = 8;      // log the first few, then stay quiet
+static UINT   g_spike_count = 0;          // spikes this report window
+
 static const char* fg_rt_mode_name()
 {
     switch (g_fg_rt_mode) {
@@ -1651,7 +1661,38 @@ static double fg_render_time_ms()
         const double vb = refresh_ms();
         int k = static_cast<int>(arr_median_ms() / vb + 0.5);
         if (k < 1) { k = 1; }
-        return static_cast<double>(k) * vb;
+        const double plan = static_cast<double>(k) * vb;
+
+        // ---- single-frame spikes -------------------------------------------------
+        // A fast camera turn (or a streamed asset) makes the game miss its slot once: the
+        // input arrives 2 vblanks late instead of 1. Telling XeFG the *plan* length for that
+        // frame is what turns one late input into an empty refresh period - it lays its batch
+        // out as if it had `plan` ms and the rest of the gap shows nothing (measured:
+        // `out: vblanks > presents`, the picture hitches).
+        // Feeding the real, vblank-snapped length instead lets the same batch be spread over
+        // the longer gap: motion is a touch slower for that one interval, but there is no
+        // hitch. That is the difference between "the game dipped to 57 fps" and "the picture
+        // juddered".
+        if (g_fg_rt_spike && g_arr_last_raw > plan * kSpikeRatio &&
+            g_arr_last_raw < 100.0) {
+            int kr = static_cast<int>(g_arr_last_raw / vb + 0.5);
+            if (kr < k) { kr = k; }
+            const int kcap = k * 3;              // never chase a real hitch (>3x the plan)
+            if (kr > kcap) { kr = kcap; }
+            if (kr > k) {
+                const double rt = static_cast<double>(kr) * vb;
+                if (g_spike_logs_left > 0) {
+                    --g_spike_logs_left;
+                    logf_("[bridge] rt spike: last input %.1fms (%.1f vblanks) > plan %.1fms"
+                          " - frameRenderTime %.1fms for this frame (%.1f vblanks)%s\n",
+                          g_arr_last_raw, g_arr_last_raw / vb, plan, rt, rt / vb,
+                          (g_spike_logs_left == 0) ? " (further spikes not logged)" : "");
+                }
+                ++g_spike_count;
+                return rt;
+            }
+        }
+        return plan;
     }
     default:
         return input_interval_ms();
@@ -6218,6 +6259,11 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
                   need, need * refresh_ms(), static_cast<unsigned long long>(g_frames),
                   arr_median_ms(), arr_wc_median_ms());
             for (int k = 1; k <= 8; ++k) { g_arr_hist[k] = 0; }
+            if (g_spike_count) {
+                logf_("[bridge]   rt spikes: %u frame(s) reported at their real length this"
+                      " window (--fg-rt-spike %d)\n", g_spike_count, g_fg_rt_spike ? 1 : 0);
+                g_spike_count = 0;
+            }
             // The same buckets for the interval the producer measured between the game's own
             // Present calls. If this is flat while `arr(vb)` is not, the game is presenting
             // evenly and the unevenness appears after it (composition / our overlay).
@@ -6685,6 +6731,11 @@ int main()
         else if (wcsncmp(p, L"median", 6) == 0) { g_fg_rt_mode = kFgRtMedian; }
         else if (wcsncmp(p, L"quant", 5) == 0)  { g_fg_rt_mode = kFgRtQuant; }
         else                                    { g_fg_rt_mode = kFgRtEma; }
+    }
+    // --fg-rt-spike 0|1: absorb single-frame input spikes by reporting the real interval to
+    // XeFG for that frame (default on; --fg-rt-spike 0 disables it for A/B).
+    if (const wchar_t* sp = wcsstr(GetCommandLineW(), L"--fg-rt-spike ")) {
+        g_fg_rt_spike = (_wtoi(sp + 14) != 0);
     }
     // --interp-auto [floor|round]: pick the interpolation count from the measured
     // input cadence so the output stays on whole vblanks (dynamic frame times).
