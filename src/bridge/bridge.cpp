@@ -2796,6 +2796,35 @@ static UINT   g_report_every = 40; // --report N: frames per statistics window
 static UINT   g_arr_count = 0;
 static ULONGLONG g_last_frame_tick = 0;
 
+// Bucketed arrival histogram, in vblanks, reset every report window. This is the direct
+// answer to "are we losing input frames, or is the game simply not delivering them?":
+// a locked 40 fps game on a 120 Hz panel must land in bucket 3 (25.0 ms) almost every
+// time; anything in bucket 4+ is a missing/gated frame, and a spread over 2/3/4 means the
+// presenter itself is not holding its cadence.
+static UINT   g_arr_hist[9] = {};         // index = vblanks rounded, 8 = "8 or more"
+// The same median taken from two different clocks. `dwm` uses the capture frame's
+// SystemRelativeTime (what the compositor stamped); `wc` uses the wall clock at the moment
+// we dequeued it. They should agree. When they do not, the difference is our own pickup
+// jitter, not lost input - which is exactly the mistake `input=` used to make.
+static double g_arr_wc_ring[kArrRing] = {};
+static UINT   g_arr_wc_n = 0;
+static UINT   g_arr_wc_i = 0;
+
+static double arr_wc_median_ms()
+{
+    if (g_arr_wc_n == 0) { return 0.0; }
+    double v[kArrRing];
+    const UINT n = g_arr_wc_n;
+    for (UINT i = 0; i < n; ++i) { v[i] = g_arr_wc_ring[i]; }
+    for (UINT i = 1; i < n; ++i) {
+        const double k = v[i];
+        int j = static_cast<int>(i) - 1;
+        while (j >= 0 && v[j] > k) { v[j + 1] = v[j]; --j; }
+        v[j + 1] = k;
+    }
+    return v[n / 2];
+}
+
 static double qpc_ms();   // defined next to the pacer below
 
 // Pacing state. Declared here because run_frame_warp needs g_pace_ms for its own
@@ -5927,6 +5956,24 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
                   send_dep ? dep_mb : 0.0, per_frame, rate * 0.001,
                   (g_arrival_ms_ema > 0.1) ? 1000.0 / g_arrival_ms_ema : 0.0);
         }
+        // Arrival histogram: where the input actually comes from. `need` is what the current
+        // multiplier requires (interp+1 vblanks per input frame), so a bucket below it means
+        // the presenter ran faster than we consume, and a bucket above it means frames were
+        // late or gated. `n` is the number of arrivals in this window - if `n` is ~20% short
+        // of `frames`, the input itself is not being delivered, not merely reprocessed.
+        {
+            UINT total_arr = 0;
+            for (int k = 1; k <= 8; ++k) { total_arr += g_arr_hist[k]; }
+            logf_("[bridge]   arr(vb):");
+            for (int k = 1; k <= 8; ++k) {
+                if (g_arr_hist[k]) { logf_(" %dx=%u", k, g_arr_hist[k]); }
+            }
+            const UINT need = g_fg_interp_actual + 1;
+            logf_("  n=%u  need %ux (%.1f ms)  frames=%llu  med dwm=%.1f wc=%.1f\n", total_arr,
+                  need, need * refresh_ms(), static_cast<unsigned long long>(g_frames),
+                  arr_median_ms(), arr_wc_median_ms());
+            for (int k = 1; k <= 8; ++k) { g_arr_hist[k] = 0; }
+        }
         logf_("[bridge]   breakdown: capture=%.1fms work=%.1fms present=%.1fms gpu=%.1fms"
               " wait=%.1fms copy=%.1fms colour=%.1fms mvs=%.1fms of=%.1fms age=%.1fms"
               " xell=%.1fms fg=%.1fms total=%.1fms cpu=%.1fms timeouts=%u mode=%d  xN=%.2f"
@@ -6807,16 +6854,19 @@ int main()
 
     // Frame timing bookkeeping shared by both paths: arrival EMA, jitter extremes and
     // the count of gaps (frames that never reached us at all).
+    //
+    // The interval comes from the capture frame's SystemRelativeTime, NOT from the wall
+    // clock at the moment we dequeued it. That difference is load-bearing:
+    //   * the compositor's stamp is the game's own cadence, quantised to vblanks;
+    //   * GetTickCount64 has 1 ms resolution, so two frames drained in one loop iteration
+    //     land in the same millisecond, the second delta is 0, and arr_push() drops it.
+    //     That biased the median upward (31.0 ms for a locked 40 fps input) and made
+    //     --fg-rt-mode quant snap frameRenderTime to 4 vblanks instead of 3, so the output
+    //     ran at 96.8 fps on a 120 Hz panel and the cadence line said NOT-EXACT.
+    // The wall clock is kept only as the fallback for a frame with no usable timestamp.
     auto note_arrival = [](IDirect3D11CaptureFrame* f) {
         const ULONGLONG now = GetTickCount64();
-        if (g_last_arrival) {
-            const double dt_arr = static_cast<double>(now - g_last_arrival);
-            if (dt_arr > 0.0 && dt_arr < 1000.0) {
-                g_arrival_ms_ema = g_arrival_ms_ema * 0.9 + dt_arr * 0.1;
-                arr_push(dt_arr);        // --fg-rt-mode median/quant + --interp-auto
-            }
-        }
-        g_last_arrival = now;
+        double dt_arr = 0.0;                  // measured interval, compositor clock first
 
         ABI::Windows::Foundation::TimeSpan wts{};
         if (SUCCEEDED(f->get_SystemRelativeTime(&wts))) {
@@ -6824,10 +6874,19 @@ int main()
             if (g_arr_prev > 0.0) {
                 const double d = ts_ms - g_arr_prev;
                 if (d > 0.0 && d < 1000.0) {
+                    dt_arr = d;
                     if (d < g_arr_min) { g_arr_min = d; }
                     if (d > g_arr_max) { g_arr_max = d; }
                     if (d > g_arrival_ms_ema * 1.6) { ++g_arr_drops; }
                     ++g_arr_count;
+                    // Bucket it in vblanks: 3 = a 40 fps game on a 120 Hz panel.
+                    const double vb = refresh_ms();
+                    if (vb > 0.5) {
+                        int k = static_cast<int>(d / vb + 0.5);
+                        if (k < 1) { k = 1; }
+                        if (k > 8) { k = 8; }
+                        ++g_arr_hist[k];
+                    }
                 }
             }
             // How old is this frame when it reaches us? That is the WGC/DWM delay the
@@ -6839,6 +6898,20 @@ int main()
             }
 
             g_arr_prev = ts_ms;
+        }
+
+        if (dt_arr <= 0.0 && g_last_arrival) {
+            const double dw = static_cast<double>(now - g_last_arrival);
+            if (dw > 0.0 && dw < 1000.0) { dt_arr = dw; }
+        }
+        g_last_arrival = now;
+
+        if (dt_arr > 0.0) {
+            g_arrival_ms_ema = g_arrival_ms_ema * 0.9 + dt_arr * 0.1;
+            arr_push(dt_arr);            // --fg-rt-mode median/quant + --interp-auto
+            g_arr_wc_ring[g_arr_wc_i] = dt_arr;
+            g_arr_wc_i = (g_arr_wc_i + 1) % kArrRing;
+            if (g_arr_wc_n < kArrRing) { ++g_arr_wc_n; }
         }
     };
 

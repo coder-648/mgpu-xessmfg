@@ -179,6 +179,68 @@ A 与 B 之间只差 `--no-depth`，第三次再跑一遍 A 用来**量漂移**�
 - XeFG 内部参数调优 —— 闭源，只有 `--fg-*` 那几个胶水开关；
 - 复用 `wait_slot` 的等待事件（见 §3.2）。
 
+### 3.7 顺手抓到的真 bug：`input=` 一直是 31 ms（墙钟采样偏差）
+
+**症状**：RTSS 把 CP2077 锁在 40 fps，`breakdown` 里 `game=25.0ms`（对），但 cadence 行写着
+`input=31.0ms = 3.72 vblanks -> rt=33.3ms -> 96.8 fps out = 1.24 vblank/frame NOT-EXACT`。
+即 **XeFG 被喂了 4 个 vblank 的 `frameRenderTime`，输出只有 96.8 fps 而不是 120**。
+
+**先排除"输入丢失"**：加了一行直方图 `arr(vb):`，把每个到达间隔按 vblank 分桶
+（用 WGC 帧自带的 `SystemRelativeTime`，即合成器时间戳）：
+
+```
+arr(vb): 3x=40  n=40  need 3x (25.0 ms)  frames=1401  med dwm=25.0
+```
+
+40 帧全部落在 3 个 vblank（25.0 ms），`n` 与 `frames` 相等 ⇒ **一帧都没丢**，
+`--pool 8` / `--jbuf 1` / `--slack 1` 三种都试过，`input=` 始终是 31 ms ⇒ 不是排队问题。
+
+**根因**：`note_arrival()` 用 `GetTickCount64()` 的**墙钟差值**做间隔统计，而它有 1 ms 分辨率：
+一次循环里排空两帧时，第二帧的差值是 0，被 `arr_push()` 的 `dt > 0` 过滤掉，
+于是中位数被系统性推高（25 → 31）。而 `--fg-rt-mode quant` 用的正是这个中位数：
+
+| | 修前 | 修后 |
+|---|---|---|
+| 间隔来源 | 排空时刻的墙钟差（丢 0 ms 样本） | 帧自带的 `SystemRelativeTime` |
+| median | 31.0 ms | **25.0 ms** |
+| `frameRenderTime`（quant） | 33.3 ms = 4 vblank | **25.0 ms = 3 vblank** |
+| 输出 | 96.8 fps = 1.24 vblank/帧 ❌ | **120.0 fps = 1.00 vblank/帧** ✅ |
+| `jitter` | 16.7..41.7 ms | **25.0..25.0 ms** |
+| `load` / `total` | 90% / 23.0 ms | **44% / 11.6 ms** |
+
+墙钟只在帧没有时间戳时才作为回退。这条同时解释了"`--fg-rt-mode quant` 改了但还是周期性丢帧"：
+quant 一直在按错误的中位数吸附。
+
+> 因此 `CONCLUSIONS.md` §5 里"3x，输入约 31 ms → 吸附 33.3 ms"那句是**这个 bug 的产物**：
+> 40 fps 锁的真实输入是 25.0 ms，quant 之后就是 25.0 ms / 1.00 vblank/帧。
+
+### 3.8 修好之后重跑同一组 A/B（4K 原生，40 fps 锁，A→B→A）
+
+修完 §3.7 之后 `cadence` 三次全部 **1.00 vblank/帧**、`input=25.0 ms`，
+A 与 B 只差 `--no-depth`：
+
+| field | A1 | B (`--no-depth`) | A3 | 读法 |
+|---|---|---|---|---|
+| `cadence` | 1.00 vb | 1.00 vb | 1.00 vb | 三次都精确，量到了真东西 |
+| `bus` | 31.6 MB/帧 | **0.0** | 31.6 MB/帧 | 整条深度流消失 |
+| `gpu` | 9.60 | 7.10 | 10.30 | B 低 2.5–3.2 ms |
+| `present` | 9.45 | 5.30 | 14.25 | B 低 4.2–9.0 ms |
+| `gpu + present`（这才是预算） | 19.1 / 24.6 | **12.4** | 见左 | 输入预算是 25.0 ms |
+| `load` | 76% | **48%** | **98%** | 带深度时 4K 原生 3x 已经**顶到预算** |
+| `slow` | 0 | 0 | **1.5 帧/窗口** | 顶到预算 ⇒ 周期性丢帧，就是用户看到的现象 |
+| `age` | 5.00 | 1.60 | 3.85 | B 的帧更年轻 |
+
+结论：
+
+1. **4K 原生 + 3x + 深度流 = 正好卡在 25 ms 预算上**（`gpu+present` 19–24.6 ms），
+   余量不足时 `present` 会被 XeFG 拉长、`slow` 冒出来 —— 这解释了过去"周期性掉一帧"。
+2. **`--no-depth` 是这一档最有效的单开关**：预算占用 98% → 48%，多出 7–12 ms。
+   代价是 disocclusion 少了深度参考（画质是否可见差异仍需 A/B 定论，见 §6）。
+3. 两次相同配置的 A 之间仍有漂移（76% ↔ 98%、`present` 9.45 ↔ 14.25），
+   所以仍然只能信"B 比两次 A 都好"这类方向性结论。
+
+
+
 ## 5. 下一轮怎么测（一次跑完，20 分钟）
 
 **测试环境**（一直是这一套）：`C:\temp\mgpu\bin` 放 `bridge.exe` + 四个 Intel DLL +
