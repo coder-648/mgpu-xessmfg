@@ -1837,6 +1837,13 @@ static double fg_render_time_ms()
     switch (g_fg_rt_mode) {
     case kFgRtRaw:
         return rt_raw_value();
+    case kFgRtEma:
+        // The forwarded interval as an EMA (alpha 0.1, i.e. ~10 frames) - the historical
+        // default before quant existed. Now only an A/B option: in fixed-multiplier mode it
+        // measured *worse* than auto in all three paired rounds (0.2/0.4/0.5% empty vblanks
+        // vs 0.1/0.1/0.3%, max hole 4-6 vblanks vs 2), because a smooth estimate lags the
+        // step when the throttled input rate actually moves. See PERF_BASELINE 3.23.
+        return (g_arrival_ms_ema > 0.5) ? g_arrival_ms_ema : rt_quant_value();
     case kFgRtMedian:
         return arr_median_ms();
     case kFgRtAuto:
