@@ -138,9 +138,14 @@ static void stream_target_size(UINT* w, UINT* h)
         mw = g_render_w_ini;
         mh = g_render_h_ini;
     }
-    if (g_stream_percent > 100) {
-        mw = (mw * 100u / static_cast<UINT>(g_stream_percent)) & ~1u;
-        mh = (mh * 100u / static_cast<UINT>(g_stream_percent)) & ~1u;
+    // StreamPercent + StreamHeight, in the same order and with the same rounding as
+    // stream_target_from() in game_capture.cpp - the slots here and the downsample targets
+    // there have to agree exactly, or the copy reads the wrong rectangle.
+    if (g_stream_percent > 100 || g_stream_height > 0) {
+        UINT w = mw, h = mh;
+        stream_target_from(mw, mh, &w, &h);
+        mw = w;
+        mh = h;
     }
     if (g_stream_align > 1) {
         const UINT a = static_cast<UINT>(g_stream_align);

@@ -420,12 +420,45 @@ static bool g_logged_size_mismatch = false;
 // that into the shared slot, so the slots stay ALLOW_CROSS_ADAPTER + row-major and are
 // never used as render targets themselves.
 
-static int  g_stream_percent = 100;   // 100 = full resolution (no downsample)
+static int  g_stream_percent = 100;   // 100 = the StreamHeight baseline (see below)
+// [capture] StreamHeight: the cross-adapter stream never exceeds this height; the width is
+// derived from the render aspect and rounded to even. 0 = no cap (follow the render size).
+//
+// This is what makes "100% = 2560x1440" work: StreamPercent still shrinks relative to the
+// render size (>100 = smaller, the historical meaning), and then the height cap pulls the
+// result down to 1440p. A 4K render with the defaults therefore streams MV/depth at
+// 2560x1440 = 28 MB/frame instead of 63 MB, which is the single biggest lever on the
+// render card's per-frame cost (HANDOFF 8-27/8-28, FINAL_CONFIG 5.17.2).
+//
+// Never upscales: a 1080p render stays 1080p. Set StreamHeight=0 to get the old behaviour
+// (full render size) back, or StreamHeight=1080 for the next step down.
+static int  g_stream_height = 1440;
 // [capture] SkipMv: do not produce the motion-vector stream at all (DEFAULT 1).
 // XeSS-FG in this libxess_fg build does not consume tagged motion vectors (MV=0,
 // MV=100000 px and the game's own real MVs all render identically - docs/findings/HANDOFF.md
 // 8.6), so the converted MV stream is pure cost: a fullscreen pass plus a 14.7 MB
 // cross-adapter write per frame. Set SkipMv=0 to bring it back (different FG library).
+// One place that decides the stream size: render size -> StreamPercent -> StreamHeight cap.
+// Both the layout helper (shared_layout.h) and the downsample setup call this, so the slots
+// and the pass targets can never disagree.
+static void stream_target_from(UINT render_w, UINT render_h, UINT* out_w, UINT* out_h)
+{
+    UINT w = render_w, h = render_h;
+    if (g_stream_percent > 100) {
+        w = w * 100u / static_cast<UINT>(g_stream_percent);
+        h = h * 100u / static_cast<UINT>(g_stream_percent);
+    }
+    if (g_stream_height > 0 && h > static_cast<UINT>(g_stream_height)) {
+        w = static_cast<UINT>(static_cast<uint64_t>(w) * static_cast<UINT>(g_stream_height) / h);
+        h = static_cast<UINT>(g_stream_height);
+    }
+    w &= ~1u;                       // even sizes only: the 2:1 downsample and the crop maths
+    h &= ~1u;                       // both assume it
+    if (w < 256u) { w = 256u; }
+    if (h < 256u) { h = 256u; }
+    *out_w = w;
+    *out_h = h;
+}
 static bool g_skip_mv = true;      // [capture] SkipMv=1: never produce the MV stream
 // v7: MV is produced only when the consumer asks for it (bridge --mv / UI).
 static bool g_mv_active = false;
@@ -1017,14 +1050,15 @@ static bool ensure_shared(ID3D12Device* device)
     // Optional: shrink the two streams (and with them the per-frame cross-adapter copy)
     // by rendering them at a lower resolution. dlss-mode independent, so DLAA's 2160p
     // MV/depth stop costing 66 MB/frame. Falls back to full size if anything fails.
-    if (g_stream_percent > 100) {
-        const UINT w = (mv_w * 100u / static_cast<UINT>(g_stream_percent)) & ~1u;
-        const UINT h = (mv_h * 100u / static_cast<UINT>(g_stream_percent)) & ~1u;
-        if (w >= 256 && h >= 256 && ds_prepare(device, w, h)) {
+    {
+        UINT w = mv_w, h = mv_h;
+        stream_target_from(mv_w, mv_h, &w, &h);
+        if ((w != mv_w || h != mv_h) && ds_prepare(device, w, h)) {
             mv_w = w;
             mv_h = h;
-            mv_src = "downsampled";
-        } else {
+            mv_src = (g_stream_height > 0 && h >= static_cast<UINT>(g_stream_height))
+                         ? "height cap" : "downsampled";
+        } else if (w != mv_w || h != mv_h) {
             ds_prepare_log("size/PSO");
         }
     }
@@ -1527,6 +1561,9 @@ static void load_config()
     // StreamPercent > 100 renders MV/depth smaller before the cross-adapter copy:
     // 150 sends them at render * 100/150 (2160p -> 1440p, 2.25x less traffic).
     g_stream_percent = GetPrivateProfileIntA("capture", "StreamPercent", 100, path);
+    g_stream_height  = GetPrivateProfileIntA("capture", "StreamHeight", 1440, path);
+    if (g_stream_height < 0)    { g_stream_height = 0; }
+    if (g_stream_height > 4320) { g_stream_height = 4320; }
     // Default ON: the tagged MVs are a dead input for this libxess_fg build, so the
     // convert pass and the 14.7 MB/frame cross-adapter write buy nothing. SkipMv=0
     // restores the stream (e.g. for a different FG library).
@@ -1574,9 +1611,10 @@ static void load_config()
     }
     if (g_force_input.empty()) { g_force_input = "auto"; }
 
-    logf_("config: Color=%d RenderWidth=%u RenderHeight=%u StreamPercent=%d SkipMv=%d DepthConvert=%d"
-          " MvNormalize=%d MvFlip=%d Input=%s (path %s)\n",
+    logf_("config: Color=%d RenderWidth=%u RenderHeight=%u StreamPercent=%d StreamHeight=%d"
+          " SkipMv=%d DepthConvert=%d MvNormalize=%d MvFlip=%d Input=%s (path %s)\n",
           g_capture_colour ? 1 : 0, g_render_w_ini, g_render_h_ini, g_stream_percent,
+          g_stream_height,
           g_skip_mv ? 1 : 0,
           g_depth_convert_cfg, g_mv_normalize_cfg, g_mv_flip_cfg,
           g_force_input.c_str(), path);

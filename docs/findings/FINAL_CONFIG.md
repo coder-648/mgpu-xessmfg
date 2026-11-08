@@ -796,8 +796,9 @@ bridge.exe --fg-probe --producer-luid 0:10392
 
 | 动作 | 4K 下的搬运量 | 代价 |
 |---|---|---|
-| 现状（MV+深度，`StreamPercent=100`） | 63.3 MB/帧（2.6 GB/s @40fps） | — |
-| `[capture] StreamPercent=150`（→1440p 再跨卡） | **28 MB/帧** | MV/深度双线性放大，画质损失很小 |
+| ~~现状~~（`StreamHeight=0`，跟随渲染尺寸） | 63.3 MB/帧（2.6 GB/s @40fps） | 旧默认，已不是默认 |
+| **新默认 `StreamHeight=1440`** | **28.2 MB/帧** | 4K 渲染（DLAA）时把 MV/深度压到 2560x1440；DLSS-Q 本身就是 1440p 渲染 ⇒ 无变化 |
+| `[capture] StreamPercent=150`（相对渲染尺寸再缩 2/3） | 28 MB/帧（4K 渲染时） | 与 `StreamHeight=1440` 等效；两者叠加会更小，一般不需要 |
 | 再叠加 `--no-depth` | **14 MB/帧**，并省掉深度转换 pass | ❌ **不建议**：`HANDOFF` §28 实测过，砍掉深度后物体与背景交接处出现**拖影/渗色**（深度是 disocclusion 判定的依据）。省字节要靠 StreamPercent，不要靠砍深度 |
 | `StreamPercent=200`（→1080p） | 16 MB/帧 | 相对 150 只再省 12 MB/帧（0.5 GB/s），收益递减；矢量 2×2 平均后运动边界（细线/栏杆/草）和指向镜头的旋转最容易露馅。**先试 150** |
 
