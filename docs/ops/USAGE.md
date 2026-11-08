@@ -169,7 +169,7 @@ bridge.exe --den 1 --pool 4 --interp 2 --no-mv ^
 | 2x 画质优先 | `--interp 1`（+ 游戏 MV） | 60 → 120 fps | 边缘伪影最少 |
 | 最低开销 | `--interp 2 --no-mv` | 40 → 120 fps | 快转时边缘更脏 |
 
-为什么是这三个组合、"深度和 FOV 其实没用"这类结论的实测数据见
+为什么这样配、哪些思路已经排除（`--cadence-hold`/`--no-depth`/动态逐帧加光流…）的实测数据见
 `docs/findings/QUALITY_VARIABLES.md` 与 `docs/findings/CONCLUSIONS.md`。
 
 ## 7. 关于 3x 以上（`--unlock-mfg`）
