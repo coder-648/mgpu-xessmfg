@@ -56,12 +56,13 @@ run_3x_of.bat Game.exe          rem 3x 满帧，推荐
 
 | 取向 | 命令 | 输出 | 备注 |
 |---|---|---|---|
-| **3x 满帧（推荐）** | `--interp 2 --fg-of` | 40 → 120 fps | 光流 MV、无闪烁、`gpu` ≈ 9 ms |
+| **动态逐帧（推荐，输入不稳时最顺）** | `--interp 5 --interp-cadence` + 游戏 MV | 35–45 → 120 fps | 每帧按实际 vblank 数取倍率，输出恒定 1 帧/vblank；**前提是 add-on 的 `StreamHeight=1440`** |
+| 3x 满帧（固定） | `--interp 2 --fg-of` | 40 → 120 fps | 光流 MV、无闪烁、`gpu` ≈ 9 ms（固定模式下光流仍可用） |
 | 2x 画质优先 | `--interp 1`（+ 游戏 MV，`SkipMv=0`） | 60 → 120 fps | 边缘伪影最少 |
 | 最低开销 | `--interp 2 --no-mv` | 40 → 120 fps | 快转时边缘更脏 |
 
-可执行版本在 `scripts/recipes/`：`run_3x_of.bat` / `run_2x_quality.bat` /
-`run_3x_nomv.bat` / `run_dump.bat`。
+可执行版本在 `scripts/recipes/`：`run_smooth.bat`（动态逐帧）/ `run_3x_of.bat` /
+`run_2x_quality.bat` / `run_3x_nomv.bat` / `run_dump.bat` / `run_smooth_batchfeed.bat`（A/B 对照）。
 
 倍率与输入帧率必须让**输出间隔等于整数个 vblank**，否则"不卡但不匀"。
 `--interp 2` = 3x，非 Intel 显卡需要 `--unlock-mfg`（**读 `docs/ops/LEGAL.md` 再用**）。
@@ -79,10 +80,11 @@ run_3x_of.bat Game.exe          rem 3x 满帧，推荐
 | 卡片 | 行 | 取值（默认 **加粗**） | 传给 bridge |
 |---|---|---|---|
 | 帧生成 | 类型 | `XeFG 1.3.1 (libxess_fg)`（只读） | — |
-| | 模式 | **固定** / 动态（实验） | 动态时 `--dyn-mfg` |
-| | 倍数 | 2x / 3x / **4x** / 5x / 6x | `--interp N-1` |
+| | 模式 | **固定** / **动态逐帧**（两块互斥，模式外的行会灰显） | 固定：`--interp N-1`；动态：`--interp 5 --interp-cadence`（`--interp 5` = 6x 容量上限） |
+| | 倍数 | 2x / 3x / **4x** / 5x / 6x（动态模式下当作**容量上限**） | `--interp N-1` |
+| | 输出帧率 (Hz) | **0**（= 面板刷新，填满每个 vblank）/ 5–1000（仅动态模式） | `--fg-out-hz N`（`0` 不发） |
 | | 输出 | **1:1 原生** / 5K→4K (0.75x) / 半分辨率 | `--den 1` / `--scale 0.75` / `--den 2` |
-| | 运动矢量 | **关闭** / 游戏 MV / 游戏 MV(反向) / AMD 光流（3x 推荐） | `--no-mv` / （不带）/ `--mv-flip` / `--fg-of` |
+| | 运动矢量 | **关闭** / 游戏 MV（动态模式下可能闪烁）/ 游戏 MV(反向) / AMD 光流（动态模式下更易 drop） | `--no-mv` / （不带）/ `--mv-flip` / `--fg-of` |
 | 捕获 | 捕获 API | `WGC`（只读） | — |
 | | 帧池深度 | 2..6，默认 **4** | `--pool N` |
 | | 最大帧延迟数 | 1..3，默认 **1** | `--latency N` |
@@ -100,7 +102,7 @@ run_3x_of.bat Game.exe          rem 3x 满帧，推荐
 > 比手填输入间隔更准。两项都还留在 `bridge.exe` 命令行里。
 
 它还会**固定**发出这几个参数，界面不暴露：
-`--unlock-mfg --fg-ui none --fg-proj-rz --fg-rt-mode quant` + `--hwnd 0x…`（目标窗口）。
+`--unlock-mfg --fg-ui none --fg-proj-rz --fg-rt-mode auto` + `--hwnd 0x…`（目标窗口）。
 
 要点：
 
@@ -123,7 +125,8 @@ add-on 读**自己旁边**的 `game_capture.ini`（即 `<GAME_DIR>\game_capture.
 | `Color` | **0** / 1 | `0` = 不做颜色跨卡拷贝（颜色由 bridge 用 WGC 抓屏）；`1` = 拷后台缓冲 |
 | `DepthConvert` | **1** / 0 | 把深度转成 R32_FLOAT 再共享。**别设 0**，缺这个键时旧版会静默失效 |
 | `SkipMv` | **0** / 1 | `1` = 永不产出 MV；`0` = 听 bridge 的请求位。**UI 里选"游戏 MV"必须 `0`** |
-| `StreamPercent` | **100** / >100 | `>100` = MV/深度先缩小再跨卡（`150` → 2160p 缩到 1440p） |
+| `StreamHeight` | **1440** / 0 / 1080 / 2160 | **跨卡流（MV+深度）的高度上限，宽度按宽高比算**。默认 1440 ⇒ 4K 渲染传 2560x1440（28 MB/帧，而不是 63）。`0` = 跟随渲染尺寸 |
+| `StreamPercent` | **100** / >100 | 在 `StreamHeight` 结果之上**再**按比例缩（相对渲染尺寸，`150` = 2/3） |
 | `StreamAlign` | **1** / 0 | 行对齐处理，别乱改 |
 | `Log` | **0** / 1 | add-on 日志（也可用环境变量 `MGPU_CAPTURE_LOG=1`）；正常玩不写文件 |
 | `SlotPolicy` | **0** / 1 | `0` = 没空槽就丢帧；`1` = 等 `SlotWaitUs` 微秒。**实测 `1` 无收益**，遗留开关 |
@@ -144,7 +147,9 @@ ReShade 侧的三条硬要求（部署包已处理，手工装时必看）：
 
 - XeFG **确实消费运动矢量**（早期"死输入"的结论是错的）；
 - **深度和投影/FOV 对画质没有可测量的影响**，别在这上面花时间；
-- 3x 的闪烁来自"MFG 补丁把 2x 模型跑多遍"，不是你的配对写错了 ⇒ 3x 用光流；
+- 3x 的闪烁来自"MFG 补丁把 2x 模型跑多遍"，不是你的配对写错了 ⇒ **固定** 3x 用光流；
+- **开 MV 会 drop，根源是渲染卡每帧的 63 MB 跨卡流量**（不是插帧算法）：add-on 现在默认把
+  MV/深度压到 1440p（28 MB/帧），实测 drop 消失 ⇒ 动态逐帧也能用游戏 MV；
 - **节拍是 vblank 算术**：`--fg-rt-mode quant` 把实测输入间隔吸附到整 vblank
   （2x@60 → 16.67 ms、3x@40 → 33.3 ms），输出正好 1.00 vblank/帧，不做这件事就会有周期性丢帧。
 
@@ -174,7 +179,8 @@ ReShade 侧的三条硬要求（部署包已处理，手工装时必看）：
 | 路径 | 内容 |
 |---|---|
 | `docs/README.md` | **文档索引 —— 从这进** |
-| `docs/ops/USAGE.md` | **完整使用说明**（安装 / 游戏内设置 / 三份配方 / 判读 / 排障 / 卸载），也是发布包里的 `README.md` |
+| `CHANGELOG.md` | **变更记录**（每个版本的变化与实测依据） |
+| `docs/ops/USAGE.md` | **完整使用说明**（安装 / 游戏内设置 / 配方 / 判读 / 排障 / 卸载），也是发布包里的 `README.md` |
 | `docs/design/` | 架构、协议 v10、输入源、厂商兼容计划 |
 | `docs/ops/` | 构建、部署、配置（占位符/ini）、UI、依赖、合规 |
 | `docs/findings/` | **结论先行**、画质变量表、性能基线、踩坑清单、实验档案、里程碑 |

@@ -12,6 +12,7 @@
 #      bin/                 bridge.exe / mgpu_ui.exe / 两个 XeSS 运行时 DLL
 #      bin/*.bat            三份配方脚本 + dump + 启动 UI（双击即可）
 #      game-pack/           ReShade add-on 部署包（install.bat 拖 exe 即装）
+#      CHANGELOG.md         本版变化（用户能感知的）+ 实测依据
 #      docs/                架构 / 协议 / 配置 / 结论 / 画质变量 / 踩坑清单
 #
 #  Usage:
@@ -141,6 +142,7 @@ TXT
 
 # ------------------------------------------------------------------ 5. docs
 cp "$REPO/LICENSE" "$REPO/NOTICE" "$REPO/ROADMAP.md" "$OUT/"
+cp "$REPO/CHANGELOG.md" "$OUT/"   # what changed in this version, with the measurements behind it
 cp "$REPO/docs/ops/USAGE.md" "$OUT/README.md"
 cp "$REPO/docs/images/ui.png" "$OUT/docs/images/"
 for f in ARCHITECTURE PROTOCOL INPUT_SOURCES; do

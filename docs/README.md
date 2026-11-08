@@ -6,7 +6,8 @@
 
 | 文档 | 内容 |
 |---|---|
-| [`../README.md`](../README.md) | 项目是什么、5 分钟上手、三份配方、已知限制 |
+| [`../README.md`](../README.md) | 项目是什么、5 分钟上手、配方、已知限制 |
+| [`../CHANGELOG.md`](../CHANGELOG.md) | **变更记录**：每个版本用户能感知的变化 + 对应实测依据 |
 | [`findings/CONCLUSIONS.md`](findings/CONCLUSIONS.md) | **结论先行**：这个 FG 消费什么、三条硬约束、倍率的真相 |
 | [`design/ARCHITECTURE.md`](design/ARCHITECTURE.md) | 为什么是两个进程、一帧的生命周期、关键取舍 |
 
@@ -14,7 +15,7 @@
 
 | 文档 | 内容 |
 |---|---|
-| [`ops/USAGE.md`](ops/USAGE.md) | **完整使用说明**：前置条件、两步安装、游戏内设置、三份配方、怎么判断正常、排障、卸载、合规 |
+| [`ops/USAGE.md`](ops/USAGE.md) | **完整使用说明**：前置条件、两步安装、游戏内设置、配方、怎么判断正常、排障、卸载、合规 |
 | [`ops/BUILD.md`](ops/BUILD.md) | 构建三件产物、第三方 SDK 的钉住版本、纯 Windows 构建、`make_release.sh` 打包 |
 | [`ops/DEPLOY.md`](ops/DEPLOY.md) | 部署包（拖 exe 即装/即卸）+ 三个必踩的坑 |
 | [`ops/CONFIG.md`](ops/CONFIG.md) | **占位符含义**、环境变量、`game_capture.ini` 每个键 |

@@ -27,10 +27,12 @@ mgpu-<版本>/
 ├─ SHA256SUMS.txt         每个文件的校验值（装完可核对）
 ├─ bin/                   ★ 工具侧：帧生成进程 + 前端
 │   ├─ 0 - UI.bat             双击 → 打开前端
-│   ├─ 1 - 3x optical flow.bat    ★ 推荐配方（40 fps → 120 fps）
+│   ├─ 1 - 3x optical flow.bat    固定 3x（40 fps → 120 fps）
 │   ├─ 2 - 2x quality.bat         画质优先（60 fps → 120 fps）
 │   ├─ 3 - 3x lowest cost.bat     预算最紧时用
 │   ├─ 4 - dump frames.bat        抓帧做离线分析（排障/对比用）
+│   ├─ 5 - smoothest (cadence).bat  ★ 推荐配方（动态逐帧，输入不稳时最顺）
+│   ├─ 6 - cadence batch feed (A-B).bat  A/B 对照，平时不用
 │   ├─ bridge.exe             帧生成进程（真正干活的）
 │   ├─ mgpu_ui.exe            前端（选游戏窗口 / 开关 / 看状态）
 │   ├─ libxess_fg.dll, libxell.dll   XeSS 帧生成运行时（**公开版包里不带**，见 §3.2）
@@ -158,11 +160,12 @@ bridge.exe --den 1 --pool 4 --interp 2 --no-mv ^
 `--interp N` = "每两帧真实帧之间插 N 帧"，所以 `--interp 2` 是 3x、`--interp 1` 是 2x。
 非 Intel 显卡上要用 3x 以上，必须加 `--unlock-mfg`（见 §7）。
 
-## 6. 三份配方怎么选
+## 6. 配方怎么选
 
-| 取向 | 命令要点 | 输出 | 画质 |
+| 取向 | 命令要点 | 输出 | 画质/前提 |
 |---|---|---|---|
-| **3x 满帧（推荐）** | `--interp 2 --fg-of` | 40 → 120 fps | 光流 MV，无闪烁 |
+| **动态逐帧（推荐）** | `--interp 5 --interp-cadence` + 游戏 MV | 35–45 → 120 fps | 每帧按实际经过的 vblank 数取倍率，输出恒定 1 帧/vblank。**前提：`game_capture.ini` 里 `StreamHeight=1440`**（默认值）；不要加 `--fg-of`、`--no-depth`、`--cadence-hold` |
+| 3x 满帧（固定） | `--interp 2 --fg-of` | 40 → 120 fps | 光流 MV，无闪烁 |
 | 2x 画质优先 | `--interp 1`（+ 游戏 MV） | 60 → 120 fps | 边缘伪影最少 |
 | 最低开销 | `--interp 2 --no-mv` | 40 → 120 fps | 快转时边缘更脏 |
 
@@ -177,8 +180,10 @@ bridge.exe --den 1 --pool 4 --interp 2 --no-mv ^
 - 只对实测的那个版本成立（`libxess_fg 1.3.1.78` / `libxell 1.3.2.10`）；换版本会
   直接拒绝执行（日志里 `*_unexpected_bytes`），不会瞎改；
 - **可能违反 Intel 的 EULA**，仅供个人研究；本项目不随仓库分发被修改的 DLL；
-- 这个 build 没有 4x 模型，3x 以上是**把 2x 模型跑多遍** ⇒ 用**游戏 MV** 会闪，
+- 这个 build 没有 4x 模型，3x 以上是**把 2x 模型跑多遍** ⇒ 固定倍数下用**游戏 MV** 会闪，
   用**光流**不闪。这就是"3x 配光流"的原因。
+- **动态逐帧例外**：cadence 会在批次之间改倍率，而光流要在同一张卡上多跑一个全屏 pass，
+  实测 drop 明显增加。动态逐帧请用**游戏 MV 或关闭 MV**，并保证 `StreamHeight=1440`。
 
 不想碰这些：用 **2x**（`--interp 1`），完全不需要 `--unlock-mfg`。
 
@@ -191,7 +196,8 @@ bridge.exe --den 1 --pool 4 --interp 2 --no-mv ^
 | `gpu` | 4K 3x 光流约 8–10 ms | 明显超标 ⇒ 插帧卡太弱，降倍率或加 `--scale 0.75` |
 | 日志 `gen N/N` | `3/3` 这种成对 | `2/3` ⇒ 生成帧没凑齐 |
 | 日志 `[mv]` | 选游戏 MV 时出现 `stream enabled` | 没出现 ⇒ `game_capture.ini` 的 `SkipMv` 不是 0 |
-| 画面 | 主体平顺 | 闪烁 ⇒ 3x/4x 用了游戏 MV，改 `--fg-of` |
+| 画面 | 主体平顺 | 固定 3x/4x 闪烁 ⇒ 改用 `--fg-of`；动态逐帧闪烁 ⇒ 改用 `--no-mv` |
+| `drop` 持续增长且开着 MV | 0 | `game_capture.ini` 里 `StreamHeight` 必须是 **1440**（默认）；旧 add-on 或设成 0 时 4K 渲染会传 63 MB/帧，渲染卡顶不住 |
 
 日志位置：配方脚本会在自己目录写 `bridge_*.txt`；前端在状态栏显示最后一条关键日志。
 
