@@ -6471,6 +6471,23 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
                   g_geo.depth_w, g_geo.depth_h, send_dep ? "" : " (not sent)",
                   send_dep ? dep_mb : 0.0, per_frame, rate * 0.001,
                   (g_arrival_ms_ema > 0.1) ? 1000.0 / g_arrival_ms_ema : 0.0);
+            // Render-card head room. There is no way to *reserve* a slice of the GPU (WDDM has
+            // no per-process budget), so the only two levers are "make the vectors cheaper"
+            // and "leave the card some time". Say so when the budget looks tight: 48 MB/frame
+            // is ~1.5 GB/s at 30 fps and ~2 GB/s at 40 fps, i.e. a fifth of a frame period
+            // spent moving vectors and depth around, on top of two full-screen passes.
+            {
+                const double share = (g_ms_total > 0.5)
+                    ? (g_ms_inputs + g_ms_copywait) / g_ms_total : 0.0;
+                if (per_frame >= 48.0 || share >= 0.25) {
+                    logf_("[bridge]   headroom: %.0f MB/frame of vectors+depth (%.0f%% of the"
+                          " loop is inputs+copy). Lower [capture] StreamPercent (150 halves"
+                          " it), drop depth with --no-depth, and cap the *game* frame rate"
+                          " (driver Max Frame Rate) so the conversion pass always has a slot"
+                          " - dropping frames after render (--lock) does not free GPU time\n",
+                          per_frame, share * 100.0);
+                }
+            }
         }
         // Arrival histogram: where the input actually comes from. `need` is what the current
         // multiplier requires (interp+1 vblanks per input frame), so a bucket below it means
