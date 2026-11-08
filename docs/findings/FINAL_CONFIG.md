@@ -439,6 +439,7 @@ bridge.exe --game PBZ.exe --den 1 --pool 4 --interp 2 --unlock-mfg --fg-ui none 
 | `--no-primaries` | 颜色对照：保留 PQ 但跳过 BT.2020 primaries 矩阵 |
 | `--tearing` | `DXGI_PRESENT_ALLOW_TEARING`。实测不解除 `present` 阻塞 |
 | `--mv-mul F` / `--mv-flip` | 强制 MV 缩放 / 翻转符号（游戏 MV 约定不同时用；CP2077 不需要） |
+| `--log-flush` | 每行日志立即 `fflush`（默认按 200 ms 节流）。排查崩溃时用：进程被杀时缓冲区里那几行可能还没落盘（`PERF_BASELINE.md` §1） |
 
 ### 4.6 多帧生成（MFG，3x–6x）
 
