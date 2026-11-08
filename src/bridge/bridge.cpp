@@ -2807,6 +2807,14 @@ static ULONGLONG g_last_frame_tick = 0;
 // time; anything in bucket 4+ is a missing/gated frame, and a spread over 2/3/4 means the
 // presenter itself is not holding its cadence.
 static UINT   g_arr_hist[9] = {};         // index = vblanks rounded, 8 = "8 or more"
+// The same bucketing for the interval the *producer* measured between the game's own two
+// Present calls (FrameShared.frame_time_ms, published as a raw value - not an EMA).
+// Comparing this with the composition-side histogram splits "the game wobbles" from
+// "DWM / our own overlay coalesces our captures":
+//   game_arr and arr both spread  -> the game's own presents are uneven
+//   game_arr flat, arr spread     -> the frames leave the game evenly and are lost after
+//                                    that (composition, our overlay, capture pool)
+static UINT   g_game_hist[9] = {};
 // The same median taken from two different clocks. `dwm` uses the capture frame's
 // SystemRelativeTime (what the compositor stamped); `wc` uses the wall clock at the moment
 // we dequeued it. They should agree. When they do not, the difference is our own pickup
@@ -5584,6 +5592,17 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     // v6: a real camera beats --fg-fov. FSR 3.1 exports near/far/vfov; DLSS-SR does
     // not, so those games keep the --fg-fov / --fg-zn constants.
     const mgpu::FrameShared& fr = g_ctl->frames[slot];
+    // Bucket the producer's own present interval exactly like the composition-side arrival
+    // histogram, so the two can be compared row by row (see g_game_hist).
+    if (fr.frame_time_ms > 0.5f && fr.frame_time_ms < 1000.0f) {
+        const double vb_g = refresh_ms();
+        if (vb_g > 0.5) {
+            int kg = static_cast<int>(static_cast<double>(fr.frame_time_ms) / vb_g + 0.5);
+            if (kg < 1) { kg = 1; }
+            if (kg > 8) { kg = 8; }
+            ++g_game_hist[kg];
+        }
+    }
     const bool cam_ok = ((g_producer_flags & mgpu::kInputFlagHasCamera) != 0) &&
                         std::isfinite(fr.near_plane) && fr.near_plane > 0.0f &&
                         fr.far_plane > fr.near_plane &&
@@ -5978,6 +5997,17 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
                   need, need * refresh_ms(), static_cast<unsigned long long>(g_frames),
                   arr_median_ms(), arr_wc_median_ms());
             for (int k = 1; k <= 8; ++k) { g_arr_hist[k] = 0; }
+            // The same buckets for the interval the producer measured between the game's own
+            // Present calls. If this is flat while `arr(vb)` is not, the game is presenting
+            // evenly and the unevenness appears after it (composition / our overlay).
+            UINT game_total = 0;
+            for (int k = 1; k <= 8; ++k) { game_total += g_game_hist[k]; }
+            logf_("[bridge]   game(vb):");
+            for (int k = 1; k <= 8; ++k) {
+                if (g_game_hist[k]) { logf_(" %dx=%u", k, g_game_hist[k]); }
+            }
+            logf_("  n=%u (producer measured)\n", game_total);
+            for (int k = 1; k <= 8; ++k) { g_game_hist[k] = 0; }
         }
         // ---- output side: are the generated frames actually reaching the display? -----
         // Nothing above can see this: `xN` is XeFG's own accounting and `cadence` is derived
