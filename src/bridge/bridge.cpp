@@ -1512,8 +1512,20 @@ static void fg_solve_cadence(const char* why)
 // Two knobs, both off by default (docs/findings/FINAL_CONFIG.md 4.2):
 //   --fg-rt-mode ema|raw|median|quant   what we hand XeFG as frameRenderTime
 //   --interp-auto [floor|round]         keep the output on a whole-vblank cadence
-enum { kFgRtEma = 0, kFgRtRaw = 1, kFgRtMedian = 2, kFgRtQuant = 3 };
+enum { kFgRtEma = 0, kFgRtRaw = 1, kFgRtMedian = 2, kFgRtQuant = 3, kFgRtAuto = 4 };
 static int g_fg_rt_mode = kFgRtQuant;   // quant: median snapped to whole vblanks (see fg_render_time_ms)
+// --fg-rt-mode auto: pick quant or raw from whether the *input rate* is moving.
+// Two EMAs of the interval, one fast, one slow; when they disagree by more than a quarter
+// of a vblank the rate is changing (unlocked / GPU-bound) and raw tracks it better, because
+// the median lags a step by a couple of windows. A locked rate keeps them together even
+// though individual frames jitter by +-1 vblank, which is exactly the distinction we want
+// (a locked 40 fps also arrives as 2/3/4 vblanks and belongs to quant).
+static double g_rt_ema_fast = 0.0;
+static double g_rt_ema_slow = 0.0;
+static int    g_rt_auto_state = 0;      // 0 = rate is steady (quant), 1 = rate is moving (raw)
+static int    g_rt_auto_agree = 0;      // consecutive frames agreeing to flip (hysteresis)
+static UINT   g_rt_auto_flips = 0;
+
 // --fg-rt-spike 0/1 (default 1): when ONE input frame arrives much later than the plan
 // (a fast camera turn, a streamed asset), report the real length to XeFG for that frame so
 // the pacer spreads its batch over the gap instead of laying it out too short and leaving an
@@ -1534,6 +1546,7 @@ static const char* fg_rt_mode_name()
     switch (g_fg_rt_mode) {
     case kFgRtRaw:    return "raw";
     case kFgRtMedian: return "median";
+    case kFgRtAuto:   return (g_rt_auto_state == 1) ? "auto:raw" : "auto:quant";
     case kFgRtQuant:  return "quant";
     default:          return "ema";
     }
@@ -1652,55 +1665,73 @@ static double input_interval_ms()
     return (g_input_ms_override > 1.0) ? g_input_ms_override : g_arrival_ms_ema;
 }
 
+// Raw: the interval the producer actually delivered. Most responsive, and the noisiest -
+// it feeds one sample of jitter straight into the pacer's plan.
+static double rt_raw_value()
+{
+    return (g_arr_last_raw > 0.0) ? g_arr_last_raw : g_arrival_ms_ema;
+}
+
+// Quant: 16-sample median snapped to whole vblanks (plus the single-frame spike handling
+// below). This is the cadence the pacer can actually lay out, so its sanity check stops
+// fighting the real pacing.
+static double rt_quant_value()
+{
+    const double vb = refresh_ms();
+    int k = static_cast<int>(arr_median_ms() / vb + 0.5);
+    if (k < 1) { k = 1; }
+    const double plan = static_cast<double>(k) * vb;
+
+    // ---- single-frame spikes -------------------------------------------------
+    // A fast camera turn (or a streamed asset) makes the game miss its slot once: the
+    // input arrives 2 vblanks late instead of 1. Telling XeFG the *plan* length for that
+    // frame is what turns one late input into an empty refresh period - it lays its batch
+    // out as if it had `plan` ms and the rest of the gap shows nothing (measured:
+    // `out: vblanks > presents`, the picture hitches).
+    // Feeding the real, vblank-snapped length instead lets the same batch be spread over
+    // the longer gap: motion is a touch slower for that one interval, but there is no
+    // hitch. That is the difference between "the game dipped to 57 fps" and "the picture
+    // juddered".
+    if (g_fg_rt_spike && g_arr_last_raw > plan * kSpikeRatio &&
+        g_arr_last_raw < 100.0) {
+        int kr = static_cast<int>(g_arr_last_raw / vb + 0.5);
+        if (kr < k) { kr = k; }
+        const int kcap = k * 3;              // never chase a real hitch (>3x the plan)
+        if (kr > kcap) { kr = kcap; }
+        if (kr > k) {
+            const double rt = static_cast<double>(kr) * vb;
+            if (g_spike_logs_left > 0) {
+                --g_spike_logs_left;
+                logf_("[bridge] rt spike: last input %.1fms (%.1f vblanks) > plan %.1fms"
+                      " - frameRenderTime %.1fms for this frame (%.1f vblanks)%s\n",
+                      g_arr_last_raw, g_arr_last_raw / vb, plan, rt, rt / vb,
+                      (g_spike_logs_left == 0) ? " (further spikes not logged)" : "");
+            }
+            ++g_spike_count;
+            return rt;
+        }
+    }
+    return plan;
+}
+
 static double fg_render_time_ms()
 {
     if (g_fg_rt_zero) { return 0.0; }
     switch (g_fg_rt_mode) {
     case kFgRtRaw:
-        return (g_arr_last_raw > 0.0) ? g_arr_last_raw : g_arrival_ms_ema;
+        return rt_raw_value();
     case kFgRtMedian:
         return arr_median_ms();
-    case kFgRtQuant: {
-        // Snap to a whole number of vblanks: that is the cadence the pacer can
-        // actually lay out, so its sanity check stops fighting the real pacing.
-        const double vb = refresh_ms();
-        int k = static_cast<int>(arr_median_ms() / vb + 0.5);
-        if (k < 1) { k = 1; }
-        const double plan = static_cast<double>(k) * vb;
-
-        // ---- single-frame spikes -------------------------------------------------
-        // A fast camera turn (or a streamed asset) makes the game miss its slot once: the
-        // input arrives 2 vblanks late instead of 1. Telling XeFG the *plan* length for that
-        // frame is what turns one late input into an empty refresh period - it lays its batch
-        // out as if it had `plan` ms and the rest of the gap shows nothing (measured:
-        // `out: vblanks > presents`, the picture hitches).
-        // Feeding the real, vblank-snapped length instead lets the same batch be spread over
-        // the longer gap: motion is a touch slower for that one interval, but there is no
-        // hitch. That is the difference between "the game dipped to 57 fps" and "the picture
-        // juddered".
-        if (g_fg_rt_spike && g_arr_last_raw > plan * kSpikeRatio &&
-            g_arr_last_raw < 100.0) {
-            int kr = static_cast<int>(g_arr_last_raw / vb + 0.5);
-            if (kr < k) { kr = k; }
-            const int kcap = k * 3;              // never chase a real hitch (>3x the plan)
-            if (kr > kcap) { kr = kcap; }
-            if (kr > k) {
-                const double rt = static_cast<double>(kr) * vb;
-                if (g_spike_logs_left > 0) {
-                    --g_spike_logs_left;
-                    logf_("[bridge] rt spike: last input %.1fms (%.1f vblanks) > plan %.1fms"
-                          " - frameRenderTime %.1fms for this frame (%.1f vblanks)%s\n",
-                          g_arr_last_raw, g_arr_last_raw / vb, plan, rt, rt / vb,
-                          (g_spike_logs_left == 0) ? " (further spikes not logged)" : "");
-                }
-                ++g_spike_count;
-                return rt;
-            }
-        }
-        return plan;
-    }
+    case kFgRtAuto:
+        // Measured both ends (PERF_BASELINE 3.19): with --interp-cadence, "raw" wins when the
+        // input rate is actually moving (0.7% empty vs 1.0%), while "quant" wins - or ties -
+        // when the rate is held by a limiter, because then the per-frame jitter is pure noise.
+        // Decide from the *rate*, not from the per-frame spread: a locked 40 fps also arrives
+        // as 2/3/4 vblanks, and that case belongs to quant.
+        return (g_rt_auto_state == 1) ? rt_raw_value() : rt_quant_value();
+    case kFgRtQuant:
     default:
-        return input_interval_ms();
+        return rt_quant_value();
     }
 }
 
@@ -6287,6 +6318,13 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
                   need, need * refresh_ms(), static_cast<unsigned long long>(g_frames),
                   arr_median_ms(), arr_wc_median_ms());
             for (int k = 1; k <= 8; ++k) { g_arr_hist[k] = 0; }
+            if (g_fg_rt_mode == kFgRtAuto) {
+                const double vb = refresh_ms();
+                logf_("[bridge]   rt auto: fast=%.1f slow=%.1f (%.2f vblanks apart) -> %s"
+                      "  flips=%u\n", g_rt_ema_fast, g_rt_ema_slow,
+                      (vb > 0.5) ? dabs_(g_rt_ema_fast - g_rt_ema_slow) / vb : 0.0,
+                      (g_rt_auto_state == 1) ? "raw" : "quant", g_rt_auto_flips);
+            }
             if (g_spike_count) {
                 logf_("[bridge]   rt spikes: %u frame(s) reported at their real length this"
                       " window (--fg-rt-spike %d)\n", g_spike_count, g_fg_rt_spike ? 1 : 0);
@@ -6768,6 +6806,7 @@ int main()
         while (*p == L' ') { ++p; }
         if (wcsncmp(p, L"raw", 3) == 0)         { g_fg_rt_mode = kFgRtRaw; }
         else if (wcsncmp(p, L"median", 6) == 0) { g_fg_rt_mode = kFgRtMedian; }
+        else if (wcsncmp(p, L"auto", 4) == 0)   { g_fg_rt_mode = kFgRtAuto; }
         else if (wcsncmp(p, L"quant", 5) == 0)  { g_fg_rt_mode = kFgRtQuant; }
         else                                    { g_fg_rt_mode = kFgRtEma; }
     }
@@ -7318,6 +7357,32 @@ int main()
             g_arr_wc_ring[g_arr_wc_i] = dt_arr;
             g_arr_wc_i = (g_arr_wc_i + 1) % kArrRing;
             if (g_arr_wc_n < kArrRing) { ++g_arr_wc_n; }
+
+            // --fg-rt-mode auto: is the *rate* moving? Fast vs slow EMA of the same interval.
+            if (g_rt_ema_fast <= 0.0) { g_rt_ema_fast = g_rt_ema_slow = dt_arr; }
+            g_rt_ema_fast = g_rt_ema_fast * 0.65 + dt_arr * 0.35;
+            g_rt_ema_slow = g_rt_ema_slow * 0.95 + dt_arr * 0.05;
+            if (g_fg_rt_mode == kFgRtAuto) {
+                const double vb = refresh_ms();
+                const bool moving = dabs_(g_rt_ema_fast - g_rt_ema_slow) > vb * 0.15;
+                const int want = moving ? 1 : 0;
+                if (want != g_rt_auto_state) {
+                    // 12 frames of agreement (~0.2-0.4 s) before flipping, so a single hiccup
+                    // cannot make the pacer's input flip back and forth.
+                    if (++g_rt_auto_agree >= 12) {
+                        g_rt_auto_state = want;
+                        g_rt_auto_agree = 0;
+                        ++g_rt_auto_flips;
+                        logf_("[bridge] --fg-rt-mode auto: input rate is %s (fast %.1f vs slow"
+                              " %.1f ms, %.2f vblanks apart) -> feeding %s\n",
+                              moving ? "moving" : "steady", g_rt_ema_fast, g_rt_ema_slow,
+                              dabs_(g_rt_ema_fast - g_rt_ema_slow) / vb,
+                              moving ? "raw" : "quant");
+                    }
+                } else {
+                    g_rt_auto_agree = 0;
+                }
+            }
         }
     };
 

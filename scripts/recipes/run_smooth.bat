@@ -21,6 +21,9 @@ rem  interp + 1). Measured empty refresh periods, 4K --den 2, same scene:
 rem      --interp 2 (kmax 3): 60fps 2.5%   40fps 10.8%
 rem      --interp 3 (kmax 4): 60fps 2.5%   40fps  1.5%   30fps 2.6%
 rem      --interp 5 (kmax 6): 60fps 0.8%   40fps  0.4%   30fps 0.6%   <- default here
+rem  --fg-rt-mode auto picks quant (locked input) or raw (rate moving) by itself; measured
+rem  0.8% / 0.4% / 0.6% locked and 0.7-0.9% unlocked.
+rem
 rem  --interp 5 costs load 81-85% (vs 19-51% at interp 3). If load sits above 100% in the
 rem  log, drop to --interp 3 (30/40 fps) or --interp 2 (60 fps).
 rem
@@ -45,6 +48,6 @@ if not exist bridge.exe (
 )
 
 bridge.exe %GAMEOPT% --den 2 --pool 4 --interp 5 --interp-cadence --unlock-mfg ^
-           --fg-ui none --fg-rt-mode quant > bridge_smooth.txt 2>&1
+           --fg-ui none --fg-rt-mode auto > bridge_smooth.txt 2>&1
 type bridge_smooth.txt
 pause

@@ -622,6 +622,56 @@ show = 1000 / g_frame_ms_ema * ps.framesPresented      // 循环墙钟间隔 * �
 | **动态/跑不满** | `--interp 5 --interp-cadence --fg-rt-mode raw`（0.7%） |
 | 想要省 GPU（接受 1.33 vblank 的抖动） | `--dyn-mfg` |
 
+### 3.20 `--fg-rt-mode auto`：判定生效，但只值 0.3 个百分点
+
+自动判断（快/慢两条 EMA 的差 > 0.15 vblank 且连续 12 帧一致 ⇒ 用 `raw`，否则 `quant`）：
+
+```
+[bridge] --fg-rt-mode auto: input rate is moving (fast 21.6 vs slow 24.1 ms, 0.29 vblanks apart) -> feeding raw
+[bridge]   rt auto: fast=25.6 slow=24.9 (0.09 vblanks apart) -> raw  flips=1
+```
+
+同一动态场景、各 60 s：
+
+| 组 | 空刷新（全窗口） | 空刷新（steady） | `max empty` | 判定 |
+|---|---|---|---|---|
+| `quant` | 1.1% | 1.0% | 13 | — |
+| `raw` | **0.8%** | **0.7%** | **5** | — |
+| **`auto`** | 1.6% | 0.9% | 31 | 翻 1 次，稳定在 raw ✅ |
+
+⇒ 判定方向正确、不抖动（`flips=1`），但 `quant` 在这个场景也只差 0.2–0.3 个百分点。
+**真正决定平滑度的是 `--interp 5` + `--interp-cadence`，`auto` 只是收尾。**
+
+### 3.21 定稿：120 Hz 面板上的四档设置（4K 捕获，`--den 2` 输出）
+
+一条命令覆盖全部四档：
+
+```
+bridge.exe --game <exe> --den 2 --pool 4 --interp 5 --interp-cadence --unlock-mfg
+           --fg-ui none --fg-rt-mode auto
+```
+
+| 场景 | RTSS 锁 | 实际倍率 | **空刷新** | `load` | `gpu` | `slow>0` 窗口 |
+|---|---|---|---|---|---|---|
+| **x2**（60 fps 进） | 60 | 2x | **0.8%** | 85% | 6.7 ms | 3/89 |
+| **x3**（40 fps 进） | 40 | 3x | **0.4%** | 84% | 10.3 ms | 2/63 |
+| **x4**（30 fps 进） | 30 | 4x | **0.6%** | 81% | 14.0 ms | 13/46 |
+| **dynamic**（不锁，跑不满） | — | 2–4x 自适应 | **0.7–0.9%** | 81% | 9.1 ms | — |
+
+**降档规则**（唯一需要人盯的数）：日志里 `load` 长期 > 100% 或 `slow` 变多时：
+
+| 场景 | 退到 | 空刷新变成 |
+|---|---|---|
+| 60 fps | `--interp 2`（kmax 3） | 2.5%（`load` 49%） |
+| 40 fps | `--interp 3`（kmax 4） | 1.5%（`load` 51%） |
+| 30 fps | `--interp 3` | 2.6%（`load` 19%） |
+
+**不要加的开关**（都有实测反例）：`--jbuf` / `--slack N`（§3.16、§9.9）、`--dyn-mfg`（§3.19，7.6%）、
+`--interp-auto`（§9.14，换档顿挫）、`--pace` / `--lock`（§9.16，与 XeFG pacer 抢）。
+
+**前提**：4K 捕获 + `--den 2`（1080p 输出）。若要 4K 原生输出（`--den 1`），预算翻 4 倍，
+`--interp` 必须降档（先试 3，再 2），并用 `load`/`slow` 实测确认。
+
 ## 4. 明确不要碰
 
 - 深度延迟 / 投影 / FOV —— 实测无差别（`CONCLUSIONS.md` §1）；
