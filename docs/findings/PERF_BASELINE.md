@@ -493,6 +493,40 @@ show = 1000 / g_frame_ms_ema * ps.framesPresented      // 循环墙钟间隔 * �
 **结论：不加 `--jbuf`。** 平滑优先级交给 `--interp 2 --interp-cadence`（§3.14，归一化 0.33），
 低延迟优先级保持默认 `--slack 0`（drain-newest）。
 
+### 3.17 "最平滑"配方在三种输入帧率下的实测（`--interp-cadence` 自适应）
+
+配方：`--interp 2 --interp-cadence --unlock-mfg --den 2 --pool 4`（4x 输入要改成 `--interp 3`，见下）。
+`--interp-cadence` 按"两个真实帧之间过了几个 vblank"逐帧定倍率，所以 **同一套参数**
+在 60/40/30 fps 输入下分别是 2x/3x/4x，输出都是 120 fps 整拍。
+
+| 输入锁 | 期望倍率 | 窗口 | `arr>2vb` | **空刷新** | 归一化 | `xN` | `gpu` | `present` | `show` 最大 |
+|---|---|---|---|---|---|---|---|---|---|
+| **60 fps（2x）** | 2 | 90 | 7.2% | **2.5%** | 0.35 | 2.00（晚到帧 2.02–2.33） | 2.5 | 6.0 | 122 |
+| 40 fps（3x） | 3 | 待测 | | | | | | | |
+| 30 fps（4x） | 4 | 待测 | | | | | | | |
+
+对照（同一 60 fps 输入）：
+
+| 配置 | 空刷新 | 归一化 |
+|---|---|---|
+| 纯 2x（默认 `quant` + spike） | 6.4% | 0.83 |
+| **`--interp 2 --interp-cadence`** | **2.5%** | **0.35** |
+
+补充：`show` 最大 122（`show=` 已改为交换链真实 Present 速率，§3.15）；
+`presents` 80–93 且始终 ≤ `vblanks`（无超额投放）；`rt spikes` 命中 55/90 个窗口（晚到帧都被
+按真实长度喂过），`bursts` 只有 4 个窗口。
+
+**4x 的前提**（`--fg-probe --unlock-mfg --interp 3` 实测）：
+
+```
+[bridge] probe: maxSupportedInterpolations (stock) 1 -> 2x
+[bridge] probe: maxSupportedInterpolations 3  ->  4x output
+[bridge] probe: VERDICT MFG available, up to 4x (--interp 2..3 = 3x..4x).
+```
+
+⇒ 补丁是按**请求的倍率**打的：`--interp 2` 只解锁到 3x，要 4x 必须 `--interp 3`。
+30 fps 输入（4 个 vblank/帧）若只用 `--interp 2`，cadence 会被截到 3x ⇒ 90 fps，不是 120。
+
 ## 4. 明确不要碰
 
 - 深度延迟 / 投影 / FOV —— 实测无差别（`CONCLUSIONS.md` §1）；
