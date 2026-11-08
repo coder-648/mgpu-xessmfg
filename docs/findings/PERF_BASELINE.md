@@ -133,17 +133,40 @@ flush，排查崩溃时用；默认按 200 ms 节流）。命令写法见 [`TOOL
 
 ## 5. 下一轮怎么测（一次跑完，20 分钟）
 
-同一场景、同一锁帧，四组，每组只看 `breakdown` + `bus` 两行：
+**测试环境**（一直是这一套）：`C:\temp\mgpu\bin` 放 `bridge.exe` + 四个 Intel DLL +
+`run_mgpu*.bat`；游戏是 `F:\steam\steamapps\common\PBZ\platform\steam\PBZ.exe`，
+add-on 的 `game_capture.ini` 就在游戏目录里。本轮的新 `bridge.exe`（`43f263f5…`）**已经
+部署在那里**，旧的留在 `bridge.exe.prev_43f2`，回滚就是换回文件名。
 
-| 组 | 配置 | 看什么 |
+**无游戏烟雾测试已通过**（不需要开局，随时可复跑）：
+
+| 命令 | 结果 |
+|---|---|
+| `bridge.exe --list-modes` | exit 0，11 个刷新率都列出，`--fg-rt-mode quant` 默认生效 |
+| `bridge.exe --fg-probe` | exit 0，AMD 6750 GRE 上 `CreateContext/GetProperties` SUCCESS，`libxess_fg 1.3.1`，`maxSupportedInterpolations 1`（未开 `--unlock-mfg`，符合预期） |
+| `bridge.exe --game NOSUCHGAME.exe --report 40` | exit 2，日志**完整到最后一行**（证明日志节流没有丢尾部：`hard_exit` 会 flush） |
+| 同上 + `--log-flush` | 同上，逐行 flush 路径也正常 |
+
+**A/B 怎么跑**（游戏开着、在平时那个位置、RTSS 仍锁 40 fps 的前提下）：
+
+| 组 | 怎么跑 | 看什么 |
 |---|---|---|
-| A | `run_3x_of.bat`（现状） | 基线：`gpu` / `total` / `cpu` / `bus` |
-| B | A + `--no-depth` | `gpu` 应降 ~1.8 ms（4K/DLAA）或 ~0.5 ms（1440p 渲染），`bus:` 少一半；确认 `gen N/N` 不掉、画质无可见差别 |
-| C | A + `[capture] StreamPercent=150` | `bus:` 应降到 ~44%，`gpu` 降；确认 MV 仍被消费（`--mv-shadow` 对照不变） |
-| D | A + `--log-flush` | 只用来确认日志节流没有掩盖问题 |
+| A | 双击 `C:\temp\mgpu\bin\perf_AB.bat` 的第一段（脚本自动跑 A 和 B） | 基线：`gpu` / `total` / `cpu` / `bus:` |
+| B | 同上（脚本第二段，自动加 `--no-depth`） | `gpu` 应降 ~1.8 ms（4K/DLAA）或 ~0.5 ms（1440p 渲染），`bus:` 少一半；确认 `gen N/N` 不掉、画质无可见差别 |
+| C | 见 `perf_AB.bat` 同目录的 `perf_C_README.txt`（`StreamPercent=150` 需要重启游戏，add-on 只在 init 读 ini） | `bus:` 应降到 ~44%，`gpu` 降；确认 MV 仍被消费 |
+| D | `--log-flush` 已并进 A/B 两组（脚本 kills bridge，不 flush 会丢尾部） | 只用来确认日志节流没有掩盖问题 |
+
+两个脚本都留在测试环境里：`perf_AB.bat`（自动 A+B 并调用分析）、`perf_ab.py`
+（解析 `breakdown`/`cadence`/`bus` 三行，打印中位数与差值）。仓库里的同名副本是
+`scripts/perf_ab.py`，用法：
+
+```
+python3 scripts/perf_ab.py --skip 3 perf_A.txt perf_B.txt
+```
 
 判定：**只要 A 的 `cadence` 是 1.00、`slow` = 0、`cpu` < 2 ms，本轮改动就是安全的**；
 B/C 的收益按 `gpu` 与 `bus:` 的下降量记账，不看 fps（paced loop 里 fps 由锁帧决定）。
+
 
 ## 6. 未做的小尾巴（不影响性能，但会误导排查）
 

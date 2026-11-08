@@ -1,7 +1,7 @@
 @echo off
 rem ===========================================================================
 rem  run_3x_of_nodepth.bat  -  A/B test for the cross-adapter bus (see
-rem                            docs/findings/PERF_BASELINE.md §5, group B)
+rem                            docs/findings/PERF_BASELINE.md section 5, group B)
 rem
 rem  Deploy to: <TOOLS_DIR>\run_3x_of_nodepth.bat   (next to bridge.exe)
 rem  Usage:     run_3x_of_nodepth.bat [game-exe-name]
@@ -24,7 +24,7 @@ rem  and the picture looks the same (depth only feeds disocclusion clamping).
 rem
 rem  If you see edges smearing when objects move fast, depth IS buying you
 rem  something on that title - go back to run_3x_of.bat and report it, because the
-rem  documentation currently says it does not (PERF_BASELINE.md §6).
+rem  documentation currently says it does not (PERF_BASELINE.md section 6).
 rem ===========================================================================
 setlocal
 cd /d "%~dp0"
