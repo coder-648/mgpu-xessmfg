@@ -787,6 +787,32 @@ bridge.exe --fg-probe --producer-luid 0:10392
 - 固定倍数下两种 MV 都能用（时间分数恒定，没有这个问题）。
 - **`--cadence-hold` 不要用**：三组都更差（空刷新 6.6–10.4%、`slow` 10–13 帧/窗口）。
 
+### 5.17.2 给渲染卡留余量：MV/深度链路的固定开销（没有 GPU 配额这回事）
+
+**先明确**：Windows/WDDM **没有 per-process GPU 配额**，NVIDIA/AMD 也没有"给某个进程留 X%"
+的 API。GPU 时间只能被抢占、不能预留。所以"永远让出 5%"只能靠两条互补的路：
+
+**① 降低为 MV 支付的开销**（这 5% 的实体就是它：两个全屏 pass + 跨卡 DMA，全在渲染卡上产生）
+
+| 动作 | 4K 下的搬运量 | 代价 |
+|---|---|---|
+| 现状（MV+深度，`StreamPercent=100`） | 63.3 MB/帧（2.6 GB/s @40fps） | — |
+| `[capture] StreamPercent=150`（→1440p 再跨卡） | **28 MB/帧** | MV/深度双线性放大，画质损失很小 |
+| 再叠加 `--no-depth` | **14 MB/帧**，并省掉深度转换 pass | 本版 `libxess_fg` 的 FG **只用 MV 做重投影**（§744），深度只影响 disocclusion ⇒ 代价最小的一刀 |
+| `StreamPercent=200`（→1080p） | 16 MB/帧 | MV 精度下降，快转时边缘更脏 |
+
+> `StreamPercent` 在 `game_capture.ini`，**改完要重启游戏**（add-on 只在加载时读）。
+
+**② 给渲染卡时间余量**（真正可控的"预留"）：
+
+- 渲染卡被吃满时，MV 转换（在游戏进程里跑，占渲染卡）只能和游戏抢执行 ⇒ 每帧多零点几毫秒抖动。
+- 让游戏少用 5–10%：**驱动级锁帧**（NVIDIA 控制面板 Max Frame Rate / RTSS）到目标帧率，
+  例如不锁 45 → 锁 40，每帧多出约 3 ms。
+- ⚠️ **`--lock N` 不算**：它在渲染完成后丢帧，GPU 负载一点没少。
+
+**诊断**：bridge 的 `bus:` 行给出每帧字节与 GB/s；当超过 48 MB/帧或 `inputs+copy` 占循环 ≥25%
+时会额外打一行 `headroom:` 建议。
+
 ### 5.18 `--input-ms X`：把"输入间隔"当成 X ms（让节拍器别过度丢帧）
 
 节拍器用的是**实测到达间隔** `g_arrival_ms_ema`（40 fps → 25 ms）。这个值既决定 `slow`/`load`
