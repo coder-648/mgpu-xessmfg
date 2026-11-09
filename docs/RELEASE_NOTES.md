@@ -4,6 +4,56 @@
 
 ---
 
+## v0.13.1 —— UE5 伪影定位到「上采样倍率」+ RE Engine/PRAGMATA 支持
+
+> 游戏用自己的卡渲染 + 超分（DLSS / FSR / XeSS），另一块卡专职跑 **XeSS-FG** 插帧，
+> 再通过覆盖窗口上屏。A 卡 + N 卡混插可用；单卡也能跑。
+
+**下载**：`mgpu-0.13.1.zip`（16.4 MB）
+`sha256: c44dd6304474773a7f3c6efd94f607d62c3dc7d4e9ea0678cad85995c97bc5e7`
+
+### 🎯 UE5 的「模型运动伪影」结案：主因是上采样倍率
+
+一整轮对照之后可以确定：**不是运动矢量的问题**。
+
+- **游戏交给 NGX 的运动矢量流本身是坏数据**（PBZ 实测：0.5% NaN/inf、17% 饱和到 fp16
+  上限 ±65504、与真实位移相关性 ≈0）⇒ 喂它就**闪 + 鬼影**；
+- 换成我们自己的光流（`--fg-of`）后**不闪**，但伪影还在 —— 再对比发现 **DLSS 性能档
+  （720p→4K）连"不插帧的游戏本身"都有伪影**；
+- **DLAA（1:1 渲染）+ `--interp 1 --fg-of` 干净**。这就是 UE5 的新推荐配方。
+
+顺手修掉一个一直存在的真 bug：`--fg-of` 的 `motionVectorScale` 以前透传游戏的 `MV.Scale`
+（PBZ 报 `1.0`），库把 screen-UV 的 `0.009` 当成 **0.009 像素** ⇒ **光流等价于没生效**
+（所以历史上"光流不闪"其实是"光流没开"）。现在用 MV 纹理尺寸。
+
+### 🧩 新增 RE Engine / PRAGMATA 支持
+
+- **NGX 入口不一定在驱动 shim 上**：RE Engine 走 Streamline，NGX 入口在游戏自带的
+  `nvngx_dlss.dll` 上。旧判据只认 `_nvngx.dll` ⇒ **一个钩子都没装**（ReShade 说注册成功，
+  但零数据）。现在按"文件名 + 真的导出 `EvaluateFeature`"判定。
+- **`[capture] LoaderHook=0`**：不碰 `kernel32!LoadLibrary*`，改为每 120 帧扫模块表 ——
+  修掉"装上 add-on 后该游戏启动极慢"（A/B 已确认是我们的钩子）。
+- **采集暂停从 `+120 帧` 改成「帧数或 8 秒」**：加载期只有 0.8 fps 时，旧逻辑等于暂停 150 秒。
+- **配置/日志回退**：游戏可能从 `_storage_\` 这类重定向目录读文件（PRAGMATA 就是），
+  本地读不到时回退 `%LOCALAPPDATA%\mgpu`；新增面包屑 `breadcrumb.log` 一行定位问题。
+- **安装器 6/6「镜像目录」**：任何子目录已有同名 add-on / 同名代理 DLL，就自动也装一份。
+
+### 🔍 新工具 / 新开关
+
+- `--fg-mv-scale raw|px|<float>`、`--fg-jittered-mv` / `--fg-no-jittered-mv`；
+  `--fg-jitter-zero` 重新生效（颜色是上采样后的画面，jitter 已解掉）。
+- 回调计时 `perf: frames=.. begin=.. barrier=..`（实测回调合计 0.17 ms/帧）。
+- `scripts/analyse_dump.py` 新增 **units fit**；新配方脚本
+  `7 - UE5 MV A-B.bat`（`auto/jit/nojit/depthinv/jitdepth/mvscale/nomv/of/ofsign/offov/jz/nodepth/only/dump`）。
+
+### ⚠️ 升级提示
+
+- `bin\` 直接覆盖；游戏侧建议重跑 `game-pack\install.bat`（它现在会自动处理 `_storage_`）。
+- **`--fg-of` 的行为变了**（以前在 `MV.Scale=1.0` 的游戏上等于没开），
+  3x/4x 的观感可能与旧版不同 —— 值得在 CP2077 等游戏上重测一次。
+
+---
+
 ## v0.13.0 —— UE5「模型运动伪影」结案：主因是上采样倍率
 
 > 游戏用自己的卡渲染 + 超分（DLSS / FSR / XeSS），另一块卡专职跑 **XeSS-FG** 插帧，
