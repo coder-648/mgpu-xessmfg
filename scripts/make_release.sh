@@ -126,6 +126,22 @@ cp "$REPO/scripts/recipes/run_dump.bat"       "$OUT/bin/4 - dump frames.bat"
 # The smoothest profile: per-frame multiplier (--interp-cadence), one command for
 # 2x/3x/4x/dynamic (docs/findings/PERF_BASELINE.md 3.17-3.21).
 cp "$REPO/scripts/recipes/run_smooth.bat"     "$OUT/bin/5 - smoothest (cadence).bat"
+# A/B twin of recipe 5 with --input-copy-queue (docs/findings/PERF_BASELINE.md 3.28.1):
+# MV/depth copies on the COPY engine, overlapping the colour convert draw.
+cp "$REPO/scripts/recipes/run_smooth_cq.bat"  "$OUT/bin/8 - smoothest + copy queue (A-B).bat"
+# 4K native output (--den 1) A/B pair for the same switch: the convert draw is 4x
+# bigger there, so the overlap window is big enough to measure (PERF_BASELINE 3.28.4).
+cp "$REPO/scripts/recipes/run_den1_a.bat"     "$OUT/bin/9 - 4K out 3x (A).bat"
+cp "$REPO/scripts/recipes/run_den1_b.bat"     "$OUT/bin/10 - 4K out 3x + cq (B).bat"
+# --prefetch-inputs (implies --input-copy-queue): the next slot's MV/depth are copied during
+# this frame's Present, ordered against the producer's fence on the copy queue (PERF_BASELINE 3.29).
+cp "$REPO/scripts/recipes/run_den1_c.bat"     "$OUT/bin/11 - 4K out 3x + prefetch (C).bat"
+# Fully automatic A/B/C/A (4x 60 s, back to back) - the operator-driven pair is too noisy
+# on this machine to settle anything (PERF_BASELINE 3.28.5).
+cp "$REPO/scripts/recipes/run_abc_4k.bat"     "$OUT/bin/12 - automatic A-B-C-A 4K (60s each).bat"
+# --slack-auto: the targeted fix for the occasional `drop 1` in --interp-cadence mode
+# (PERF_BASELINE 3.30). A/B twin of recipe 5, log bridge_slack.txt.
+cp "$REPO/scripts/recipes/run_slack_ab.bat"   "$OUT/bin/13 - smoothest + anti-drop (A-B).bat"
 cp "$REPO/scripts/recipes/run_smooth_batchfeed.bat" "$OUT/bin/6 - cadence batch feed (A-B).bat"
 # UE5 motion-vector A/B: auto (JITTERED_MV from the game's DLSS flag) / nojit / nomv.
 # Background: docs/findings/UE5_MV_OPTISCALER.md 5.1.
@@ -154,7 +170,7 @@ done
 for f in CONFIG BUILD DEPLOY UI LEGAL; do
     cp "$REPO/docs/ops/$f.md" "$OUT/docs/ops/"
 done
-for f in CONCLUSIONS QUALITY_VARIABLES FINAL_CONFIG UE5_MV_OPTISCALER RE_ENGINE_NOTES; do
+for f in CONCLUSIONS QUALITY_VARIABLES FINAL_CONFIG UE5_MV_OPTISCALER RE_ENGINE_NOTES PERF_BASELINE; do
     cp "$REPO/docs/findings/$f.md" "$OUT/docs/findings/"
 done
 

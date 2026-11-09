@@ -392,6 +392,10 @@ bridge.exe --game PBZ.exe --den 1 --pool 4 --interp 2 --unlock-mfg --fg-ui none 
 | `--buffers N` | `2` | 2–4 | 交换链缓冲数 | 默认 `2`（加到 3 实测无收益） |
 | `--latency N` | `1` | 1–4 | DXGI 最大帧延迟 | 默认 `1` |
 | `--no-throttle` | off | — | 不等上一帧 GPU 完成（队列深度 >1） | ❌ 实测更差，别用 |
+| `--input-copy-queue` | off | — | MV/深度的**跨卡拷贝**改走独立 COPY 队列（拷贝/DMA 引擎），与 convert draw 重叠；这条路上 tag 不再传我们的 command list（资源活到下次 Present，见 `PERF_BASELINE.md` §3.28.1）。`--no-mv`/`--no-depth`/`--no-inputs`/`--dump`/`--fg-of`/`--no-throttle` 下自动失效 | ❌ **日常不要用**。`--den 1` 实测 `present` −1.0 / `total` −1.5…−2.0 ms，但体感 **A 更好**（B 段空刷新 34 vs 13 个空 vblank）；`--den 2` 压根测不出来。只作 A/B 测量工具（配方 9/10） |
+| `--prefetch-inputs` | off | — | 隐含 `--input-copy-queue`；把 slot N+1 的 MV/深度放在帧 N 的 Present 之后拷贝，帧 N+1 只排一个等待。日志 `pf: N 命中 / M 帧内补拷` | ❌ **不要用**。机制 100% 命中，但空刷新 0.32 → **2.90/窗**、15/60 窗口空 >4 个（搬运挪出帧外 → 循环跑赢 pacer → cadence 少要帧）。配方 11 |
+| `--slack-auto` | off | — | 抗丢帧：当排队的抓取帧**确实带新内容**（`frames[].published` 变了）时多留一帧而不是丢掉；UI 的「抗丢帧 (A/B)」开关 | ✅ **建议开**（几乎零成本，只在那几帧 +1 个间隔）。日志 `slack-auto: N held back, M dropped [K real loss / M-K duplicate]`，只有 K 是真丢内容（§3.30） |
+| `[capture] OffloadQueue` | `0` | 0/1 | add-on 把 MV/深度的**跨卡拷贝** + 我们自己 RT 的反向状态转换搬到 add-on 自己的队列上（游戏 list 只转出/还原）；`stats:` 行多出 `offload=/stalls=/fail=` | ❌ **不要用**。功能验收通过（`offload=9987`、`stalls=0`、`fail=0`），但收益未量到（对照被场景漂移吃掉）。需要重启游戏才生效（§3.29.2） |
 | `--pace HZ` / `--pace auto` | 关闭 | 10–240 Hz | 定点呈现 | ❌ **不要用**（§5.3） |
 | `--slack N` | `0` | 0–3 | 最多扣住 N+1 个抓取帧、**处理最旧的**：把"晚一帧就丢"换成"晚一帧就多等一帧"。`0` = 排空取最新（零延迟） | 只在"尾部超预算"时有用（判据见 §9.8）；代价最多 +N 个输入间隔的延迟 |
 | `--fg-rt-mode ema\|raw\|median\|quant\|auto` | `quant` | — | 喂给 XeFG 的 `frameRenderTime` 用哪种估计：指数平均 / 上一帧原始值 / 16 帧中位数 / 中位数吸附到整数 vblank / 按速率是否移动自动在 quant 与 raw 间切 | **默认 `quant`**；UI 用 `auto`（锁帧时 quant、帧率真的在漂时 raw）。`ema` 配对实测最差（固定 3x：0.2–0.5% 空刷新 vs auto 的 0.1–0.3%），只作 A/B |

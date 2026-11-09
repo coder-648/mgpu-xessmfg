@@ -4,6 +4,70 @@
 
 ---
 
+## v0.13.2 —— 并行化复审：能并行的都试过了，结论是"默认全关"
+
+> 游戏用自己的卡渲染 + 超分（DLSS / FSR / XeSS），另一块卡专职跑 **XeSS-FG** 插帧，
+> 再通过覆盖窗口上屏。A 卡 + N 卡混插可用；单卡也能跑。
+
+**下载**：`mgpu-0.13.2.zip`（3.0 MB）
+`sha256: 9238408d82e19fc5a0e2c8e1d3dc1e7062b7258af14f0c127605de876daf1c7a`
+
+> 本包**不含 Intel 的 `libxess_fg.dll` / `libxell.dll`**（按 Intel 自己的许可，不随本项目分发）。
+> 放好这两个文件才能跑，取法与版本要求见包内 `bin\README-DLL.txt`：
+> XeSS SDK v3.0.2 的 `bin/`（2x 任意 1.3.x 都行；3x 以上要 `--unlock-mfg`，只对实测过的
+> `libxess_fg 1.3.1.78` / `libxell 1.3.2.10` 成立）。
+
+### 🎯 这一轮做了什么
+
+把 fg 链路上**还能并行/异步的地方全部实现并真机实测了一遍**，然后按数据决定留哪些：
+
+| 方向 | 做法 | 结论 |
+|---|---|---|
+| 跨卡 MV/深度拷贝 | `--input-copy-queue`：搬到自己那条 COPY 队列，与颜色 convert draw 重叠 | ❌ `--den 2` 测不出来；`--den 1` 单趟 −1…−2 ms 但体感更差 |
+| 提前一帧预取 | `--prefetch-inputs`：slot N+1 在帧 N 的 Present 之后拷 | ❌ 机制 100% 命中，但空刷新 0.32 → **2.90/窗**（循环跑赢 pacer） |
+| 搬出游戏队列 | `[capture] OffloadQueue=1`（add-on） | ❌ 功能验收通过（9987 帧 / 0 stall / 0 fail），收益未量到 |
+| 抗丢帧 | `--slack-auto`（UI 开关） | ✅ 建议开：几乎零成本，只在"真有新内容"那几帧 +1 个间隔延迟 |
+
+**新开关全部默认关闭**，默认行为与 v0.13.1 完全一致。
+
+### 🎁 UI 新增两个控件
+
+- **捕获 → 色彩空间**：`HDR10（默认）` / `SDR（BT.709）`。之前 `sdr` 是 ini 里的死键
+  （有字段、没控件、也不传给 bridge）。我们抓的是 scRGB(FP16)，HDR 源永不丢；
+  在你的显示器是 SDR 时选 `SDR` 才不会发灰。
+- **帧生成 → 抗丢帧 (A/B)**：对应 `--slack-auto`。
+
+### 🩹 修掉的问题
+
+1. **`WGC sees 60 fps but the game only renders 38.4 fps` 是假警报。** 它拿我们的**中位数**
+   去比生产端的**一次原始采样**：游戏 ~44 fps 落在 120 Hz 面板上时，帧间隔本来就在 2/3/4 个
+   vblank 之间跳。这条误报把排查引向"游戏自带 FG"（实测游戏 FG 是关的）。现在两边都取
+   16 帧中位数，并把 **DWM 重复合成**列为第二种可能原因。
+2. **`--fg-warp` 两条 list 共用一份 command allocator**：对**还在执行**的 allocator 做 Reset
+   是 D3D12 的未定义行为。现在双 allocator 轮换；顺带修掉 `back_buffer()` 失败时第二条 list
+   往已关闭的 list 里录。
+3. **UI 的 `sdr` / `slack1` 两个死键**接上了（见上）。
+
+### 📊 顺手量到的事实（以后不用重测）
+
+- **OSD 的 `drop N` 大多不是掉帧**：`--slack-auto` 的判据证明，被丢弃的抓取帧里生产端
+  `frame_published` 没有变化 —— 是 DWM 把同一帧重复合成上来的副本，丢掉不损失画面。
+  新日志把它拆成 `[K real loss / M-K duplicate]`，**只有 K 是真丢内容**。
+- **手工分次跑 A/B 在本机不成立**：同配置两趟 `total` 差 **3.2 ms**、`age` 差 6 倍。
+  仓库里新增 `bin\12 - automatic A-B-C-A 4K (60s each).bat`（自动连续跑四段）—— 本机唯一可信的跑法。
+- **我们自己没有任何硬编码帧率上限**：`--lock` / `--fg-out-hz` / `--pace` 默认全关，
+  UI 里"建议锁帧"只是提示（不传给 bridge）。
+
+### ⚠️ 兼容性
+
+- 目标 DLL 仍是 `libxess_fg 1.3.1.78` / `libxell 1.3.2.10`（`--unlock-mfg` 只对实测过的版本成立）；
+- `game_capture.ini` 新增 `OffloadQueue=0`（默认关，键不存在也等价）；
+- 一切原配方、原命令行参数行为不变。
+
+细节与全部实测数据：`docs/findings/PERF_BASELINE.md` §3.28–§3.30。
+
+---
+
 ## v0.13.1 —— UE5 伪影定位到「上采样倍率」+ RE Engine/PRAGMATA 支持
 
 > 游戏用自己的卡渲染 + 超分（DLSS / FSR / XeSS），另一块卡专职跑 **XeSS-FG** 插帧，

@@ -119,20 +119,42 @@ mgpu-<版本>/
 
 （上屏帧率 / 倍数 / 游戏输入帧率 / 等 GPU 的时间 / 游戏帧间隔 / 限帧 / 丢帧）
 
+> **`drop N` 是什么**：它数的是"我们主动丢掉了一个**抓取帧**"。其中相当一部分是同一帧被
+> 合成器重复送来的副本（我们处理的帧率与游戏自己 Present 的帧率一致时，丢的多半是副本），
+> **不损失画面**。要区分"真丢内容"和"重复帧"，开着 `抗丢帧` 看日志那行
+> `slack-auto: N held back, M dropped [K real loss / M-K duplicate]` —— 只有 **K** 是真的丢了一帧。
+
+界面上的两个"模式"开关值得知道：
+
+- **捕获 → 色彩空间**：默认 **HDR10**（BT.2020 + PQ）。我们抓的是 scRGB(FP16)，HDR 信息不丢；
+  如果你的显示器是 **SDR**，选 `SDR（BT.709）` 才不会发灰（反过来在 HDR 屏上选 SDR 会发灰，属正常）。
+- **帧生成 → 抗丢帧 (A/B)**：默认关。打开后只有"确实有新内容"的抓取帧才会被多留一帧
+  （代价是那一帧 +1 个输入间隔的延迟），几乎零成本，建议开着。
+
 界面上改任何一项，卡片里"启动命令"都会同步变化 —— 那就是实际执行的命令行。
 界面说明见 `docs/ops/UI.md`。
 
 ### 5.2 用命令行 / 配方脚本
 
-`bin\` 里有 4 份脚本，**直接双击就能跑**（不给参数时 bridge 处理"当前前台窗口"，
+`bin\` 里有 14 份脚本，**直接双击就能跑**（不给参数时 bridge 处理"当前前台窗口"，
 所以先点一下游戏窗口再双击脚本），也可以把**游戏的 exe 拖到脚本上**来指定目标。
 
 | 脚本 | 用途 |
 |---|---|
-| `1 - 3x optical flow.bat` | 3x 满帧（推荐） |
+| `0 - UI.bat` | 启动前端 |
+| `1 - 3x optical flow.bat` | 3x 满帧（固定倍数 + 光流） |
 | `2 - 2x quality.bat` | 2x 画质优先 |
 | `3 - 3x lowest cost.bat` | 预算最紧 |
 | `4 - dump frames.bat` | 抓 colour/depth/MV 做离线分析 |
+| **`5 - smoothest (cadence).bat`** | **动态逐帧，日常推荐**（输出恒定 1 帧/vblank） |
+| `6 - cadence batch feed (A-B).bat` | A/B：另一种 `frameRenderTime` 喂法（实测更差，只作对照） |
+| `7 - UE5 MV A-B.bat` | UE5 运动矢量 A/B 矩阵 |
+| `8 - smoothest + copy queue (A-B).bat` | 配方 5 + 跨卡拷贝走 COPY 队列（实测无收益） |
+| `9 - 4K out 3x (A).bat` | 4K **原生输出**基线（`--den 1 --interp 3`） |
+| `10 - 4K out 3x + cq (B).bat` | 9 + `--input-copy-queue` |
+| `11 - 4K out 3x + prefetch (C).bat` | 9 + `--prefetch-inputs`（实测空刷新变差） |
+| **`12 - automatic A-B-C-A 4K (60s each).bat`** | **自动连续跑四段**：本机做性能 A/B 唯一可信的方式（手工分次会差 3 ms 以上） |
+| `13 - smoothest + anti-drop (A-B).bat` | 配方 5 + `--slack-auto`（抗丢帧） |
 
 等价的手打命令：
 

@@ -512,6 +512,18 @@ static UINT         g_producer_output_h = 0;
 // the tail is what misses - a sustained deficit fills the buffer and then drops
 // frames anyway (measured, docs/findings/FINAL_CONFIG.md 9.8).
 static UINT         g_slack = 0;
+// --slack-auto (see the drain block in main): absorb one queued frame instead of dropping it
+// when the previous frame did not fit its input interval. Off by default; it is the targeted
+// fix for the occasional "drop 1" the OSD shows in --interp-cadence runs.
+static bool         g_slack_auto = false;
+static UINT         g_slack_auto_drops = 0;   // frames still dropped while --slack-auto is on
+static UINT         g_slack_auto_real  = 0;   // ... of which had new producer content (real loss)
+static UINT         g_slack_auto_holds = 0;   // frames held back (would have been dropped)
+static bool         g_last_overran = false;   // last run_frame() exceeded the input interval
+// Producer publication counter we last consumed (v10's `frame_published`). --slack-auto uses
+// it to tell "this queued capture carries new content" from "DWM re-composited the same
+// frame": only the former is worth holding an extra interval for.
+static uint64_t     g_last_content_pub = 0;
 // --jbuf N (0..3): the *correct* version of the same idea (P3). Every captured frame is
 // copied into one of OUR textures immediately and the WGC frame is released at once, so
 // the capture pool is never held hostage - holding it is exactly what made --slack cost
@@ -3571,12 +3583,23 @@ static bool ensure_local_copy(ComPtr<ID3D12Resource>& dst, ID3D12Resource* src,
     return true;
 }
 
+// Which command list the *input* copies are recorded into. Null means "the frame's own
+// list" (g_list), which is what every mode except --input-copy-queue uses. See the copy
+// queue block next to run_frame_ex(): only plain CopyTextureRegion is ever redirected, so
+// the experimental modes (clears, barriers, --dump readbacks) keep working unchanged.
+static ID3D12GraphicsCommandList* g_copy_target = nullptr;
+// Number of CopyTextureRegion calls recorded so far. --prefetch-inputs uses it to tell a
+// real prefetch from an empty list (a slot whose streams had no view this frame).
+static UINT g_copy_count = 0;
+
 // Copies the live content rectangle out of one of our placed views into a local texture.
 // Both sides agree on the rectangle through StreamShared.width/height; the slot capacity
 // (and therefore the row pitch) is fixed for the lifetime of the process.
 static void copy_content(ID3D12Resource* dst, ID3D12Resource* src, UINT w, UINT h)
 {
     if (!dst || !src || w == 0 || h == 0) { return; }
+    ID3D12GraphicsCommandList* list = g_copy_target ? g_copy_target : g_list.Get();
+    if (!list) { return; }
     D3D12_TEXTURE_COPY_LOCATION d{};
     d.pResource = dst;
     d.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -3590,7 +3613,8 @@ static void copy_content(ID3D12Resource* dst, ID3D12Resource* src, UINT w, UINT 
     box.right = w;
     box.bottom = h;
     box.back = 1;
-    g_list->CopyTextureRegion(&d, 0, 0, 0, &s, &box);
+    list->CopyTextureRegion(&d, 0, 0, 0, &s, &box);
+    ++g_copy_count;
 }
 
 static void ensure_dummy_mv(UINT slot);      // declared below (used by --no-mv)
@@ -4189,6 +4213,43 @@ static ComPtr<ID3D12PipelineState>  g_warp_pso;
 static UINT  g_hist_write = 0;
 static bool  g_hist_valid = false;
 
+// The warp path submits *two* lists per input frame (the interpolated midpoint, then the
+// real frame), and the midpoint's Present() only queues it. Resetting one command
+// allocator for the second list while the first is still executing is undefined
+// behaviour in D3D12 - it was a latent hazard (it only ever showed up as a driver
+// hiccup). Two (allocator, list) pairs are kept and the shared helpers flip between them
+// once per frame; gpu_throttle() at the top of the next call waits for the fence both
+// lists signalled, so a pair is always retired before it is reset again.
+static ComPtr<ID3D12CommandAllocator>     g_alloc_alt;
+static ComPtr<ID3D12GraphicsCommandList>  g_list_alt;
+
+static void warp_ensure_alt_pair()
+{
+    if (g_list_alt) { return; }
+    if (FAILED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                IID_PPV_ARGS(&g_alloc_alt))) ||
+        FAILED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                           g_alloc_alt.Get(), nullptr,
+                                           IID_PPV_ARGS(&g_list_alt)))) {
+        logf_("[bridge] warp: second command list FAILED - the two lists keep sharing one"
+              " allocator, which is not legal while the first one is in flight\n");
+        g_alloc_alt.Reset();
+        g_list_alt.Reset();
+        return;
+    }
+    g_list_alt->Close();
+}
+
+static void warp_use_alt_pair()
+{
+    warp_ensure_alt_pair();
+    if (!g_list_alt) { return; }      // creation failed: keep the old (unclean) behaviour
+    // ComPtr::Swap only exchanges the pointers: the pair that was just submitted simply
+    // becomes "the other pair" and is reset after the next gpu_throttle().
+    g_alloc.Swap(g_alloc_alt);
+    g_list.Swap(g_list_alt);
+}
+
 static void barrier_to(ID3D12Resource* res, D3D12_RESOURCE_STATES& state,
                        D3D12_RESOURCE_STATES next)
 {
@@ -4544,6 +4605,9 @@ static void run_frame_warp(ID3D11Texture2D* colour11)
     if (!service_shared_layout()) { return; }
     ++g_present_id;
     if (g_no_throttle) { g_ms_throttle = 0.0; } else { gpu_throttle(); }
+    // Create the second (allocator, list) pair up front, so the swap in the middle of the
+    // frame is always a plain pointer exchange - not on the first frame only.
+    warp_ensure_alt_pair();
     const double t_work0 = qpc_ms();
 
     if (g_colour_mutex) { g_colour_mutex->AcquireSync(0, 20); }
@@ -4664,11 +4728,16 @@ static void run_frame_warp(ID3D11Texture2D* colour11)
             const double mid = qpc_ms() + g_pace_ms * 0.5;
             while (qpc_ms() < mid) { Sleep(0); }
         }
-
-        // --- list 2: the real frame, which has to go out after the midpoint -----
-        g_alloc->Reset();
-        g_list->Reset(g_alloc.Get(), nullptr);
     }
+
+    // --- list 2: the real frame, which has to go out after the midpoint -----
+    // Its own (allocator, list) pair: list 1 may still be executing and resetting its
+    // allocator now would be undefined behaviour (see warp_use_alt_pair()). This is
+    // deliberately outside the have_bb1 branch - without a first present the list is
+    // still closed here and the second list has to be opened either way.
+    warp_use_alt_pair();
+    g_alloc->Reset();
+    g_list->Reset(g_alloc.Get(), nullptr);
 
     const UINT bbi2 = g_swapchain->GetCurrentBackBufferIndex();
     ID3D12Resource* bb2 = nullptr;
@@ -5689,10 +5758,15 @@ static void retire_input(ComPtr<ID3D12Resource>& r)
 
 static void collect_retired_inputs()
 {
-    for (size_t i = 0; i < g_retired_inputs.size();) {
+    // Swap-remove instead of erase(): the vectors hold at most a handful of entries, but
+    // this runs once per frame and the ordering of the retire list carries no meaning.
+    size_t i = 0;
+    while (i < g_retired_inputs.size()) {
         if (g_present_id - g_retired_at[i] >= kRetirePresents) {
-            g_retired_inputs.erase(g_retired_inputs.begin() + static_cast<ptrdiff_t>(i));
-            g_retired_at.erase(g_retired_at.begin() + static_cast<ptrdiff_t>(i));
+            g_retired_inputs[i] = g_retired_inputs.back();
+            g_retired_at[i] = g_retired_at.back();
+            g_retired_inputs.pop_back();
+            g_retired_at.pop_back();
         } else {
             ++i;
         }
@@ -5736,8 +5810,10 @@ static void ack_previous_slot()
 
 // Drops our local (consumer-side) copies of the input streams. Only their *size* can
 // change now: the placed views are fixed for the life of the process (protocol v9).
+static void prefetch_invalidate();          // --prefetch-inputs, defined below
 static void release_local_inputs()
 {
+    prefetch_invalidate();
     for (UINT s = 0; s < mgpu::kMaxSlots; ++s) {
         retire_input(g_mv_local[s]);
         retire_input(g_depth_local[s]);
@@ -5757,6 +5833,7 @@ static void release_local_inputs()
 // v9: only used on teardown / when the producer's block becomes invalid.
 static void release_shared_views()
 {
+    prefetch_invalidate();
     for (UINT s = 0; s < mgpu::kMaxSlots; ++s) {
         g_mv[s].Reset();
         g_depth[s].Reset();
@@ -5828,6 +5905,209 @@ static bool service_shared_layout()
         }
     }
     return true;
+}
+
+// ---------------- --input-copy-queue: MV/depth copies on a COPY queue ---------
+// The frame's own list is a DIRECT list, and everything on it runs in order on the 3D
+// engine: our colour convert draw, then the MV/depth copies that read host memory over
+// PCIe (~14 MB/frame each at 1440p, 33 MB at 4K), and XeSS-FG's own work at Present().
+// Those copies are pure transfers, so a COPY queue can move them on the copy/DMA engine
+// *at the same time* as the convert draw instead of queueing behind it. Measured share of
+// the loop: `mvs` + PCIe wait is the one stage that scales with the stream size, and
+// docs/findings/PERF_BASELINE.md §3.3 puts 1440p at ~1.8 ms/frame and 4K at ~3.6 ms.
+//
+// Ordering, and why the tags do not use our list here:
+//   copy queue: [mv+depth CopyTextureRegion] -> Signal(copy fence)
+//   direct    : [our list: convert draw]      -> Wait(copy fence) -> Present() -> XeFG
+// The Wait is queued *after* our list, so the two overlap; XeSS-FG's work is submitted at
+// Present() and therefore starts only after the copies have landed. What makes that legal
+// is that the tagged resources are no longer referenced by our list: their validity is
+// XEFG_SWAPCHAIN_RV_UNTIL_NEXT_PRESENT, and xefg_swapchain_d3d12.h says pCmdList "is only
+// required if the resource is not valid until the next present call". Passing NULL keeps
+// the copy queue and the direct queue from ever touching the same resource at once (the
+// implicit COMMON promotion on each side would otherwise race). If XeFG starts refusing
+// frames with this switch on, it needs the list after all - then the copies have to go
+// back to the direct queue, i.e. drop the switch.
+//
+// Not used with the experimental modes: --no-inputs/--no-mv/--no-depth record clears
+// (ClearRenderTargetView is illegal on a COPY list), --dump records readback copies in our
+// own list that must be ordered after the input copies, and --fg-of owns depth through its
+// own descriptor heap.
+static bool g_input_copy_queue = false;     // --input-copy-queue
+static bool g_cq_reported = false;
+static ComPtr<ID3D12CommandQueue>         g_copy_queue;
+static ComPtr<ID3D12CommandAllocator>     g_copy_alloc;
+static ComPtr<ID3D12GraphicsCommandList>  g_copy_list;
+static ComPtr<ID3D12Fence>                g_copy_fence;
+static UINT64                             g_copy_value = 0;
+static double                             g_ms_cq = 0.0;   // queueing the cross-queue wait
+static double                             g_max_cq = 0.0;
+
+static bool input_copy_queue_usable()
+{
+    if (!g_input_copy_queue) { return false; }
+    if (g_no_inputs || g_no_mv || g_no_depth || g_dump_frames > 0) { return false; }
+    // --no-throttle removes the fence wait that retires the previous frame's copy list, and
+    // resetting a command allocator that is still executing is undefined behaviour. The
+    // switch exists to measure the depth-1 cost, not to run with a second queue in flight.
+    if (g_no_throttle) { return false; }
+#if MGPU_FG_OF
+    if (g_fg_of) { return false; }
+#endif
+    if (g_copy_list) { return true; }
+    D3D12_COMMAND_QUEUE_DESC q{};
+    q.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+    if (FAILED(g_device->CreateCommandQueue(&q, IID_PPV_ARGS(&g_copy_queue))) ||
+        FAILED(g_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY,
+                                                IID_PPV_ARGS(&g_copy_alloc))) ||
+        FAILED(g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY,
+                                          g_copy_alloc.Get(), nullptr,
+                                          IID_PPV_ARGS(&g_copy_list))) ||
+        FAILED(g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                     IID_PPV_ARGS(&g_copy_fence)))) {
+        logf_("[bridge] --input-copy-queue: copy queue FAILED - falling back to the direct"
+              " queue (the MV/depth copies then queue behind the convert draw)\n");
+        g_copy_queue.Reset();
+        g_copy_alloc.Reset();
+        g_copy_list.Reset();
+        g_copy_fence.Reset();
+        g_input_copy_queue = false;
+        return false;
+    }
+    g_copy_list->Close();
+    return true;
+}
+
+// Re-opens the copy list and points copy_content() at it. Returns false when the copies
+// must stay on the frame's own list.
+static bool input_copy_begin()
+{
+    if (!input_copy_queue_usable()) { return false; }
+    if (!g_cq_reported) {
+        g_cq_reported = true;
+        logf_("[bridge] --input-copy-queue: MV/depth copies go on a COPY queue and overlap"
+              " the colour convert draw (tagged without our command list, see the switch)\n");
+    }
+    // A command allocator must not be reset while its list is still executing on the GPU.
+    // With --prefetch-inputs the previous submission happened *after* the previous frame's
+    // Present, i.e. outside the fence gpu_throttle() waits for, so check it here instead of
+    // relying on the caller's ordering. Bounded: the copies are ~1-3 ms of copy-engine work
+    // and the loop is one frame apart.
+    if (g_copy_fence && g_copy_fence->GetCompletedValue() < g_copy_value) {
+        const double t0 = qpc_ms();
+        wait_fence_value(g_copy_fence.Get(), g_copy_value, 50);
+        const double dt = qpc_ms() - t0;
+        g_ms_cq = g_ms_cq * 0.9 + dt * 0.1;
+        if (dt > g_max_cq) { g_max_cq = dt; }
+    }
+    g_copy_alloc->Reset();
+    g_copy_list->Reset(g_copy_alloc.Get(), nullptr);
+    g_copy_target = g_copy_list.Get();
+    return true;
+}
+
+// Closes and submits the copy list. Nothing else may record into it afterwards, so the
+// redirection is cleared here even on the error paths.
+static void input_copy_submit(bool worked)
+{
+    g_copy_target = nullptr;
+    if (!worked || !g_copy_list) { return; }
+    g_copy_list->Close();
+    ID3D12CommandList* lists[] = { g_copy_list.Get() };
+    g_copy_queue->ExecuteCommandLists(1, lists);
+    g_copy_queue->Signal(g_copy_fence.Get(), ++g_copy_value);
+}
+
+// Queues the cross-queue wait on the direct queue. Must be called *after* our own list has
+// been submitted (so the convert draw and the copies overlap) and *before* Present(), which
+// is when XeSS-FG's work enters the queue and starts reading the tagged resources.
+static void input_copy_wait()
+{
+    const double t0 = qpc_ms();
+    g_queue->Wait(g_copy_fence.Get(), g_copy_value);
+    const double dt = qpc_ms() - t0;
+    g_ms_cq = g_ms_cq * 0.9 + dt * 0.1;
+    if (dt > g_max_cq) { g_max_cq = dt; }
+}
+
+// ---------------------- --prefetch-inputs: copy one frame ahead ---------------
+// The round-robin slot walk makes the *next* frame's slot known while the current one is
+// still being presented, so its MV/depth can be copied during that Present() block instead
+// of at the start of the next frame. Two things make this worth it and one makes it safe:
+//
+//   worth it : the copies are 28 MB/frame of PCIe *read* at 1440p (63 MB at 4K). Measured
+//              with --input-copy-queue, overlapping them with the convert draw already
+//              bought ~1 ms; here they leave the frame entirely.
+//   safe     : the copy runs on the COPY queue and the producer's cross-adapter fence is
+//              waited on *on that queue* (GPU side, no CPU polling), so the copy cannot
+//              read a slot the producer has not finished publishing. That is stricter than
+//              the main path, which never waits for the producer at all.
+//   --depth-lag still works: copy_inputs_local() advances g_ring_write here, which is
+//              exactly the entry the next frame's tag picks up (nothing advances it in
+//              between because the frame's own copy stage is skipped on a prefetch hit).
+//
+// Requires --input-copy-queue (it is implied). Off by default: it changes which frame each
+// slot is read for, and that is the kind of change that has to be seen in a real run.
+static bool   g_prefetch_inputs = false;    // --prefetch-inputs
+static bool   g_pf_valid = false;           // a prefetch is pending on the copy queue
+static UINT   g_pf_slot = 0;                // ... for this slot
+static UINT   g_pf_gen = 0xFFFFFFFFu;       // ... with this producer geometry generation
+static UINT64 g_pf_fence = 0;               // copy-fence value that retires it
+static UINT   g_pf_hits = 0;                // frames served from a prefetch
+static UINT   g_pf_misses = 0;              // frames that had to copy in-frame
+static bool   g_pf_reported = false;
+
+static bool prefetch_usable()
+{
+    return g_prefetch_inputs && !g_reuse_frame && input_copy_queue_usable();
+}
+
+static void prefetch_invalidate()
+{
+    g_pf_valid = false;
+    g_pf_gen   = 0xFFFFFFFFu;
+}
+
+// Queues the cross-queue wait for a *prefetched* copy. Same position as input_copy_wait()
+// (after our list, before Present), but it waits on the value the prefetch signalled.
+static void prefetch_wait()
+{
+    const double t0 = qpc_ms();
+    g_queue->Wait(g_copy_fence.Get(), g_pf_fence);
+    const double dt = qpc_ms() - t0;
+    g_ms_cq = g_ms_cq * 0.9 + dt * 0.1;
+    if (dt > g_max_cq) { g_max_cq = dt; }
+}
+
+// Records + submits the copies for `next_slot` and leaves them running while this frame is
+// presented. Called once per frame, after Present + Signal, so nothing it does can delay
+// the frame that is already on its way to the panel.
+static void prefetch_next_inputs(UINT next_slot)
+{
+    if (!prefetch_usable()) { return; }
+    if (!g_ctl || next_slot >= mgpu::kMaxSlots) { return; }
+    if (!g_fwd[next_slot]) { return; }                 // no fence: cannot order it
+    const uint64_t published = g_ctl->frames[next_slot].published;
+    if (published == 0) { return; }                    // the producer never filled it
+    if (!input_copy_begin()) { return; }
+    if (!g_cq_reported) { g_cq_reported = true; }
+    if (!g_pf_reported) {
+        g_pf_reported = true;
+        logf_("[bridge] --prefetch-inputs: MV/depth for the next slot are copied during this"
+              " frame's Present (copy queue waits for the producer's fence on %u)\n", next_slot);
+    }
+    // GPU-side wait for the producer's publication of that slot - the only place in the
+    // main path where our reads are ordered against the producer at all.
+    g_copy_queue->Wait(g_fwd[next_slot].Get(), published);
+    const UINT before = g_copy_count;
+    copy_inputs_local(next_slot);
+    const bool recorded = (g_copy_count != before);
+    input_copy_submit(recorded);
+    if (!recorded) { return; }
+    g_pf_valid = true;
+    g_pf_slot  = next_slot;
+    g_pf_gen   = g_ctl->generation;
+    g_pf_fence = g_copy_value;
 }
 
 static void run_frame_ex(ID3D11Texture2D* colour11)
@@ -6099,23 +6379,47 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     g_list->ResourceBarrier(1, &bb[0]);
     bb_state = D3D12_RESOURCE_STATE_PRESENT;
 
-    // 4. tag the FG inputs while the list is still open. The producer's resources
-    //    live on a heap imported from a file mapping with ALLOW_CROSS_ADAPTER;
-    //    XeSS-FG fails to copy those ("Failed to allocate memory for a copy of
-    //    DEPTH"), so plain local copies are tagged instead. Those copies pull data
-    //    that physically lives on the NVIDIA card across to the AMD one, so both the
-    //    recording time and the GPU wait for the previous frame are worth watching.
-    {
+    // 4. tag the FG inputs. The producer's resources live on a heap imported from a file
+    //    mapping with ALLOW_CROSS_ADAPTER; XeSS-FG fails to copy those ("Failed to
+    //    allocate memory for a copy of DEPTH"), so plain local copies are tagged instead.
+    //    Those copies pull data that physically lives on the NVIDIA card across to the
+    //    AMD one, so both the recording time and the GPU wait for the previous frame are
+    //    worth watching.
+    //
+    //    --input-copy-queue: they are recorded into the copy queue's list here and start
+    //    executing while this list's convert draw is still being recorded; the direct
+    //    queue is made to wait for them *after* the submit below, so the two overlap and
+    //    XeSS-FG's work (submitted at Present) still sees finished data.
+    //    --prefetch-inputs: normally they were already recorded during the *previous*
+    //    frame's Present, so this frame only queues the wait.
+    bool pf_hit = false;
+    if (g_prefetch_inputs) {
+        if (g_pf_valid && g_pf_slot == slot && g_pf_gen == g_ctl->generation) {
+            pf_hit = true;
+            g_pf_valid = false;                     // consumed; g_pf_fence keeps the value
+            ++g_pf_hits;
+        } else {
+            if (g_pf_valid) { ++g_pf_misses; }      // a prefetch existed but for another slot
+            g_pf_valid = false;
+        }
+    }
+    const bool cq = pf_hit ? false : input_copy_begin();
+    if (!pf_hit) {
         const double m0 = qpc_ms();
         if (g_no_inputs) { ensure_dummy_inputs(slot); } else { copy_inputs_local(slot); }
         const double m1 = qpc_ms();
         g_ms_inputs = g_ms_inputs * 0.9 + (m1 - m0) * 0.1;
         if (m1 - m0 > g_max_inputs) { g_max_inputs = m1 - m0; }
+        input_copy_submit(cq);
     }
 
     xefg_swapchain_d3d12_resource_data_t rd{};
     rd.validity = XEFG_SWAPCHAIN_RV_UNTIL_NEXT_PRESENT;
     rd.resourceBase = { 0, 0 };
+    // --input-copy-queue: the copies are not in this list, so neither are the tags. The
+    // library only needs the list for resources that stop being valid before the next
+    // present; ours live until then (see the switch's comment).
+    ID3D12CommandList* tag_list = (cq || pf_hit) ? nullptr : g_list.Get();
     // MV and depth can be different sizes (UE5: MVs at render size, depth at full res), so
     // each is tagged with its own stream size - the old code used streams[1] for both.
 #if MGPU_FG_OF
@@ -6132,7 +6436,7 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     }
     rd.incomingState = D3D12_RESOURCE_STATE_COMMON;
     rd.type = XEFG_SWAPCHAIN_RES_MOTION_VECTOR;
-    g_api.D3D12TagFrameResource(g_fg, g_list.Get(), present_id, &rd);
+    g_api.D3D12TagFrameResource(g_fg, tag_list, present_id, &rd);
 
     rd.resourceSize = { g_ctl->streams[2].width, g_ctl->streams[2].height };
     rd.pResource = g_depth_local[slot].Get();
@@ -6148,7 +6452,7 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
         }
     }
     rd.type = XEFG_SWAPCHAIN_RES_DEPTH;
-    g_api.D3D12TagFrameResource(g_fg, g_list.Get(), present_id, &rd);
+    g_api.D3D12TagFrameResource(g_fg, tag_list, present_id, &rd);
 
     // --dump: record the readback copies in this list, i.e. after everything that
     // feeds XeSS-FG and before Close, so they see exactly what was tagged.
@@ -6159,6 +6463,11 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
                                     XELL_RENDERSUBMIT_START); }
     ID3D12CommandList* lists[] = { g_list.Get() };
     g_queue->ExecuteCommandLists(1, lists);
+    // --input-copy-queue: our list (convert draw) is queued first, so the MV/depth copies
+    // on the copy queue run *concurrently* with it. This wait sits between our list and
+    // Present(), which is where XeSS-FG submits the work that reads those resources.
+    if (cq) { input_copy_wait(); }
+    else if (pf_hit) { prefetch_wait(); }
     if (g_xell) { xellAddMarkerData(g_xell, present_id,
                                     XELL_RENDERSUBMIT_END); }
     g_ms_work = g_ms_work * 0.9 + (qpc_ms() - t_work0) * 0.1;
@@ -6294,27 +6603,56 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     // v6 cross-check: the add-on measures the game's own present interval. A large
     // mismatch means our capture cadence is not the game's (WGC batching, a limiter
     // in between), and frameRenderTime comes from *our* estimate - worth one line.
+    //
+    // The producer publishes a RAW single interval (FrameShared.frame_time_ms, not an EMA),
+    // so comparing it against our *median* fired on a perfectly healthy beat pattern: a game
+    // at ~44 fps on a 120 Hz panel alternates 2/3 vblank presents (16.7 / 25.0 ms), our
+    // median reads 16.7 and one raw 3-vblank sample reads 25-26 ms -> "WGC sees 60 fps but
+    // the game only renders 38". That is a false positive and it cost a debugging session on
+    // 2026-11-09 (the game's own frame generation was in fact OFF). Both sides now use a
+    // median over the same window, so only a real rate mismatch can trigger it.
     {
         static unsigned dt_frames = 0;
         static bool dt_warned = false;
+        // 16-sample medians, one per frame, of the producer's own present interval.
+        static float s_ring[16] = {};
+        static UINT  s_n = 0, s_i = 0;
+        if (fr.frame_time_ms > 0.5f && fr.frame_time_ms < 1000.0f) {
+            s_ring[s_i] = fr.frame_time_ms;
+            s_i = (s_i + 1) % 16u;
+            if (s_n < 16) { ++s_n; }
+        }
+        double producer_ms = 0.0;
+        if (s_n > 0) {
+            float v[16];
+            for (UINT i = 0; i < s_n; ++i) { v[i] = s_ring[i]; }
+            for (UINT i = 1; i < s_n; ++i) {          // n <= 16: insertion sort is fine
+                const float k = v[i];
+                int j = static_cast<int>(i) - 1;
+                while (j >= 0 && v[j] > k) { v[j + 1] = v[j]; --j; }
+                v[j + 1] = k;
+            }
+            producer_ms = v[s_n / 2];
+        }
         ++dt_frames;
-        if (!dt_warned && dt_frames > 120 && fr.frame_time_ms > 1.0f && rt_ms > 1.0 &&
-            (fr.frame_time_ms > rt_ms * 1.35 || fr.frame_time_ms < rt_ms * 0.74)) {
+        if (!dt_warned && dt_frames > 120 && producer_ms > 1.0 && rt_ms > 1.0 &&
+            (producer_ms > rt_ms * 1.35 || producer_ms < rt_ms * 0.74)) {
             dt_warned = true;
-            logf_("[bridge] note: producer frame time %.2f ms vs our capture cadence"
+            logf_("[bridge] note: producer frame time %.2f ms (median) vs our capture cadence"
                   " %.2f ms - WGC batching or a limiter between them (frameRenderTime"
                   " uses ours, docs/findings/FINAL_CONFIG.md 5.4)\n",
-                  static_cast<double>(fr.frame_time_ms), rt_ms);
+                  producer_ms, rt_ms);
             // The dangerous direction: WGC delivers MORE frames than the game renders.
-            // That is the signature of the game's own frame generation (DLSS-G / FSR FG):
-            // it replaces the present path with its own proxy swap chain, WGC then captures
-            // black and the overlay goes black while every counter below stays healthy.
-            if (fr.frame_time_ms > rt_ms * 1.35) {
-                logf_("[bridge]   WARNING: WGC sees %.1f fps but the game only renders %.1f fps."
-                      " That is almost always the game's OWN frame generation (DLSS-G / FSR FG)"
-                      " - turn it OFF and keep only the upscaler (docs/findings/FINAL_CONFIG.md 2.1.2),"
-                      " otherwise the capture is black even though the pipeline reports SUCCESS\n",
-                      1000.0 / rt_ms, 1000.0 / static_cast<double>(fr.frame_time_ms));
+            // Real causes: the game's own frame generation (DLSS-G / FSR FG), or DWM
+            // re-compositing the same content on the composition clock while the window has
+            // lost independent flip (our topmost overlay does exactly that - HANDOFF 8.6).
+            if (producer_ms > rt_ms * 1.35) {
+                logf_("[bridge]   WARNING: WGC sees %.1f fps but the game renders %.1f fps."
+                      " Either the game's OWN frame generation is on (DLSS-G / FSR FG - turn it"
+                      " off, FINAL_CONFIG 2.1.2), or DWM is re-compositing duplicates because"
+                      " the game window lost independent flip (our overlay: try"
+                      " --overlay-hidden). Duplicates are dropped, not interpolated\n",
+                      1000.0 / rt_ms, 1000.0 / producer_ms);
             }
         }
     }
@@ -6352,9 +6690,23 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
         (g_ms_throttle + g_ms_present) > input_interval_ms()) {
         ++g_slow_frames;
     }
+    // Per-frame version of the test above (g_slow_frames is a per-window counter): the main
+    // loop's --slack-auto uses this to decide whether to absorb a queued frame instead of
+    // dropping it. Same criterion, so the two never disagree about what "overran" means.
+    g_last_overran = (input_interval_ms() > 1.0) &&
+                     ((g_ms_throttle + g_ms_present) > input_interval_ms());
 
     if (!g_reuse_frame) { g_mv_slot = (g_mv_slot + 1) % slots; }
     ++g_frames;
+    // Remember which producer publication this frame consumed, for --slack-auto's
+    // duplicate-vs-new-content test in the main loop.
+    if (g_ctl) { g_last_content_pub = g_ctl->frame_published; }
+
+    // --prefetch-inputs: submit the NEXT frame's MV/depth copies now. They run on the copy
+    // queue during this frame's Present()/vblank wait, i.e. off the next frame's critical
+    // path; the next frame only queues a wait for them. g_mv_slot has already advanced, so
+    // it names exactly the slot the next frame will read.
+    if (g_prefetch_inputs && !g_reuse_frame) { prefetch_next_inputs(g_mv_slot % slots); }
 
     // Re-assert our z-order every frame batch: the game raises itself on activation.
     assert_topmost();
@@ -6543,6 +6895,7 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
         const double mx_gpu = g_max_gpu, mx_pres = g_max_present, mx_gap = g_max_gap;
         const double mx_wait = g_max_wait;
         const double mx_cw = g_max_copywait, mx_in = g_max_inputs, mx_tot = g_max_total;
+        const double mx_cq = g_max_cq; g_max_cq = 0.0;
         const double mx_xe = g_max_xell, mx_fg = g_max_fg;
         const double mx_col = g_max_colour; g_max_colour = 0.0;
         const double mx_age = g_max_age; g_max_age = 0.0;
@@ -6550,7 +6903,7 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
         // the descriptor/barrier setup, the present bookkeeping and this report itself.
         // If this grows, the next thing to look at is ours, not XeSS-FG's.
         const double accounted = g_ms_colour + g_ms_copywait + g_ms_work + g_ms_wait +
-                                 g_ms_inputs + g_ms_of + g_ms_xell + g_ms_fg +
+                                 g_ms_inputs + g_ms_cq + g_ms_of + g_ms_xell + g_ms_fg +
                                  g_ms_throttle + g_ms_present;
         const double cpu_only = (g_ms_total > accounted) ? (g_ms_total - accounted) : 0.0;
         const UINT x2m = g_x2_miss;
@@ -6736,19 +7089,42 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
             }
         }
         logf_("[bridge]   breakdown: capture=%.1fms work=%.1fms present=%.1fms gpu=%.1fms"
-              " wait=%.1fms copy=%.1fms colour=%.1fms mvs=%.1fms of=%.1fms age=%.1fms"
+              " wait=%.1fms copy=%.1fms colour=%.1fms mvs=%.1fms cq=%.1fms of=%.1fms age=%.1fms"
               " xell=%.1fms fg=%.1fms total=%.1fms cpu=%.1fms timeouts=%u mode=%d  xN=%.2f"
               "  game=%.1fms  jitter=%.1f..%.1fms  arr_gaps=%u  load=%.0f%%  slow=%u"
               "  pace=%.1fms repres=%u skip=%u"
-              "  worst(gpu %.1f/pres %.1f/wait %.1f/copy %.1f/colour %.1f/mvs %.1f/of %.1f/age %.1f"
+              "  worst(gpu %.1f/pres %.1f/wait %.1f/copy %.1f/colour %.1f/mvs %.1f/cq %.1f"
+              "/of %.1f/age %.1f"
               "/xell %.1f/fg %.1f/total %.1f/gap %.1f) xNmiss=%u\n",
               g_ms_capture, g_ms_work, g_ms_present, g_ms_throttle, g_ms_wait,
-              g_ms_copywait, g_ms_colour, g_ms_inputs, g_ms_of, g_ms_age, g_ms_xell,
+              g_ms_copywait, g_ms_colour, g_ms_inputs, g_ms_cq, g_ms_of, g_ms_age, g_ms_xell,
               g_ms_fg, g_ms_total, cpu_only,
               g_slot_timeouts, g_colour_mode, xn, g_arrival_ms_ema, jit_min, jit_max,
               drops, budget, slow, g_pace_ms, pace_rep, pace_sk,
-              mx_gpu, mx_pres, mx_wait, mx_cw, mx_col, mx_in, g_max_of, mx_age, mx_xe,
+              mx_gpu, mx_pres, mx_wait, mx_cw, mx_col, mx_in, mx_cq, g_max_of, mx_age, mx_xe,
               mx_fg, mx_tot, mx_gap, x2m);
+        // --prefetch-inputs hit/miss for this window (only worth a line when it is on).
+        if (g_prefetch_inputs) {
+            static UINT s_pf_h = 0, s_pf_m = 0;
+            logf_("[bridge]   pf: %u frame(s) served from a prefetched copy, %u had to copy"
+                  " in-frame (this window)\n", g_pf_hits - s_pf_h, g_pf_misses - s_pf_m);
+            s_pf_h = g_pf_hits;
+            s_pf_m = g_pf_misses;
+        }
+        // --slack-auto: how many frames were absorbed instead of dropped this window, and how
+        // many were still dropped - split into "carried new content" (a real lost input frame)
+        // and "duplicate" (free). Only printed when it is on.
+        if (g_slack_auto) {
+            static UINT s_hold = 0, s_drop = 0, s_real = 0;
+            const UINT dh = g_slack_auto_holds - s_hold;
+            const UINT dd = g_slack_auto_drops - s_drop;
+            const UINT dr = g_slack_auto_real - s_real;
+            logf_("[bridge]   slack-auto: %u held back (would have been dropped), %u dropped"
+                  " [%u real loss / %u duplicate]  (this window)\n", dh, dd, dr, dd - dr);
+            s_hold = g_slack_auto_holds;
+            s_drop = g_slack_auto_drops;
+            s_real = g_slack_auto_real;
+        }
 
         // ---- end-to-end latency estimate, measured from inside the process -----
         //
@@ -7142,6 +7518,13 @@ int main()
         const int n = _wtoi(sl + 8);
         if (n >= 0 && n <= 3) { g_slack = static_cast<UINT>(n); }
     }
+    if (wcsstr(GetCommandLineW(), L"--slack-auto")) {
+        g_slack_auto = true;
+        logf_("[bridge] --slack-auto: a queued capture is held (instead of dropped) whenever"
+              " the producer published new content since we consumed the last one - targeted at"
+              " the occasional 'drop 1' in --interp-cadence runs, without --slack 1's constant"
+              " +1 interval. Per-window counts: 'slack-auto: N held back / M still dropped'\n");
+    }
     if (wcsstr(GetCommandLineW(), L"--tearing")) { g_tearing = true; }
     if (wcsstr(GetCommandLineW(), L"--overlay-layered")) { g_overlay_layered = true; }
     if (wcsstr(GetCommandLineW(), L"--relay-input")) { g_relay_input = true; }
@@ -7371,6 +7754,24 @@ int main()
               " cannot answer the pairing question\n");
     }
     if (wcsstr(GetCommandLineW(), L"--no-throttle")) { g_no_throttle = true; }
+    // --input-copy-queue: MV/depth copies on their own COPY queue so they run on the copy
+    // engine at the same time as the colour convert draw (see the block next to
+    // run_frame_ex()). Off by default: it is the first structural change to the submit
+    // order, and its failure mode (XeFG refusing frames because the tags lost their
+    // command list) has to be seen in an A/B run before it can be a default.
+    if (wcsstr(GetCommandLineW(), L"--input-copy-queue")) {
+        g_input_copy_queue = true;
+        logf_("[bridge] --input-copy-queue: MV/depth copies will use a COPY queue\n");
+    }
+    // --prefetch-inputs: copy the *next* frame's MV/depth during this frame's Present.
+    // Implies --input-copy-queue (it needs the second queue to get the copies off the frame
+    // in the first place). Off by default: it changes which frame each slot is read for.
+    if (wcsstr(GetCommandLineW(), L"--prefetch-inputs")) {
+        g_prefetch_inputs = true;
+        g_input_copy_queue = true;
+        logf_("[bridge] --prefetch-inputs: MV/depth are copied one frame ahead (implies"
+              " --input-copy-queue)\n");
+    }
     if (const wchar_t* wm = wcsstr(GetCommandLineW(), L"--wait-ms ")) {
         const int n = _wtoi(wm + 10);
         if (n >= 0 && n <= 200) { g_wait_ms = static_cast<DWORD>(n); }
@@ -7883,6 +8284,15 @@ int main()
         // --slack N keeps up to N+1 frames and processes the OLDEST, so a late frame
         // is absorbed by the next one instead of being thrown away. The cap is what
         // bounds the added latency: the (N+2)th frame in the queue drops the oldest.
+        //
+        // --slack-auto: the same absorption, but only while the queued frame is *new
+        // content*. The OSD's "drop 1" is a capture we discard; whether that costs a real
+        // input frame depends on whether the producer published something new in between.
+        // With the game at ~44 fps on a 120 Hz panel WGC/DWM hands over more captures than the
+        // game produces (arr(vb) alternates 2x/4x while game(vb) alternates 2x/3x - measured
+        // 2026-11-09), and those duplicates are free to drop. Only when the producer's
+        // publication counter moved do we hold the extra frame instead (one interval of
+        // latency, once) so the real frame is not lost. `--slack 1` holds unconditionally.
         {
             // --jbuf N owns the queue depth in its own mode (N+1 in flight, oldest
             // processed first); --slack N is the legacy variant that holds WGC frames.
@@ -7891,7 +8301,9 @@ int main()
                 for (auto& t : g_jbuf_pending) { g_jbuf_free.push_back(t); }
                 g_jbuf_pending.clear();
             }
-            const size_t cap = static_cast<size_t>((g_jbuf > 0) ? g_jbuf : g_slack) + 1;
+            size_t cap = static_cast<size_t>((g_jbuf > 0) ? g_jbuf : g_slack) + 1;
+            const bool new_content = g_ctl && (g_ctl->frame_published != g_last_content_pub);
+            if (g_slack_auto && g_jbuf == 0 && g_slack == 0 && new_content) { cap = 2; }
             for (;;) {
                 ComPtr<IDirect3D11CaptureFrame> f;
                 if (FAILED(g_pool->TryGetNextFrame(&f)) || !f) { break; }
@@ -7917,8 +8329,21 @@ int main()
                     if (g_jbuf > 0) { jbuf_give_back(slack_q.front().second); }
                     slack_q.pop_front();
                     ++g_pace_skips;
+                    if (g_slack_auto) {
+                        ++g_slack_auto_drops;
+                        // Re-check at the moment of the drop: if the producer has published a
+                        // new frame since we consumed the last one, this capture carried real
+                        // content and the drop costs a frame of motion. Otherwise it is a
+                        // duplicate the compositor produced (WGC hands over more captures than
+                        // the game presents) and dropping it is free.
+                        const bool nc = g_ctl && (g_ctl->frame_published != g_last_content_pub);
+                        if (nc) { ++g_slack_auto_real; }
+                    }
                 }
             }
+            // --slack-auto bookkeeping: a frame was held back (= would have been dropped
+            // with the default cap) when the queue still has one left after the drain.
+            if (g_slack_auto && cap > 1 && slack_q.size() > 1) { ++g_slack_auto_holds; }
         }
 
         if (slack_q.empty()) {

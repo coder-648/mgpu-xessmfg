@@ -801,6 +801,109 @@ static bool ds_prepare(ID3D12Device* device, UINT w, UINT h)
 }
 
 
+// ============== [capture] OffloadQueue: cross-adapter copies on our own queue ==========
+// Why: the MV/depth downscale passes and the 28-63 MB/frame cross-adapter *write* used to be
+// recorded into the game's own command list, i.e. they sat between the game's last draw and
+// its Present(). Measured cost of that traffic on the render card: ~3.6 ms/frame at 4K
+// (docs/findings/PERF_BASELINE.md 3.3), which is exactly what makes frame delivery late on a
+// saturated card (3.26).
+//
+// What this does NOT do (deliberately): it never hands a *game-owned* resource to a second
+// queue. Only our own render target (g_ds_rt[which]) and our own shared slot (g_slot[...])
+// move, so there is no cross-queue state hand-over with anything the game touches. The
+// conversion pass itself stays on the game's list (its source IS a game resource).
+//
+// Flow per frame:
+//   game list : [pass] -> g_ds_rt[which]: RENDER_TARGET -> COPY_SOURCE   (restore deferred)
+//   present   : game_queue->Signal(off_fence)   [ordered after that list]
+//   our queue : Wait(off_fence) -> CopyTextureRegion(g_ds_rt -> slot)
+//               -> g_ds_rt: COPY_SOURCE -> RENDER_TARGET
+//               -> Signal(g_fwd[slot])   [the consumer waits on this one]
+// Next frame's begin_effects waits (CPU, bounded) for our queue to have restored the state
+// before the pass renders into g_ds_rt again. If that wait ever times out we restart the
+// texture on the game's list instead and stay in-frame this time (see offload_guard).
+//
+// Off by default: a second queue inside the game process is the one change whose failure
+// mode is a device reset, so it has to be switched on deliberately and watched.
+static bool  g_offload = false;                 // [capture] OffloadQueue
+static ID3D12CommandQueue*        g_off_queue = nullptr;
+static ID3D12CommandAllocator*    g_off_alloc = nullptr;
+static ID3D12GraphicsCommandList* g_off_list  = nullptr;
+static ID3D12Fence*               g_off_fence = nullptr;   // local, same device
+static ID3D12Fence*               g_off_ready = nullptr;   // game queue -> our queue
+static UINT64 g_off_value   = 0;                // last value signalled on g_off_fence
+static UINT64 g_off_ready_value = 0;            // ... and on g_off_ready
+static UINT64 g_off_pending = 0;                // value not yet waited for
+static UINT   g_off_frames  = 0;                // frames whose copies ran on our queue
+static UINT   g_off_stalls  = 0;                // CPU stalls in offload_guard()
+static UINT   g_off_failed  = 0;                // times we had to fall back mid-run
+static bool   g_off_stream[3] = { false, false, false };   // 1 = mv, 2 = depth
+// Which streams our render target is currently left in COPY_SOURCE for. This is the
+// authoritative flag for "someone still has to restore this state", so a fallback can always
+// put it back even when the copy itself was skipped.
+static bool   g_off_deferred[3] = { false, false, false };
+static bool   g_off_logged = false;
+
+static void offload_fail(const char* why)
+{
+    if (g_off_failed == 0) { logf_("  [offload] %s - falling back to the game's queue\r\n", why); }
+    ++g_off_failed;
+    g_offload = false;
+}
+
+static bool offload_ensure(ID3D12Device* dev)
+{
+    if (g_off_list || g_off_queue) { return true; }
+    if (!dev) { return false; }
+    D3D12_COMMAND_QUEUE_DESC q{};
+    q.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (FAILED(dev->CreateCommandQueue(&q, __uuidof(ID3D12CommandQueue),
+                                       reinterpret_cast<void**>(&g_off_queue))) ||
+        FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                           __uuidof(ID3D12CommandAllocator),
+                                           reinterpret_cast<void**>(&g_off_alloc))) ||
+        FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_off_alloc,
+                                      nullptr, __uuidof(ID3D12GraphicsCommandList),
+                                      reinterpret_cast<void**>(&g_off_list))) ||
+        FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                                reinterpret_cast<void**>(&g_off_fence))) ||
+        FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence),
+                                reinterpret_cast<void**>(&g_off_ready)))) {
+        offload_fail("could not create the second queue");
+        return false;
+    }
+    g_off_list->Close();
+    if (!g_off_logged) {
+        g_off_logged = true;
+        logf_("  [offload] MV/depth cross-adapter copies run on our own queue"
+             " (conversion passes stay on the game's list)\r\n");
+    }
+    return true;
+}
+
+// CPU-side wait for the previous frame's offload work to have restored g_ds_rt. Bounded: our
+// copies are ~0.2 ms of copy-engine work and the game frame is 16-33 ms, so this is a
+// safety net, not a pacing mechanism. Returns false when the state could not be restored.
+static bool offload_guard()
+{
+    if (!g_offload || !g_off_fence || g_off_pending == 0) { return true; }
+    if (g_off_fence->GetCompletedValue() >= g_off_pending) {
+        g_off_pending = 0;
+        return true;
+    }
+    const ULONGLONG t0 = GetTickCount64();
+    while (g_off_fence->GetCompletedValue() < g_off_pending) {
+        if (GetTickCount64() - t0 > 4) {
+            ++g_off_stalls;
+            offload_fail("the second queue did not retire in time");
+            return false;      // caller must re-establish the state on the game's list
+        }
+        YieldProcessor();
+    }
+    g_off_pending = 0;
+    return true;
+}
+
 // One stream per call: `which` 0 = MV (R16G16_FLOAT), 1 = depth (R32).
 // The shared slots are placed at a fixed kStreamMaxW x kStreamMaxH (protocol v9), so a
 // copy into one must cover only the live content rectangle: the consumer copies exactly
@@ -843,8 +946,10 @@ static void copy_into_slot(ID3D12GraphicsCommandList* list, ID3D12Resource* src,
 
 // The caller has already transitioned `src` to a shader-readable state and restores it
 // afterwards; `dst` is the shared slot (COMMON, row-major, cross-adapter).
+// `defer_copy` (OffloadQueue) ends the pass with our render target in COPY_SOURCE instead of
+// copying + restoring here: the copy then runs on our own queue in the present callback.
 static bool ds_run(ID3D12GraphicsCommandList* list, int which, ID3D12Resource* src,
-                   ID3D12Resource* dst)
+                   ID3D12Resource* dst, bool defer_copy = false)
 {
     if (!g_ds_ready || !src || !dst || which < 0 || which > 1) { return false; }
 
@@ -906,12 +1011,115 @@ static bool ds_run(ID3D12GraphicsCommandList* list, int which, ID3D12Resource* s
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     list->ResourceBarrier(1, &b);
 
+    if (defer_copy) {
+        // OffloadQueue: the copy and the reverse transition happen on our own queue (see
+        // offload_submit). Leaving the resource in COPY_SOURCE here is what makes the copy
+        // legal on another queue - and the next frame waits for our restore before this pass
+        // renders into it again (offload_guard).
+        g_off_stream[which + 1] = true;
+        g_off_deferred[which + 1] = true;
+        return true;
+    }
+
     copy_into_slot(list, g_ds_rt[which].Get(), dst);
 
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     list->ResourceBarrier(1, &b);
     return true;
+}
+
+// Brings g_ds_rt[which] back to RENDER_TARGET on the *game's* list. Only used when an
+// offloaded copy could not be submitted (offload_guard timed out / the switch was turned off
+// mid-run): without it the next pass would render into a COPY_SOURCE resource.
+static void ds_restore_on_game_list(ID3D12GraphicsCommandList* list, int which)
+{
+    if (!list || !g_ds_rt[which]) { return; }
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.pResource = g_ds_rt[which].Get();
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    list->ResourceBarrier(1, &b);
+}
+
+// Records the deferred copies + the reverse transitions into g_off_list. Returns false when
+// there was nothing to record (no stream was deferred).
+static bool offload_record_copies(UINT slot)
+{
+    if (!g_off_deferred[1] && !g_off_deferred[2]) { return false; }
+    g_off_alloc->Reset();
+    g_off_list->Reset(g_off_alloc, nullptr);
+    bool any = false;
+    for (int which = 0; which < 2; ++which) {
+        const int stream = which + 1;
+        if (!g_off_deferred[stream]) { continue; }
+        // The copy is skipped when the target is gone, but the state is always restored -
+        // an unresolved COPY_SOURCE is what would break the next frame's pass.
+        if (g_ds_rt[which] && g_slot[stream][slot]) {
+            copy_into_slot(g_off_list, g_ds_rt[which].Get(), g_slot[stream][slot].Get());
+            any = true;
+        }
+        if (g_ds_rt[which]) {
+            D3D12_RESOURCE_BARRIER b{};
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            b.Transition.pResource = g_ds_rt[which].Get();
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            g_off_list->ResourceBarrier(1, &b);
+        }
+    }
+    g_off_list->Close();
+    g_off_deferred[1] = g_off_deferred[2] = false;
+    if (any) { ++g_off_frames; }
+    return true;
+}
+
+// Runs the deferred copies on our own queue and signals the consumer's cross-adapter fence
+// from *there*, so the signal a consumer waits on now comes from the queue that actually
+// wrote the slot. Two fences are involved:
+//   g_off_ready  (local)     : the game's queue signals it after the list holding the pass
+//   our queue    -> Wait(ready) -> copies + restore -> Signal(g_off_fence) -> Signal(g_fwd)
+// Returns true when the frame's MV/depth were handed over; the caller must then NOT signal
+// g_fwd[slot] from the game's queue itself.
+static bool offload_submit(UINT slot, UINT64 fwd_value)
+{
+    if (!g_offload || !g_off_queue || !g_off_list || !g_off_fence || !g_off_ready) { return false; }
+    if (!g_game_queue || !g_fwd[slot]) { return false; }
+
+    // Our work must be ordered after the game's list (the pass) and before the consumer is
+    // told the slot is ready; both are queue operations, not list ones.
+    const UINT64 ready = ++g_off_ready_value;
+    if (FAILED(g_game_queue->Signal(g_off_ready, ready))) { return false; }
+    if (!offload_record_copies(slot)) { return false; }
+
+    g_off_queue->Wait(g_off_ready, ready);
+    ID3D12CommandList* lists[] = { g_off_list };
+    g_off_queue->ExecuteCommandLists(1, lists);
+    g_off_pending = ++g_off_value;
+    g_off_queue->Signal(g_off_fence, g_off_pending);
+    g_off_queue->Signal(g_fwd[slot].Get(), fwd_value);
+    g_off_stream[1] = g_off_stream[2] = false;
+    return true;
+}
+
+// Last resort: the deferred streams could not be handed to our queue, so run the same list on
+// the *game's* queue (it is still ordered after the pass) and signal our own fence, so the
+// guard in the next frame's begin_effects sees a complete state again. The caller then
+// signals the consumer's fence as usual.
+static void offload_rescue(UINT slot)
+{
+    if (!g_game_queue || !g_off_list) { g_off_stream[1] = g_off_stream[2] = false; return; }
+    if (!offload_record_copies(slot)) { g_off_stream[1] = g_off_stream[2] = false; return; }
+    ID3D12CommandList* lists[] = { g_off_list };
+    g_game_queue->ExecuteCommandLists(1, lists);
+    if (g_off_fence) {
+        g_off_pending = ++g_off_value;
+        g_game_queue->Signal(g_off_fence, g_off_pending);
+    }
+    g_off_stream[1] = g_off_stream[2] = false;
 }
 
 // Resolves mgpu_depth_tap.fx's output texture. ReShade only has it once the effect is
@@ -922,7 +1130,7 @@ static int g_rt_depth_tries = 0;
 // Same-frame depth: copy the game's depth into our typeless texture, then run the existing
 // pass on it (converts to R32 and scales to the MV size in one go).
 static bool record_depth_convert(ID3D12GraphicsCommandList* list, ID3D12Resource* src,
-                                 ID3D12Resource* dst)
+                                 ID3D12Resource* dst, bool defer_copy = false)
 {
     if (!src || !dst || !g_ds_ready) { return false; }
     if (!ensure_depth_tl(g_ds_device, src)) { return false; }
@@ -1003,7 +1211,7 @@ static bool record_depth_convert(ID3D12GraphicsCommandList* list, ID3D12Resource
 
     native_barrier(list, src, resource_usage::copy_source, before);
 
-    const bool ok = ds_run(list, 1, g_depth_tl.Get(), dst);
+    const bool ok = ds_run(list, 1, g_depth_tl.Get(), dst, defer_copy);
 
     tracked_set_state(key, static_cast<uint32_t>(before));
     return ok;
@@ -1423,7 +1631,8 @@ static bool record_copy_tracked(command_list* /*cmd*/, ID3D12GraphicsCommandList
 // stream-sized target first (ds_run), which is what shrinks the cross-adapter copy.
 // Only the barrier targets differ: the draw reads the source as a shader resource.
 static bool record_downsample(command_list* cmd, ID3D12GraphicsCommandList* native_list,
-                              ID3D12Resource* src, ID3D12Resource* dst, int which)
+                              ID3D12Resource* src, ID3D12Resource* dst, int which,
+                              bool defer_copy = false)
 {
     const int sidx = (which == 0) ? 1 : 2;      // stream index: 1 = mv, 2 = depth
     const uint64_t key = reinterpret_cast<uint64_t>(src);
@@ -1452,7 +1661,10 @@ static bool record_downsample(command_list* cmd, ID3D12GraphicsCommandList* nati
     if (static_cast<uint32_t>(before) != static_cast<uint32_t>(read_as)) {
         native_barrier(native_list, src, before, read_as);
     }
-    const bool ok = ds_run(native_list, which, src, dst);
+    const bool ok = ds_run(native_list, which, src, dst, defer_copy);
+    // The game's own resource is restored here in every mode: our second queue only touches
+    // g_ds_rt (our render target) and the shared slot, so the game's state must stay correct
+    // on its own list. Only the *copy* + g_ds_rt's reverse transition are deferred.
     if (static_cast<uint32_t>(before) != static_cast<uint32_t>(read_as)) {
         native_barrier(native_list, src, read_as, before);
     }
@@ -1509,9 +1721,14 @@ static void log_stats()
     const unsigned overrun = ctl ? ctl->producer_overrun : 0;
     const unsigned waits   = ctl ? ctl->producer_waits : 0;
     logf_("  stats: seen=%d copied=%d skipped=%d  avg record=%.3f ms  frame=%llu"
-          "  q=%u/%u ov=%u waits=%u\n",
+          "  q=%u/%u ov=%u waits=%u",
           g_frames_seen, g_frames_copied, g_frames_skipped,
           avg, (unsigned long long)g_frame, queue_depth(), mgpu::kMaxSlots, overrun, waits);
+    // OffloadQueue counters only appear once the switch (or a fallback) has been seen.
+    if (g_offload || g_off_frames || g_off_failed) {
+        logf_("  offload=%u stalls=%u fail=%u", g_off_frames, g_off_stalls, g_off_failed);
+    }
+    logf_("\n");
 }
 
 // Formats and sizes must match exactly for CopyResource. The loading screen can
@@ -1649,6 +1866,13 @@ static void load_config()
     g_test_rebuild = GetPrivateProfileIntA("capture", "TestSize", 0, path);
     g_slot_policy  = GetPrivateProfileIntA("capture", "SlotPolicy", 0, path);
     g_slot_wait_us = GetPrivateProfileIntA("capture", "SlotWaitUs", 2000, path);
+
+    // OffloadQueue=1 runs the MV/depth *cross-adapter copies* on a command queue of our own
+    // (created on the game's device) instead of inside the game's command list, so the
+    // 28-63 MB/frame write no longer sits between the game's last draw and its Present().
+    // The conversion passes stay on the game's list; only our own render target and the
+    // shared slot move. Default 0: it is the one change whose failure mode is a device reset.
+    g_offload = GetPrivateProfileIntA("capture", "OffloadQueue", 0, path) != 0;
 
     g_stream_align = GetPrivateProfileIntA("capture", "StreamAlign", 1, path);
     if (g_stream_align != 1 && g_stream_align != 2 && g_stream_align != 4 &&
@@ -1908,6 +2132,28 @@ static void on_begin_effects(effect_runtime* rt, command_list* cmd,
 
     g_game_queue = reinterpret_cast<ID3D12CommandQueue*>(rt->get_command_queue()->get_native());
 
+    // [capture] OffloadQueue: the previous frame's copies must have finished (and restored
+    // g_ds_rt) before the passes below render into it again. Bounded CPU wait, normally
+    // already satisfied; on timeout the state is re-established on the game's list.
+    bool offload_ok = false;
+    if (g_offload) {
+        if (!offload_ensure(game_device)) {
+            // offload_fail() already logged and cleared g_offload
+        } else if (offload_guard()) {
+            offload_ok = true;
+            g_off_deferred[1] = g_off_deferred[2] = false;   // our queue restored them
+        } else {
+            // Could not confirm the restore: put the *deferred* targets back on the game's
+            // list so this frame's passes are legal, and stay in-frame for this frame.
+            for (int which = 0; which < 2; ++which) {
+                if (!g_off_deferred[which + 1]) { continue; }
+                ds_restore_on_game_list(native_list, which);
+                g_off_deferred[which + 1] = false;
+            }
+        }
+    }
+    g_off_stream[1] = g_off_stream[2] = false;
+
     const double t0 = now_ms();
 
     // The streams are sized once per game process, so flipping the DLSS mode mid-run
@@ -1991,7 +2237,7 @@ static void on_begin_effects(effect_runtime* rt, command_list* cmd,
         // this same pass - was perfectly sane. Sampling with an SRV makes the source
         // layout irrelevant.
         if (g_ds_on || g_mv_pass || g_ds_ready) {
-            mv_ok = record_downsample(cmd, native_list, g_inputs.mv, dst, 0);
+            mv_ok = record_downsample(cmd, native_list, g_inputs.mv, dst, 0, offload_ok);
         }
         if (!mv_ok && copy_compatible(g_inputs.mv, dst)) {
             mv_ok = record_copy_tracked(cmd, native_list, g_inputs.mv, dst, 1);
@@ -2021,7 +2267,7 @@ static void on_begin_effects(effect_runtime* rt, command_list* cmd,
         if (g_depth_pass && g_depth_convert_cfg == 2) { shadow = reshade_depth_resource(); }
         if (g_depth_pass && g_depth_convert_cfg == 1) {
             // DepthConvert=1: same-frame real depth via our typeless copy.
-            depth_ok = record_depth_convert(native_list, g_inputs.depth, dst);
+            depth_ok = record_depth_convert(native_list, g_inputs.depth, dst, offload_ok);
         } else if (shadow) {
             // ReShade's own R32F depth output, one frame old and in a state we know.
             depth_ok = record_shadow_depth_copy(native_list, shadow, dst,
@@ -2029,7 +2275,7 @@ static void on_begin_effects(effect_runtime* rt, command_list* cmd,
         } else if (g_ds_on) {
             // Depth is rendered into the R32 stream: converts D32_S8X24 (UE5) to R32 and
             // rescales to the MV size in the same pass, so no crop and no format guessing.
-            depth_ok = record_downsample(cmd, native_list, g_inputs.depth, dst, 1);
+            depth_ok = record_downsample(cmd, native_list, g_inputs.depth, dst, 1, offload_ok);
         } else if (copy_compatible(g_inputs.depth, dst)) {
             depth_ok = record_copy_tracked(cmd, native_list, g_inputs.depth, dst, 2);
         } else if (copy_formats_ok(g_inputs.depth, dst)) {
@@ -2136,7 +2382,15 @@ static void on_reshade_present(effect_runtime* /*rt*/)
                                               (g_mv_active ? mgpu::kInputFlagMvActive : 0);
             MemoryBarrier();
         }
-        if (SUCCEEDED(g_game_queue->Signal(g_fwd[slot].Get(), value))) {
+        // OffloadQueue: hand the deferred copies to our own queue (which then signals the
+        // consumer's fence), or rescue them on the game's queue if that was not possible.
+        bool signalled = false;
+        if (g_offload && (g_off_stream[1] || g_off_stream[2])) {
+            signalled = offload_submit(slot, value);     // signals g_fwd[slot] from our queue
+            if (!signalled) { offload_rescue(slot); }    // copies on the game's queue instead
+        }
+        if (!signalled) { signalled = SUCCEEDED(g_game_queue->Signal(g_fwd[slot].Get(), value)); }
+        if (signalled) {
             g_fwd_expected[slot] = value;
             g_slot_index = (g_cur_slot + 1) % mgpu::kMaxSlots;
         }

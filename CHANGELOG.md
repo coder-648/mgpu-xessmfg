@@ -3,6 +3,72 @@
 只记**用户能感知**的变化与对应实测依据。每条结论的原始数据在
 `docs/findings/PERF_BASELINE.md` / `FINAL_CONFIG.md`。
 
+## v0.13.2 —— 并行化复审：所有"还能并行"的地方都试过了，结论是默认全关（2026-11-09）
+
+**一句话**：把 fg 链路上还能并行/异步的地方全部实现并实测了一遍 —— 3 个默认关的新开关
+（跨卡拷贝走 COPY 队列、MV/深度提前一帧、add-on 把跨卡写搬出游戏队列）、1 个抗丢帧模式，
+外加 3 个真修复。**新开关全部默认关闭，默认行为与本版之前完全一致**；每个开关的实测数据、
+为什么留/为什么不用，都在 `docs/findings/PERF_BASELINE.md` §3.28–§3.30。
+
+### 修掉的问题（默认生效）
+
+1. **`--fg-warp` 两条 list 共用一份 command allocator。** 这条实验路径一个输入帧提交两条 list
+   （插值中点 + 真帧），而中点那次 `Present()` 只是把 list 排进队列；原代码在两次提交之间
+   `Reset()` 同一个 allocator —— D3D12 里对**还在执行**的 allocator 做 Reset 是未定义行为。
+   现在两对 `(allocator, list)` 每帧轮换，靠下一帧开头的 `gpu_throttle()` 保证换进来的那对已退休；
+   顺带修掉 `back_buffer()` 失败时第二条 list 往**已关闭**的 list 里录的问题。
+2. **`WGC sees 60 fps but the game only renders 38.4 fps` 是假警报。** 它拿我们的**中位数**
+   （16.7 ms）去比生产端的**一次原始采样**（26 ms）；真实情况是游戏 ~44 fps 落在 120 Hz 面板上，
+   帧间隔在 2/3/4 个 vblank 之间正常跳动，两边**中位数**都只是"最常见的那个桶"。
+   这条误报曾把排查引向"游戏自带 FG"（实测游戏 FG 是关的）。现在两边都取 16 帧中位数再比，
+   并把 **DWM 重复合成**列为第二种可能原因（我们的顶层覆盖窗口会让游戏窗口失去独立翻转）。
+3. **UI 的两个死键接上了。** `mgpu_ui.ini` 里的 `sdr` 与 `slack1` 一直存在，但
+   `ID_SDR` / `ID_SLACK` **不在任何控件表里**、`build_cmdline` 也从不发对应开关 —— 等于摆设。
+
+### 新增 UI 控件
+
+| 位置 | 控件 | 作用 |
+|---|---|---|
+| 捕获 → **色彩空间** | `HDR10（默认）` / `SDR（BT.709）` | 选 SDR 发 `--sdr`：bridge 走 BT.709 + gamma 2.2，并把交换链色彩空间声明成 SDR。我们抓的是 scRGB(FP16)，HDR 源永不丢；在 HDR 显示器上选 SDR 会发灰，那是模式本身 |
+| 帧生成 → **抗丢帧 (A/B)** | 开 / 关 | 发 `--slack-auto`：当排队的抓取帧确实带着**新内容**时，多留一帧而不是丢掉（代价是那一帧 +1 个间隔延迟） |
+
+### 新增命令行开关（默认全关）
+
+| 开关 | 作用 | 实测结论 |
+|---|---|---|
+| `--input-copy-queue` | MV/深度的跨卡拷贝走独立 COPY 队列，与颜色 convert draw 重叠 | `--den 2` 测不出来（重叠窗口只有 0.2–0.5 ms）；`--den 1` 单趟 A/B 有 −1…−2 ms 但体感更差（空刷新 34 vs 13）。**不用** |
+| `--prefetch-inputs`（隐含上一条） | 把 slot N+1 的 MV/深度放在帧 N 的 Present 之后拷贝 | 机制 100% 命中（`pf 40/0`），但空刷新 0.32 → **2.90/窗**、15/60 窗口空 >4 个：搬运挪出帧外 → 循环跑赢 pacer → `--interp-cadence` 少要帧。**不用** |
+| `[capture] OffloadQueue=1`（add-on） | 跨卡拷贝 + 我们自己 RT 的反向状态转换搬到 add-on 自己的队列 | 功能验收通过（`offload=9987`、`stalls=0`、`fail=0`、6 分钟无异常、回退链一次没触发），**收益未量到**（对照被场景漂移吃掉）。**不用**，游戏侧 add-on 已回滚 |
+| `--slack-auto` | 抗丢帧：真有新内容时多留一帧 | 缺省关。实测它的 `held` 只有 3 次而丢了 20 次 ⇒ 20 次丢弃里生产端根本没发布新帧 = **重复帧**。建议**开着**（几乎零成本），但不是必须 |
+
+### 顺手量到的事实（以后不用重测）
+
+- **OSD 的 `drop N` 大多不是"掉帧"**：`--slack-auto` 的判据证明那些被丢弃的抓取帧里
+  生产端 `frame_published` 没有变化 —— 是 DWM 把同一帧重复合成上来的，丢掉不损失画面。
+  新日志把丢弃拆成 `[K real loss / M-K duplicate]`，**只有 K 是真丢内容**。
+- **手工分次跑 A/B 在本机不成立**：同一配置两趟 `total` 差 **3.2 ms**、`age` 差 6 倍（7.9 vs 48.5 ms），
+  比被测效应还大。必须用 `bin\12 - automatic A-B-C-A 4K (60s each).bat` 这种**自动连续**跑法。
+- **我们自己没有任何硬编码帧率上限**：`--lock` / `--fg-out-hz` / `--pace` 默认全关，UI 里那行
+  "建议锁帧"只是提示（不会传给 bridge）；交换链是 `Present(0)` + BufferCount 2 + MaxFrameLatency 1
+  （限的是在飞帧数，不是帧率）。日志里的 `in=25 ms` 就是 RTSS 锁的 40 fps。
+
+### 新增配方脚本
+
+```
+9  - 4K out 3x (A).bat                     4K 原生输出基线（--den 1 --interp 3）
+10 - 4K out 3x + cq (B).bat                + --input-copy-queue
+11 - 4K out 3x + prefetch (C).bat          + --prefetch-inputs
+12 - automatic A-B-C-A 4K (60s each).bat   自动连续跑四段（本机唯一可信的 A/B 方式）
+13 - smoothest + anti-drop (A-B).bat       配方 5 + --slack-auto
+8  - smoothest + copy queue (A-B).bat      配方 5 + --input-copy-queue
+```
+
+### 这一版真正可用的东西
+
+`--fg-warp` 的双 allocator 修复（真隐患）、`breakdown` 的 `cq=` 字段、
+`collect_retired_inputs()` 的 swap-remove、UI 的「色彩空间」与「抗丢帧」两个控件、
+`--slack-auto`、以及上面那条**假警报的修正**。其余全部默认关。
+
 ## v0.13.1 —— RE Engine / PRAGMATA 支持（2026-11-09，已实测通过）
 
 **结论**：PRAGMATA 这条路走通了 —— `input source: ngx`、`shared ready`、bridge 正常出帧、

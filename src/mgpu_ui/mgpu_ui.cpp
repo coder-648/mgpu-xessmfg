@@ -273,9 +273,11 @@ static const RowDef kRowsFg[] = {
     { ID_OUTFPS,  L"输出帧率 (Hz, 0=面板)", RK_EDIT },
     { ID_OUT,     L"输出",            RK_DD   },
     { ID_MV,      L"运动矢量",        RK_DD   },
+    { ID_SLACK,   L"抗丢帧 (A/B)",    RK_TOG  },
 };
 static const RowDef kRowsCap[] = {
     { ID_CAP_API, L"捕获 API",        RK_INFO },
+    { ID_SDR,     L"色彩空间",        RK_DD   },
     { ID_POOL,    L"帧池深度",        RK_SPIN },
     { ID_LAT,     L"最大帧延迟数",    RK_SPIN },
 };
@@ -296,8 +298,8 @@ static const RowDef kRowsOverlay[] = {
 };
 
 static const CardDef kCards[] = {
-    { L"帧生成",       kRowsFg,     8, 0 },
-    { L"捕获",         kRowsCap,    3, 1 },
+    { L"帧生成",       kRowsFg,     9, 0 },
+    { L"捕获",         kRowsCap,    4, 1 },
     { L"启动",         kRowsLaunch, 3, 0 },
     { L"GPU / 显示器", kRowsDev,    2, 1 },
     { L"叠加层",       kRowsOverlay, 3, 1 },
@@ -318,6 +320,11 @@ static const wchar_t* kOptUi[]     = { L"关闭", L"自动" };
 static const wchar_t* kOptRt[]     = { L"ema", L"median (16 帧)" };
 static const wchar_t* kOptLock[]   = { L"关闭", L"30 fps", L"24 fps", L"40 fps", L"60 fps" };
 static const wchar_t* kOptTMode[]  = { L"前景窗口 (鼠标点进游戏再按热键)", L"上一次启动的窗口" };
+// 色彩空间：我们捕获到的是 scRGB(FP16) 的 HDR 画面，默认按 HDR10（BT.2020 primaries + PQ）
+// 编码输出；--sdr 走 BT.709 + gamma 2.2 且告诉交换链这是 SDR。
+// 在 HDR 显示器上选 SDR 会看起来发灰/发闷（这是 SDR 在 HDR 屏上的正常表现，不是 bug），
+// 反之在 SDR 显示器上保持 HDR10 会发灰发亮。所以做成一个显式开关。
+static const wchar_t* kOptColor[]  = { L"HDR10（默认）", L"SDR（BT.709）" };
 static const double   kLockFps[]   = { 0.0, 30.0, 24.0, 40.0, 60.0 };
 
 static std::wstring hotkey_name();          // defined with the input handling
@@ -328,6 +335,7 @@ static int opt_count(Id id)
     case ID_FG_MODE: return 2;
     case ID_OUT:     return 3;
     case ID_MV:      return 4;
+    case ID_SDR:     return 2;
     case ID_FOV:     return 4;
     case ID_IVL:     return 6;
     case ID_UI:      return 2;
@@ -347,6 +355,7 @@ static const wchar_t* opt_text(Id id, int i)
     case ID_FG_MODE: return kOptFgMode[i % 2];
     case ID_OUT:     return kOptOut[i % 3];
     case ID_MV:      return kOptMv[i % 4];
+    case ID_SDR:     return kOptColor[i % 2];
     case ID_FOV:     return kOptFov[i % 4];
     case ID_IVL:     return kOptIvl[i % 6];
     case ID_UI:      return kOptUi[i % 2];
@@ -388,6 +397,7 @@ static int opt_get(Id id)
     case ID_FG_MODE: return S().fg_mode;
     case ID_OUT:     return S().out_mode;
     case ID_MV:      return S().mv_mode;
+    case ID_SDR:     return S().sdr ? 1 : 0;
     case ID_FOV:     return S().fov_sel;
     case ID_IVL:     return S().ivl_sel;
     case ID_UI:      return S().ui_none ? 0 : 1;
@@ -784,6 +794,15 @@ static std::wstring build_cmdline(HWND target, bool display)
     if (S().overlay_layered) { cmd += L" --overlay-layered"; }
     if (S().relay_input) { cmd += L" --relay-input"; }
     if (!S().osd) { cmd += L" --no-osd"; }
+    // 色彩空间：默认 HDR10（BT.2020 + PQ）。选 SDR 时发 --sdr，由 bridge 切到 BT.709 +
+    // gamma 2.2 并把交换链色彩空间声明成 SDR（g_colour_mode = 2）。
+    // 我们捕获的是 scRGB(FP16)，所以 HDR 源永远不丢；SDR 只是"编码成 SDR 再上屏"，
+    // 在 HDR 显示器上会明显发灰 —— 那是模式本身，不是链路出错。
+    if (S().sdr) { cmd += L" --sdr"; }
+    // 抗丢帧：OSD 偶尔出现的 "drop 1" 就是主循环把排队的旧帧丢掉了（drain-newest）。
+    // --slack-auto 只在"生产端在我们上次消费后确实又发布了新帧"时多留一帧，把丢弃换成
+    // 一次 +1 间隔的延迟，代价只发生在真有新内容的时候（--slack 1 是恒定 +1 间隔，命令行备选）。
+    if (S().slack1) { cmd += L" --slack-auto"; }
     cmd += L" --unlock-mfg --fg-ui none --fg-proj-rz --fg-rt-mode auto";
     // FOV and 输入间隔 are no longer exposed in the UI (2026-11-08): FOV only feeds the
     // synthetic projection, which the XeFG frame-generation path ignores (5.16), and
@@ -1651,7 +1670,7 @@ static void toggle_field(Id id)
     case ID_UNLOCK:  S().unlock_mfg = !S().unlock_mfg; break;
     case ID_SLACK:   S().slack1 = !S().slack1; break;
     case ID_TEAR:    S().tearing = !S().tearing; break;
-    case ID_SDR:     S().sdr = !S().sdr; break;
+    // ID_SDR is a dropdown (色彩空间 HDR10/SDR), handled in set_opt() - not a toggle.
     case ID_LAYERED:
         S().overlay_layered = !S().overlay_layered;
         // A/B 两种叠加层模式互斥：开一个就关掉另一个
@@ -1692,6 +1711,11 @@ static void set_opt(Id id, int idx)
     case ID_FG_MODE: S().fg_mode = idx % 2; S().cadence = (S().fg_mode == 1); break;
     case ID_OUT:     S().out_mode = idx % 3; break;
     case ID_MV:      S().mv_mode = idx % 4; break;
+    case ID_SDR:
+        S().sdr = (idx % 2) == 1;
+        set_msg(S().sdr ? L"SDR 输出（BT.709）：HDR 显示器上会发灰，属正常"
+                        : L"HDR10 输出（BT.2020 + PQ）");
+        break;
     case ID_FOV:     S().fov_sel = idx % 4; break;
     case ID_IVL:     S().ivl_sel = idx % 6; break;
     case ID_UI:      S().ui_none = (idx % 2) == 0; break;
