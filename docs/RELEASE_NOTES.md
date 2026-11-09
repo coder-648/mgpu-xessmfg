@@ -10,7 +10,7 @@
 > 再通过覆盖窗口上屏。A 卡 + N 卡混插可用；单卡也能跑。
 
 **下载**：`mgpu-0.13.2.zip`（16.5 MB）
-`sha256: cbd27ac7714adc45eb21bfb96c6d168c50baa7b14d0474d45a2ceb812438efe1`
+`sha256: 25dff7e0daaf08a9d16bee83e7a2150570d6d8160baf07ad866a9dd4f5878558`
 
 > 与 `v0.13.1` 一致，本包**内含** Intel 的 `libxess_fg.dll`（22.9 MB）与 `libxell.dll`，
 > 解压即跑（目标版本 `libxess_fg 1.3.1.78` / `libxell 1.3.2.10`，`--unlock-mfg` 只对实测过的版本成立）。
