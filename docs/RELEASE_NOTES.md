@@ -9,13 +9,13 @@
 > 游戏用自己的卡渲染 + 超分（DLSS / FSR / XeSS），另一块卡专职跑 **XeSS-FG** 插帧，
 > 再通过覆盖窗口上屏。A 卡 + N 卡混插可用；单卡也能跑。
 
-**下载**：`mgpu-0.13.2.zip`（3.0 MB）
-`sha256: 9238408d82e19fc5a0e2c8e1d3dc1e7062b7258af14f0c127605de876daf1c7a`
+**下载**：`mgpu-0.13.2.zip`（16.5 MB）
+`sha256: cbd27ac7714adc45eb21bfb96c6d168c50baa7b14d0474d45a2ceb812438efe1`
 
-> 本包**不含 Intel 的 `libxess_fg.dll` / `libxell.dll`**（按 Intel 自己的许可，不随本项目分发）。
-> 放好这两个文件才能跑，取法与版本要求见包内 `bin\README-DLL.txt`：
-> XeSS SDK v3.0.2 的 `bin/`（2x 任意 1.3.x 都行；3x 以上要 `--unlock-mfg`，只对实测过的
-> `libxess_fg 1.3.1.78` / `libxell 1.3.2.10` 成立）。
+> 与 `v0.13.1` 一致，本包**内含** Intel 的 `libxess_fg.dll`（22.9 MB）与 `libxell.dll`，
+> 解压即跑（目标版本 `libxess_fg 1.3.1.78` / `libxell 1.3.2.10`，`--unlock-mfg` 只对实测过的版本成立）。
+> 若要做**不含**它们的公开分发，跑 `SKIP_XESS_DLLS=1 ./scripts/make_release.sh`，
+> 取法与版本要求见随包生成的 `bin\README-DLL.txt`（见 `docs/ops/LEGAL.md`）。
 
 ### 🎯 这一轮做了什么
 
