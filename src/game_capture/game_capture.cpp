@@ -95,6 +95,30 @@ static unsigned long long process_uptime_ms()
 // opened unless asked for: [capture] Log=1 in game_capture.ini, or MGPU_CAPTURE_LOG=1
 // in the environment (handy, because the env var can be set by a launcher while the
 // ini has to be edited before the game starts).
+// Where the add-on reads its ini from.
+//  1. next to the DLL (the normal case);
+//  2. %LOCALAPPDATA%\mgpu\game_capture.ini when that file does not exist - some titles run
+//     with a redirected / read-only game directory (PRAGMATA loads the add-on from
+//     E:\PRAGMATA\_storage_, so the ini is looked up there and a copy in the game root is
+//     never read; see docs/findings/RE_ENGINE_NOTES.md 6.4).
+static void resolve_ini_path(char* out, size_t count)
+{
+    out[0] = '\0';
+    if (g_self != nullptr) { GetModuleFileNameA(g_self, out, (DWORD)count); }
+    if (char* dot = strrchr(out, '.')) {
+        strcpy_s(dot, count - (size_t)(dot - out), ".ini");
+    }
+    if (out[0] != '\0' && GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES) { return; }
+
+    char dir[MAX_PATH]{};
+    const DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", dir, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) { return; }         // keep the local path (defaults)
+    char alt[MAX_PATH]{};
+    _snprintf_s(alt, sizeof(alt), _TRUNCATE, "%s\\mgpu\\game_capture.ini", dir);
+    if (GetFileAttributesA(alt) == INVALID_FILE_ATTRIBUTES) { return; }
+    strcpy_s(out, count, alt);
+}
+
 static bool log_requested()
 {
     char env[16]{};
@@ -103,10 +127,7 @@ static bool log_requested()
         return true;
     }
     char ini[MAX_PATH]{};
-    GetModuleFileNameA(g_self, ini, MAX_PATH);
-    if (char* dot = strrchr(ini, '.')) {
-        strcpy_s(dot, MAX_PATH - (dot - ini), ".ini");
-    }
+    resolve_ini_path(ini, sizeof(ini));
     return GetPrivateProfileIntA("capture", "Log", 0, ini) != 0;
 }
 
@@ -122,6 +143,28 @@ static void open_log()
     // away every earlier attempt. _SH_DENYNO so the file can be read while the game runs
     // (fopen's default sharing denied it, which made live diagnosis impossible).
     g_log = _fsopen(path, "a", _SH_DENYNO);
+    if (g_log == nullptr) {
+        // Fallback: some titles (or their DRM) refuse writes next to the game executable,
+        // and then *every* diagnostic goes silent - which is exactly what happened with
+        // PRAGMATA (RE Engine, 2026-11-09): ReShade logged "Registered add-on" from inside
+        // AddonInit, yet this file never appeared. Record the attempt next to the user's
+        // profile instead, including why the local one failed.
+        const DWORD err = GetLastError();
+        char dir[MAX_PATH]{};
+        const DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", dir, MAX_PATH);
+        if (n > 0 && n < MAX_PATH) {
+            strcat_s(dir, "\\mgpu");
+            CreateDirectoryA(dir, nullptr);
+            char alt[MAX_PATH]{};
+            _snprintf_s(alt, sizeof(alt), _TRUNCATE, "%s\\game_capture-%lu.log", dir,
+                        (unsigned long)GetCurrentProcessId());
+            g_log = _fsopen(alt, "a", _SH_DENYNO);
+            if (g_log != nullptr) {
+                logf_("=== local log '%s' could not be opened (error %lu), using %s ===\n",
+                      path, (unsigned long)err, alt);
+            }
+        }
+    }
     if (g_log) {
         SYSTEMTIME st{};
         GetLocalTime(&st);
@@ -379,6 +422,31 @@ static float  g_present_interval_ms = 0.0f;
 static bool   g_logged_missing_state[3] = { false, false, false };
 static bool   g_step_logged[3] = { false, false, false };
 static UINT64 g_skip_capture_until = 0;
+// Hard wall-clock cap for that pause. The frame count is the real criterion (a resize
+// invalidates every game resource and the next few frames are still settling), but on a
+// title that presents at ~1 fps while loading 120 frames is minutes - PRAGMATA (RE Engine,
+// 2026-11-09) sat at 0.8 fps for 148 s, so the capture stayed paused for the whole start-up.
+static double g_skip_until_ms = 0.0;
+
+// --- callback timing (2026-11-09) ------------------------------------------------------
+// PRAGMATA (RE Engine) took minutes to load with this add-on and loaded normally without it,
+// yet every callback below is a handful of instructions. Measure instead of argue: these
+// accumulators are printed with the 120-frame heartbeat, so one run says where the time
+// goes. Cost: two QPC reads per callback (~40 ns).
+static double   g_perf_barrier_ms    = 0.0;
+static double   g_perf_begin_ms      = 0.0;
+static double   g_perf_present_ms    = 0.0;
+static uint64_t g_perf_barrier_calls = 0;
+static uint64_t g_perf_barrier_items = 0;
+static bool     g_loader_hook        = true;   // [capture] LoaderHook=0 disables it
+
+struct PerfAccum
+{
+    double* dst;
+    double  t0;
+    explicit PerfAccum(double* d) : dst(d), t0(now_ms()) {}
+    ~PerfAccum() { *dst += now_ms() - t0; }
+};
 static bool   g_first_colour_logged = false;
 
 static const char* kStreamName[3] = { "color", "mv", "depth" };
@@ -1278,6 +1346,9 @@ static void on_barrier(command_list*, uint32_t count, const resource* resources,
     // Hot path: a handful of relaxed atomic reads, no lock. Only resources we are
     // actually watching are looked up (at most kTrackedResources compares).
     if (count == 0) { return; }
+    PerfAccum acc(&g_perf_barrier_ms);
+    ++g_perf_barrier_calls;
+    g_perf_barrier_items += count;
     for (uint32_t i = 0; i < count; ++i) {
         tracked_set_state(resources[i].handle, static_cast<uint32_t>(new_states[i]));
     }
@@ -1531,7 +1602,8 @@ static void on_init_swapchain(swapchain* sw, bool resize)
     // A resize recreates every game resource; touching them while that happens is
     // what hung earlier runs, so stay out of the way for a couple of seconds.
     g_skip_capture_until = g_frame + 120;
-    logf_("\ninit_swapchain: %p resize=%d - pausing capture until frame %llu\n",
+    g_skip_until_ms     = now_ms() + 8000.0;   // ... but never longer than 8 s of wall time
+    logf_("\ninit_swapchain: %p resize=%d - pausing capture until frame %llu (max 8 s)\n",
           (void*)sw, resize ? 1 : 0, (unsigned long long)g_skip_capture_until);
 }
 
@@ -1545,10 +1617,7 @@ static void on_init_swapchain(swapchain* sw, bool resize)
 static void load_config()
 {
     char path[MAX_PATH]{};
-    GetModuleFileNameA(g_self, path, MAX_PATH);
-    if (char* dot = strrchr(path, '.')) {
-        strcpy_s(dot, MAX_PATH - (dot - path), ".ini");
-    }
+    resolve_ini_path(path, sizeof(path));
 
     char value[32]{};
     if (GetPrivateProfileStringA("capture", "Color", "1", value, sizeof(value), path) > 0) {
@@ -1611,13 +1680,18 @@ static void load_config()
     }
     if (g_force_input.empty()) { g_force_input = "auto"; }
 
+    // [capture] LoaderHook=0: do not patch kernel32!LoadLibrary*. The sources are then only
+    // found by rescanning the module list every 120 frames - slower to notice, but it keeps
+    // us out of the game's loader, which is the prime suspect for RE Engine's slow start-up.
+    g_loader_hook = GetPrivateProfileIntA("capture", "LoaderHook", 1, path) != 0;
+
     logf_("config: Color=%d RenderWidth=%u RenderHeight=%u StreamPercent=%d StreamHeight=%d"
-          " SkipMv=%d DepthConvert=%d MvNormalize=%d MvFlip=%d Input=%s (path %s)\n",
+          " SkipMv=%d DepthConvert=%d MvNormalize=%d MvFlip=%d LoaderHook=%d Input=%s (path %s)\n",
           g_capture_colour ? 1 : 0, g_render_w_ini, g_render_h_ini, g_stream_percent,
           g_stream_height,
           g_skip_mv ? 1 : 0,
           g_depth_convert_cfg, g_mv_normalize_cfg, g_mv_flip_cfg,
-          g_force_input.c_str(), path);
+          g_loader_hook ? 1 : 0, g_force_input.c_str(), path);
 }
 
 // Asks the sources for this frame's inputs. The first source that has data wins and
@@ -1797,10 +1871,19 @@ static bool claim_publish_slot()
 static void on_begin_effects(effect_runtime* rt, command_list* cmd,
                              resource_view /*rtv*/, resource_view /*rtv_srgb*/)
 {
+    PerfAccum acc(&g_perf_begin_ms);
     ++g_frames_seen;
+    if (!g_loader_hook && (g_frames_seen % 120) == 0) {
+        // No loader hook (see [capture] LoaderHook): pick up modules that appeared after
+        // init, so NGX/FFX/XeSS are still found - just up to 120 frames later.
+        scan_loaded_modules();
+    }
     if (!fetch_inputs()) { return; }
 
-    if (g_frame < g_skip_capture_until) { return; }
+    // Paused after a swap-chain (re)create: whichever comes first, the frame count or the
+    // wall-clock cap (see g_skip_until_ms - a slow-loading title presents far too few
+    // frames per second for a pure frame count to mean "a couple of seconds").
+    if (g_frame < g_skip_capture_until && now_ms() < g_skip_until_ms) { return; }
     release_old_resources();
 
     device* dev = rt->get_device();
@@ -1995,6 +2078,21 @@ static void on_begin_effects(effect_runtime* rt, command_list* cmd,
 // the place where the (future) named-mapping producer will push a frame.
 static void on_reshade_present(effect_runtime* /*rt*/)
 {
+    PerfAccum acc(&g_perf_present_ms);
+    // Every 120 presents, print what our own callbacks cost in the window. This is the
+    // question "is the add-on what makes this game load slowly?" answered with numbers.
+    if (g_frames_seen != 0 && (g_frames_seen <= 5 || (g_frames_seen % 120) == 0)) {
+        logf_("perf: frames=%llu begin=%.1fms barrier=%.1fms (%llu calls / %llu items)"
+              " present=%.1fms\n",
+              (unsigned long long)g_frames_seen, g_perf_begin_ms, g_perf_barrier_ms,
+              (unsigned long long)g_perf_barrier_calls,
+              (unsigned long long)g_perf_barrier_items, g_perf_present_ms);
+        g_perf_barrier_ms = 0.0;
+        g_perf_begin_ms   = 0.0;
+        g_perf_present_ms = 0.0;
+        g_perf_barrier_calls = 0;
+        g_perf_barrier_items = 0;
+    }
     // Present happens after the game submitted the list our copies live on, so a
     // queue signal here is ordered behind them: the bridge can trust the slot.
     //
@@ -2069,10 +2167,44 @@ static void on_init_effect_runtime(effect_runtime* rt)
 
 // ------------------------------------------------------------------ add-on
 
+// Unconditional breadcrumb in %LOCALAPPDATA%\mgpu\breadcrumb.log.
+// PRAGMATA (2026-11-09) showed that "ReShade logged Registered add-on" and "we wrote a byte
+// of log" can disagree, and every hypothesis about why costs a game launch. This line needs
+// no ini, no writable game directory and no logging switch: it answers "did AddonInit run,
+// which ini did we read, what did it say, did the log open" in one shot.
+static void write_breadcrumb(const char* stage)
+{
+    char dir[MAX_PATH]{};
+    const DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", dir, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) { return; }
+    strcat_s(dir, "\\mgpu");
+    CreateDirectoryA(dir, nullptr);
+
+    char addon[MAX_PATH]{};
+    GetModuleFileNameA(g_self, addon, MAX_PATH);
+    char ini[MAX_PATH]{};
+    strcpy_s(ini, addon);
+    if (char* dot = strrchr(ini, '.')) { strcpy_s(dot, MAX_PATH - (dot - ini), ".ini"); }
+
+    char path[MAX_PATH]{};
+    _snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\breadcrumb.log", dir);
+    FILE* f = _fsopen(path, "a", _SH_DENYNO);
+    if (f == nullptr) { return; }
+
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    fprintf(f, "[%02u:%02u:%02u.%03u] pid %lu  %s  addon=%s  ini=%s  Log=%d  g_log=%s\n",
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+            (unsigned long)GetCurrentProcessId(), stage, addon, ini,
+            GetPrivateProfileIntA("capture", "Log", 0, ini), (g_log != nullptr) ? "open" : "null");
+    fclose(f);
+}
+
 extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE reshade_module)
 {
     g_self = addon_module;
     open_log();
+    write_breadcrumb("AddonInit");
     logf_("AddonInit (addon=%p reshade=%p)\n", (void*)addon_module, (void*)reshade_module);
     // Build stamp: the DLL is only picked up when the game process starts, so "which
     // version am I running" is the first question every time something looks unchanged.
@@ -2094,22 +2226,31 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE re
 
     // Loader hooks, so a source is told about a module the moment the game loads it
     // (M2: for DLSS that module is the driver-store _nvngx.dll).
-    mgpu::input::ensure_minhook();
-    HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
-    struct LoaderHook { const char* name; LPVOID detour; LPVOID* original; };
-    LoaderHook hooks[] = {
-        { "LoadLibraryExW", reinterpret_cast<LPVOID>(&hook_load_library_ex_w),
-                            reinterpret_cast<LPVOID*>(&g_real_load_library_ex_w) },
-        { "LoadLibraryW",   reinterpret_cast<LPVOID>(&hook_load_library_w),
-                            reinterpret_cast<LPVOID*>(&g_real_load_library_w) },
-    };
-    for (auto& lh : hooks) {
-        LPVOID addr = reinterpret_cast<LPVOID>(GetProcAddress(kernel32, lh.name));
-        if (!addr) { continue; }
-        if (MH_CreateHook(addr, lh.detour, lh.original) == MH_OK &&
-            MH_EnableHook(addr) == MH_OK) {
-            logf_("loader hook %s OK\n", lh.name);
+    // The ini has to be read *before* this, because LoaderHook decides whether we patch
+    // kernel32 at all.
+    load_config();
+
+    if (g_loader_hook) {
+        mgpu::input::ensure_minhook();
+        HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+        struct LoaderHook { const char* name; LPVOID detour; LPVOID* original; };
+        LoaderHook hooks[] = {
+            { "LoadLibraryExW", reinterpret_cast<LPVOID>(&hook_load_library_ex_w),
+                                reinterpret_cast<LPVOID*>(&g_real_load_library_ex_w) },
+            { "LoadLibraryW",   reinterpret_cast<LPVOID>(&hook_load_library_w),
+                                reinterpret_cast<LPVOID*>(&g_real_load_library_w) },
+        };
+        for (auto& lh : hooks) {
+            LPVOID addr = reinterpret_cast<LPVOID>(GetProcAddress(kernel32, lh.name));
+            if (!addr) { continue; }
+            if (MH_CreateHook(addr, lh.detour, lh.original) == MH_OK &&
+                MH_EnableHook(addr) == MH_OK) {
+                logf_("loader hook %s OK\n", lh.name);
+            }
         }
+    } else {
+        logf_("loader hooks DISABLED ([capture] LoaderHook=0) - modules are found by"
+              " rescanning every 120 frames\n");
     }
     scan_loaded_modules();
 
@@ -2120,7 +2261,6 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE re
     reshade::register_event<reshade::addon_event::reshade_present>(on_reshade_present);
 
     logf_("events: init_effect_runtime, barrier, reshade_begin_effects, reshade_present\n");
-    load_config();
 
 
     return true;

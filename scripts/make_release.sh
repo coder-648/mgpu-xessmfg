@@ -127,6 +127,9 @@ cp "$REPO/scripts/recipes/run_dump.bat"       "$OUT/bin/4 - dump frames.bat"
 # 2x/3x/4x/dynamic (docs/findings/PERF_BASELINE.md 3.17-3.21).
 cp "$REPO/scripts/recipes/run_smooth.bat"     "$OUT/bin/5 - smoothest (cadence).bat"
 cp "$REPO/scripts/recipes/run_smooth_batchfeed.bat" "$OUT/bin/6 - cadence batch feed (A-B).bat"
+# UE5 motion-vector A/B: auto (JITTERED_MV from the game's DLSS flag) / nojit / nomv.
+# Background: docs/findings/UE5_MV_OPTISCALER.md 5.1.
+cp "$REPO/scripts/recipes/run_ue5_mv_ab.bat"  "$OUT/bin/7 - UE5 MV A-B.bat"
 printf '@echo off\r\nrem Start the front-end (bridge.exe must be in this folder).\r\ncd /d "%%~dp0"\r\nstart "" "mgpu_ui.exe"\r\n' \
     > "$OUT/bin/0 - UI.bat"
 
@@ -151,7 +154,7 @@ done
 for f in CONFIG BUILD DEPLOY UI LEGAL; do
     cp "$REPO/docs/ops/$f.md" "$OUT/docs/ops/"
 done
-for f in CONCLUSIONS QUALITY_VARIABLES FINAL_CONFIG; do
+for f in CONCLUSIONS QUALITY_VARIABLES FINAL_CONFIG UE5_MV_OPTISCALER RE_ENGINE_NOTES; do
     cp "$REPO/docs/findings/$f.md" "$OUT/docs/findings/"
 done
 

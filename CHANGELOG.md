@@ -3,6 +3,90 @@
 只记**用户能感知**的变化与对应实测依据。每条结论的原始数据在
 `docs/findings/PERF_BASELINE.md` / `FINAL_CONFIG.md`。
 
+## v0.13.1 —— RE Engine / PRAGMATA 支持（2026-11-09，已实测通过）
+
+**结论**：PRAGMATA 这条路走通了 —— `input source: ngx`、`shared ready`、bridge 正常出帧、
+热键可以启动。排查过程中修掉 4 个真问题，其中两个属于"看起来在跑、其实什么都没发生"的静默失效。
+
+### 修掉的问题
+
+1. **NGX 入口不一定在驱动 shim 上。** RE Engine（Streamline）的 NGX 入口来自
+   **游戏目录自带的 `nvngx_dlss.dll`**；旧判据只认 `_nvngx.dll` ⇒ 一个钩子都没装
+   （ReShade 仍然报告 add-on 注册成功，但零数据）。现在判据 = 文件名含 `nvngx`
+   ＋ **真的导出 `NVSDK_NGX_D3D12_EvaluateFeature`** ＋ 排除 `dlssg/dlssd/dlssnr`
+   （CP2077 那些只读版本号的副本仍被第 3 条挡掉）。顺带：一个 provider 挂上就停，
+   不再对转发到同一地址的 shim 重复挂载并打出 `NGX hooks FAILED`。
+2. **采集暂停按帧算是慢加载游戏的灾难。** `init_swapchain` 之后 `+120 帧`，而 PRAGMATA
+   加载期只有 **0.8 fps** ⇒ 实际暂停 **150 秒**，整个启动阶段不产出任何数据。
+   现在改成「帧数或 **8 秒**，先到先算」。
+3. **`LoadLibrary` 钩子拖慢 RE Engine 的加载**（用户 A/B：关掉 add-on 加载就正常）。
+   新增 `[capture] LoaderHook=0` —— 完全不碰 `kernel32`，改为每 120 帧扫一次模块表。
+   同时加了回调计时：实测我们的回调合计 **0.17 ms/帧**（barrier 0.02 ms/帧，约 400 次/帧）
+   ⇒ "慢"确实来自钩子本身，不是回调里的活。
+4. **游戏可能不从你改的目录读文件。** PRAGMATA 实际从
+   `E:\PRAGMATA\_storage_\game_capture.addon64` 加载（进程级重定向），于是它找的 ini 是
+   `_storage_\game_capture.ini` —— 我们改根目录那份**从来没被读过**，`Log` 一直是默认 0，
+   所以"日志一行都没有"。
+   - add-on：本地 ini 不存在时回退到 `%LOCALAPPDATA%\mgpu\game_capture.ini`；日志打不开时
+     回退到 `%LOCALAPPDATA%\mgpu\game_capture-<pid>.log`；
+   - 新增**面包屑** `%LOCALAPPDATA%\mgpu\breadcrumb.log`（每次 `AddonInit` 写一行：add-on
+     的真实路径、ini 路径、`Log` 值、日志是否打开）—— 这次就是它一眼定位的；
+   - 安装器新增 **6/6 镜像目录**：任何子目录里已有同名 add-on 或同名代理 DLL，就把
+     add-on + ini 也放一份过去（`_storage_` 这类容器从此自动覆盖）。
+
+### 实测（PRAGMATA）
+
+```
+config: ... SkipMv=0 DepthConvert=1 ... LoaderHook=0 Input=auto (path e:\pragmata\_storage_\game_capture.ini)
+NGX provider: ...\_nvngx.dll   ->   NGX hooks active
+dlss feature flags 0xB: MVJittered=0 MVLowRes=1 DepthInverted=1
+input source: ngx (api 1) - pinned for this process
+shared ready: name=Local\mgpu_mailbox_v1 pid=23056 used=253.6 MB reserved=253.6 MB slots=4
+perf: frames=10680  begin=20ms  barrier=2.4ms (41k calls / 241k items)  present=1.4ms
+```
+
+排查全过程（含"GPU 0% 不是掉驱动"、"热键其实收到了"两次误判的证伪）见
+`docs/findings/RE_ENGINE_NOTES.md` §3.1、§6.1–§6.4。
+- 全部通过后：重建发布为 **v0.13.1**（0.13.0 的 add-on 不含以上修复）。
+
+---
+
+## v0.13.0 —— UE5「模型运动伪影」结案（2026-11-09）
+
+**一句话**：伪影的主因是**上采样倍率**，不是运动矢量。游戏内 **DLAA（或最高画质档）+ `--interp 1 --fg-of`**
+是本次唯一实测"干净"的组合；UE5 交给 NGX 的那条 MV 流是坏数据，不要用。
+（完整证据链、排除表、dump 数字：`docs/findings/UE5_MV_OPTISCALER.md` §7–§8。）
+
+**用户能感知的变化**
+
+- **新配方**：`--interp 1 --fg-of` + 游戏内 DLAA（4K 下 26→52 fps，实测无模型边缘伪影）。
+  DLSS 性能档（720p→4K，3 倍放大）**连不插帧的游戏本身**都有一点伪影，那部分不该算在插帧头上。
+- **`--fg-of` 真的能用了**：以前 `motionVectorScale` 透传游戏的 `MV.Scale`（PBZ 报 1.0），
+  库把 screen-UV 的 0.009 当成 0.009 像素 ⇒ 光流等价于没生效。现在用 MV 纹理尺寸
+  （日志 `mvscale=(1278.0000, 720.0000)`）。**这条影响所有用 `--fg-of` 的配方（含 3x/4x 推荐档），
+  `MV.Scale=1.0` 的游戏以前等于没开光流。**
+- **add-on 开始读游戏声明的 DLSS flags** 并转发 `MVJittered` / `MVLowRes` / **`DepthInverted`（新增）**：
+  日志 `dlss feature flags 0x4B: MVJittered=0 MVLowRes=1 DepthInverted=1`（需 `game_capture.ini` 的 `Log=1`）。
+  PBZ 声明 `MVJittered=0`，所以"UE5 的 MV 带抖动、开 `JITTERED_MV` 就能修"这条**被证伪**。
+- 新开关：`--fg-mv-scale raw|px|<float>`、`--fg-no-jittered-mv`；
+  `--fg-jitter-zero` 重新生效（我们的颜色是上采样后的画面，jitter 已解掉，这是它的 A/B 对照）。
+- `scripts/analyse_dump.py` 新增 **units fit**（拟合 `motion_px = mv_raw × k` 判 MV 单位与配对）；
+  新配方脚本 `scripts/recipes/run_ue5_mv_ab.bat`（`auto/jit/nojit/depthinv/jitdepth/mvscale/nomv/of/ofsign/offov/jz/nodepth/only/dump`）。
+
+**实测（PBZ，2x @ 60 锁帧，`cadence` 精确）**
+
+| 档 | 结果 |
+|---|---|
+| 游戏 MV（`auto`）/ `jit` / `depthinv` | 伪影 + **闪烁** |
+| `--no-mv` | 不闪，仍有边角伪影 |
+| `--fg-of`（scale 修好前 / 后） | 与 `--no-mv` 相同 / 仍相同 ⇒ 伪影与 MV 无关 |
+| **DLAA + `--fg-of`** | **干净** |
+
+dump 出来的游戏 MV：0.5% NaN/inf、17% 饱和到 fp16 上限（±65504）、x 中位 0 / y 中位 +31、
+与真实位移相关性 ≈0 —— 不是可用的速度场（与 2026-11-07 对 PBZ 的旧结论一致）。
+
+---
+
 ## v0.12.2 —— 文档：UE5 备注（2026-11-09）
 
 - README 新增「游戏引擎备注」：**UE5 不建议用运动矢量**（加 `--no-mv`）+ **必须开「分层窗口」**

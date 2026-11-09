@@ -178,31 +178,31 @@ function Install-One {
 }
 
 # ---------------------------------------------------------------- 1. 代理 DLL
-Step "1/5 ReShade 宿主（$Proxy.dll）"
+Step "1/6 ReShade 宿主（$Proxy.dll）"
 $reshade = Join-Path $files 'ReShade64.dll'
 $reshadeSha = Get-Sha $reshade
 Install-One $reshade (Join-Path $GameDir ($Proxy + '.dll')) "$Proxy.dll"
 
 # ---------------------------------------------------------------- 2. add-on
-Step "2/5 add-on"
+Step "2/6 add-on"
 $addonSrc = Join-Path $files 'game_capture.addon64'
 Install-One $addonSrc (Join-Path $GameDir 'game_capture.addon64') 'game_capture.addon64'
 
 # ---------------------------------------------------------------- 3. add-on 的 ini
 #  key 名和默认值都会随版本变化（例如 StreamHeight=1440 是 v0.12 才有的），
 #  留着旧 ini 就会"参数看起来设了但没生效"，所以这里无条件覆盖。
-Step "3/5 add-on 配置"
+Step "3/6 add-on 配置"
 Install-One (Join-Path $files 'game_capture.ini') (Join-Path $GameDir 'game_capture.ini') 'game_capture.ini'
 
 # ---------------------------------------------------------------- 4. 空转效果
-Step "4/5 空转效果（让 ReShade 绑定深度）"
+Step "4/6 空转效果（让 ReShade 绑定深度）"
 $fxDstDir = Join-Path $GameDir 'reshade-shaders\Shaders'
 $fxSrc = Join-Path $files 'reshade-shaders\Shaders\mgpu_depth_tap.fx'
 $fxDst = Join-Path $fxDstDir 'mgpu_depth_tap.fx'
 Install-One $fxSrc $fxDst 'mgpu_depth_tap.fx'
 
 # ---------------------------------------------------------------- 5. 预设 + ReShade.ini
-Step "5/5 预设与 ReShade.ini"
+Step "5/6 预设与 ReShade.ini"
 Install-One (Join-Path $files 'ReShadePreset.ini') (Join-Path $GameDir 'ReShadePreset.ini') 'ReShadePreset.ini'
 
 $rini = Join-Path $GameDir 'ReShade.ini'
@@ -257,6 +257,25 @@ if ($KeepReShadeIni) {
     # 都是本包这份。ReShade 面板里的设置会被重置（原件在 *.mgpu_bak 里）。
     Install-One (Join-Path $files 'ReShade.ini') $rini 'ReShade.ini'
 }
+
+# ------------------------------------------------------- 6/6 镜像目录（引擎重定向）
+# 有些游戏进程并不从游戏根目录读文件：PRAGMATA（RE Engine）实际从
+# `<游戏>\ _storage_\game_capture.addon64` 加载 add-on，于是 ini 也在那个目录里找 ——
+# 只装根目录的结果是"装好了、但配置不生效、日志一行都没有"（2026-11-09 实测）。
+# 规则：任何子目录里如果已经有同名 add-on 或同名代理 DLL，就把 add-on + ini 也放一份过去。
+Step "6/6 镜像目录（引擎重定向）"
+$mirrored = 0
+foreach ($sub in @(Get-ChildItem -LiteralPath $GameDir -Directory -ErrorAction SilentlyContinue)) {
+    $d = $sub.FullName
+    $hit = (Test-Path -LiteralPath (Join-Path $d 'game_capture.addon64')) -or
+           (Test-Path -LiteralPath (Join-Path $d ($Proxy + '.dll')))
+    if (-not $hit) { continue }
+    Install-One $addonSrc (Join-Path $d 'game_capture.addon64') ("镜像\{0}\game_capture.addon64" -f $sub.Name)
+    Install-One (Join-Path $files 'game_capture.ini') (Join-Path $d 'game_capture.ini') ("镜像\{0}\game_capture.ini" -f $sub.Name)
+    Info ("镜像目录：{0}" -f $d)
+    $mirrored++
+}
+if ($mirrored -eq 0) { Info "没有发现需要镜像的目录（正常）" }
 
 # ---------------------------------------------------------------- 残留扫描
 Step "残留检查"

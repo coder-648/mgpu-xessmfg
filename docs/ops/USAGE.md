@@ -165,13 +165,28 @@ bridge.exe --den 1 --pool 4 --interp 2 --no-mv ^
 | 取向 | 命令要点 | 输出 | 画质/前提 |
 |---|---|---|---|
 | **动态逐帧（推荐）** | `--interp 5 --interp-cadence` + 游戏 MV | 35–45 → 120 fps | 每帧按实际经过的 vblank 数取倍率，输出恒定 1 帧/vblank。**前提：`game_capture.ini` 里 `StreamHeight=1440`**（默认值）；不要加 `--fg-of`、`--no-depth`、`--cadence-hold` |
+| **UE5 / 高画质（DLAA）** | `--interp 1 --fg-of` + 游戏内 **DLAA**（或最高画质档） | 26 → 52 fps（4K DLAA） | **实测最干净**：伪影的主因是上采样倍率，1:1 渲染时没有（`docs/findings/UE5_MV_OPTISCALER.md` §8） |
 | 3x 满帧（固定） | `--interp 2 --fg-of` | 40 → 120 fps | 光流 MV，无闪烁 |
-| 2x 画质优先 | `--interp 1`（+ 游戏 MV） | 60 → 120 fps | 边缘伪影最少 |
+| 2x 画质优先 | `--interp 1`（+ 游戏 MV） | 60 → 120 fps | 边缘伪影最少 —— **但 UE5 的 MV 流可能是坏的**，见下 |
 | 最低开销 | `--interp 2 --no-mv` | 40 → 120 fps | 快转时边缘更脏 |
 
-> **UE5 游戏**（影之刃零 / 黑神话 等）：**用 `--no-mv`**（运动矢量 = 关闭）。UE5 的 MV 是在抖动后的
-> 画面上算的，且常混用像素/UV 单位与反向矢量，3x/4x 下容易闪和拖影；关掉还少一个全屏 pass 和一半
-> 跨卡流量。另外**必须开着「分层窗口」**（`--overlay-layered`，默认已开）：UE5 自认为"未激活"时会
+> **UE5 游戏**（影之刃零 / 黑神话 等）：**DLAA（或最高画质档）+ `--fg-of`** —— 2026-11-09 实测这是唯一"干净"的组合。
+>
+> 一整轮的排查结果（细节见 `docs/findings/UE5_MV_OPTISCALER.md`）：
+> - PBZ 自己的 DLSS 声明是 `0x4B`（`IsHDR｜MVLowRes｜DepthInverted｜AutoExposure`），说明 MV 已去抖动、
+>   深度是反向 Z（add-on 现在会读这个 flags，日志 `dlss feature flags ...` + `[bridge] initFlags=..`）；
+> - 它交给 NGX 的那条 MV 流**是坏的**：0.5% NaN/inf、17% 饱和到 fp16 上限、与真实位移相关性 ≈0
+>   ⇒ 喂它就闪 + 鬼影，`--fg-jittered-mv` / `--fg-mv-scale px` / `--fg-depth-inv` 都救不了；
+> - 换成我们自己的光流（`--fg-of`）后**不再闪**，但**伪影依旧** —— 再对比发现：
+>   **伪影的主因是上采样倍率**。DLSS 性能档（720p→4K，3 倍）连"不插帧的游戏本身"都有一点伪影，
+>   而 **DLAA（1:1 渲染）** 下伪影消失。
+>
+> 所以：
+> - **画质优先**：游戏内 **DLAA** + `--interp 1 --fg-of`（4K DLAA 下 26→52 fps，实测干净）；
+> - 必须用 DLSS 性能/平衡档时：伪影随放大倍率走，与开不开 FG 关系没那么大，别把它算在插帧头上；
+> - 游戏 MV 在 UE5 上直接不用（`--no-mv` 或 `--fg-of`）。
+>
+> 另外**必须开着「分层窗口」**（`--overlay-layered`，默认已开）：UE5 自认为"未激活"时会
 > 丢掉菜单点击（攻击照旧有反应），只有分层窗口下菜单才收得到鼠标。
 
 为什么这样配、哪些思路已经排除（`--cadence-hold`/`--no-depth`/动态逐帧加光流…）的实测数据见

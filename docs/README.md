@@ -38,6 +38,8 @@
 | [`findings/MFG.md`](findings/MFG.md) | 多帧生成（`--unlock-mfg`）的原理与字节补丁说明 |
 | [`findings/XESS_FG_NOTES.md`](findings/XESS_FG_NOTES.md) | XeFG 开发指南的提炼 |
 | [`findings/OPTISCALER_NOTES.md`](findings/OPTISCALER_NOTES.md) | XeFG 的 MV 约定 / 相机运动重投影（上游 GPL-3.0） |
+| [`findings/UE5_MV_OPTISCALER.md`](findings/UE5_MV_OPTISCALER.md) | **OptiScaler 怎么处理 UE5**（影之刃/黑猴/明末）+ 我们缺的三步 |
+| [`findings/RE_ENGINE_NOTES.md`](findings/RE_ENGINE_NOTES.md) | **RE Engine / PRAGMATA**：NGX 入口在游戏自带 `nvngx_dlss.dll` 上（修复待验证） |
 | [`findings/TOOLING_NOTES.md`](findings/TOOLING_NOTES.md) | 工具链与命令行的注意事项 |
 | [`findings/ENV_REPORT.md`](findings/ENV_REPORT.md) | 实测环境记录 |
 

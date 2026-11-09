@@ -21,7 +21,8 @@
 | 取向 | 配置 | 输出 | 画质 |
 |---|---|---|---|
 | **3x 满帧（推荐）** | `--interp 2 --fg-of` | 120 fps 整拍 | 光流 MV、无闪烁、`gpu` 9 ms |
-| 2x 画质优先 | `--interp 1` + 游戏 MV（`SkipMv=0`）+ 游戏 jitter（锁 60 fps 则 120） | 80 / 120 fps | 边缘伪影最少 |
+| **UE5 / DLAA（2026-11-09 新增）** | `--interp 1 --fg-of` + 游戏内 DLAA | 26 → 52 fps（4K DLAA） | **唯一实测"干净"的组合**：伪影主因是上采样倍率，1:1 时没有（`docs/findings/UE5_MV_OPTISCALER.md` §8） |
+| 2x 画质优先 | `--interp 1` + 游戏 MV（`SkipMv=0`）+ 游戏 jitter（锁 60 fps 则 120） | 80 / 120 fps | 边缘伪影最少 —— **UE5 的 MV 流可能是坏的**，PC/其它引擎仍适用 |
 | 最低开销 | `--interp 2 --no-mv` | 120 fps | 快转时边缘更脏 |
 
 对应的可执行脚本在 `scripts/recipes/`：

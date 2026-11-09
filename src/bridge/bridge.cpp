@@ -539,18 +539,20 @@ static UINT         g_nopace_windows = 0;   // consecutive suspicious windows
 //   --fg-ui none   UI_MODE_NONE, not AUTO     (OptiScaler [XeFG] UIComposition=false)
 //   --fg-scene F   xefgSwapChainSetSceneChangeThreshold(F) (default in the DLL: 0.7)
 //   --fg-depth-inv INVERTED_DEPTH init flag    (reversed/infinite-Z depth)
+//   --fg-jittered-mv / --fg-no-jittered-mv  JITTERED_MV init flag ("remove jitter from
+//                  input velocity"); normally driven by the producer's DLSS MVJittered hint
 static bool         g_fg_rt_zero = false;
 // The frame constants are the one input XeFG gets that we can only approximate. UE5's
 // jitter sign and the synthetic projection matrix are the two remaining suspects for the
 // "never goes away" edge / model-edge artifacts, so both are switchable at runtime.
 static bool         g_fg_jitter_flip = false;   // --fg-jitter-flip
-// --fg-jitter-zero: DEPRECATED (2026-11-08) and now ignored. The reasoning below used to be
-// "the colour is the upscaled output, so zero the jitter" - measured wrong once motion
-// vectors are enabled: the game computes its vectors on the jittered render, so XeFG needs
-// the real jitter to align history. Passing the game jitter removed both the flicker and
-// most of the model-edge ghosting that jitter=0 showed (PBZ, 2x@40, real MV). The flag is
-// still parsed so old scripts do not fail, but it no longer does anything.
-static bool         g_fg_jitter_zero = false;   // set but never used
+// --fg-jitter-zero: DEPRECATED-looking name, but it is the A/B control once more
+// (2026-11-09). The 2026-11-08 measurement ("real jitter is better") was made while the
+// motion-vector stream was junk, so it is being re-tested: our colour is the *upscaled*
+// output (DLSS/TSR already resolved the jitter), so telling XeFG that this frame carries
+// j0 may make it shift its history by j0 for nothing - which reads as edge ghosting that no
+// MV source fixes.
+static bool         g_fg_jitter_zero = false;   // --fg-jitter-zero: pass jitter = 0
 static bool         g_fg_no_proj = false;       // --fg-no-proj
 static bool         g_fg_proj_rz = false;       // --fg-proj-rz: reversed-Z infinite-far
 // The projection is the one frame constant we can only approximate, so its two numbers are
@@ -562,6 +564,64 @@ static bool         g_fg_consts_logged = false;
 static bool         g_fg_ui_none = false;
 static float        g_fg_scene = 0.0f;
 static bool         g_fg_depth_inv = false;
+// --fg-jittered-mv / --fg-no-jittered-mv: XEFG_SWAPCHAIN_INIT_FLAG_JITTERED_MV, which the
+// SDK documents as "Remove jitter from input velocity"
+// (third_party/xess/inc/xess_fg/xefg_swapchain.h:95). UE5 computes its velocity on the
+// jittered render, so the +-0.5 px Halton offset is still inside the vectors; without this
+// flag XeFG treats that offset as real motion, which is exactly the model-edge smear we
+// kept attributing to "UE5 MVs are weird".
+// OptiScaler does the same: it maps the game's DLSS MVJittered flag onto this init flag
+// (OptiScaler/upscalers/IFeature.cpp:112 -> OptiScaler/framegen/xefg/XeFG_Dx12.cpp:362),
+// see docs/findings/UE5_MV_OPTISCALER.md 5.1.
+// The add-on now publishes the game's declaration as mgpu::kInputFlagMvJittered, so this
+// turns itself on per game; --fg-jittered-mv forces it on and --fg-no-jittered-mv vetoes
+// the automatic path (that pairing is what makes a clean A/B possible).
+static bool         g_fg_jittered_mv = false;
+static bool         g_fg_jittered_mv_forced = false;   // -jittered-mv / --no-jittered-mv given
+// --fg-mv-scale raw|px|<float>: what we hand XeFG as motionVectorScaleX/Y.
+//   raw  (default) the producer's own NGX MV.Scale, unchanged
+//   px             game scale * MV texture size (turns "UV-space vectors", which report a
+//                  scale of 1.0, into the pixel-space vectors XeFG documents:
+//                  "screen-space motion in pixels", third_party/xess/doc/...guide:809)
+//   <float>        force both components to that number
+// PBZ reports MV.Scale = (1, 1) while CP2077 reports (2560, 1440), so the two games store
+// their vectors in different units - this switch is how the difference gets measured
+// instead of guessed (docs/findings/UE5_MV_OPTISCALER.md 5.2).
+static int          g_fg_mv_scale_mode = 0;            // 0 raw, 1 px, 2 forced
+static float        g_fg_mv_scale_force = 1.0f;
+
+// True when the vectors we tag are NOT the game's (optical flow, or none at all).
+static bool own_mv_path()
+{
+#if MGPU_FG_OF
+    return g_fg_of;
+#else
+    return false;
+#endif
+}
+
+// Turn the producer's own declarations into our init flags. Called at every point where the
+// flags could have become known (peek, open, and again just before the XeFG swap chain is
+// created), because the add-on only learns them when the game creates its DLSS feature and
+// that can easily be later than the bridge start.
+static void adopt_producer_hints(uint32_t producer_flags)
+{
+    if (!g_fg_depth_inv && (producer_flags & mgpu::kInputFlagInvertedDepth) != 0) {
+        g_fg_depth_inv = true;
+        logf_("[bridge]   producer says the depth is inverted - enabling"
+              " XEFG_SWAPCHAIN_INIT_FLAG_INVERTED_DEPTH (as --fg-depth-inv would)\n");
+    }
+    // Scope of the automatic path: only the "game's own motion vectors" recipe. With --fg-of
+    // the vectors are measured by us between two captured (already jittered) frames, and with
+    // --no-mv there are none at all; both are recipes that were never measured with this
+    // flag, so they keep byte-for-byte the old behaviour. --fg-jittered-mv still forces it.
+    if (!g_fg_jittered_mv && !g_fg_jittered_mv_forced && !g_no_mv && !own_mv_path() &&
+        (producer_flags & mgpu::kInputFlagMvJittered) != 0) {
+        g_fg_jittered_mv = true;
+        logf_("[bridge]   producer says its motion vectors still carry the jitter - enabling"
+              " XEFG_SWAPCHAIN_INIT_FLAG_JITTERED_MV (as --fg-jittered-mv would)\n");
+    }
+}
 static xefg_dyn::Api g_api;                // resolved libxess_fg.dll entry points
 
 // The window that actually owns the swap chain. It is not always g_bridge_wnd:
@@ -2304,18 +2364,30 @@ static bool init_fg()
     }
 
     xefg_swapchain_d3d12_init_params_t ip{};
+    // Last chance to learn what the game declared: the add-on only knows MVJittered (and the
+    // depth sign) once the game has created its DLSS feature, which can easily be after
+    // peek_producer()/open_shared() ran. Re-read the freshest flags here - after this point
+    // the init flags are frozen for the whole run.
+    if (g_ctl != nullptr) {
+        g_producer_flags = g_ctl->producer.input_flags;
+        adopt_producer_hints(g_producer_flags);
+    }
     // The count asked for here is what the DLL will actually add per real frame;
     // want_interp was already clamped to maxSupportedInterpolations above.
     ip.maxInterpolatedFrames = want_interp;
     ip.initFlags = g_fg_depth_inv ? XEFG_SWAPCHAIN_INIT_FLAG_INVERTED_DEPTH
                                   : XEFG_SWAPCHAIN_INIT_FLAG_NONE;
-    // --fg-hi-res-mv / --fg-jittered-mv used to set the HIGH_RES_MV / JITTERED_MV flags
-    // here. Both were removed with the rest of the MV work: neither flag changes the
-    // picture on libxess_fg 1.3.1, because tagged MVs are a dead input
-    // (docs/findings/FINAL_CONFIG.md 2.1.2 结论 1).
+    // JITTERED_MV makes the library take the frame's jitter back out of the velocity
+    // ("Remove jitter from input velocity", xefg_swapchain.h:95). OptiScaler sets it from
+    // the game's DLSS MVJittered flag; UE5 titles do report that flag, so their vectors keep
+    // the +-0.5 px Halton offset and XeFG read it as real motion (= model-edge smear).
+    // HIGH_RES_MV deliberately stays out: the SDK marks it
+    // "Deprecated. Setting this flag has no effect." (xefg_swapchain.h:91).
+    if (g_fg_jittered_mv) { ip.initFlags |= XEFG_SWAPCHAIN_INIT_FLAG_JITTERED_MV; }
     if (ip.initFlags != XEFG_SWAPCHAIN_INIT_FLAG_NONE) {
-        logf_("[bridge] initFlags=0x%x (inverted_depth=%d)\n",
-              static_cast<unsigned>(ip.initFlags), g_fg_depth_inv ? 1 : 0);
+        logf_("[bridge] initFlags=0x%x (inverted_depth=%d jittered_mv=%d)\n",
+              static_cast<unsigned>(ip.initFlags), g_fg_depth_inv ? 1 : 0,
+              g_fg_jittered_mv ? 1 : 0);
     }
     // AUTO probes for a UI texture we never provide; NONE says it outright.
     ip.uiMode = g_fg_ui_none ? XEFG_SWAPCHAIN_UI_MODE_NONE : XEFG_SWAPCHAIN_UI_MODE_AUTO;
@@ -2598,6 +2670,7 @@ static bool peek_producer()
             g_producer_output_h = c->producer.output_h;
             g_have_producer     = true;
             ok = true;
+            adopt_producer_hints(g_producer_flags);
 
             int32_t hi = 0;
             uint32_t lo = 0;
@@ -2693,11 +2766,7 @@ static bool open_shared()
             logf_("[bridge]   producer supplies the camera (near/far/vfov) - the"
                   " projection no longer depends on --fg-fov\n");
         }
-        if ((g_producer_flags & mgpu::kInputFlagInvertedDepth) && !g_fg_depth_inv) {
-            g_fg_depth_inv = true;
-            logf_("[bridge]   producer says the depth is inverted - enabling"
-                  " XEFG_SWAPCHAIN_INIT_FLAG_INVERTED_DEPTH (as --fg-depth-inv would)\n");
-        }
+        adopt_producer_hints(g_producer_flags);
         if (g_have_producer) {
             const uint64_t consumer_luid =
                 mgpu::pack_luid(g_consumer_desc.AdapterLuid.HighPart,
@@ -5743,6 +5812,21 @@ static bool service_shared_layout()
         g_seen_geo_generation = g_ctl->generation;
         refresh_input_geo();
     }
+    // The producer rewrites its input flags every frame, and the add-on can only learn
+    // MVJittered once the game has created its DLSS feature - which may well be after the
+    // bridge opened the mapping. Adopting a late flag still fixes the per-frame uses
+    // (camera presence, depth sign), but the XeFG init flags were fixed by
+    // InitFromSwapChainDesc, so say it out loud instead of silently testing the wrong thing.
+    if (g_ctl->producer.input_flags != g_producer_flags) {
+        const UINT before = g_producer_flags;
+        g_producer_flags = g_ctl->producer.input_flags;
+        if (((g_producer_flags & ~before) & mgpu::kInputFlagMvJittered) != 0) {
+            logf_("[bridge] WARNING: the producer only now reported that its motion vectors"
+                  " still carry the jitter. The XeFG swap chain was created before that, so"
+                  " the flag did NOT take effect - restart the bridge after the game is"
+                  " in-world, or pass --fg-jittered-mv\n");
+        }
+    }
     return true;
 }
 
@@ -6128,6 +6212,11 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     // render, so this is what XeFG needs to align its history (see g_fg_jitter_zero above).
     cd.jitterOffsetX = g_ctl->frames[slot].jitter_x;
     cd.jitterOffsetY = g_ctl->frames[slot].jitter_y;
+    if (g_fg_jitter_zero) {
+        // A/B: our colour is the post-upscaler image, i.e. the jitter is already resolved.
+        cd.jitterOffsetX = 0.0f;
+        cd.jitterOffsetY = 0.0f;
+    }
     if (g_fg_jitter_flip) {
         cd.jitterOffsetX = -cd.jitterOffsetX;
         cd.jitterOffsetY = -cd.jitterOffsetY;
@@ -6140,6 +6229,31 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     if (cd.motionVectorScaleX == 0.0f && cd.motionVectorScaleY == 0.0f) {
         cd.motionVectorScaleX = 1.0f;
         cd.motionVectorScaleY = 1.0f;
+    }
+    // --fg-mv-scale: the two conventions seen in the field. CP2077 reports (2560, 1440) and
+    // its texels are UV; PBZ reports (1, 1) while XeFG documents its vectors as
+    // "screen-space motion in pixels", so 'px' turns the latter into pixels and the two can
+    // be compared instead of argued about (docs/findings/UE5_MV_OPTISCALER.md 5.2).
+    if (g_fg_mv_scale_mode == 1) {
+        const float sx = static_cast<float>(g_ctl->streams[1].width ? g_ctl->streams[1].width : 1u);
+        const float sy = static_cast<float>(g_ctl->streams[1].height ? g_ctl->streams[1].height : 1u);
+        cd.motionVectorScaleX *= sx;
+        cd.motionVectorScaleY *= sy;
+    } else if (g_fg_mv_scale_mode == 2) {
+        cd.motionVectorScaleX = g_fg_mv_scale_force;
+        cd.motionVectorScaleY = g_fg_mv_scale_force;
+    }
+    // --fg-of: the producers' MV.Scale describes THEIR texture, not ours. Our optical-flow
+    // pass writes screen UV of the captured frame (480x270 SINT -> UV), so with the
+    // producer's scale - 1.0 on PBZ - the library multiplied those UV values by 1 and saw
+    // ~0.009 px of motion instead of ~35 px. That is exactly why "optical flow" looked
+    // identical to "no motion vectors" (PBZ, 2026-11-09).
+    // The space is the render/MV one, not the 4K output: every game that reports a usable
+    // MV.Scale reports its render size there (CP2077: 2560x1440), and XeFG's definition of
+    // "pixels" has to agree with the depth/MV grid it gets.
+    if (own_mv_path()) {
+        cd.motionVectorScaleX = static_cast<float>(g_ctl->streams[1].width ? g_ctl->streams[1].width : 1u);
+        cd.motionVectorScaleY = static_cast<float>(g_ctl->streams[1].height ? g_ctl->streams[1].height : 1u);
     }
     if (g_mv_sign < 0.0f) {
         cd.motionVectorScaleX = -cd.motionVectorScaleX;
@@ -6986,6 +7100,33 @@ int main()
         if (v > 0.0f && v <= 10.0f) { g_fg_scene = v; }
     }
     if (wcsstr(GetCommandLineW(), L"--fg-depth-inv")) { g_fg_depth_inv = true; }
+    // --fg-jittered-mv / --fg-no-jittered-mv: XEFG_SWAPCHAIN_INIT_FLAG_JITTERED_MV ("remove
+    // jitter from input velocity"). The add-on publishes the game's own DLSS MVJittered
+    // declaration, so normally this turns itself on; these two force it for an A/B run.
+    if (wcsstr(GetCommandLineW(), L"--fg-jittered-mv")) {
+        g_fg_jittered_mv = true;
+        g_fg_jittered_mv_forced = true;
+    }
+    if (wcsstr(GetCommandLineW(), L"--fg-no-jittered-mv")) {
+        g_fg_jittered_mv = false;
+        g_fg_jittered_mv_forced = true;
+    }
+    // --fg-mv-scale raw|px|<float>: see the globals above.
+    if (const wchar_t* mvs = wcsstr(GetCommandLineW(), L"--fg-mv-scale ")) {
+        const wchar_t* p = mvs + 14;
+        while (*p == L' ') { ++p; }
+        if (wcsncmp(p, L"px", 2) == 0) {
+            g_fg_mv_scale_mode = 1;
+        } else if (wcsncmp(p, L"raw", 3) == 0) {
+            g_fg_mv_scale_mode = 0;
+        } else {
+            const float v = static_cast<float>(_wtof(p));
+            if (v > 0.0f && v < 100000.0f) {
+                g_fg_mv_scale_mode = 2;
+                g_fg_mv_scale_force = v;
+            }
+        }
+    }
     // --probe-colour N: log whether the captured colour is black every N frames.
     if (const wchar_t* pcx = wcsstr(GetCommandLineW(), L"--probe-colour ")) {
         const int n = _wtoi(pcx + 15);
@@ -7014,10 +7155,10 @@ int main()
         if (n >= 0 && n < static_cast<int>(mgpu::kMaxSlots)) { g_depth_lag = n; }
     }
     if (wcsstr(GetCommandLineW(), L"--fg-jitter-zero")) {
-        g_fg_jitter_zero = true;      // kept for compatibility only
-        logf_("[bridge] --fg-jitter-zero is DEPRECATED and ignored: the game's jitter is"
-              " always passed now (measured better - it removed the flicker and most of"
-              " the model-edge ghosting). Drop the flag at your convenience.\n");
+        g_fg_jitter_zero = true;
+        logf_("[bridge] --fg-jitter-zero: passing jitter = 0. Our colour is the post-upscaler"
+              " image (the jitter is already resolved), so this is the A/B control for"
+              " 'is XeFG shifting its history by a jitter that is no longer there?'\n");
     }
     if (wcsstr(GetCommandLineW(), L"--fg-debug-tag-interp")) { g_fg_tag_interp = true; }
     if (wcsstr(GetCommandLineW(), L"--fg-debug-only-interp")) { g_fg_only_interp = true; }
@@ -7376,11 +7517,14 @@ int main()
         }
     }
 
-    if (g_fg_rt_zero || g_fg_ui_none || g_fg_scene > 0.0f || g_fg_depth_inv) {
-        logf_("[bridge] XeFG tuning: rt=%s ui=%s scene=%.2f depthInv=%d\n",
+    if (g_fg_rt_zero || g_fg_ui_none || g_fg_scene > 0.0f || g_fg_depth_inv ||
+        g_fg_jittered_mv_forced) {
+        logf_("[bridge] XeFG tuning: rt=%s ui=%s scene=%.2f depthInv=%d jitteredMV=%d%s\n",
               g_fg_rt_zero ? "zero" : "input",
               g_fg_ui_none ? "none" : "auto",
-              g_fg_scene, g_fg_depth_inv ? 1 : 0);
+              g_fg_scene, g_fg_depth_inv ? 1 : 0, g_fg_jittered_mv ? 1 : 0,
+              g_fg_jittered_mv_forced ? (g_fg_jittered_mv ? " (forced ON)" : " (forced OFF)")
+                                      : " (automatic: follows the producer's DLSS flag)");
     }
     if (g_slack > 0) {
         logf_("[bridge] --slack %u: holding up to %u captured frames, processing the oldest"

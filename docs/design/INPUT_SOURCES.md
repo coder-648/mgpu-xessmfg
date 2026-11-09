@@ -24,9 +24,16 @@ add-on 里"这一帧的 MV/深度/相机从哪来"被抽成 `mgpu::input::Source
 
 ### `ngx` — DLSS-SR
 
-- 只钩**真正执行 DLSS 的那个模块**。CP2077 会加载好几个 `nvngx_dlss.dll` 副本
-  只是为了读版本号，实际执行的是驱动商店的 shim `_nvngx.dll`
-  （`docs/findings/milestones/M2_RESULTS.md`，这条是 load-bearing 的，别"清理"掉）。
+- 只钩**真正执行 DLSS 的那个模块**。判据（2026-11-09 起）：
+  1. 取**文件名**，必须含 `nvngx`（覆盖 `_nvngx.dll`、`nvngx.dll`、`nvngx_dlss.dll`）；
+  2. 排除 `dlssg` / `dlssd` / `dlssnr`（帧生成 / 光追重建 / NR 不是本项目的输入源）；
+  3. **真的导出 `NVSDK_NGX_D3D12_EvaluateFeature`** 才挂。
+- 为什么不是"只认 `_nvngx.dll`"：CP2077 会加载好几个 `nvngx_dlss.dll` 副本只是为了读版本号，
+  实际执行的是驱动商店的 shim `_nvngx.dll`（`docs/findings/milestones/M2_RESULTS.md`，load-bearing）；
+  但 **RE Engine / Streamline** 的题目（PRAGMATA）把 `nvngx_dlss.dll` 放在游戏目录并
+  **直接调用它的 NGX 入口**，旧的"只认 shim"规则让它们**一个钩子都装不上**
+  （`docs/findings/RE_ENGINE_NOTES.md`）。第 3 条判据同时满足这两种情况：
+  CP2077 那些只读版本号的副本不导出入口，仍然被挡掉。
 - 拿不到相机 ⇒ bridge 用合成投影（`--fg-fov`）。实测合成投影对画质没有影响
   （见 `docs/findings/CONCLUSIONS.md` §1），所以这不是缺陷。
 

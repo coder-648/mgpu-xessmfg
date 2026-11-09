@@ -4,6 +4,44 @@
 
 ---
 
+## v0.13.0 —— UE5「模型运动伪影」结案：主因是上采样倍率
+
+> 游戏用自己的卡渲染 + 超分（DLSS / FSR / XeSS），另一块卡专职跑 **XeSS-FG** 插帧，
+> 再通过覆盖窗口上屏。A 卡 + N 卡混插可用；单卡也能跑。
+
+这版把 UE5（影之刃零 / 黑神话 / 明末 …）上一直存在的**模型边缘伪影**查清了：
+**主因不是运动矢量，而是上采样倍率** —— 插帧插的是上采样之后的画面，DLSS 性能档
+（720p→4K，3 倍）连"不插帧的游戏本身"都有一点伪影；换成 **DLAA（1:1）+ `--fg-of`** 就干净。
+
+### ✨ 新配方
+
+- **UE5 / 画质优先**：游戏内 **DLAA**（或最高画质档）+ `--interp 1 --fg-of`
+  （4K DLAA 下 26→52 fps，实测无模型边缘伪影）
+- 必须用性能/平衡档时：伪影随放大倍率走，与开不开插帧关系没那么大
+
+### 🔧 修掉的真 bug
+
+- **`--fg-of` 之前基本没生效**：光流场是 screen-UV，`motionVectorScale` 却透传游戏的
+  `MV.Scale`（PBZ 报 `1.0`）⇒ 库把 `0.009` 当成 0.009 像素。现在用 MV 纹理尺寸
+  （日志 `mvscale=(1278.0000, 720.0000)`）。**影响所有 `--fg-of` 配方，含 3x/4x 推荐档。**
+- **add-on 开始读游戏声明的 DLSS flags** 并转发 `MVJittered` / `MVLowRes` / **`DepthInverted`**；
+  bridge 在创建 swap chain 前再读一次，迟到会打 WARNING。PBZ 声明
+  `0x4B = IsHDR｜MVLowRes｜DepthInverted｜AutoExposure`（`MVJittered=0`）。
+
+### 🔍 新工具
+
+- `--fg-mv-scale raw|px|<float>`、`--fg-no-jittered-mv`；`--fg-jitter-zero` 重新生效（A/B 用）
+- `scripts/analyse_dump.py` 的 **units fit**：拟合 `motion_px = mv_raw × k`，直接判 MV 单位与帧配对
+- `scripts/recipes/run_ue5_mv_ab.bat`：`auto/jit/nojit/depthinv/jitdepth/mvscale/nomv/of/ofsign/offov/jz/nodepth/only/dump`
+
+### ⚠️ 注意
+
+- UE5 交给 NGX 的运动矢量可能是**坏数据**（PBZ 实测：0.5% NaN/inf、17% 饱和到 fp16 上限、
+  与真实位移相关性 ≈0）⇒ 那条流别用，用 `--fg-of` 或 `--no-mv`
+- 详细证据链：`docs/findings/UE5_MV_OPTISCALER.md` §7–§8
+
+---
+
 ## v0.12.2 —— 双卡帧生成：动态逐帧可用、MV 不再 drop
 
 > 游戏用自己的卡渲染 + 超分（DLSS / FSR / XeSS），另一块卡专职跑 **XeSS-FG** 插帧，

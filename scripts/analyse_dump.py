@@ -183,6 +183,7 @@ def main():
 
     print("\n--- what the dumped MV claims for each frame ---")
     mv_means = []
+    mv_raw = []                      # block means in the texture's own units
     for i, f in enumerate(frames):
         msx = float(f["meta"].get("mv_scale", ["1", "1"])[0])
         msy = float(f["meta"].get("mv_scale", ["1", "1"])[1])
@@ -191,12 +192,54 @@ def main():
         sx = (1.0 / msx) if msx > 0 else (1.0 / cw)
         sy = (1.0 / msy) if msy > 0 else (1.0 / ch)
         field = mv_blocks(f["mv"])
+        mv_raw.append((float(field[:, :, 0].mean()), float(field[:, :, 1].mean())))
         px = field * np.array([sx * cw, sy * ch], dtype=np.float32)
         mv_means.append((float(px[:, :, 0].mean()), float(px[:, :, 1].mean()),
                          float(np.abs(px).mean())))
         print("  frame %d : mean=(%+8.2f, %+8.2f) px   mean|mv|=%7.2f px   zeros=%.0f%%"
+              "   raw=(%+10.5f, %+10.5f)  (mv_scale %.3f, %.3f)"
               % (i, mv_means[-1][0], mv_means[-1][1], mv_means[-1][2],
-                 100.0 * float((np.abs(field).sum(axis=2) < 1e-6).mean())))
+                 100.0 * float((np.abs(field).sum(axis=2) < 1e-6).mean()),
+                 mv_raw[-1][0], mv_raw[-1][1], msx, msy))
+
+    # ---------------------------------------------------------------- units
+    # XeFG documents its velocity as "screen-space motion in pixels"
+    # (third_party/xess/doc/xess_fg_developer_guide_english.md:809), so what matters is
+    # how the raw texel values map to pixels.  Rather than assuming one convention, fit
+    #     motion_px = mv_raw * k
+    # against the colour motion measured above and name the convention it lands on.
+    print("\n--- MV units: fit  motion_px = mv_raw * k  against the colour motion ---")
+    num_x = den_x = num_y = den_y = 0.0
+    for i in range(1, len(frames)):
+        rx, ry = mv_raw[i]
+        mx, my = colour_motion[i - 1][0], colour_motion[i - 1][1]   # (i-1) -> i
+        num_x += rx * mx
+        den_x += rx * rx
+        num_y += ry * my
+        den_y += ry * ry
+    if den_x < 1e-12 and den_y < 1e-12:
+        print("  MV field is all zeros - nothing to fit (is SkipMv=1?)")
+    else:
+        kx = (num_x / den_x) if den_x > 1e-12 else float("nan")
+        ky = (num_y / den_y) if den_y > 1e-12 else float("nan")
+        print("  fitted k = (%.3f, %.3f)   [1 = pixels, %.0f/%.0f = UV, %.0f/%.0f = NDC]"
+              % (kx, ky, cw, ch, cw / 2, ch / 2))
+        if kx == kx or ky == ky:
+            guesses = (("pixels", 1.0, 1.0), ("UV * size", cw, ch),
+                       ("NDC * size/2", cw / 2.0, ch / 2.0))
+            best = None
+            for name, gx, gy in guesses:
+                ex = abs(np.log10(abs(kx) / gx)) if kx not in (0.0,) and gx else 9.9
+                ey = abs(np.log10(abs(ky) / gy)) if ky not in (0.0,) and gy else 9.9
+                e = max(ex, ey)
+                print("    %-14s expects k=(%8.1f, %8.1f)   log10 error %.2f"
+                      % (name, gx, gy, e))
+                if best is None or e < best[1]:
+                    best = (name, e)
+            print("  => closest convention: %s (log10 error %.2f)" % best)
+            if best[0] != "pixels":
+                print("     XeFG wants pixels, so motionVectorScaleX/Y should be"
+                      " multiplied by about %.0f / %.0f." % (kx, ky))
 
     print("\n--- verdict: which colour pair does frame i's MV match? ---")
     for i in range(1, len(frames) - 1):

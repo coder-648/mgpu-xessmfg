@@ -85,6 +85,26 @@
 
 ## 工程债
 
+### 0. RE Engine / PRAGMATA：NGX 钩子 + 加载慢 + 目录重定向 ✅ 已实现并验证（v0.13.1）
+
+**问题**：PRAGMATA 走 Streamline，NGX 入口在游戏目录自带的 `nvngx_dlss.dll` 上；
+旧的"只认 `_nvngx.dll`"判据让它一个钩子都没装（add-on 被 ReShade 正常加载但无数据）。
+
+**已做并验证**：① `in_ngx.cpp` 判据改为"文件名含 `nvngx` ＋ 真的导出 `EvaluateFeature` ＋
+排除 `dlssg/dlssd/dlssnr`"；② `[capture] LoaderHook=0` 解决加载变慢；③ 采集暂停改为
+"帧数或 8 秒"；④ 面包屑 + ini/日志回退到 `%LOCALAPPDATA%\mgpu`；⑤ 安装器 6/6 镜像
+`_storage_` 这类重定向目录。PRAGMATA 实测：`input source: ngx` + `shared ready` + bridge 出帧。
+
+**下次做**：
+
+1. 游戏目录里双击 `apply-mgpu-addon.bat`（会先确认进程退出，再替换成 `.new`）；
+2. 进世界跑十几秒，看 `game_capture.log` 是否出现
+   `NGX provider: ...nvngx_dlss.dll` / `NGX hooks active` / `input source: ngx`；
+3. 通了就重建发布 **v0.13.1**，并用 dump 看 RE Engine 的 MV 是否可用
+   （`7 - UE5 MV A-B.bat <exe> dump 1` + `analyse_dump.py`）。
+
+细节：`docs/findings/RE_ENGINE_NOTES.md`。
+
 性能相关的基线数据与候选优化（含"怎么验"）见
 `docs/findings/PERF_BASELINE.md` §3，这里不重复。
 

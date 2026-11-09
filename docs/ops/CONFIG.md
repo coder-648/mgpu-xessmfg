@@ -45,6 +45,7 @@ RESHADE_SRC=/mnt/d/ReShade64.dll ./scripts/make_addon_package.sh
 | `DepthConvert` | `0` / `1` | **默认 `1`**：把深度转成 R32_FLOAT 再共享。缺这个键时旧版本会静默失效 |
 | `Input` | `auto` / `ngx` / `ffx` / `xess` / `depth` | 输入源；`auto` 先到先用。见 `docs/design/INPUT_SOURCES.md` |
 | `Log` | `0` / `1` | 默认关，排查时开 |
+| `LoaderHook` | `1`（默认）/ `0` | `1` = 钩住 `kernel32!LoadLibrary*`，游戏一加载 `nvngx`/`amd_fidelityfx`/`libxess` 就立刻发现；`0` = **不碰游戏的加载器**，改为每 120 帧扫一次模块表（发现晚一点）。**排查"装上 add-on 后游戏加载变慢"时先试 `0`**（RE Engine / PRAGMATA 案例见 `docs/findings/RE_ENGINE_NOTES.md` §6） |
 | `SlotPolicy` | `0` / `1` | `0` = 没空槽就丢这一帧（实时默认）；`1` = 最多等 `SlotWaitUs` 微秒。**实测 `1` 没有收益**，当遗留开关看 |
 | `SlotWaitUs` | 微秒 | 仅 `SlotPolicy=1` 时生效，默认 `2000` |
 | `RenderWidth` / `RenderHeight` | ≥256 才生效 | 强制渲染分辨率（只在游戏上报错时用） |
@@ -59,6 +60,8 @@ RESHADE_SRC=/mnt/d/ReShade64.dll ./scripts/make_addon_package.sh
 |---|---|
 | `--input-ms X` | 把"输入间隔"当成 X ms（**仅影响 `load`/`slow` 统计**；`--fg-rt-mode quant` 下不再参与 pacing）。界面已不开放这一项 |
 | `--no-mv` / `--fg-of` | 前者完全不产 MV，后者改用 AMD 光流算 MV。**两者互斥** |
+| `--fg-jittered-mv` / `--fg-no-jittered-mv` | 置/清 `XEFG_SWAPCHAIN_INIT_FLAG_JITTERED_MV`（SDK 原文："Remove jitter from input velocity"）。**通常不用手动加**：add-on 会把游戏在 DLSS `CreateFeature` 里声明的 `MVJittered`（以及 `DepthInverted`）上报，bridge 自动跟随（日志 `dlss feature flags 0x..: ...` + `initFlags=0x..`）。PBZ 实测声明 `MVJittered=0`，所以那里**不该**置。自动路径**只管"游戏 MV"**：`--fg-of` 与 `--no-mv` 不受影响（要试就显式加 `--fg-jittered-mv`） |
+| `--fg-mv-scale raw\|px\|<float>` | 交给 XeFG 的 `motionVectorScaleX/Y`。`raw`（默认）= 游戏自己的 `MV.Scale`；`px` = 游戏 scale × MV 纹理尺寸（把"UV 空间矢量"折算成 XeFG 文档要求的**像素**）；`<float>` = 强制该值。PBZ 报 `(1,1)`、CP2077 报 `(2560,1440)`，所以这条要用 `--dump` + `scripts/analyse_dump.py` 的 units fit 量出来再定（详见 `docs/findings/UE5_MV_OPTISCALER.md` §7.3） |
 
 ### 4.1 上屏放哪块屏（2026-11-08 新增）
 

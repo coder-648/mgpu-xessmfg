@@ -11,11 +11,16 @@ rem    --interp 1      one interpolated frame per real frame (2x).
 rem    no --no-mv      the game's own motion vectors are tagged. At 2x this is
 rem                    the cleanest edge result - the vectors describe what the
 rem                    game actually moved.
+rem                    CAVEAT (2026-11-09): not every title hands NGX a usable
+rem                    field - on Phantom Blade Zero it is broken (NaN/inf, fp16
+rem                    saturation, no correlation with the real motion), and it
+rem                    flickers. For UE5 prefer "--fg-of" (7 - UE5 MV A-B.bat,
+rem                    variant "of"); see docs/findings/UE5_MV_OPTISCALER.md 7.4.
 rem    --fg-rt-mode quant  the measured 16/17 ms of a 60 fps lock snaps to 2 x 8.33 =
 rem                    16.67 ms, i.e. exactly 120.0 fps out (1.00 vblank/frame).
-rem    jitter          the game's own jitter is used automatically - do NOT pass
-rem                    --fg-jitter-zero (deprecated, prints a notice and does
-rem                    nothing now).
+rem    jitter          the game's own jitter is used automatically. --fg-jitter-zero
+rem                    is an A/B control again (2026-11-09): our colour is the
+rem                    post-upscaler image, so the jitter is arguably already gone.
 rem
 rem  The add-on side must produce the MV stream: game_capture.ini SkipMv=0.
 rem
