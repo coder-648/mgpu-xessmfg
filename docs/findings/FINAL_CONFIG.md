@@ -1153,7 +1153,7 @@ compose→present ≈ game->wgc + 输入间隔     43.0 ≈ 11.8 + 33.3 - 2
 | 顺序 | 动作 | 代价 |
 |---|---|---|
 | 1 | `--buffers 3` | 无（但 1440p 下实测无收益，5K 未系统验证） |
-| 2 | `--latency 2` | 延迟 +1 帧 |
+| 2 | `--latency 2` | 理论上 +1 帧，实测无可测差别（§9.4）；别指望它降延迟 |
 | 3 | `--scale 0.95` | 轻微放大，几乎看不出 |
 | 4 | 锁帧降到 28–29（RTSS 支持小数） | 输出略降 |
 
@@ -1162,11 +1162,30 @@ compose→present ≈ game->wgc + 输入间隔     43.0 ≈ 11.8 + 33.3 - 2
 DWM/WGC 固有。探索方向：禁用 DWM 批处理、排查抢焦点的窗口（浏览器/更新弹窗）。
 日志里对应一条 `HITCH gap=176ms`。
 
-### 9.4 延迟仍有 ~60–70 ms
+### 9.4 延迟：不是"每项 25 ms"，是 **2·T_in + age**（2026-11-09 重算）
 
-构成（40fps 下每项约 25 ms）：WGC 抓取 1 帧 → XeFG 模型 ~13–25 ms → GPU 队列 1 帧。
-**还没系统测过的组合**：`--buffers 3 --latency 2`、去掉 GPU 队列那一帧（需要重新设计
-`gpu_throttle()` 的同步点）。测的时候以 `skip` 不恶化为前提。
+旧版这一节写的是"构成：WGC 抓取 1 帧 → XeFG 模型 ~13–25 ms → GPU 队列 1 帧，合计 ~60–70 ms"。
+把 §6.3.1 / §6.3.2 的四组实测放一起对，模型应该写成：
+
+```
+click->photons ≈ T_in(游戏输入→合成) + age(DWM/WGC hop 7–12 ms) + bridge + scanout(0..1 vblank)
+饱和输出时 bridge ≈ T_in  ⇒  饱和档 = 2·T_in + age + [0, vblank]
+```
+
+`bridge` 里那 31.4 ms **不是"我们的开销"**，而是"本批最后一帧的 vblank"——XeFG 只能在
+prev→cur 之间插帧，真帧必须最后上屏，这一帧是插值本身的几何成本（DLSS-G / FSR-FG 同样有）。
+因此**降延迟只有三条路**：提高输入帧率、在同 120 fps 下取最小倍数、或干脆不填满面板
+（用空刷新换一个输入间隔）。插值分辨率（`--den`/`--scale`）**不降延迟**（§6.3.2：1440p 40.5
+vs 4K 43.0，差的就是 `age`）。
+
+**已经测过、确认无用的**：`--buffers 3` / `--latency 2`（MFG.md §5、M4 §10.1）、
+`--no-throttle`（去掉 GPU 队列那一帧，实测更差）、`--jbuf N` / `--slack N`（每个 N 加一个
+输入间隔）、`--pace` / `--lock`（与 XeFG 的 pacer 抢）。
+
+**唯一还没试的低延迟组合**：**3x@1440p@40**（`--den 2 --interp 2 --unlock-mfg`）——同样
+120 fps，推算 `click->photons` **55–58 ms**，比 4x@4K@30 的 77.4 低约 20 ms。测的时候以
+`skip`/`slow` 不恶化、空刷新不高于 0.6% 为前提。分场景的完整算账与剩余候选（`--capture-monitor`、
+`--overlay-layered`、给 `LATENCY` 行加 `age` p95）见 `PERF_BASELINE.md` §3.27。
 
 ### 9.5 可选：`--fg warp` 的插值质量
 

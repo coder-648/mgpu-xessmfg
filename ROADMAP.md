@@ -83,6 +83,31 @@
 3. **颜色拷贝失败必须降级为 warning**，不能再走 `ok = false`（现在会连坐 MV/深度）；
 4. 颜色槽按实际分辨率放置，别固定 5120×2880。
 
+### 7. 延迟档实测：3x@1440p@40（**唯一还没跑的"同 120 fps 更低延迟"点**）
+
+**问题**：现在四档配方（`docs/findings/PERF_BASELINE.md` §3.21）只按"填满面板 + 空刷新最低"选，
+没有按延迟选。算账见同文件 §3.27：饱和档的延迟是 `2·T_in + age`，所以同样 120 fps，
+`2x@60 ≈ 40–48 ms` < `3x@40 ≈ 55–65` < `4x@30 ≈ 73–82`。**4x@30 是延迟最差的一档**，
+而它恰好是现在 4K 的默认配方。
+
+**做法**（不需要改代码，只缺一次实测）：
+
+```
+bridge.exe --game <exe> --den 2 --pool 4 --interp 2 --unlock-mfg --fg-ui none --fg-rt-mode auto
+```
+
+RTSS 锁 40 fps，同场景跑 ≥60 s；对照组是 `--interp 3 --den 2`（4x@30，实测 73–82 ms）。
+
+**判据**：
+
+1. `scripts/latstats.py` 看 `compose->photons` 与 `est. click->photons`，预期 55–58 ms；
+2. `skip=0`、`slow>0` 的窗口数不比 4x@30 多；
+3. 空刷新不高于 4x@30 的 0.6%（`out: presents vs vblanks`）；
+4. 4K 原生（`--den 1`）装不下 3x@40（实测只有 106 fps），所以这条只能是 1440p 插值。
+
+顺带两个几乎零成本的对照（同一次会话里跑）：`--capture-monitor`（看 `game->wgc` 是否下降）、
+`--overlay-layered` 开/关（分层窗口是否多走一次 DWM 合成）。
+
 ## 工程债
 
 ### 0. RE Engine / PRAGMATA：NGX 钩子 + 加载慢 + 目录重定向 ✅ 已实现并验证（v0.13.1）
