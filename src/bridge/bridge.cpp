@@ -1374,6 +1374,27 @@ static bool start_wgc()
     }
     ComPtr<IGraphicsCaptureSession2> session2;
     if (SUCCEEDED(g_session.As(&session2))) { session2->put_IsCursorCaptureEnabled(FALSE); }
+    // Recent Windows builds default to a 16 ms minimum WGC update interval.
+    // That throttles a 120 fps game to about 60 captured frames per second.
+    // Request a 2 ms minimum interval for this session; older Windows keeps its defaults.
+    ComPtr<ABI::Windows::Graphics::Capture::IGraphicsCaptureSession5> session5;
+    if (SUCCEEDED(g_session.As(&session5))) {
+        ABI::Windows::Foundation::TimeSpan before{}, requested{}, after{};
+        requested.Duration = 20000; // 2 ms in 100 ns units.
+        const HRESULT before_hr = session5->get_MinUpdateInterval(&before);
+        const HRESULT set_hr = session5->put_MinUpdateInterval(requested);
+        const HRESULT after_hr = session5->get_MinUpdateInterval(&after);
+        logf_("[bridge] WGC MinUpdateInterval: before=%lld ticks (hr=0x%08lX), "
+              "requested=20000 ticks (2 ms), after=%lld ticks (hr=0x%08lX), set_hr=0x%08lX\n",
+              static_cast<long long>(before.Duration), static_cast<unsigned long>(before_hr),
+              static_cast<long long>(after.Duration), static_cast<unsigned long>(after_hr),
+              static_cast<unsigned long>(set_hr));
+        if (FAILED(set_hr)) {
+            logf_("[bridge] WARNING: could not set the WGC update interval to 2 ms\n");
+        }
+    } else {
+        logf_("[bridge] WGC MinUpdateInterval unavailable; keeping OS defaults\n");
+    }
     if (FAILED(g_session->StartCapture())) {
         logf_("[bridge] StartCapture FAILED\n");
         return false;
