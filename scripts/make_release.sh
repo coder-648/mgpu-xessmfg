@@ -129,6 +129,22 @@ cp "$REPO/scripts/recipes/run_smooth.bat"     "$OUT/bin/5 - smoothest (cadence).
 # A/B twin of recipe 5 with --input-copy-queue (docs/findings/PERF_BASELINE.md 3.28.1):
 # MV/depth copies on the COPY engine, overlapping the colour convert draw.
 cp "$REPO/scripts/recipes/run_smooth_cq.bat"  "$OUT/bin/8 - smoothest + copy queue (A-B).bat"
+# A/B/C test pair for the MV source and the VRR pacing (2026-11-10). They ship inside the
+# bundle so a re-extract cannot lose them - the earlier hand-placed copies disappeared exactly
+# that way.
+cp "$REPO/scripts/recipes/run_test_jittered_mv.bat"  "$OUT/bin/A - jittered MV (test).bat"
+cp "$REPO/scripts/recipes/run_test_optical_flow.bat" "$OUT/bin/B - optical flow (reference).bat"
+cp "$REPO/scripts/recipes/run_test_vrr.bat"          "$OUT/bin/C - VRR uniform (test).bat"
+# Attribution trio (2026-11-10): no-FG / fixed-2x / VRR+half. Only these three runs can say
+# whether a stutter comes from the capture+present path, from the variable-rate logic, or from
+# the frame-generation cost - guessing at the cadence algorithm alone was unproductive.
+cp "$REPO/scripts/recipes/run_diag_no_fg.bat"   "$OUT/bin/D1 - no FG (attribution).bat"
+cp "$REPO/scripts/recipes/run_diag_fixed2x.bat" "$OUT/bin/D2 - fixed 2x (attribution).bat"
+cp "$REPO/scripts/recipes/run_diag_vrr_half.bat" "$OUT/bin/D3 - VRR + half res (attribution).bat"
+# WGC delivery throttle: the default MinUpdateInterval caps capture at ~60 fps (2026-11-10).
+cp "$REPO/scripts/recipes/run_diag_wgc.bat"     "$OUT/bin/E - WGC no throttle (test).bat"
+# Dynamic mode with the batch budget pinned to k vblanks (2026-11-10).
+cp "$REPO/scripts/recipes/run_diag_cad_rt.bat"  "$OUT/bin/F - dynamic + k*vblank budget (test).bat"
 # 4K native output (--den 1) A/B pair for the same switch: the convert draw is 4x
 # bigger there, so the overlap window is big enough to measure (PERF_BASELINE 3.28.4).
 cp "$REPO/scripts/recipes/run_den1_a.bat"     "$OUT/bin/9 - 4K out 3x (A).bat"

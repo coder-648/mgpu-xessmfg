@@ -74,6 +74,60 @@ consumed[k] >= 它上次发布在该槽位的 published
 生产端写 `width/height` 时先把 `seq` 变奇数，写完变偶数。消费端读到奇数就重试，
 所以永远不会把旧 `width` 和新 `height` 拼在一起。
 
+### (d) v11：`FrameShared.semantics`（生产端**实测**的输入语义）
+
+`ProducerInfo.input_flags` 里放的是**游戏/API 声明**的东西；`semantics` 放的是生产端
+**量出来**的东西（add-on 的在线探针，每 ~2 s 一次）。为什么要分开：实测已经证明声明会错
+（PBZ 对 FSR 送 UV、对 DLSS/XeSS 送像素；`cameraFOV` 是水平 FOV；XeSS 段根本没有深度）。
+
+| 位 | 含义 |
+|---|---|
+| `0..1` | MV 单位：`0` 未知、`1` 像素、`2` "小量级"（UV 或 NDC —— 单靠幅值分不开，只有声明能区分） |
+| `2..3` | MV 方向：`0` 未知、`1` `prev−cur`、`2` `cur−prev` |
+| `4..5` | 深度方向：`0` 未知、`1` 反向 Z、`2` 正向 Z |
+| `8..15` | MV 质量分 `0..255`（= `1 − 残差比`，A-v2/A-v3 用） |
+| `16` | MV 单位是**实测**的（否则是声明/未知） |
+| `17` | 方向是**实测**的 |
+| `18` | 深度方向是**实测**的 |
+| `19` | MV 可用（质量分 > 0.15）；为 0 时消费端应退回自算光流 |
+
+`valid_w/h` 是 MV/深度纹理里的**有效子矩形**（游戏可能申请得比渲染尺寸大，PBZ 深度
+2564×1444 vs 渲染 2562×1441）。
+
+现状（v12 起）：消费端**已开始用**它——`semantics` 里的单位/符号/深度方向会与声明合并后驱动
+initFlags（NDC velocity 就是靠它），而 `--mv-flip` / `--fg-mv-scale` / `--fg-depth-inv` 保留为
+**覆盖**（显式开关永远优先）。
+
+`19` 号位（`kSemMvUsable`）自 A-v3 起**真的有人消费**了：为 0 且 `kSemQualityKnown` 置位时，
+bridge 这一帧改用自己算的光流（`--no-of-fallback` 可关）。它与 `--fg-of` 的区别是**不取消**
+`kRequestMv`，所以生产端一说"可用"就立刻切回来。
+
+## 4.6 v12：真实投影矩阵（`view_to_clip`）
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `view_to_clip[16]` | `float` | 游戏自己的 view→clip，**行主序**，与 `sl::Constants::cameraViewToClip` 同布局 |
+| `matrix_tick_ms` | `uint64_t` | 生产端**采集**它的时刻（0 = 没有） |
+
+- 来源（**两条，互为备份**）：
+  1. Streamline `sl::Constants.cameraViewToClip`（游戏用 SL 出 FG 时；官档注明不含 TAA jitter）；
+  2. **XeFG `xefg_swapchain_frame_constant_data_t.projectionMatrix`**（游戏自己经 XeSS-FG 出 FG 时；
+     jitter 走单独的 `jitterOffsetX/Y`，投影本身干净）。PBZ 在 unlocker 下的实测就属于这种：
+     `04:00` 的会话里一条 `sl.const` 都没有，只有 `xefg.const`。
+  两条都写进同一个槽，先到先得（同一帧内容一致）。
+- **没有相机的情况**：游戏既不用 SL 也不开 FG（纯 DLSS-SR）时，我们拿不到任何矩阵，
+  `--fg-fov` 继续生效 —— 数据不存在，不是没读。
+- 只有在 `ProducerInfo.input_flags` 带 `kInputFlagHasMatrix`（`1<<7`）时才有效。
+- **为什么需要**：DLSS-SR 不导出相机，于是所有 NGX 标题过去都靠 `--fg-fov` 猜投影
+  （默认 60°，和 PBZ 真实的 46.7° 垂直 FOV 差 13°）。有了这条，`--fg-fov` 对这些标题直接退役。
+- **过期即失效**：`matrix_tick_ms` 超过 500 ms 或未来时间戳，消费端就当没有，退回合成投影 ——
+  游戏切走 Streamline 之后矩阵不会僵在那里。
+- **交接方式**：命名共享内存 `Local\mgpu_fg_camera_v1`（结构 = `seq + tick + matrix + near/far/vfov`）。
+  不能用进程内 `static`：PBZ 启动时重建 swapchain ⇒ **ReShade 重载 add-on**（一次启动装载 5 次），
+  旧实例装的钩子往旧实例的全局里写，新实例的 present 路径读到 0（实测 `raw_tick=0`、写者确实执行）。
+  见 `docs/findings/PBZ_NOTES.md` §5.6。
+- 生产端只在**源自己没有相机**时才填（FSR 3.1 声明了 near/far/vfov，那条路径不受影响）。
+
 ## 5. 颜色与输入流的配对语义
 
 **结论先说**：`MV ↔ 深度` 严格同帧；`WGC 颜色 ↔ MV/深度` **不是**帧号级对应，

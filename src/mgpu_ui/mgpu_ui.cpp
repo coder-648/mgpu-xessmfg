@@ -124,6 +124,9 @@ struct State
     // 捕获
     int  pool = 4;             // -> --pool
     int  latency = 1;          // -> --latency
+    // WGC 交付节流（GraphicsCaptureSession5::MinUpdateInterval）**不再暴露为选项**：
+    // 2026-11-10 实测关掉它（0 ms）后输入延迟与流畅度立刻明显改善，而默认的 ~16.6 ms 会把
+    // 捕获钉在 ~60 fps。现在由 bridge 默认 = 0（`--wgc-minint 16` 可恢复旧行为，仅命令行）。
     // XeFG 输入
     // MV source: 0 = off (--no-mv), 1 = the game MV, 2 = the game MV reversed (--mv-flip)
     int  mv_mode = 0;
@@ -273,7 +276,12 @@ static const RowDef kRowsFg[] = {
     { ID_OUTFPS,  L"输出帧率 (Hz, 0=面板)", RK_EDIT },
     { ID_OUT,     L"输出",            RK_DD   },
     { ID_MV,      L"运动矢量",        RK_DD   },
-    { ID_SLACK,   L"抗丢帧 (A/B)",    RK_TOG  },
+    // 抗丢帧 (--slack-auto) removed 2026-11-10: for an *interpolated* stream, holding a
+    // capture back makes the two real frames further apart in time, so every generated frame
+    // covers a longer gap - the judder got worse and bigger, not better.
+    // VRR 均匀间隔 (--vrr) removed the same day: in practice it did not solve the problem
+    // (the input rate's own jitter dominates), so the UI keeps the single, well-tested path.
+    // Both remain on bridge.exe as command-line experiments.
 };
 static const RowDef kRowsCap[] = {
     { ID_CAP_API, L"捕获 API",        RK_INFO },
@@ -298,7 +306,7 @@ static const RowDef kRowsOverlay[] = {
 };
 
 static const CardDef kCards[] = {
-    { L"帧生成",       kRowsFg,     9, 0 },
+    { L"帧生成",       kRowsFg,     8, 0 },
     { L"捕获",         kRowsCap,    4, 1 },
     { L"启动",         kRowsLaunch, 3, 0 },
     { L"GPU / 显示器", kRowsDev,    2, 1 },
@@ -310,9 +318,9 @@ static const CardDef kCards[] = {
 static const int kCardCount = (int)(sizeof(kCards) / sizeof(kCards[0]));
 
 // ------------------------------------------------------------------ options
-static const wchar_t* kOptFgMode[] = { L"固定", L"动态逐帧" };
+static const wchar_t* kOptFgMode[] = { L"固定", L"动态逐帧", L"关闭 (1:1 直通)" };
 static const wchar_t* kOptOut[]    = { L"1:1 原生", L"5K -> 4K (0.75x)", L"半分辨率" };
-static const wchar_t* kOptMv[]     = { L"关闭", L"游戏 MV", L"游戏 MV (反向)", L"AMD 光流" };
+static const wchar_t* kOptMv[]     = { L"关闭", L"游戏 MV", L"AMD 光流" };
 static const wchar_t* kOptFov[]    = { L"55.0", L"58.7", L"60.0", L"65.0" };
 static const wchar_t* kOptIvl[]    = { L"自动（倍数+1 vblank 余量）", L"16.7 ms (60 fps)", L"20 ms (50 fps)",
                                       L"25 ms (40 fps)", L"33 ms (30 fps)", L"41.7 ms (24 fps)" };
@@ -352,9 +360,9 @@ static int opt_count(Id id)
 static const wchar_t* opt_text(Id id, int i)
 {
     switch (id) {
-    case ID_FG_MODE: return kOptFgMode[i % 2];
+    case ID_FG_MODE: return kOptFgMode[i % 3];
     case ID_OUT:     return kOptOut[i % 3];
-    case ID_MV:      return kOptMv[i % 4];
+    case ID_MV:      return kOptMv[i % 3];
     case ID_SDR:     return kOptColor[i % 2];
     case ID_FOV:     return kOptFov[i % 4];
     case ID_IVL:     return kOptIvl[i % 6];
@@ -386,7 +394,7 @@ static const wchar_t* opt_text(Id id, int i)
 // 互斥：模式外的控件灰显并且点不动（固定模式看不到"输出帧率"，动态模式看不到"倍数"）。
 static bool row_enabled(Id id)
 {
-    if (id == ID_INTERP) { return S().fg_mode != 1; }    // 固定 only
+    if (id == ID_INTERP) { return S().fg_mode == 0; }    // 固定 only
     if (id == ID_OUTFPS) { return S().fg_mode == 1; }    // 动态逐帧 only
     return true;
 }
@@ -628,6 +636,11 @@ static void load_profile(int i)
     s.hotkey      = ini_r(sec, L"hotkey3", s.hotkey);
     if (s.hotkey < 0 || s.hotkey >= kHotkeyCount) { s.hotkey = 0; }
     s.mv_mode     = ini_r(sec, L"mv_mode", ini_r(sec, L"no_mv", 1) != 0 ? 0 : 1);
+    // 0 = off, 1 = game MV, 2 = reversed, 3 = AMD optical flow. The clamp used to stop at 2,
+    // so selecting "AMD 光流" was reset to "关闭" on the next start (found 2026-11-10).
+    // Migration: the list lost its "reversed" entry (2026-11-10), so old ini values shift.
+    if (s.mv_mode == 3) { s.mv_mode = 2; }        // optical flow: index 3 -> 2
+    else if (s.mv_mode == 2) { s.mv_mode = 1; }   // reversed -> plain game MV (flip is obsolete)
     if (s.mv_mode < 0 || s.mv_mode > 2) { s.mv_mode = 0; }
     s.jitter_zero = ini_r(sec, L"jitter_zero", s.jitter_zero ? 1 : 0) != 0;
     s.proj_rz     = ini_r(sec, L"proj_rz", s.proj_rz ? 1 : 0) != 0;
@@ -755,15 +768,22 @@ static std::wstring build_cmdline(HWND target, bool display)
     static const wchar_t* kOut[] = { L" --den 1", L" --scale 0.75", L" --den 2" };
     cmd += kOut[(S().out_mode >= 0 && S().out_mode <= 2) ? S().out_mode : 0];
 
+    // WGC 交付节流：开 = 16 ms（Windows 默认量级，捕获上限 ~60 fps）；关 = 0（解除节流，
+    // 捕获能超过 60，代价是拷贝更频繁）。显式发参数，避免不同 Windows 版本默认值不一致。
+
     wchar_t b[256]{};
     // 模式 1（动态逐帧）时倍数只当作"解锁上限"：--interp 5 = 6x 容量，让 40fps 的 4-vblank、
     // 30fps 的 5-6-vblank 抖动帧也能被填满（实测 3.17/3.18：上限给 3x 时 40fps 空刷新 10.8%，
     // 给 6x 是 1.5%）。模式 0（固定）按用户选的固定倍数。
     const bool dynamic_mode = (S().fg_mode == 1);
+    const bool no_fg_mode   = (S().fg_mode == 2);
     const int interp_req = dynamic_mode ? 5 : (S().interp - 1);
     _snwprintf_s(b, _TRUNCATE, L" --pool %d --latency %d --interp %d",
                  S().pool, S().latency, interp_req);
     cmd += b;
+    // 模式 2 = 关闭（1:1 直通）：输入够快时（>= 面板刷新的一半）插帧只会多出面板显示不了的帧，
+    // 直通反而最顺、延迟最低（2026-11-10 WGC 节流解除后实测）。
+    if (no_fg_mode) { cmd += L" --no-fg"; }
     if (dynamic_mode) {
         cmd += L" --interp-cadence";
         // 输出帧率上限（0 = 面板刷新，不发送）：把"120Hz 面板但只要 60fps"变成
@@ -799,22 +819,21 @@ static std::wstring build_cmdline(HWND target, bool display)
     // 我们捕获的是 scRGB(FP16)，所以 HDR 源永远不丢；SDR 只是"编码成 SDR 再上屏"，
     // 在 HDR 显示器上会明显发灰 —— 那是模式本身，不是链路出错。
     if (S().sdr) { cmd += L" --sdr"; }
-    // 抗丢帧：OSD 偶尔出现的 "drop 1" 就是主循环把排队的旧帧丢掉了（drain-newest）。
-    // --slack-auto 只在"生产端在我们上次消费后确实又发布了新帧"时多留一帧，把丢弃换成
-    // 一次 +1 间隔的延迟，代价只发生在真有新内容的时候（--slack 1 是恒定 +1 间隔，命令行备选）。
-    if (S().slack1) { cmd += L" --slack-auto"; }
+    // 抗丢帧（--slack-auto）已从 UI 移除（2026-11-10）：对插帧它是负优化，见 kRowsFg 的注释。
+    // 参数仍保留在 bridge.exe 上供 A/B。
     cmd += L" --unlock-mfg --fg-ui none --fg-proj-rz --fg-rt-mode auto";
     // FOV and 输入间隔 are no longer exposed in the UI (2026-11-08): FOV only feeds the
     // synthetic projection, which the XeFG frame-generation path ignores (5.16), and
     // --input-ms no longer matters for pacing now that frameRenderTime is vblank-snapped.
     // Both remain available as bridge.exe command-line switches.
-    // MV: 0 = off, 1 = the game vectors (bridge asks the add-on for the MV stream;
-    // the add-on has to run with SkipMv=0), 2 = reversed (--mv-flip).
+    // MV: 0 = off, 1 = the game's vectors (default; the add-on must run with SkipMv=0),
+    // 2 = AMD optical flow. "reversed" (--mv-flip) used to be a third entry: with the
+    // declaration-first semantics the sign is fixed by the API contract (previous minus
+    // current), so a flip is never the answer - it was removed 2026-11-10. The bridge flag
+    // stays for experiments.
     if (S().mv_mode == 0) {
         cmd += L" --no-mv";
     } else if (S().mv_mode == 2) {
-        cmd += L" --mv-flip";   // game vectors, reversed
-    } else if (S().mv_mode == 3) {
         // AMD optical flow from the captured colour (FidelityFX). Uses only the colour plus
         // the game's native depth as an edge-guided upsample weight - no reprojection
         // matrix, no synthetic camera (docs FINAL_CONFIG 5.19).
@@ -1041,8 +1060,15 @@ static void start_bridge()
                          L"这个窗口 (pid %lu) 不是游戏进程；共享内存由 pid %lu 创建 —— 请点进游戏再按热键",
                          (unsigned long)tpid, (unsigned long)ppid);
         } else {
+            // ppid == 0 covers two very different situations, and the old text said "no add-on"
+            // for both - which sent people looking for a missing file when the add-on was
+            // loaded and simply had not captured a frame yet (the shared block is created on the
+            // first captured frame, because it needs the game's device and stream sizes).
+            // Wuchang/PBZ, 2026-11-10.
             _snwprintf_s(m, _TRUNCATE,
-                         L"目标进程 (pid %lu) 里没有 game_capture add-on，无法抓帧",
+                         L"目标进程 (pid %lu) 还没有抓到第一帧：确认游戏里超分（DLSS / XeSS）"
+                         L"已开启、且已进入游戏画面，再按热键；若一直如此，把该目录的 "
+                         L"game_capture.ini 里 Log 改成 1 后重开游戏看日志",
                          (unsigned long)tpid);
         }
         set_msg(m);
@@ -1102,7 +1128,7 @@ static void start_bridge()
     // Point out the one combination that pays for MV without seeing the benefit: at 3x the
     // generated frames come from the patched 2x model applied twice, and that model-edge
     // ghosting dominates whatever the motion vectors fix (measured 2026-11-08).
-    if ((S().mv_mode == 1 || S().mv_mode == 2) && S().interp >= 2) {
+    if (S().mv_mode == 1 && S().interp >= 2) {
         // Only the GAME's vectors flicker at 3x (jitter-relative, misaligned with the
         // resolved colour). --fg-of estimates them from that colour, so it is fine at 3x
         // and is in fact the recommended 3x choice (docs 5.19).
@@ -1349,7 +1375,7 @@ static std::wstring dd_caption(Id id)
     //              (FINAL_CONFIG 5.17) -> flicker.
     //   off      = cheapest and the smoothest of the three per the same test.
     if (id == ID_MV && S().fg_mode == 1) {
-        if (S().mv_mode == 3) { return L"AMD 光流（动态逐帧更易 drop）"; }
+        if (S().mv_mode == 2) { return L"AMD 光流（动态逐帧更易 drop）"; }
         if (S().mv_mode == 1) { return L"游戏 MV（动态逐帧可能闪烁）"; }
     }
     return opt_text(id, opt_get(id));
@@ -1708,9 +1734,9 @@ static void bump_spin(Id id, int dir)
 static void set_opt(Id id, int idx)
 {
     switch (id) {
-    case ID_FG_MODE: S().fg_mode = idx % 2; S().cadence = (S().fg_mode == 1); break;
+    case ID_FG_MODE: S().fg_mode = idx % 3; S().cadence = (S().fg_mode == 1); break;
     case ID_OUT:     S().out_mode = idx % 3; break;
-    case ID_MV:      S().mv_mode = idx % 4; break;
+    case ID_MV:      S().mv_mode = idx % 3; break;
     case ID_SDR:
         S().sdr = (idx % 2) == 1;
         set_msg(S().sdr ? L"SDR 输出（BT.709）：HDR 显示器上会发灰，属正常"

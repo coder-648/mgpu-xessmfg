@@ -45,11 +45,13 @@ RESHADE_SRC=/mnt/d/ReShade64.dll ./scripts/make_addon_package.sh
 | `DepthConvert` | `0` / `1` | **默认 `1`**：把深度转成 R32_FLOAT 再共享。缺这个键时旧版本会静默失效 |
 | `Input` | `auto` / `ngx` / `ffx` / `xess` / `depth` | 输入源；`auto` 先到先用。见 `docs/design/INPUT_SOURCES.md` |
 | `Log` | `0` / `1` | 默认关，排查时开 |
+| `FgSniff` | `0`（默认）/ `1` | **只读**地钩住游戏自己的帧生成（Streamline `slSetConstants`/`slSetTag*`、`nvngx_dlssg` 的 `DLSSG.*` 参数、`libxess_fg` 的 `xefgSwapChainTagFrameConstants`），把游戏**自己声明**的投影矩阵 / `clipToPrevClip` / MV 尺度 / jitter / 深度方向打进 add-on 日志。不发布任何数据、不改参数、不会成为 `Input` 源。需同时 `Log=1`。见 `docs/findings/FG_SNIFF.md` |
 | `LoaderHook` | `1`（默认）/ `0` | `1` = 钩住 `kernel32!LoadLibrary*`，游戏一加载 `nvngx`/`amd_fidelityfx`/`libxess` 就立刻发现；`0` = **不碰游戏的加载器**，改为每 120 帧扫一次模块表（发现晚一点）。**排查"装上 add-on 后游戏加载变慢"时先试 `0`**（RE Engine / PRAGMATA 案例见 `docs/findings/RE_ENGINE_NOTES.md` §6） |
 | `SlotPolicy` | `0` / `1` | `0` = 没空槽就丢这一帧（实时默认）；`1` = 最多等 `SlotWaitUs` 微秒。**实测 `1` 没有收益**，当遗留开关看 |
 | `SlotWaitUs` | 微秒 | 仅 `SlotPolicy=1` 时生效，默认 `2000` |
 | `RenderWidth` / `RenderHeight` | ≥256 才生效 | 强制渲染分辨率（只在游戏上报错时用） |
-| `MvNormalize` / `MvFlip` | `0` / `1` | MV 单位/符号修正，默认全 `0` |
+| `MvNormalize` / `MvFlip` | `0` / `1` | MV 单位/符号修正。`MvNormalize=auto` 会按**声明**的单位自动换算（pixels→÷流宽、ndc→×0.5）；默认 `0` = 原样透传，因为换算会改变 bridge 收到的数据，必须显式开 |
+| `StreamlineCamera` | `1`（默认）/ `0` | 把 Streamline `sl::Constants` 里的**真实投影矩阵**（不含 TAA jitter）发给 bridge（协议 v12），让它不再靠 `--fg-fov` 猜。DLSS 不导出相机，这是唯一拿到真 FOV/aspect/无限远 reversed-Z 的途径；源自己声明相机时（FSR 3.1）不生效 |
 
 ## 4. bridge 侧
 

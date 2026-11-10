@@ -124,12 +124,31 @@ NVSDK_NGX_Result NVSDK_CONV hook_evaluate(
     const NVSDK_NGX_Parameter* parameters,
     void* callback)
 {
+    // The same entry point serves both features: a title without Streamline evaluates
+    // its frame generation here too (PBZ does). The sniffer checks [capture] FgSniff
+    // first and then looks for the DLSSG.* parameters, so with the switch off this is a
+    // single boolean test.
+    mgpu::input::on_ngx_evaluate(parameters);
+
     bool ok_w = false, ok_h = false, ok_jx = false, ok_jy = false;
 
     ID3D12Resource* mv = read_resource(parameters, NVSDK_NGX_Parameter_MotionVectors);
     ID3D12Resource* dp = read_resource(parameters, NVSDK_NGX_Parameter_Depth);
 
     if (mv && dp) {
+        // Log the identity of the SR motion-vector texture when it changes: the FG path
+        // tags its own MV (in_fg.cpp, "sl.tags ... MOTION_VECTORS (1) <ptr>"), and
+        // comparing the two pointers is how we answer "is the FG vector field the same
+        // texture the upscaler sees, or a different one?".
+        if (mv != g_reported.mv) {
+            const D3D12_RESOURCE_DESC md = mv->GetDesc();
+            const D3D12_RESOURCE_DESC dd = dp->GetDesc();
+            mgpu::input::logf("ngx: sr mv=%p %ux%u fmt=%u | depth=%p %ux%u fmt=%u\n",
+                              (void*)mv, static_cast<unsigned>(md.Width), md.Height,
+                              static_cast<unsigned>(md.Format),
+                              (void*)dp, static_cast<unsigned>(dd.Width), dd.Height,
+                              static_cast<unsigned>(dd.Format));
+        }
         g_reported.mv    = mv;
         g_reported.depth = dp;
 
@@ -333,6 +352,40 @@ public:
         }
         out.serial = f.serial;
         out.tick_ms = f.tick_ms;
+        // ---- normalized semantics -------------------------------------------------
+        // MV.Scale is the multiplier that turns the stored texels into PIXELS. That is how
+        // DLSS consumes it, and it is the only thing a maintained wrapper forwards:
+        // OptiScaler copies NVSDK_NGX_Parameter_MV_Scale_X/Y straight into FSR's/XeSS's
+        // motionVectorScale (upscalers/fsr2_212/FSR2Feature_Dx12_212.cpp:259) and never
+        // inspects "what unit the texture is in" at all. So the declaration already answers
+        // the question, and it is not ambiguous:
+        //   scale ~= 1        -> the texture holds pixel offsets  (PBZ: mean|v| = 3.4)
+        //   scale ~= width    -> the texture holds UV             (PBZ: 2880, mean|v| = 0.009)
+        //   scale ~= width/2  -> the texture holds NDC
+        // Both PBZ sessions (2026-11-10) agree with this reading - 2880 measured UV, 1.0
+        // measured pixels - so the earlier "1.0 is ambiguous, let the online probe measure
+        // it" note was wrong, and it is what pushed the fragile ±mv residual test into the
+        // driving seat. See docs/findings/INPUT_SEMANTICS.md.
+        const float nxs = fabsf(f.mv_scale_x);
+        const float nys = fabsf(f.mv_scale_y);
+        const float nw  = static_cast<float>(f.render_w);
+        if (nxs > 0.0f && nxs <= 1.5f && nys <= 1.5f) {
+            out.mv_unit = mgpu::input::MvUnit::pixels;
+        } else if (nw > 0.0f && nxs >= 0.7f * nw && nxs <= 4.0f * nw) {
+            out.mv_unit = mgpu::input::MvUnit::uv;
+        } else if (nw > 0.0f && nxs >= 0.35f * nw && nxs < 0.7f * nw) {
+            out.mv_unit = mgpu::input::MvUnit::ndc;
+        }
+        // Every one of these APIs defines its motion vectors as previous-minus-current, so
+        // the sign needs no declaration and no measurement: a game that flipped it would
+        // break its own DLSS. MvFlip stays as an explicit override for the rare liar.
+        out.mv_sign       = mgpu::input::MvSign::prev_minus_cur;
+        out.camera_source = mgpu::input::CameraSource::none;
+        out.invalid_marker = 0.0f;
+        // NGX's Width/Height is the valid render size; a padded depth texture is what the
+        // crop in ds_run() uses to avoid stretching the field.
+        out.valid_w = f.render_w;
+        out.valid_h = f.render_h;
         return true;
     }
 };

@@ -222,6 +222,17 @@ void mgpu::input::logf(const char* fmt, ...)
     va_end(a);
 }
 
+// A source cannot resolve the ini path itself (resolve_ini_path is the host's, and it
+// knows about the %LOCALAPPDATA% fallback), so config reads go through here. Cheap
+// enough for the few times a source asks - in_fg.cpp caches the answer.
+int mgpu::input::config_int(const char* key, int def)
+{
+    if (key == nullptr) { return def; }
+    char path[MAX_PATH]{};
+    resolve_ini_path(path, sizeof(path));
+    return GetPrivateProfileIntA("capture", key, def, path);
+}
+
 // ---------------------------------------------------------- resource tracking
 // Only the resources a source reported are watched: tracking *every* barrier was
 // the original mistake - the loading screen issues tens of thousands of them while
@@ -350,10 +361,30 @@ static HMODULE (WINAPI* g_real_load_library_w)(LPCWSTR) = nullptr;
 
 // Every module load is offered to every source; each one decides by path whether it
 // cares (ngx wants `_nvngx.dll`, ffx will want `amd_fidelityfx*`, xess `libxess`).
+//
+// **Queued, not handled here.** This runs inside LoadLibrary, i.e. with the loader lock held,
+// and the handlers do heavy things: install MinHook trampolines (patching another module's
+// code) and - for the Streamline sniffer - CreateToolhelp32Snapshot, which takes the loader
+// lock itself. Doing that re-entrantly is a classic wedged-process: Wuchang: Fallen Feathers
+// hung during start-up exactly here on 2026-11-10 (log ends on the sniffer's first line, no
+// crash dump). The queue is drained from on_begin_effects, outside the loader lock.
+static HMODULE g_pending_mods[32] = {};
+static volatile LONG g_pending_count = 0;
+// Set in AddonInit, serviced by the first on_begin_effects (see the comment there).
+static bool g_scan_pending = false;
+// ReShade unloads add-ons by calling AddonUninit and then freeing the module. A loader-hook
+// detour that fires between those two points would touch g_sources (a std::vector with a
+// destructor) - the same hot-unload hazard that produced the null-mutex crash on Wuchang.
+// Every callback that can outlive AddonUninit checks this first.
+static volatile bool g_addon_alive = false;
+
 static void notify_sources(HMODULE m)
 {
-    if (!m) { return; }
-    for (auto* s : g_sources) { s->on_module(m); }
+    if (!m || !g_addon_alive) { return; }
+    const LONG i = InterlockedIncrement(&g_pending_count) - 1;
+    if (i < static_cast<LONG>(sizeof(g_pending_mods) / sizeof(g_pending_mods[0]))) {
+        g_pending_mods[i] = m;
+    }
 }
 
 static HMODULE WINAPI hook_load_library_ex_w(LPCWSTR name, HANDLE file, DWORD flags)
@@ -374,6 +405,29 @@ static void scan_loaded_modules()
 {
     // Sources that hook a module the game loaded *before* the add-on was injected.
     for (auto* s : g_sources) { s->scan_existing(); }
+}
+
+// Handle what the loader hooks queued, outside the loader lock (see notify_sources).
+static void drain_pending_modules()
+{
+    if (!g_addon_alive) { return; }
+    const LONG n = InterlockedExchange(&g_pending_count, 0);
+    if (n <= 0) { return; }
+    const LONG cap = static_cast<LONG>(sizeof(g_pending_mods) / sizeof(g_pending_mods[0]));
+    const LONG done = (n < cap) ? n : cap;
+    if (n > cap) { logf_("modules: %ld loads arrived, only %ld queued (the 120-frame rescan"
+                         " will pick the rest up)\n", n, cap); }
+    static bool logged = false;
+    if (!logged && done > 0) {
+        logged = true;
+        logf_("modules: %ld queued load(s) handled outside the loader lock\n", done);
+    }
+    for (LONG i = 0; i < done; ++i) {
+        HMODULE m = g_pending_mods[i];
+        g_pending_mods[i] = nullptr;
+        if (!m) { continue; }
+        for (auto* s : g_sources) { s->on_module(m); }
+    }
 }
 
 // -------------------------------------------------------------- capture state
@@ -419,6 +473,52 @@ static double g_capture_ms_total = 0.0;
 // capture cadence; it is not used for pacing.
 static double g_last_present_ms = 0.0;
 static float  g_present_interval_ms = 0.0f;
+// Streamline camera hand-off (protocol v12).
+// Why a named shared-memory section instead of plain globals: PBZ rebuilds its swapchain at
+// startup (init_swapchain resize=0/1 in the log), ReShade reloads add-ons on that, and the XeFG
+// hooks stay installed in the *old* module instance while the present path runs in the new one.
+// Their globals are different memory, which is exactly what `raw_tick=0 seq=0` while the writer
+// demonstrably ran looked like (2026-11-10 04:23). A named section is the same bytes for every
+// instance in the session, so the hand-off cannot depend on who owns the module.
+struct FgCamSlot
+{
+    volatile LONG64 seq;      // odd while a write is in flight
+    uint64_t tick;            // when the matrix was captured (0 = nothing yet)
+    float    m[16];
+    float    near_z, far_z, vfov;
+    uint32_t magic;
+};
+static constexpr uint32_t kFgCamMagic = 0x4d475055u;   // 'MGUP'
+static FgCamSlot g_fg_cam_local = {};                  // fallback when the mapping fails
+static FgCamSlot* g_fg_cam_slot = nullptr;
+
+static FgCamSlot* fg_cam_slot()
+{
+    if (g_fg_cam_slot) { return g_fg_cam_slot; }
+    HANDLE h = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+                                  sizeof(FgCamSlot), "Local\\mgpu_fg_camera_v1");
+    if (h != nullptr) {
+        void* p = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(FgCamSlot));
+        if (p != nullptr) {
+            g_fg_cam_slot = static_cast<FgCamSlot*>(p);
+            if (g_fg_cam_slot->magic != kFgCamMagic) {
+                memset(g_fg_cam_slot, 0, sizeof(FgCamSlot));
+                g_fg_cam_slot->magic = kFgCamMagic;
+            }
+            return g_fg_cam_slot;
+        }
+        CloseHandle(h);
+    }
+    g_fg_cam_slot = &g_fg_cam_local;
+    g_fg_cam_local.magic = kFgCamMagic;
+    return g_fg_cam_slot;
+}
+
+static bool     g_fg_cam_ok   = true;    // [capture] StreamlineCamera=0 turns it off
+static bool     g_fg_cam_used = false;   // logged once
+static bool     g_fg_cam_live = false;   // set by current_fg_camera() for the current frame
+
+
 static bool   g_logged_missing_state[3] = { false, false, false };
 static bool   g_step_logged[3] = { false, false, false };
 static UINT64 g_skip_capture_until = 0;
@@ -544,9 +644,11 @@ static bool g_ds_ready = false;       // PSOs/RTs for the pass exist
 // Some titles hand NGX motion vectors that are not in the unit space XeFG expects (UE5
 // has been observed mixing pixel units and backwards vectors). Normalising and/or flipping
 // them through the same pass costs one fullscreen draw and fixes the interpolation without
-// touching the game: [capture] MvNormalize=1 divides by the render size, MvFlip=1 negates.
+// touching the game: [capture] MvNormalize=auto follows what the source declared, 1 forces
+// "divide by the render size", 0 keeps the stream as-is (default - changing the stream's
+// unit silently would change what the bridge receives), MvFlip=1 negates.
 static bool  g_mv_pass = false;
-static int   g_mv_normalize_cfg = 0;
+static int   g_mv_normalize_cfg = 0;    // 0 = as-is (default), -1 = auto (follow declaration)
 static int   g_mv_flip_cfg = 0;
 static float g_mv_scale_x = 1.0f;
 static float g_mv_scale_y = 1.0f;
@@ -660,6 +762,9 @@ static UINT     g_ds_rtv_stride = 0;
 static UINT     g_ds_srv_stride = 0;
 static uint64_t g_ds_src_seen[2] = { 0, 0 };        // last source pointer per stream
 static bool     g_ds_logged = false;
+
+// Defined with the probe code below ds_prepare (it needs the shared state there).
+static void probe_create(ID3D12Device* device);
 
 static void ds_prepare_log(const char* why)
 {
@@ -797,6 +902,7 @@ static bool ds_prepare(ID3D12Device* device, UINT w, UINT h)
     g_ds_ready = true;
     logf_("downsample: MV/depth pass targets are %ux%u (capacity), drawing %ux%u\n",
           mgpu::kStreamMaxW, mgpu::kStreamMaxH, w, h);
+    probe_create(device);
     return true;
 }
 
@@ -831,6 +937,9 @@ static ID3D12CommandAllocator*    g_off_alloc = nullptr;
 static ID3D12GraphicsCommandList* g_off_list  = nullptr;
 static ID3D12Fence*               g_off_fence = nullptr;   // local, same device
 static ID3D12Fence*               g_off_ready = nullptr;   // game queue -> our queue
+// The device our queue/allocator/list/fences were created on. Every resource they touch has
+// to belong to the same one; the check lives in offload_same_device().
+static ID3D12Device*              g_off_dev   = nullptr;
 static UINT64 g_off_value   = 0;                // last value signalled on g_off_fence
 static UINT64 g_off_ready_value = 0;            // ... and on g_off_ready
 static UINT64 g_off_pending = 0;                // value not yet waited for
@@ -873,6 +982,7 @@ static bool offload_ensure(ID3D12Device* dev)
         return false;
     }
     g_off_list->Close();
+    g_off_dev = dev;
     if (!g_off_logged) {
         g_off_logged = true;
         logf_("  [offload] MV/depth cross-adapter copies run on our own queue"
@@ -948,12 +1058,660 @@ static void copy_into_slot(ID3D12GraphicsCommandList* list, ID3D12Resource* src,
 // afterwards; `dst` is the shared slot (COMMON, row-major, cross-adapter).
 // `defer_copy` (OffloadQueue) ends the pass with our render target in COPY_SOURCE instead of
 // copying + restoring here: the copy then runs on our own queue in the present callback.
+// ---------------------------------------------------------------- online MV probe
+//
+// Reads a 64x64 patch of the MV stream back every ~2 s and reports which *unit* the field
+// is in (pixels vs UV) - the question that used to need a `--dump` and a python fit.
+// Everything here is read-only and non-blocking: the copy rides on the command list that
+// already has the MV target in COPY_SOURCE, and the map only happens once the fence says
+// the GPU is done (a 16 KB staging read, no stall).
+//
+// The *sign* (previous-current vs current-previous) needs the previous frame's depth to
+// test against, so it is not decided here; the line says so explicitly instead of
+// guessing.
+// 256 instead of 128: PBZ measured mean|v| = 33..56 px per frame during a normal camera
+// turn, so a 128 px patch left 73% of the texels outside the "offset <= 16" window
+// (2026-11-10 03:26: big=46222 of 63504) - the *correct* scale was starved of votes and a
+// wrong one won. A 256 px patch with a 64 texel cap covers ordinary motion at 4K.
+static constexpr UINT kProbeDim = 256;
+// An offset larger than a quarter patch cannot be tested at all: the sample would come
+// from outside the copied patch (nothing was copied there).
+static constexpr float kProbeMaxOff = static_cast<float>(kProbeDim) / 4.0f;
+static constexpr uint32_t kProbeEvery = 120;   // frames between probes (~2 s at 60 fps)
+
+// Depth is sampled at four places instead of one corner: a single 64x64 patch of a wall
+// has no far plane in it, which is exactly what made the first version report
+// "ambiguous" on PBZ (min 0.0062 / max 0.0091 - a flat surface 11-16 m away). Sky or the
+// far plane nearly always lands in one of these.
+static constexpr UINT kProbeSpots = 4;
+
+static ComPtr<ID3D12Resource> g_probe_buf;        // MV patches: 2 gens x kProbeSpots
+static ComPtr<ID3D12Resource> g_probe_depth_buf;  // depth patches: 2 gens x kProbeSpots
+static ComPtr<ID3D12Fence>    g_probe_fence;
+static UINT64                 g_probe_fence_val = 0;
+static UINT64                 g_probe_pending   = 0;
+static UINT                   g_probe_pitch     = 0;   // mv row pitch
+static UINT                   g_probe_offset    = 0;
+static UINT                   g_probe_mv_slot   = 0;   // bytes per mv patch
+static UINT                   g_probe_d_pitch   = 0;   // depth row pitch
+static UINT                   g_probe_d_offset  = 0;
+static UINT                   g_probe_d_slot    = 0;   // bytes per depth patch
+static bool                   g_probe_ready     = false;
+static bool                   g_probe_armed     = false;   // a copy was recorded this frame
+// Last probe verdict packed as mgpu::kSem* bits. Published per frame (protocol v11) so the
+// consumer can stop guessing; stays 0 until the probe has an answer.
+static uint32_t               g_sem             = 0;
+// 1 = mv, 2 = depth, and <<2 for generation 1. Generation 0 is "the previous frame",
+// copied one frame before generation 1 - that pair is what makes the sign test possible.
+static uint32_t               g_probe_have      = 0;
+static int                    g_probe_gen       = -1;      // -1 idle, 0/1 = copying
+static uint32_t               g_probe_gen_frame = 0;
+
+static float half_to_float(uint16_t h)
+{
+    const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1Fu;
+    uint32_t mant = h & 0x3FFu;
+    uint32_t bits = 0;
+    if (exp == 0) {
+        if (mant == 0) { bits = sign; }
+        else {                          // subnormal
+            uint32_t e = 127 - 15 + 1;
+            while ((mant & 0x400u) == 0) { mant <<= 1; --e; }
+            bits = sign | (e << 23) | ((mant & 0x3FFu) << 13);
+        }
+    } else if (exp == 0x1F) {
+        bits = sign | 0x7F800000u | (mant << 13);
+    } else {
+        bits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+    }
+    float f = 0.0f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+// Creates a READBACK buffer of `bytes` - used for the multi-patch depth probe.
+static bool probe_make_readback_sized(ID3D12Device* device, UINT64 bytes,
+                                      ComPtr<ID3D12Resource>& out)
+{
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = bytes;
+    bd.Height = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels = 1;
+    bd.Format = DXGI_FORMAT_UNKNOWN;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_READBACK;
+    hp.CreationNodeMask = 1;
+    hp.VisibleNodeMask = 1;
+    return SUCCEEDED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
+                                                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                    IID_PPV_ARGS(&out)));
+}
+
+static void probe_create(ID3D12Device* device)
+{
+    if (g_probe_ready || !device) { return; }
+
+    // Both streams live in a multi-patch READBACK buffer: 2 generations x 4 spots, so the
+    // sign test can compare "this frame" against "the frame before it" without a second
+    // copy point or any extra state transition.
+    auto alloc = [&](DXGI_FORMAT fmt, ComPtr<ID3D12Resource>& buf, UINT* pitch,
+                     UINT* offset, UINT* slot) -> bool {
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = kProbeDim;
+        td.Height = kProbeDim;
+        td.DepthOrArraySize = 1;
+        td.MipLevels = 1;
+        td.Format = fmt;
+        td.SampleDesc.Count = 1;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+        UINT rows = 0;
+        UINT64 row_size = 0, total = 0;
+        device->GetCopyableFootprints(&td, 0, 1, 0, &fp, &rows, &row_size, &total);
+        if (total == 0) { return false; }
+        if (!probe_make_readback_sized(device, total * kProbeSpots * 2, buf)) { return false; }
+        *pitch = fp.Footprint.RowPitch;
+        *offset = static_cast<UINT>(fp.Offset);
+        *slot = static_cast<UINT>(total);
+        return true;
+    };
+
+    if (!alloc(DXGI_FORMAT_R16G16_FLOAT, g_probe_buf, &g_probe_pitch, &g_probe_offset,
+               &g_probe_mv_slot)) {
+        logf_("probe: mv readback FAILED - probing off\n");
+        return;
+    }
+    // Depth goes through the same machinery. Its direction is what the APIs disagree about
+    // in the field (PBZ: DLSS/FSR say reversed, XeSS has no depth at all), so it is
+    // measured instead of trusted.
+    if (!alloc(DXGI_FORMAT_R32_FLOAT, g_probe_depth_buf, &g_probe_d_pitch, &g_probe_d_offset,
+               &g_probe_d_slot)) {
+        logf_("probe: depth readback FAILED - probing off\n");
+        g_probe_buf.Reset();
+        return;
+    }
+    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_probe_fence)))) {
+        logf_("probe: CreateFence FAILED - probing off\n");
+        g_probe_buf.Reset();
+        g_probe_depth_buf.Reset();
+        return;
+    }
+    g_probe_ready  = true;
+    logf_("probe: sampling ON (%ux%u x %u spots x 2 frames, every %u frames)\n",
+          kProbeDim, kProbeDim, kProbeSpots, kProbeEvery);
+}
+
+// Called from ds_run while the target is already in COPY_SOURCE. `which` matches the
+// stream: 0 = motion vectors, 1 = depth.
+static void probe_issue(ID3D12GraphicsCommandList* list, int which, uint32_t frame)
+{
+    if (!g_probe_ready || !list || (which != 0 && which != 1)) { return; }
+    if (g_ds_w < kProbeDim || g_ds_h < kProbeDim) { return; }
+
+    // Round gating. A previous round must have been consumed before a new one starts, but
+    // the *second frame* of the current round must still be copied while its own copies are
+    // in flight - the old code bailed out on `pending` here, which kept generation 1 from
+    // ever landing and left `sign` permanently unknown (found 2026-11-10: bridge logged
+    // "sign=unknown(unknown)" every time).
+    if (g_probe_gen < 0) {
+        if (g_probe_have != 0 || g_probe_pending != 0) { return; }
+        if ((frame % kProbeEvery) != 0) { return; }
+        g_probe_gen = 0;
+        g_probe_gen_frame = frame;
+    } else if (g_probe_gen == 0) {
+        if (frame == g_probe_gen_frame) {
+            // the other stream of the same frame - stay in generation 0
+        } else if (frame == g_probe_gen_frame + 1) {
+            g_probe_gen = 1;
+        } else {
+            g_probe_gen = -1;      // missed the pair (stall, menu); retry next round
+            return;
+        }
+    }
+
+    ID3D12Resource* buf = (which == 0) ? g_probe_buf.Get() : g_probe_depth_buf.Get();
+    if (!buf) { return; }
+    const UINT pitch  = (which == 0) ? g_probe_pitch : g_probe_d_pitch;
+    const UINT offset = (which == 0) ? g_probe_offset : g_probe_d_offset;
+    const UINT slot   = (which == 0) ? g_probe_mv_slot : g_probe_d_slot;
+    const DXGI_FORMAT fmt = (which == 0) ? DXGI_FORMAT_R16G16_FLOAT : DXGI_FORMAT_R32_FLOAT;
+
+    D3D12_TEXTURE_COPY_LOCATION s{};
+    s.pResource = g_ds_rt[which].Get();
+    s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    s.SubresourceIndex = 0;
+
+    // Same four places for both streams, so MV and depth describe the same pixels.
+    const UINT w = g_ds_w, h = g_ds_h;
+    const UINT xs[kProbeSpots] = { (w - kProbeDim) / 2, (w - kProbeDim) / 2,
+                                   0, w - kProbeDim };
+    const UINT ys[kProbeSpots] = { 0, h - kProbeDim,
+                                   (h - kProbeDim) / 2, (h - kProbeDim) / 2 };
+    const UINT base = static_cast<UINT>(g_probe_gen) * kProbeSpots;
+
+    for (UINT i = 0; i < kProbeSpots; ++i) {
+        D3D12_TEXTURE_COPY_LOCATION d{};
+        d.pResource = buf;
+        d.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        d.PlacedFootprint.Offset = offset + static_cast<UINT64>(base + i) * slot;
+        d.PlacedFootprint.Footprint.Format = fmt;
+        d.PlacedFootprint.Footprint.Width = kProbeDim;
+        d.PlacedFootprint.Footprint.Height = kProbeDim;
+        d.PlacedFootprint.Footprint.Depth = 1;
+        d.PlacedFootprint.Footprint.RowPitch = pitch;
+
+        D3D12_BOX box{};
+        box.left = xs[i];
+        box.top = ys[i];
+        box.front = 0;
+        box.right = xs[i] + kProbeDim;
+        box.bottom = ys[i] + kProbeDim;
+        box.back = 1;
+        list->CopyTextureRegion(&d, 0, 0, 0, &s, &box);
+    }
+    g_probe_have |= 1u << (which + 2 * g_probe_gen);
+    // The list is only submitted by the game, so the fence has to be signalled from the
+    // queue later (probe_report does it once the frame is in flight). This keeps the
+    // whole probe off the GPU's critical path.
+    g_probe_armed = true;
+}
+
+// Called from the present callback: consume the probe when the GPU has finished it and
+// turn the numbers into one decision-oriented line.
+static void probe_report()
+{
+    if (!g_probe_ready) { return; }
+    // The copies were recorded on the game's list during on_begin_effects; by the time we
+    // get to present that list is in flight, so signalling here orders the fence after
+    // them. The map itself happens one present later (never blocks).
+    if (g_probe_armed) {
+        g_probe_armed = false;
+        if (g_game_queue != nullptr) {
+            ++g_probe_fence_val;
+            if (SUCCEEDED(g_game_queue->Signal(g_probe_fence.Get(), g_probe_fence_val))) {
+                g_probe_pending = g_probe_fence_val;
+            }
+        }
+        return;
+    }
+    if (g_probe_pending == 0) { return; }
+    if (g_probe_fence->GetCompletedValue() < g_probe_pending) { return; }
+
+    const bool have_mv0  = (g_probe_have & (1u << 0)) != 0;
+    const bool have_dep0 = (g_probe_have & (1u << 1)) != 0;
+    const bool have_mv1  = (g_probe_have & (1u << 2)) != 0;
+    const bool have_dep1 = (g_probe_have & (1u << 3)) != 0;
+
+    void* mv_map = nullptr;
+    void* dp_map = nullptr;
+    if ((have_mv0 || have_mv1) && g_probe_buf) {
+        if (FAILED(g_probe_buf->Map(0, nullptr, &mv_map))) { mv_map = nullptr; }
+    }
+    if ((have_dep0 || have_dep1) && g_probe_depth_buf) {
+        if (FAILED(g_probe_depth_buf->Map(0, nullptr, &dp_map))) { dp_map = nullptr; }
+    }
+
+    auto mv_at = [&](UINT gen, UINT spot, UINT x, UINT y, float* ox, float* oy) {
+        const uint8_t* b = static_cast<const uint8_t*>(mv_map) + g_probe_offset +
+                           static_cast<UINT64>(gen * kProbeSpots + spot) * g_probe_mv_slot;
+        const uint16_t* row = reinterpret_cast<const uint16_t*>(b + y * g_probe_pitch);
+        *ox = half_to_float(row[x * 2]);
+        *oy = half_to_float(row[x * 2 + 1]);
+    };
+    auto dp_at = [&](UINT gen, UINT spot, int x, int y) -> float {
+        if (x < 0) { x = 0; }
+        if (y < 0) { y = 0; }
+        if (x >= static_cast<int>(kProbeDim)) { x = static_cast<int>(kProbeDim) - 1; }
+        if (y >= static_cast<int>(kProbeDim)) { y = static_cast<int>(kProbeDim) - 1; }
+        const uint8_t* b = static_cast<const uint8_t*>(dp_map) + g_probe_d_offset +
+                           static_cast<UINT64>(gen * kProbeSpots + spot) * g_probe_d_slot;
+        const float* row = reinterpret_cast<const float*>(b + y * g_probe_d_pitch);
+        return row[x];
+    };
+
+    // ---- 1. unit: magnitude class over every patch we have ----
+    uint32_t n_valid = 0, n_invalid = 0, n_large = 0;
+    double sum_x = 0.0, sum_y = 0.0;
+    if (mv_map != nullptr) {
+        for (UINT gen = 0; gen < 2; ++gen) {
+            if ((gen == 0 && !have_mv0) || (gen == 1 && !have_mv1)) { continue; }
+            for (UINT spot = 0; spot < kProbeSpots; ++spot) {
+                for (UINT y = 0; y < kProbeDim; ++y) {
+                    for (UINT x = 0; x < kProbeDim; ++x) {
+                        float vx = 0.0f, vy = 0.0f;
+                        mv_at(gen, spot, x, y, &vx, &vy);
+                        if (!(vx == vx) || !(vy == vy) || fabsf(vx) > 6.0e4f || fabsf(vy) > 6.0e4f) {
+                            ++n_invalid;
+                            continue;
+                        }
+                        if (fabsf(vx) > 1000.0f || fabsf(vy) > 1000.0f) { ++n_large; continue; }
+                        sum_x += fabsf(vx);
+                        sum_y += fabsf(vy);
+                        ++n_valid;
+                    }
+                }
+            }
+        }
+    }
+    if (n_valid >= 256) {
+        float raw_x = static_cast<float>(sum_x / n_valid);
+        float raw_y = static_cast<float>(sum_y / n_valid);
+        if (g_mv_scale_x != 0.0f) { raw_x = fabsf(raw_x / g_mv_scale_x); }
+        if (g_mv_scale_y != 0.0f) { raw_y = fabsf(raw_y / g_mv_scale_y); }
+        const float total = static_cast<float>(n_valid + n_invalid + n_large);
+        const float big = (raw_x > raw_y) ? raw_x : raw_y;
+        const char* unit = "ambiguous (scene nearly static? retry)";
+        if (big > 0.5f) { unit = "pixels"; } else if (big < 0.02f) { unit = "UV"; }
+        const mgpu::input::MvUnit declared = g_inputs.mv_unit;
+        const char* verdict = "";
+        if (declared != mgpu::input::MvUnit::unknown) {
+            const bool declared_small = (declared != mgpu::input::MvUnit::pixels);
+            const bool measured_small = (big < 0.5f);
+            verdict = (declared_small == measured_small)
+                          ? "  (agrees with the declaration)"
+                          : "  (DISAGREES with the declaration - trust the measurement)";
+        }
+        logf_("probe: mv mean|v|=(%.3f,%.3f) invalid=%.1f%% large=%.1f%% -> unit=%s"
+              "  magnitude=%.3f  declared=%s%s\n",
+              raw_x, raw_y, 100.0f * n_invalid / total, 100.0f * n_large / total,
+              unit, big, mgpu::input::mv_unit_name(declared), verdict);
+        // Publish the verdict as one code: 1 = pixels, 2 = "small" (uv or ndc - the
+        // magnitude test cannot tell those two apart, and only a declaration can).
+        // A declaration always wins: the probe is a cross-check there, not a source of
+        // truth. It only fills the field when the API said nothing.
+        if (declared == mgpu::input::MvUnit::unknown) {
+            uint32_t code = 0;
+            if (big > 0.5f) { code = 1; } else if (big < 0.02f) { code = 2; }
+            g_sem = (g_sem & ~(3u << mgpu::kSemMvUnitShift)) | (code << mgpu::kSemMvUnitShift);
+            // Clear the "measured" flag when the magnitude class is inconclusive, otherwise the
+            // consumer sees "unknown(measured)" - a stale bit from an earlier round.
+            if (code != 0) { g_sem |= mgpu::kSemMvMeasured; }
+            else           { g_sem &= ~mgpu::kSemMvMeasured; }
+        }
+    }
+
+    // ---- 2. depth direction over the newest generation ----
+    if (dp_map != nullptr) {
+        const UINT gen = have_dep1 ? 1u : 0u;
+        float mn = 1.0e30f, mx = -1.0e30f;
+        double sum = 0.0;
+        uint32_t n = 0, n_far0 = 0, n_near1 = 0, n_bad = 0;
+        for (UINT spot = 0; spot < kProbeSpots; ++spot) {
+            for (UINT y = 0; y < kProbeDim; ++y) {
+                for (UINT x = 0; x < kProbeDim; ++x) {
+                    const float v = dp_at(gen, spot, static_cast<int>(x), static_cast<int>(y));
+                    if (!(v == v)) { ++n_bad; continue; }
+                    if (v < mn) { mn = v; }
+                    if (v > mx) { mx = v; }
+                    sum += v;
+                    ++n;
+                    if (v <= 1.0e-6f) { ++n_far0; }
+                    if (v >= 0.999f) { ++n_near1; }
+                }
+            }
+        }
+        if (n >= 256) {
+            const float pz = 100.0f * static_cast<float>(n_far0) / static_cast<float>(n);
+            const float po = 100.0f * static_cast<float>(n_near1) / static_cast<float>(n);
+            int measured = 0;                 // +1 reversed, -1 forward, 0 unknown
+            const char* what = "ambiguous (range spans the middle)";
+            if (pz > 20.0f && po < 20.0f) {
+                measured = 1;
+                what = "reversed-Z (far plane is 0)";
+            } else if (po > 20.0f && pz < 20.0f) {
+                measured = -1;
+                what = "forward-Z (far plane is 1)";
+            } else if (mx < 0.5f) {
+                measured = 1;
+                what = "reversed-Z (tentative: nothing near 1)";
+            } else if (mn > 0.5f) {
+                measured = -1;
+                what = "forward-Z (tentative: everything near 1)";
+            }
+            const bool declared_inv = (g_inputs.flags & mgpu::kInputFlagInvertedDepth) != 0;
+            const char* agree = "";
+            if (measured != 0) {
+                agree = ((measured > 0) == declared_inv)
+                            ? "  (agrees with the declaration)"
+                            : "  (DISAGREES with the declaration - trust the measurement)";
+            }
+            logf_("probe: depth min=%.4f mean=%.4f max=%.4f far0=%.0f%% near1=%.0f%%"
+                  " bad=%.1f%% (%u patches) -> %s  declared=%s%s\n",
+                  mn, static_cast<float>(sum / n), mx, pz, po,
+                  100.0f * static_cast<float>(n_bad) / static_cast<float>(n), kProbeSpots,
+                  what, declared_inv ? "reversed" : "forward", agree);
+            const uint32_t dc = (measured > 0) ? 1u : ((measured < 0) ? 2u : 0u);
+            g_sem = (g_sem & ~(3u << mgpu::kSemDepthShift)) | (dc << mgpu::kSemDepthShift);
+            if (dc != 0) { g_sem |= mgpu::kSemDepthMeasured; }
+            else         { g_sem &= ~mgpu::kSemDepthMeasured; }
+        }
+    }
+
+    // ---- 3. sign (paired win rate, and a second independent unit measurement) ----
+    // Only a LAST RESORT now: every upscaler API defines its vectors as previous-minus-
+    // current, and the sources publish that contract (in_ngx.cpp). The ±mv depth test is for
+    // sources that declare nothing, so it stays off the hot path instead of gating the
+    // pipeline on a fragile statistic (three rewrites of this test on 2026-11-10 is enough
+    // evidence that it should never be the primary answer).
+    if (g_inputs.mv_unit != mgpu::input::MvUnit::unknown) {
+        static bool once = false;
+        if (!once) {
+            once = true;
+            logf_("probe: sign skipped (mv unit declared=%s, sign is the API contract)\n",
+                  mgpu::input::mv_unit_name(g_inputs.mv_unit));
+        }
+    } else if (mv_map != nullptr && dp_map != nullptr && have_mv0 && have_dep0 && have_dep1) {
+        const float rw = (g_inputs.valid_w > 0) ? static_cast<float>(g_inputs.valid_w)
+                                               : static_cast<float>(g_ds_w);
+        const float rh = (g_inputs.valid_h > 0) ? static_cast<float>(g_inputs.valid_h)
+                                               : static_cast<float>(g_ds_h);
+        const float sw = static_cast<float>(g_ds_w);
+        const float sh = static_cast<float>(g_ds_h);
+        auto dp_bilin = [&](UINT gen, UINT spot, float fx, float fy) -> float {
+            const float maxf = static_cast<float>(kProbeDim) - 1.001f;
+            if (fx < 0.0f) { fx = 0.0f; }
+            if (fy < 0.0f) { fy = 0.0f; }
+            if (fx > maxf) { fx = maxf; }
+            if (fy > maxf) { fy = maxf; }
+            const int x0 = static_cast<int>(fx);
+            const int y0 = static_cast<int>(fy);
+            const float tx = fx - static_cast<float>(x0);
+            const float ty = fy - static_cast<float>(y0);
+            const float a = dp_at(gen, spot, x0, y0);
+            const float b = dp_at(gen, spot, x0 + 1, y0);
+            const float c = dp_at(gen, spot, x0, y0 + 1);
+            const float d = dp_at(gen, spot, x0 + 1, y0 + 1);
+            return (a + (b - a) * tx) * (1.0f - ty) + (c + (d - c) * tx) * ty;
+        };
+
+        struct Cand { const char* name; uint32_t unit_code; float kx, ky; };
+        const Cand cands[3] = {
+            { "pixels", 1u, sw / rw, sh / rh },
+            { "uv",     2u, sw,      sh      },
+            { "ndc",    3u, sw * 0.5f, sh * 0.5f },
+        };
+
+        int      best = -1;
+        double   best_z = 0.0;           // |wins - n/2| / sqrt(n/4): ranking by a z-score
+                                         // instead of the raw margin means a lucky 446-vote
+                                         // subsample cannot outrank a solid 22k-vote one -
+                                         // which is exactly what happened on 2026-11-10
+                                         // 03:21 (uv/446 beat pixels/22206 on a 0.3% residual
+                                         // difference that was pure noise).
+        double   best_margin = 0.0;      // |win rate - 0.5|, reported for humans
+        double   best_rate = 0.5;
+        double   best_plus = 0.0, best_minus = 0.0;
+        uint32_t best_used = 0, best_static = 0, best_big = 0, best_flat = 0, best_out = 0;
+
+        for (int ci = 0; ci < 3; ++ci) {
+            double sum_plus = 0.0, sum_minus = 0.0;
+            uint32_t used = 0, wins = 0, skipped_static = 0, skipped_big = 0;
+            uint32_t skipped_flat = 0, skipped_out = 0;
+            for (UINT spot = 0; spot < kProbeSpots; ++spot) {
+                // Stride 2: the field is spatially correlated, so every other texel carries
+                // the same verdict for a quarter of the work. The probe runs on the render
+                // thread inside the present callback, so cost matters (256^2 x 4 spots x 3
+                // scales with full bilinear would be a visible hitch every 2 s).
+                for (int y = 1; y + 1 < static_cast<int>(kProbeDim); y += 2) {
+                    for (int x = 1; x + 1 < static_cast<int>(kProbeDim); x += 2) {
+                        float mx2 = 0.0f, my2 = 0.0f;
+                        mv_at(1, spot, static_cast<UINT>(x), static_cast<UINT>(y), &mx2, &my2);
+                        if (!(mx2 == mx2) || !(my2 == my2)) { continue; }
+                        const float sx = mx2 * cands[ci].kx;
+                        const float sy = my2 * cands[ci].ky;
+                        // A wrong scale blows the offsets up by orders of magnitude, and a
+                        // correct one can still exceed what a patch can test; both land here
+                        // so the log shows *why* a candidate had few votes.
+                        if (fabsf(sx) > kProbeMaxOff || fabsf(sy) > kProbeMaxOff) {
+                            ++skipped_big;
+                            continue;
+                        }
+                        // Sub-quarter-texel motion cannot be separated from interpolation
+                        // noise: both offsets land in the same texels.
+                        if (fabsf(sx) < 0.25f && fabsf(sy) < 0.25f) { ++skipped_static; continue; }
+                        const float fx = static_cast<float>(x);
+                        const float fy = static_cast<float>(y);
+                        // Both warped samples must come from inside the copied patch.
+                        const float lim = static_cast<float>(kProbeDim) - 1.001f;
+                        if (fx + sx < 0.0f || fx + sx > lim || fy + sy < 0.0f || fy + sy > lim ||
+                            fx - sx < 0.0f || fx - sx > lim || fy - sy < 0.0f || fy - sy > lim) {
+                            ++skipped_out;
+                            continue;
+                        }
+                        const float cur = dp_bilin(1, spot, fx, fy);
+                        // Skip the degenerate poles (cleared / sky): relative depth error is
+                        // meaningless there and the vectors are usually invalid anyway. Both
+                        // ends are excluded so the rule is direction-agnostic (reversed-Z puts
+                        // sky at 0, forward-Z puts it at 1).
+                        if (!(cur > 1.0e-5f) || !(cur < 0.99999f)) { continue; }
+                        // Discriminating power: how much does the depth actually change when
+                        // the sample moves by |offset|? On a flat wall it does not change at
+                        // all, both signs fit equally well, and the "vote" is pure rounding -
+                        // that is exactly what produced plus=0.00323 minus=0.00322 on
+                        // 2026-11-10 03:21. Only texels where a wrong warp must show up can
+                        // decide the sign.
+                        const float gx = dp_at(1, spot, x + 2, y) - dp_at(1, spot, x - 2, y);
+                        const float gy = dp_at(1, spot, x, y + 2) - dp_at(1, spot, x, y - 2);
+                        const float slope = 0.25f * sqrtf(gx * gx + gy * gy);   // depth per texel
+                        const float off = sqrtf(sx * sx + sy * sy);
+                        if (!(slope * off > 0.02f * cur)) { ++skipped_flat; continue; }
+                        const float a = dp_bilin(0, spot, fx + sx, fy + sy);
+                        const float b = dp_bilin(0, spot, fx - sx, fy - sy);
+                        if (!(a > 1.0e-5f) || !(a < 0.99999f)) { continue; }
+                        if (!(b > 1.0e-5f) || !(b < 0.99999f)) { continue; }
+                        const float e_plus  = fabsf(a - cur);
+                        const float e_minus = fabsf(b - cur);
+                        sum_plus  += e_plus;
+                        sum_minus += e_minus;
+                        if (e_plus < e_minus) { ++wins; }
+                        ++used;
+                    }
+                }
+            }
+            // At least 2000 votes out of 4 x 126 x 126 = 63504 possible: below that the win
+            // rate is too noisy to carry a verdict, however extreme it looks.
+            if (used < 2000) { continue; }
+            const double rate = static_cast<double>(wins) / static_cast<double>(used);
+            const double margin = fabs(rate - 0.5);
+            // z of a binomial vote count: (wins - n/2) / sqrt(n/4).
+            const double z = fabs(static_cast<double>(wins) - 0.5 * used) /
+                             sqrt(0.25 * static_cast<double>(used));
+            if (z > best_z) {
+                best = ci;
+                best_z = z;
+                best_margin = margin;
+                best_rate = rate;
+                best_plus = sum_plus / used;
+                best_minus = sum_minus / used;
+                best_used = used;
+                best_static = skipped_static;
+                best_big = skipped_big;
+                best_flat = skipped_flat;
+                best_out = skipped_out;
+            }
+        }
+
+        if (best >= 0) {
+            const bool  plus_better = (best_rate > 0.5);
+            const float quality = static_cast<float>(2.0 * best_margin);   // 0..1
+            // How much better the winning direction actually aligns. A vote majority that
+            // moves the residual by 0.3% (03:21: plus=0.00323 minus=0.00322) is not a
+            // direction, it is rounding - require a visible gap as well as a clear vote.
+            const float gap = (best_plus > best_minus)
+                                  ? static_cast<float>((best_plus - best_minus) / (best_plus + 1.0e-9))
+                                  : static_cast<float>((best_minus - best_plus) / (best_minus + 1.0e-9));
+            const bool  decided = (best_z > 5.0) && (gap > 0.02);
+            const char* what = "unknown (win rate is a coin flip - vectors do not align)";
+            if (decided) {
+                what = plus_better ? "prev-cur (+mv aligns)"
+                                   : "cur-prev (-mv aligns)  (game vectors are flipped)";
+            } else if (best_z > 5.0) {
+                what = "unknown (votes lean one way but both offsets fit equally well)";
+            }
+            logf_("probe: sign scale=%s used=%u static=%u flat=%u big=%u out=%u"
+                  " wins=%.1f%% z=%.1f mean|d| plus=%.5f minus=%.5f -> %s  quality=%.2f\n",
+                  cands[best].name, best_used, best_static, best_flat, best_big, best_out,
+                  best_rate * 100.0,
+                  static_cast<float>(best_z),
+                  static_cast<float>(best_plus), static_cast<float>(best_minus), what,
+                  quality);
+            // Publish: the scale with the clearest win rate is the MV unit, the rate itself
+            // is the sign, and the margin over a coin flip is the quality.
+            const uint32_t best_unit = cands[best].unit_code;
+            g_sem = (g_sem & ~(3u << mgpu::kSemMvUnitShift)) |
+                    (best_unit << mgpu::kSemMvUnitShift);
+            g_sem |= mgpu::kSemMvMeasured;
+            g_sem = (g_sem & ~(0xFFu << mgpu::kSemMvQualityShift)) |
+                    (static_cast<uint32_t>(quality * 255.0f) << mgpu::kSemMvQualityShift);
+            if (decided) {
+                g_sem |= mgpu::kSemQualityKnown;
+                g_sem = (g_sem & ~(3u << mgpu::kSemMvSignShift)) |
+                        ((plus_better ? 1u : 2u) << mgpu::kSemMvSignShift);
+                g_sem |= mgpu::kSemSignMeasured;
+                if (quality > 0.15f) { g_sem |= mgpu::kSemMvUsable; }
+                else                 { g_sem &= ~mgpu::kSemMvUsable; }
+            } else {
+                g_sem &= ~(mgpu::kSemQualityKnown | (3u << mgpu::kSemMvSignShift) |
+                           mgpu::kSemSignMeasured | mgpu::kSemMvUsable);
+            }
+        } else {
+            // No candidate got 2000 votes: say so instead of staying silent, otherwise the
+            // absence of a `probe: sign` line looks like the probe is broken.
+            logf_("probe: sign unavailable (every scale had < 2000 usable texels - scene too"
+                  " still, or the MV does not cover the sampled corners)\n");
+        }
+    }
+
+     if (mv_map != nullptr) { g_probe_buf->Unmap(0, nullptr); }
+    if (dp_map != nullptr) { g_probe_depth_buf->Unmap(0, nullptr); }
+    g_probe_have = 0;
+    g_probe_pending = 0;
+    g_probe_gen = -1;
+}
+
+// Called from ds_run while the MV target is already in COPY_SOURCE.
+
 static bool ds_run(ID3D12GraphicsCommandList* list, int which, ID3D12Resource* src,
                    ID3D12Resource* dst, bool defer_copy = false)
 {
     if (!g_ds_ready || !src || !dst || which < 0 || which > 1) { return false; }
 
     const uint64_t key = reinterpret_cast<uint64_t>(src);
+    // Crop the sample to the *valid* sub-rect of the source. Some titles allocate the
+    // stream texture a few pixels larger than the render size and keep the image in the
+    // top-left corner: PBZ's depth is 2564x1444 while the render size (and the rect SL
+    // declares as the tag extent) is 2562x1441. Sampling [0,1] of the whole texture
+    // stretches the field by tex/valid and shifts it towards the edges.
+    // Conservative by design: only a small excess with the content at (0,0) is corrected;
+    // anything else (dynamic resolution sub-rects, padded rows) keeps the old behaviour
+    // and says so once.
+    float uv_max_x = 1.0f, uv_max_y = 1.0f;
+    {
+        const D3D12_RESOURCE_DESC sdesc = src->GetDesc();
+        const UINT tw = static_cast<UINT>(sdesc.Width);
+        const UINT th = sdesc.Height;
+        const UINT vw = (g_inputs.render_w > 0 && g_inputs.render_w <= tw) ? g_inputs.render_w : tw;
+        const UINT vh = (g_inputs.render_h > 0 && g_inputs.render_h <= th) ? g_inputs.render_h : th;
+        if ((vw != tw || vh != th) && (tw - vw) <= 16 && (th - vh) <= 16) {
+            uv_max_x = static_cast<float>(vw) / static_cast<float>(tw);
+            uv_max_y = static_cast<float>(vh) / static_cast<float>(th);
+        }
+        // Log the geometry once per *change*. Keyed on the sizes only: the game rotates
+        // several depth targets between frames (PBZ alternates two), so including the
+        // resource pointer here logged the same line every frame (1150 lines in 3 min).
+        static uint32_t logged_dims[2][4] = {};   // per stream: vw, vh, tw, th
+        static bool     logged_once[2] = { false, false };
+        if (!logged_once[which] || logged_dims[which][0] != vw || logged_dims[which][1] != vh ||
+            logged_dims[which][2] != tw || logged_dims[which][3] != th) {
+            logged_once[which] = true;
+            logged_dims[which][0] = vw;
+            logged_dims[which][1] = vh;
+            logged_dims[which][2] = tw;
+            logged_dims[which][3] = th;
+            const char* nm = (which == 0) ? "mv" : "depth";
+            if (uv_max_x < 1.0f || uv_max_y < 1.0f) {
+                logf_("\ncrop: %s tex %ux%u -> valid %ux%u (uvMax=%.5f,%.5f)\n",
+                      nm, tw, th, vw, vh, uv_max_x, uv_max_y);
+            } else if (vw != tw || vh != th) {
+                // Not a failure: the two sizes differ by more than a padded border, so this is
+                // a *different-resolution* input (XeSS hands us 3840x2160 HIGH_RES_MV for a
+                // 2562x1441 render). uvMax stays 1.0, the pass samples the whole texture and
+                // resamples it onto the render grid - which is exactly what "FG wants
+                // render-size MVs" means in OptiScaler's ForceFGRenderSizeMVs quirk
+                // (docs/findings/OPTISCALER_QUIRKS.md 3.2). The old wording here ("excess too
+                // large") read like we were giving up.
+                logf_("\ncrop: %s tex %ux%u vs render %ux%u - resampling the whole texture\n",
+                      nm, tw, th, vw, vh);
+            }
+        }
+    }
+
     if (g_ds_src_seen[which] != key) {
         // The SRV format has to match what the game's resource actually is: UE5 hands us
         // D32_FLOAT_S8X24_UINT, whose shader view is R32_FLOAT_X8X24_TYPELESS; a plain
@@ -998,7 +1756,8 @@ static bool ds_run(ID3D12GraphicsCommandList* list, int which, ID3D12Resource* s
     gpu.ptr += static_cast<SIZE_T>(which) * g_ds_srv_stride;
     list->SetGraphicsRootDescriptorTable(0, gpu);
     const float k[4] = { (which == 0) ? g_mv_scale_x : 1.0f,
-                         (which == 0) ? g_mv_scale_y : 1.0f, 0.0f, 0.0f };
+                         (which == 0) ? g_mv_scale_y : 1.0f,
+                         uv_max_x, uv_max_y };
     list->SetGraphicsRoot32BitConstants(1, 4, k, 0);
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     list->DrawInstanced(3, 1, 0, 0);
@@ -1010,6 +1769,11 @@ static bool ds_run(ID3D12GraphicsCommandList* list, int which, ID3D12Resource* s
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     list->ResourceBarrier(1, &b);
+
+    // The target is in COPY_SOURCE right here: cheapest possible place for the probe copy
+    // (see probe_issue). Both streams are sampled - MV for the unit, depth for the depth
+    // direction the APIs disagree about.
+    probe_issue(list, which, static_cast<uint32_t>(g_frame));
 
     if (defer_copy) {
         // OffloadQueue: the copy and the reverse transition happen on our own queue (see
@@ -1046,6 +1810,26 @@ static void ds_restore_on_game_list(ID3D12GraphicsCommandList* list, int which)
 
 // Records the deferred copies + the reverse transitions into g_off_list. Returns false when
 // there was nothing to record (no stream was deferred).
+static bool offload_same_device(ID3D12Resource* res)
+{
+    if (!res || !g_off_queue || !g_off_dev) { return true; }
+    // The queue, the allocator and everything they touch must belong to ONE device. With two
+    // GPUs in the process (the whole point of this project) mixing them is a device removal,
+    // and the crash surfaces far from the copy that caused it. OptiScaler carries a quirk for
+    // exactly this class of bug (CreateSLOnThe2ndDevice / ForceCreateD3D12Device,
+    // docs/findings/OPTISCALER_QUIRKS.md 2.2).
+    ID3D12Device* dev = nullptr;
+    if (FAILED(res->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&dev))) || !dev) {
+        return true;               // cannot tell - do not invent a failure
+    }
+    const bool same = (dev == g_off_dev);
+    dev->Release();
+    if (!same) {
+        offload_fail("a resource lives on a different D3D12 device than our queue");
+    }
+    return same;
+}
+
 static bool offload_record_copies(UINT slot)
 {
     if (!g_off_deferred[1] && !g_off_deferred[2]) { return false; }
@@ -1058,6 +1842,15 @@ static bool offload_record_copies(UINT slot)
         // The copy is skipped when the target is gone, but the state is always restored -
         // an unresolved COPY_SOURCE is what would break the next frame's pass.
         if (g_ds_rt[which] && g_slot[stream][slot]) {
+            if (!offload_same_device(g_ds_rt[which].Get()) ||
+                !offload_same_device(g_slot[stream][slot].Get())) {
+                // offload_same_device() already turned the queue off. Close what was recorded
+                // and return: the caller then rescues these copies on the game's queue
+                // (offload_rescue), which also restores the COPY_SOURCE state - so the
+                // deferred flags must stay set.
+                g_off_list->Close();
+                return false;
+            }
             copy_into_slot(g_off_list, g_ds_rt[which].Get(), g_slot[stream][slot].Get());
             any = true;
         }
@@ -1371,20 +2164,39 @@ static bool ensure_shared(ID3D12Device* device)
 
     // Optional MV fix-up: if the game's vectors are in pixels or point backwards, the pass
     // scales/flips them on the way into the stream. Costs one fullscreen draw.
+    //
+    // Which conversion to apply is DECLARED, not measured: NGX/FFX hand us MV.Scale, and
+    // `pixels = stored * MV.Scale` means the unit is known (see in_ngx.cpp). MvNormalize=auto
+    // (the default) therefore follows the source; 0/1/2 stay as explicit overrides for a
+    // title that lies about its scale.
+    int norm = g_mv_normalize_cfg;
+    if (norm < 0) {
+        switch (g_inputs.mv_unit) {
+        case mgpu::input::MvUnit::pixels: norm = 1; break;   // pixels -> UV
+        case mgpu::input::MvUnit::ndc:    norm = 3; break;   // NDC -> UV (halve)
+        default:                          norm = 0; break;   // uv, or undeclared: as-is
+        }
+        logf_("mv unit: declared=%s -> %s\n", mgpu::input::mv_unit_name(g_inputs.mv_unit),
+              norm == 1 ? "divide by stream size (pixels -> uv)"
+                        : (norm == 3 ? "halve (ndc -> uv)" : "pass through (uv / undeclared)"));
+    }
     g_mv_scale_x = 1.0f;
     g_mv_scale_y = 1.0f;
-    if (g_mv_normalize_cfg == 1 && mv_w > 0 && mv_h > 0) {
+    if (norm == 1 && mv_w > 0 && mv_h > 0) {
         g_mv_scale_x = 1.0f / static_cast<float>(mv_w);
         g_mv_scale_y = 1.0f / static_cast<float>(mv_h);
-    } else if (g_mv_normalize_cfg == 2 && g_rt_buffer_w > 0 && g_rt_buffer_h > 0) {
+    } else if (norm == 2 && g_rt_buffer_w > 0 && g_rt_buffer_h > 0) {
         g_mv_scale_x = 1.0f / static_cast<float>(g_rt_buffer_w);
         g_mv_scale_y = 1.0f / static_cast<float>(g_rt_buffer_h);
+    } else if (norm == 3) {
+        g_mv_scale_x = 0.5f;
+        g_mv_scale_y = 0.5f;
     }
     if (g_mv_flip_cfg) {
         g_mv_scale_x = -g_mv_scale_x;
         g_mv_scale_y = -g_mv_scale_y;
     }
-    g_mv_pass = (g_mv_normalize_cfg != 0 || g_mv_flip_cfg != 0);
+    g_mv_pass = (norm != 0 || g_mv_flip_cfg != 0);
     g_mv_w = mv_w;
     g_mv_h = mv_h;
 
@@ -1890,7 +2702,17 @@ static void load_config()
     // MvNormalize=1 divides the motion vectors by the render size (pixel units -> UV),
     // MvFlip=1 negates them (backwards vectors). Both are UE5 fix-ups; each costs one
     // fullscreen draw. 0 / 0 keeps the old identity copy path.
-    g_mv_normalize_cfg = GetPrivateProfileIntA("capture", "MvNormalize", 0, path) ? 1 : 0;
+    // MvNormalize: 0 (default) = pass the vectors through untouched, -1/auto = derive the
+    // conversion from the declared MV unit, 1 = divide by the render size (pixels -> UV),
+    // 2 = divide by the output size. auto is opt-in on purpose: it changes what the stream
+    // carries, so it must be a deliberate act, not a silent default.
+    {
+        char buf[16] = { 0 };
+        GetPrivateProfileStringA("capture", "MvNormalize", "0", buf, sizeof(buf), path);
+        if (_stricmp(buf, "auto") == 0) { g_mv_normalize_cfg = -1; }
+        else { g_mv_normalize_cfg = atoi(buf); }
+    }
+
     g_mv_flip_cfg      = GetPrivateProfileIntA("capture", "MvFlip", 0, path) ? 1 : 0;
 
     // Input=auto|ngx|ffx|xess|depth: which upscaler to take the frame from. auto (the
@@ -1909,13 +2731,192 @@ static void load_config()
     // us out of the game's loader, which is the prime suspect for RE Engine's slow start-up.
     g_loader_hook = GetPrivateProfileIntA("capture", "LoaderHook", 1, path) != 0;
 
+    // [capture] StreamlineCamera=0: do not take the projection from the Streamline constants the
+    // diagnostic sniffer sees. Default 1 - DLSS-SR exports no camera at all, so without this
+    // every NGX title gets the --fg-fov guess. It changes nothing for sources that declare one.
+    g_fg_cam_ok = GetPrivateProfileIntA("capture", "StreamlineCamera", 1, path) != 0;
+
     logf_("config: Color=%d RenderWidth=%u RenderHeight=%u StreamPercent=%d StreamHeight=%d"
-          " SkipMv=%d DepthConvert=%d MvNormalize=%d MvFlip=%d LoaderHook=%d Input=%s (path %s)\n",
+          " SkipMv=%d DepthConvert=%d MvNormalize=%d MvFlip=%d LoaderHook=%d FgSniff=%d"
+          " Input=%s (path %s)\n",
           g_capture_colour ? 1 : 0, g_render_w_ini, g_render_h_ini, g_stream_percent,
           g_stream_height,
           g_skip_mv ? 1 : 0,
           g_depth_convert_cfg, g_mv_normalize_cfg, g_mv_flip_cfg,
-          g_loader_hook ? 1 : 0, g_force_input.c_str(), path);
+          g_loader_hook ? 1 : 0,
+          GetPrivateProfileIntA("capture", "FgSniff", 0, path) != 0 ? 1 : 0,
+          g_force_input.c_str(), path);
+}
+
+// --------------------------------------------------------- Streamline camera (v12)
+// in_fg.cpp sees the game's sl::Constants (jitter-free view-to-clip). It is a *diagnostic*
+// source - never polled, never pinned - so it hands the camera over through these instead of
+// pretending to be an input. The sequence counter makes the hand-off tear-free; the timestamp
+// lets the frame path ignore a camera left over from an API the game has since abandoned.
+// (The storage lives next to the other globals, because the ini reader needs g_fg_cam_ok.)
+
+void mgpu::input::publish_fg_camera(const float view_to_clip[16], float near_z, float far_z,
+                                    float vfov_rad, uint64_t tick_ms)
+{
+    if (!view_to_clip) { return; }
+    FgCamSlot* s = fg_cam_slot();
+    InterlockedIncrement64(&s->seq);
+    memcpy(s->m, view_to_clip, sizeof(s->m));
+    s->near_z = near_z;
+    s->far_z  = far_z;
+    s->vfov   = vfov_rad;
+    // The timestamp doubles as "there is data": stored last, released by the interlocked
+    // increment below (full barrier on x86/x64).
+    s->tick = tick_ms;
+    InterlockedIncrement64(&s->seq);
+}
+
+bool mgpu::input::fg_camera(float out16[16], float* near_z, float* far_z, float* vfov_rad,
+                            uint64_t* tick_ms)
+{
+    if (!out16) { return false; }
+    FgCamSlot* s = fg_cam_slot();
+    for (int tries = 0; tries < 4; ++tries) {
+        const LONG64 s0 = InterlockedCompareExchange64(&s->seq, 0, 0);
+        if ((s0 & 1) != 0) { continue; }
+        float tmp[16];
+        memcpy(tmp, s->m, sizeof(tmp));
+        const float nz = s->near_z, fz = s->far_z, vf = s->vfov;
+        const uint64_t tk = s->tick;
+        if (InterlockedCompareExchange64(&s->seq, 0, 0) != s0) { continue; }
+        memcpy(out16, tmp, sizeof(tmp));
+        if (near_z)   { *near_z = nz; }
+        if (far_z)    { *far_z = fz; }
+        if (vfov_rad) { *vfov_rad = vf; }
+        if (tick_ms)  { *tick_ms = tk; }
+        return tk != 0;
+    }
+    return false;
+}
+
+// Is this a projection matrix at all? The same shape test OptiScaler uses before trusting a
+// captured matrix (inputs/FG/XeFG_Inputs_Dx12.cpp:126 IsProjection): w is +-z, no w
+// translation, no x/y mixing. A turned-camera matrix fails the last two, a garbage buffer
+// fails the first.
+static bool looks_like_projection(const float m[16])
+{
+    for (int i = 0; i < 16; ++i) { if (!(m[i] == m[i])) { return false; } }
+    if (fabsf(m[15]) > 1.0e-2f) { return false; }
+    if (fabsf(m[1]) > 1.0e-3f || fabsf(m[4]) > 1.0e-3f) { return false; }
+    const float a = fabsf(m[11]), b = fabsf(m[14]);
+    return (fabsf(a - 1.0f) < 1.0e-3f) || (fabsf(b - 1.0f) < 1.0e-3f);
+}
+
+// Once per published frame: is there a fresh real projection to use?
+// Deliberately does NOT touch g_inputs.flags: if the sniffer goes quiet (the game switched to
+// another API) a flag left behind would freeze the projection forever. The caller publishes a
+// timestamp instead, so the consumer sees the matrix go stale by itself.
+static bool current_fg_camera(float out16[16], uint64_t* out_tick)
+{
+    g_fg_cam_live = false;
+    // Diagnostics: say *why* the matrix is not used, once per distinct reason, plus a throttled
+    // state line - "the camera line never appears" is indistinguishable from "the game has no
+    // camera" without it, and that difference decides whether there is a bug here.
+    auto why = [](const char* msg) {
+        static const char* last = nullptr;
+        if (last == msg) { return; }
+        last = msg;
+        logf_("camera: not used (%s)\n", msg);
+    };
+    float m[16];
+    float nz = 0.0f, fz = 0.0f, vf = 0.0f;
+    uint64_t tk = 0;
+    const bool src_has_cam = (g_inputs.flags & mgpu::kInputFlagHasCamera) != 0;
+    const bool fg_ok = mgpu::input::fg_camera(m, &nz, &fz, &vf, &tk);
+    const uint64_t now = GetTickCount64();
+    const bool fresh = fg_ok && tk != 0 && now >= tk && (now - tk) <= 250ull;
+    const bool shape = fg_ok && looks_like_projection(m);
+    const bool ok = g_fg_cam_ok && !src_has_cam && fresh && shape;
+
+    {
+        static uint64_t last_log = 0;
+        if (now - last_log >= 5000ull) {
+            last_log = now;
+            logf_("camera: state enabled=%d src_camera=%d read=%d tick=%llu age=%lldms"
+                  " shape=%d raw_tick=%llu seq=%lld -> %s\n",
+                  g_fg_cam_ok ? 1 : 0, src_has_cam ? 1 : 0, fg_ok ? 1 : 0,
+                  static_cast<unsigned long long>(tk),
+                  fg_ok ? static_cast<long long>(now - tk) : -1LL,
+                  shape ? 1 : 0,
+                  static_cast<unsigned long long>(fg_cam_slot()->tick),
+                  static_cast<long long>(fg_cam_slot()->seq),
+                  ok ? "USED" : "not used");
+        }
+    }
+
+    if (!g_fg_cam_ok) { why("[capture] StreamlineCamera=0"); return false; }
+    if (src_has_cam) {
+        why("the input source declares its own camera");
+        return false;   // the source wins
+    }
+    if (!fg_ok) {
+        why("no matrix published yet (no sl::Constants and no XeFG frame constants)");
+        return false;
+    }
+    if (!fresh) {
+        why("the published matrix is stale (older than 250 ms)");
+        return false;
+    }
+    if (!shape) {
+        why("the published matrix does not look like a projection (rejected)");
+        return false;
+    }
+    memcpy(out16, m, 16 * sizeof(float));
+    if (out_tick) { *out_tick = tk; }
+    g_fg_cam_live = true;
+    if (!g_fg_cam_used) {
+        g_fg_cam_used = true;
+        // Derive what we will actually hand over: XeFG's frame constants carry only the matrix
+        // (near/far/fov arrive as 0), so printing those fields showed "fovY=0.00deg" while the
+        // bridge correctly used 60.00 deg.
+        const float fy = (fabsf(m[5]) > 1.0e-6f) ? (2.0f * atanf(1.0f / fabsf(m[5]))) : 0.0f;
+        const float asp = (fabsf(m[5]) > 1.0e-6f && fabsf(m[0]) > 1.0e-6f)
+                              ? (fabsf(m[5]) / fabsf(m[0])) : 0.0f;
+        logf_("camera: using the game's own projection matrix (Streamline constants / XeFG"
+              " frame constants)\n"
+              "  rows [%+.4f %+.4f %+.4f %+.4f] [%+.4f %+.4f %+.4f %+.4f]\n"
+              "       [%+.4f %+.4f %+.4f %+.4f] [%+.4f %+.4f %+.4f %+.4f]\n"
+              "  fovY=%.2fdeg aspect=%.3f - --fg-fov is no longer used for this title\n",
+              m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7],
+              m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15],
+              fy * 57.2957795f, asp);
+    }
+    return true;
+}
+
+// One line per change of the *declared* semantics. This is what makes "every game is
+// different" visible instead of guessable: the source states what its API knows,
+// `unknown` states what it does not, and `probe:` fills the gap at runtime.
+static void log_semantics()
+{
+    static uint32_t logged_bits = 0xFFFFFFFFu;
+    static uint32_t logged_dims = 0xFFFFFFFFu;
+    const mgpu::input::FrameInputs& f = g_inputs;
+    const uint32_t bits = static_cast<uint32_t>(f.mv_unit) |
+                          (static_cast<uint32_t>(f.mv_sign) << 4) |
+                          (static_cast<uint32_t>(f.camera_source) << 8) |
+                          ((f.flags & mgpu::kInputFlagInvertedDepth) ? (1u << 12) : 0u) |
+                          ((f.depth == nullptr) ? (1u << 13) : 0u);
+    const uint32_t dims = (f.valid_w << 16) ^ f.valid_h;
+    if (bits == logged_bits && dims == logged_dims) { return; }
+    logged_bits = bits;
+    logged_dims = dims;
+    // No depth texture at all (PBZ's XeSS: "HIGH_RES_MV: no depth") is not "forward-Z" - the
+    // first version printed depth=forward there, which reads like a declaration that the
+    // buffer is the wrong way round. Say what is true instead.
+    const char* dep = (f.depth == nullptr)
+                          ? "n/a (no depth)"
+                          : ((f.flags & mgpu::kInputFlagInvertedDepth) ? "reversed" : "forward");
+    logf_("semantics: mv=%s sign=%s camera=%s depth=%s valid=%ux%u\n",
+          mgpu::input::mv_unit_name(f.mv_unit),
+          mgpu::input::mv_sign_name(f.mv_sign),
+          mgpu::input::camera_source_name(f.camera_source),
+          dep, f.valid_w, f.valid_h);
 }
 
 // Asks the sources for this frame's inputs. The first source that has data wins and
@@ -1927,6 +2928,9 @@ static bool fetch_inputs()
 
     if (!g_source) {
         for (auto* s : g_sources) {
+            // Diagnostic-only sources (in_fg.cpp) are not inputs: never polled, never
+            // pinned, and never listed by the "waiting for ..." hints below.
+            if (!s->is_input()) { continue; }
             if (forced && g_force_input != s->name()) { continue; }
             mgpu::input::FrameInputs in;
             if (!s->poll(in)) { continue; }
@@ -1943,11 +2947,13 @@ static bool fetch_inputs()
             g_input_api = s->api_id();
             logf_("\ninput source: %s (api %u)%s - pinned for this process\n",
                   s->name(), g_input_api, forced ? " [forced by [capture] Input]" : "");
+            log_semantics();
             return true;
         }
         if ((g_frames_seen % 120) == 1) {
             char list[128]{};
             for (auto* s : g_sources) {
+                if (!s->is_input()) { continue; }
                 if (forced && g_force_input != s->name()) { continue; }
                 if (list[0]) { strcat_s(list, ", "); }
                 strcat_s(list, s->name());
@@ -1963,6 +2969,7 @@ static bool fetch_inputs()
             hinted = true;
             char names[128]{};
             for (auto* s : g_sources) {
+                if (!s->is_input()) { continue; }
                 if (forced && g_force_input != s->name()) { continue; }
                 if (names[0]) { strcat_s(names, ", "); }
                 strcat_s(names, s->name());
@@ -1994,6 +3001,7 @@ static bool fetch_inputs()
     g_source_quiet = 0;
     g_inputs    = in;
     g_input_api = g_source->api_id();
+    log_semantics();
     return true;
 }
 // ---------------------------------------------------------------- v10 credit window
@@ -2097,6 +3105,15 @@ static void on_begin_effects(effect_runtime* rt, command_list* cmd,
 {
     PerfAccum acc(&g_perf_begin_ms);
     ++g_frames_seen;
+    // Module discovery happens *here*, not in AddonInit: the initial scan walks the module
+    // list with CreateToolhelp32Snapshot and installs hooks, and doing that from ReShade's
+    // add-on init (inside the device-creation call, with the loader lock contended) wedged
+    // Wuchang: Fallen Feathers on 2026-11-10. One frame of delay costs nothing.
+    if (g_scan_pending) {
+        g_scan_pending = false;
+        scan_loaded_modules();
+    }
+    drain_pending_modules();
     if (!g_loader_hook && (g_frames_seen % 120) == 0) {
         // No loader hook (see [capture] LoaderHook): pick up modules that appeared after
         // init, so NGX/FFX/XeSS are still found - just up to 120 frames later.
@@ -2227,6 +3244,14 @@ static void on_begin_effects(effect_runtime* rt, command_list* cmd,
     if (!g_mv_active) {
         // Nobody consumes this stream: neither convert it nor write it across the bus.
         // The slot keeps its last content; the bridge zeroes MV when it asked for none.
+        // The unit probe measures THIS stream, so it cannot run either - say so once
+        // instead of leaving the missing `probe:` line a mystery.
+        static bool hinted = false;
+        if (g_probe_ready && !hinted && g_frames_seen > 120 && g_inputs.mv != nullptr) {
+            hinted = true;
+            logf_("  [mv] the consumer did not ask for motion vectors, so `probe:` stays"
+                  " silent - enable MV in the bridge/UI to have the unit measured\n");
+        }
     } else {
         ID3D12Resource* dst = g_slot[1][g_cur_slot].Get();
         bool mv_ok = false;
@@ -2325,6 +3350,8 @@ static void on_begin_effects(effect_runtime* rt, command_list* cmd,
 static void on_reshade_present(effect_runtime* /*rt*/)
 {
     PerfAccum acc(&g_perf_present_ms);
+    // Consume a finished MV probe (a 16 KB staging read, never blocks).
+    probe_report();
     // Every 120 presents, print what our own callbacks cost in the window. This is the
     // question "is the add-on what makes this game load slowly?" answered with numbers.
     if (g_frames_seen != 0 && (g_frames_seen <= 5 || (g_frames_seen % 120) == 0)) {
@@ -2362,14 +3389,38 @@ static void on_reshade_present(effect_runtime* /*rt*/)
         if (ctl) {
             ctl->frames[slot].ready      = 0;      // invalidate while we rewrite the rest
             MemoryBarrier();
+            // v12: a real projection (Streamline constants) if this source has none of its own.
+            float cam_mtx[16];
+            uint64_t cam_tick = 0;
+            const bool have_cam_mtx = current_fg_camera(cam_mtx, &cam_tick);
             ctl->frame_published         = g_frame;
             ctl->frames[slot].frame_id   = g_inputs.serial;
             ctl->frames[slot].jitter_x   = g_inputs.jitter_x;
             ctl->frames[slot].jitter_y   = g_inputs.jitter_y;
             ctl->frames[slot].render_w   = g_inputs.render_w;
             ctl->frames[slot].render_h   = g_inputs.render_h;
-            ctl->frames[slot].mv_scale_x = g_inputs.mv_scale_x;
-            ctl->frames[slot].mv_scale_y = g_inputs.mv_scale_y;
+            // The published scale must match what the STREAM holds, not just what the game
+            // declared. XeFG's motionVectorScale means "pixels per velocity unit" (OptiScaler
+            // derives it the same way: 1.0 for a pixel-space source, size*0.5 with a negated Y
+            // for NDC - inputs/FG/XeFG_Inputs_Dx12.cpp:514). With MvNormalize the stream is
+            // rewritten (pixels/mv_w, or ndc*0.5), so the declared scale alone would be ~2560x
+            // off - a silent quality bug, so it is folded in here.
+            float pub_mv_x = g_inputs.mv_scale_x;
+            float pub_mv_y = g_inputs.mv_scale_y;
+            if (g_mv_normalize_cfg == 1 || (g_mv_normalize_cfg < 0 && g_inputs.mv_unit == mgpu::input::MvUnit::pixels)) {
+                pub_mv_x *= static_cast<float>(g_mv_w ? g_mv_w : 1);
+                pub_mv_y *= static_cast<float>(g_mv_h ? g_mv_h : 1);
+            } else if (g_mv_normalize_cfg == 3 || (g_mv_normalize_cfg < 0 && g_inputs.mv_unit == mgpu::input::MvUnit::ndc)) {
+                // NDC: pixels = ndc * size/2, and Y flips (NDC +Y is up, screen/UV +Y is down).
+                // OptiScaler's XeFG path does exactly this: mvScaleY *= size.y * -0.5f
+                // (inputs/FG/XeFG_Inputs_Dx12.cpp:521). The matching USE_NDC_VELOCITY init flag
+                // is not wired up in the bridge yet - followed up in OPTISCALER_QUIRKS.md.
+                pub_mv_x *= 2.0f;
+                pub_mv_y *= -2.0f;
+            }
+            if (g_mv_flip_cfg) { pub_mv_x = -pub_mv_x; pub_mv_y = -pub_mv_y; }
+            ctl->frames[slot].mv_scale_x = pub_mv_x;
+            ctl->frames[slot].mv_scale_y = pub_mv_y;
             // v6: camera comes from the source when it has one (FSR 3.1 exports
             // near/far/vfov; DLSS-SR does not, so those stay 0 and the bridge keeps
             // using --fg-fov). The matching flag lives in ctl->producer.input_flags.
@@ -2377,9 +3428,61 @@ static void on_reshade_present(effect_runtime* /*rt*/)
             ctl->frames[slot].far_plane     = g_inputs.far_plane;
             ctl->frames[slot].vfov_rad      = g_inputs.vfov_rad;
             ctl->frames[slot].frame_time_ms = g_present_interval_ms;
+            // v11: what the probe measured (0 = nothing measured yet). The consumer logs it
+            // and - once it trusts it - uses it instead of the per-game switches.
+            //
+            // Declarations are published too, because they are the primary source: the unit
+            // comes from MV.Scale / the XeSS velocity-space flag, the sign from the API
+            // contract, the depth direction from the API's own flag. The probe only fills a
+            // gap (it is skipped entirely when the unit is declared), so without this the
+            // consumer would see "mv=unknown" for a source that declared everything.
+            {
+                uint32_t sem_out = g_sem;
+                if ((sem_out & mgpu::kSemMvMeasured) == 0) {
+                    uint32_t u = 0;
+                    switch (g_inputs.mv_unit) {
+                    case mgpu::input::MvUnit::pixels: u = 1; break;
+                    case mgpu::input::MvUnit::uv:     u = 2; break;
+                    case mgpu::input::MvUnit::ndc:    u = 3; break;
+                    default: break;
+                    }
+                    sem_out = (sem_out & ~(3u << mgpu::kSemMvUnitShift)) |
+                              (u << mgpu::kSemMvUnitShift);
+                }
+                if ((sem_out & mgpu::kSemSignMeasured) == 0 &&
+                    g_inputs.mv_sign != mgpu::input::MvSign::unknown) {
+                    sem_out = (sem_out & ~(3u << mgpu::kSemMvSignShift)) |
+                              ((g_inputs.mv_sign == mgpu::input::MvSign::prev_minus_cur ? 1u : 2u)
+                               << mgpu::kSemMvSignShift);
+                }
+                if ((sem_out & mgpu::kSemDepthMeasured) == 0 && g_inputs.depth != nullptr) {
+                    const uint32_t dc = (g_inputs.flags & mgpu::kInputFlagInvertedDepth) ? 1u : 2u;
+                    sem_out = (sem_out & ~(3u << mgpu::kSemDepthShift)) |
+                              (dc << mgpu::kSemDepthShift);
+                }
+                ctl->frames[slot].semantics = sem_out;
+            }
+            // v12: the game's own projection, when we have one (see adopt_fg_camera).
+            // v12: the game's own projection, when the sniffer has a fresh one.
+            if (have_cam_mtx) {
+                memcpy(ctl->frames[slot].view_to_clip, cam_mtx,
+                       sizeof(ctl->frames[slot].view_to_clip));
+                ctl->frames[slot].matrix_tick_ms = cam_tick;
+            } else {
+                ctl->frames[slot].matrix_tick_ms = 0;
+            }
+            ctl->frames[slot].valid_w       = g_inputs.valid_w;
+            ctl->frames[slot].valid_h       = g_inputs.valid_h;
             ctl->frames[slot].published     = value;   // v10: what the consumer ACKs with
+            // The NDC bit is what lets the consumer set XEFG_SWAPCHAIN_INIT_FLAG_USE_NDC_VELOCITY
+            // (only an NDC source needs it; the flag also implies the Y flip, which the mv_scale
+            // published above already carries). Derived from the declared unit, so an XeSS source
+            // with USE_NDC_VELOCITY gets it for free.
             ctl->producer.input_flags       = (g_inputs.flags & ~mgpu::kInputFlagMvActive) |
-                                              (g_mv_active ? mgpu::kInputFlagMvActive : 0);
+                                              (g_mv_active ? mgpu::kInputFlagMvActive : 0) |
+                                              (g_fg_cam_live ? mgpu::kInputFlagHasMatrix : 0u) |
+                                              (g_inputs.mv_unit == mgpu::input::MvUnit::ndc
+                                                   ? mgpu::kInputFlagMvNdc : 0u);
             MemoryBarrier();
         }
         // OffloadQueue: hand the deferred copies to our own queue (which then signals the
@@ -2477,6 +3580,11 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE re
     g_sources.push_back(mgpu::input::make_ngx_source());
     g_sources.push_back(mgpu::input::make_ffx_source());
     g_sources.push_back(mgpu::input::make_xess_source());
+    // Last, and not an input at all: it only wants the module-load notifications so it
+    // can read what the game's *own* frame generation is handed (projection matrix,
+    // MV scale, depth direction). Its poll() always returns false, so `Input=auto`
+    // can never pin it and nothing it sees is published ([capture] FgSniff).
+    g_sources.push_back(mgpu::input::make_fg_source());
 
     // Loader hooks, so a source is told about a module the moment the game loads it
     // (M2: for DLSS that module is the driver-store _nvngx.dll).
@@ -2506,7 +3614,13 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE re
         logf_("loader hooks DISABLED ([capture] LoaderHook=0) - modules are found by"
               " rescanning every 120 frames\n");
     }
-    scan_loaded_modules();
+    // Deferred: walking the module list (CreateToolhelp32Snapshot, which takes the loader lock)
+    // and installing hooks from ReShade's add-on init wedges titles whose start-up is still
+    // loading DLLs - Wuchang: Fallen Feathers, 2026-11-10: the log stopped right here and the
+    // process sat there. The first on_begin_effects does the same work one frame later,
+    // outside that path.
+    g_scan_pending = true;
+    logf_("modules: initial scan deferred to the first frame\n");
 
     reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
     reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
@@ -2516,12 +3630,13 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE re
 
     logf_("events: init_effect_runtime, barrier, reshade_begin_effects, reshade_present\n");
 
-
+    g_addon_alive = true;    // late callbacks are safe from here on (cleared in AddonUninit)
     return true;
 }
 
 extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon_module, HMODULE reshade_module)
 {
+    g_addon_alive = false;   // first thing: stop the loader-hook path from touching our state
     logf_("AddonUninit\n");
     log_stats();
 

@@ -130,8 +130,27 @@ RTSS 锁 40 fps，同场景跑 ≥60 s；对照组是 `--interp 3 --den 2`（4x@
 
 细节：`docs/findings/RE_ENGINE_NOTES.md`。
 
-性能相关的基线数据与候选优化（含"怎么验"）见
-`docs/findings/PERF_BASELINE.md` §3，这里不重复。
+### 1. 帧生成真相：只读抓游戏自己的 FG（诊断）✅ 已实现（add-on only）
+
+**问题**：UE5 那条路拿不到投影矩阵（NGX 不导出相机），MV 的尺度/符号/深度方向只能靠
+`--fg-fov`、`--fg-zn`、`--mv-flip` 一个个 A/B 试出来；而**帧生成 API 必须拿到完整相机**，
+游戏其实每帧都在声明它。
+
+**已做**：`src/game_capture/in_fg.cpp` + `[capture] FgSniff=1`。钩三选一（按游戏实际用哪个）：
+Streamline `sl.interposer`（`slSetConstants` / `slSetTag*` / `slEvaluateFeature` /
+`slDLSSGGetState`）、`nvngx_dlssg`（`DLSSG.*` 参数）、`libxess_fg`
+（`xefgSwapChainTagFrameConstants` / `TagFrameResource`）。**只读**：参数不改、`poll()` 恒 false、
+不新增协议字段，`Input=auto` 永远不会钉住它。SM86 解锁补丁不影响可挂性
+（`framesToGenerateMax>1` 反而是"挂到了补丁那份"的证据）。说明：`docs/findings/FG_SNIFF.md`。
+
+**下次做**：
+
+1. 影之刃/黑猴/明末任选一款，`FgSniff=1` + `Log=1` + 游戏自带 FG 打开，跑 30 s；
+2. 看日志里 `mvs=` / `dpi` / `mvj` 与 tag 的分辨率，先把 `UE5_MV_OPTISCALER.md` §7.3/§7.4 的两个悬案结掉；
+3. 若 `cameraViewToClip` 可信，再上协议 v11（`FrameShared` +16 floats + `kInputFlagHasProjection`），
+   让 `--fg-fov` 在 UE5 上退役。
+
+
 
 | 项 | 说明 |
 |---|---|

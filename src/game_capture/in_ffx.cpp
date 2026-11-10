@@ -418,6 +418,20 @@ public:
         out.flags  = flags;
         out.serial = f.serial;
         out.tick_ms = f.tick_ms;
+        // ---- normalized semantics -------------------------------------------------
+        // FSR 2.2/3.x is the only source that exports a real camera (vertical FOV, near,
+        // far). Its velocities are UV-space and motionVectorScale converts them to pixels,
+        // so the unit is declared. The sign is not, so it stays unknown.
+        out.mv_unit        = mgpu::input::MvUnit::uv;
+        // All of these APIs define their vectors as previous-minus-current (a game that
+        // flipped it would break its own upscaler); MvFlip is the explicit escape hatch.
+        out.mv_sign        = mgpu::input::MvSign::prev_minus_cur;
+        out.camera_source  = (flags & mgpu::kInputFlagHasCamera)
+                                 ? mgpu::input::CameraSource::declared
+                                 : mgpu::input::CameraSource::none;
+        out.invalid_marker = 0.0f;
+        out.valid_w = f.render_w;
+        out.valid_h = f.render_h;
         return true;
     }
 };

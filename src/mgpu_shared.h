@@ -60,7 +60,16 @@ inline constexpr uint32_t kSharedMagic   = 0x55475047u;   // 'GPUM'
 //      (b) `FrameShared.published`：该槽最近一次发布的 fence 值，消费端据此回 ACK（它不看
 //          跨卡 fence，那在上面读不出来，HANDOFF 8.6）。
 //      (c) `StreamShared.seq`：元数据 seqlock（奇=正在写），替掉消费端"读两次碰运气 + clamp"。
-inline constexpr uint32_t kSharedVersion = 10;
+// v11: FrameShared gains the producer's *measured* semantics (FrameShared.semantics +
+//      valid_w/h): the online probe's verdict on MV unit / MV sign / depth direction, so
+//      the consumer stops guessing when an API declaration is missing or wrong
+//      (docs/findings/INPUT_SEMANTICS.md). Appended at the end - offsets up to v10 are
+//      unchanged.
+// v12: FrameShared gains `view_to_clip` + `matrix_tick_ms`: the game's own (jitter-free)
+//      view-to-clip matrix from Streamline's sl::Constants, so the consumer stops
+//      synthesising a projection from an FOV guess (docs/findings/INPUT_SEMANTICS.md).
+//      Appended at the end - offsets up to v11 are unchanged.
+inline constexpr uint32_t kSharedVersion = 12;
 
 // The mapping is created once, at a size that fits the largest stream we support
 // (see kStreamMaxW/H), so a layout rebuild never has to recreate it - that would
@@ -87,9 +96,29 @@ inline constexpr uint32_t kInputFlagHiResMv       = 1u << 3;  // MV at output re
 inline constexpr uint32_t kInputFlagHasCamera     = 1u << 4;  // near/far/vfov are valid
 inline constexpr uint32_t kInputFlagHdr           = 1u << 5;
 inline constexpr uint32_t kInputFlagMvActive      = 1u << 6;  // the MV stream is being fed
+// v12: FrameShared carries a real view-to-clip matrix (Streamline sl::Constants). With it the
+// consumer uses the game's own projection instead of synthesising one from --fg-fov.
+inline constexpr uint32_t kInputFlagHasMatrix     = 1u << 7;
 
 // consumer -> producer requests (SharedControl.consumer_request)
 inline constexpr uint32_t kRequestMv = 1u << 0;
+
+// ---- v11: measured semantics (FrameShared.semantics) --------------------------------
+// Packed so the whole verdict fits in one word. `Measured` tells the consumer whether the
+// field came from the online probe or is still the producer's declaration/unknown.
+inline constexpr uint32_t kSemMvUnitShift   = 0;   // 0 unknown, 1 pixels, 2 uv, 3 ndc
+inline constexpr uint32_t kSemMvSignShift   = 2;   // 0 unknown, 1 prev-cur, 2 cur-prev
+inline constexpr uint32_t kSemDepthShift    = 4;   // 0 unknown, 1 reversed, 2 forward
+inline constexpr uint32_t kSemMvQualityShift = 8;  // 8 bits, quality * 255
+inline constexpr uint32_t kSemMvMeasured    = 1u << 16;
+inline constexpr uint32_t kSemSignMeasured  = 1u << 17;
+inline constexpr uint32_t kSemDepthMeasured = 1u << 18;
+// Was the MV field usable at all? Low = the residual test found the vectors do not align,
+// which is the signal to fall back to our own optical flow (--fg-of).
+inline constexpr uint32_t kSemMvUsable      = 1u << 19;
+// The quality byte above is a real measurement (the sign test ran). Without this bit the
+// consumer must print "unknown", not "quality 0" - a missing measurement is not a bad one.
+inline constexpr uint32_t kSemQualityKnown  = 1u << 20;
 
 // LUIDs travel as one uint64 so this header stays windows.h free.
 inline uint64_t pack_luid(int32_t high, uint32_t low)
@@ -177,6 +206,25 @@ struct FrameShared
     // queried from the consuming node, so this header field is the only way it can name
     // "which publication I am done with".
     uint64_t published;
+    // ---- v11 ----
+    // What the producer *measured* about its own inputs, as opposed to what the API
+    // declared (that stays in ProducerInfo.input_flags). The add-on's online probe fills
+    // these every ~2 s; `kSem*Measured` says which of them are real measurements.
+    // See docs/findings/INPUT_SEMANTICS.md.
+    uint32_t semantics;      // kSem* bits
+    uint32_t valid_w;        // valid sub-rect of the MV/depth textures (0 = whole texture)
+    uint32_t valid_h;
+    uint32_t _pad_v11;
+    // ---- v12 ----
+    // The game's own view-to-clip matrix, captured from Streamline's sl::Constants (which
+    // is documented as jitter-free). With it the consumer stops *synthesising* a projection
+    // from an FOV guess: the real aspect, the infinite-far form and reversed-Z are all in
+    // here. Row major, same layout as sl::Constants::cameraViewToClip. Only meaningful when
+    // ProducerInfo.input_flags has kInputFlagHasMatrix; `matrix_tick_ms` is when the
+    // producer captured it, so a stale matrix (the game switched to another API) is
+    // detectable the same way a stale source is.
+    float    view_to_clip[16];
+    uint64_t matrix_tick_ms;
 };
 
 struct SharedControl

@@ -80,6 +80,7 @@ using Microsoft::WRL::ComPtr;
 using ABI::Windows::Graphics::Capture::IGraphicsCaptureItem;
 using ABI::Windows::Graphics::Capture::IGraphicsCaptureSession;
 using ABI::Windows::Graphics::Capture::IGraphicsCaptureSession2;
+using ABI::Windows::Graphics::Capture::IGraphicsCaptureSession5;
 using ABI::Windows::Graphics::Capture::IDirect3D11CaptureFrame;
 using ABI::Windows::Graphics::Capture::IDirect3D11CaptureFramePool;
 using ABI::Windows::Graphics::Capture::IDirect3D11CaptureFramePoolStatics2;
@@ -412,6 +413,33 @@ static ComPtr<ID3D12Resource> g_mv_shadow_tex[mgpu::kMaxSlots];
 // --fg-of: compute the motion vectors with FidelityFX optical flow on the AMD card from
 // the captured colour, instead of copying the producer's stream.
 static bool g_fg_of = false;
+// A-v3: automatic fallback. The producer publishes whether its own vectors are usable
+// (kSemMvUsable, from the online probe); when it says they are not, this frame uses our optical
+// flow instead of feeding XeFG garbage. Only ever *adds* frames of good input - when the
+// producer's vectors come back usable we switch straight back, because we never stop asking for
+// them (unlike --fg-of, which drops the request entirely).
+static bool g_of_fallback = true;    // --no-of-fallback turns it off
+static bool g_game_mv_forced = false; // --game-mv: never auto-switch to optical flow
+// --vrr: the panel follows us (G-Sync / FreeSync), so do NOT try to fill every vblank.
+//
+// Filling every vblank forces the count to alternate on a fractional input rate (3.5x average
+// = 3,4,3,4...), which makes each output frame cover 8.3 or 11.1 ms: the refresh periods are
+// full but the *motion* changes speed - precisely the residual judder measured on 2026-11-10
+// (presents=140 vblanks=141, "avg 3.50x", 0.98 vblank/frame).
+//
+// With a VRR panel the better goal is uniform spacing: keep k fixed for as long as the input
+// rate holds, and let each frame be k/t_in apart (e.g. 3 frames over 28.6 ms = 9.5 ms each =
+// 105 fps). The panel locks to whatever we send; every interval is identical.
+static bool         g_vrr = false;
+// --wgc-minint <ms>: **default 0 = no throttle.** WGC's MinUpdateInterval defaults to one
+// compositor interval (~16.6 ms), i.e. WGC hands over at most ~60 frames/s no matter how fast the
+// game presents. Measured 2026-11-10: turning that throttle off made input latency and smoothness
+// "instantly better" (PBZ), which also explains why every capture-rate measurement had capped out
+// around 59.6 fps. 16 restores the old ~60 fps ceiling; N sets N ms.
+static int          g_wgc_minint_ms = 0;
+
+static bool g_of_active   = false;   // per frame: OF is this frame's vector source
+static bool g_of_fresh    = false;   // per frame: of_record() actually ran this frame
 // --fg-of-sign / --fg-of-scale: hit the MV convention A/B without a rebuild.
 // --fg-of-guide: colour-similarity weight for the edge-aware upsample (0 = bilinear).
 static float g_of_sign = 1.0f;
@@ -566,6 +594,13 @@ static bool         g_fg_jitter_flip = false;   // --fg-jitter-flip
 // MV source fixes.
 static bool         g_fg_jitter_zero = false;   // --fg-jitter-zero: pass jitter = 0
 static bool         g_fg_no_proj = false;       // --fg-no-proj
+// --fg-use-matrix: hand the game's own view-to-clip to XeFG verbatim. Off by default, because
+// OptiScaler does NOT do that even though it has the same matrix: it derives near/far/FOV from
+// it and passes camera values instead, with a comment that UE titles "seem to not be passing
+// the correct cameraViewToClip" (inputs/FG/Streamline_Inputs.cpp:207). Deriving keeps us on the
+// projection form this code already ships (reversed-Z infinite far) and only makes the numbers
+// real - which is the whole point of v12 anyway.
+static bool         g_fg_use_matrix = false;
 static bool         g_fg_proj_rz = false;       // --fg-proj-rz: reversed-Z infinite-far
 // The projection is the one frame constant we can only approximate, so its two numbers are
 // tunable: --fg-fov (vertical field of view, degrees) and --fg-zn (near plane). UE5's
@@ -1386,6 +1421,38 @@ static bool start_wgc()
     }
     ComPtr<IGraphicsCaptureSession2> session2;
     if (SUCCEEDED(g_session.As(&session2))) { session2->put_IsCursorCaptureEnabled(FALSE); }
+
+    // ---- WGC delivery throttle (Windows 11, SDK 22621+) --------------------------------
+    // IGraphicsCaptureSession5::MinUpdateInterval defaults to one compositor interval
+    // (~16.6 ms), i.e. WGC hands over at most ~60 frames/s no matter how fast the game
+    // presents - the "WGC has a 16 ms floor" that users report, and the reason a title running
+    // at 90+ fps can still look like 60 through this path. Setting it to 0 removes the
+    // throttle; it costs more capture work, so it stays a switch (`--wgc-minint 0`) until
+    // measured. Cases: -1 = leave Windows' default (log it), 0 = no throttle, N = N ms.
+    {
+        ComPtr<IGraphicsCaptureSession5> session5;
+        if (SUCCEEDED(g_session.As(&session5))) {
+            if (g_wgc_minint_ms >= 0) {
+                ABI::Windows::Foundation::TimeSpan ts{};
+                ts.Duration = static_cast<LONGLONG>(g_wgc_minint_ms) * 10000;   // 100 ns ticks
+                const HRESULT hr = session5->put_MinUpdateInterval(ts);
+                logf_("[bridge] WGC MinUpdateInterval = %d ms (%s)\n", g_wgc_minint_ms,
+                      SUCCEEDED(hr) ? "accepted" : "REJECTED - the driver/OS ignored it");
+            } else {
+                ABI::Windows::Foundation::TimeSpan cur{};
+                if (SUCCEEDED(session5->get_MinUpdateInterval(&cur)) && cur.Duration > 0) {
+                    logf_("[bridge] WGC MinUpdateInterval = %.2f ms (Windows default; %.0f fps cap"
+                          " - try --wgc-minint 0)\n", cur.Duration / 10000.0,
+                          10000000.0 / static_cast<double>(cur.Duration));
+                } else {
+                    logf_("[bridge] WGC MinUpdateInterval = 0 (no throttle)\n");
+                }
+            }
+        } else {
+            logf_("[bridge] WGC session has no MinUpdateInterval (Windows 10) - delivery is"
+                  " capped by the compositor\n");
+        }
+    }
     if (FAILED(g_session->StartCapture())) {
         logf_("[bridge] StartCapture FAILED\n");
         return false;
@@ -1642,9 +1709,13 @@ static bool   g_cad_rt_logged = false;
 // late frame asks for 4-5 generated frames, the next fast one asks for 2. The long-run average
 // stays right, but the picture's rhythm changes on almost every frame (measured 17-32 count
 // switches per 1 s window while the input fluctuates 2..6 vblanks), and that is what reads as
-// "一卡一卡". A short EMA gives the same average with a steady count; only a real rate change
-// moves it.
-static int    g_cad_smooth = 8;
+// "一卡一卡".
+//
+// Default 0 since 2026-11-10: stability now comes from the *median* (arr_median_ms, 16 samples)
+// alone. Stacking an EMA on top of a median added ~0.5-0.8 s of lag, so a real rate change
+// (60 -> 40 fps) kept the count too low for about a second - visible as the picture running
+// slightly slow before it caught up. Set >1 only to damp a title whose median still moves.
+static int    g_cad_smooth = 0;
 static double g_cad_arr_s = 0.0;
 static int    g_cad_hold_frames = 0;
 static int    g_cad_hold = 0;
@@ -1756,59 +1827,243 @@ static UINT   g_cad_switches = 0;        // count changes actually issued
 static UINT   g_cad_fail = 0;            // ... that the DLL refused
 // (g_dyn_mfg is declared above, next to fg_apply_interp.)
 
+// Mean of the same ring, with each sample clamped to 3x the median so one alt-tab or asset
+// stream does not buy a dozen generated frames.
+//
+// Why the cadence needs the *mean* and not the median (2026-11-10): the input distribution is
+// right-skewed - mostly 25 ms with frequent 33-42 ms frames. The median therefore always reads
+// 25.0 ms (3.00 vblanks) while the real average was 28.1 ms (3.375 vblanks), so the accumulator
+// asked for 3 frames per input and left ~12% of refresh periods showing a duplicate:
+//
+//   out: presents=120  expected=120  vblanks=135      <- 40 inputs x 3 frames, but 135 vblanks
+//
+// XeFG emitted every frame it was asked for; the count was simply too low for the elapsed time.
+// Averaging the ring gives "how many vblanks per input on average", which is exactly what
+// "fill every vblank" needs. Stability still comes from the bounded phase + one-step slew.
+static double arr_mean_ms()
+{
+    if (g_arr_ring_n == 0) { return g_arrival_ms_ema; }
+    const double med = arr_median_ms();
+    const double cap = (med > 0.5) ? (3.0 * med) : 0.0;
+    double sum = 0.0;
+    for (UINT i = 0; i < g_arr_ring_n; ++i) {
+        double v = g_arr_ring[i];
+        if (cap > 0.0 && v > cap) { v = cap; }
+        sum += v;
+    }
+    return sum / static_cast<double>(g_arr_ring_n);
+}
+
+// --cad-batch-rt: in cadence mode, pace each batch over the vblanks it actually covers
+// (k * vblank) instead of over the measured arrival interval, and take the input rate from the
+// *producer's own present interval* (FrameShared.frame_time_ms) rather than from our WGC
+// arrival times.
+//
+// Why both changes together (measured 2026-11-10): a batch of 3 frames spread over a 28.3 ms
+// mean gives 9.4 ms per frame while a batch of 4 gives 7.1 ms - the spacing alternates instead
+// of being one frame per vblank, which is the residual judder in dynamic mode. k*vblank fixes
+// the spacing, but on 2026-11-08 it drifted (xN 3.00 -> 3.38) because our own Present blocking
+// inflates the arrival interval we measure - a feedback loop. Measuring on the producer's clock
+// removes that coupling: the game's present interval does not depend on what we do.
+static bool g_cad_batch_rt = false;
+
+// Newest published frame's present interval, in ms (0 = unusable). Slot-agnostic on purpose:
+// the bridge picks its slot after this decision, and the interval is the same for all of them.
+static double producer_interval_ms()
+{
+    if (!g_ctl) { return 0.0; }
+    uint64_t newest = 0;
+    double ms = 0.0;
+    for (UINT i = 0; i < mgpu::kMaxSlots; ++i) {
+        const mgpu::FrameShared& f = g_ctl->frames[i];
+        if (f.published == 0) { continue; }
+        if (f.frame_id >= newest) { newest = f.frame_id; ms = static_cast<double>(f.frame_time_ms); }
+    }
+    return (ms > 3.0 && ms < 100.0) ? ms : 0.0;
+}
+
 // Phase-accumulator step; returns the count to use for this real frame.
+
+//
+// This is the feature that exists for an **unlocked, fluctuating** frame rate, so the two
+// things that matter are (a) one trustworthy estimate of "what rate is the input running at"
+// and (b) never scheduling more output frames than the panel has vblanks to show.
+//
+// 2026-11-10 (Wuchang/PBZ, 120 Hz panel, 35-50 fps input) it did neither: it accumulated a
+// *single-sample* interval (8-sample EMA) while the log line printed a 16-sample median, and
+// the count was capped only by the DLL's ceiling. The log said it plainly:
+//
+//   input=25.0ms = 3.00 vblanks -> avg 5.00x, 200.0 fps out = 0.60 vblank/frame NOT-EXACT
+//   input=16.7ms = 2.00 vblanks -> avg 2.98x, 178.5 fps out = 0.67 vblank/frame NOT-EXACT
+//   input=25.0ms = 3.00 vblanks -> avg 3.00x, 120.0 fps out = 1.00 vblank/frame   (correct)
+//
+// 200 fps on a 120 Hz panel means XeFG spreads its batch over more time than it has: some
+// refresh periods show two frames, others none. That is the judder.
 static UINT cadence_next_slots()
 {
     const double vb = refresh_ms();
-    // Track the raw last interval (reacts immediately) but fall back to the EMA while
-    // it warms up; a median would lag behind the very transitions we are following.
-    double t_in = (g_arr_last_raw > 0.5) ? g_arr_last_raw : g_arrival_ms_ema;
-    // Smoothed input interval (see g_cad_smooth). The phase accumulator below wants the rate
-    // the input is *running at*, not the timing of the single frame that just landed.
+    // The *mean*, not the median: this accumulator answers "how many output frames is the time
+    // since the last input frame worth", and on a right-skewed distribution the median
+    // under-counts by ~12% (see arr_mean_ms). A single long frame is clamped inside the mean so
+    // it cannot buy a dozen frames.
+    double t_in = arr_mean_ms();
+    if (t_in < 0.5) { t_in = (g_arr_last_raw > 0.5) ? g_arr_last_raw : (1000.0 / 60.0); }
+    // --cad-batch-rt: measure on the game's clock, not on ours (see producer_interval_ms).
+    static bool prod_logged = false;
+    if (g_cad_batch_rt) {
+        const double p = producer_interval_ms();
+        if (p > 0.0) {
+            t_in = p;
+            if (!prod_logged) {
+                prod_logged = true;
+                logf_("[bridge] --cad-batch-rt: input rate from the producer's own present"
+                      " interval (%.2f ms), batch paced over k vblanks\n", p);
+            }
+        }
+    }
+    // Optional extra smoothing (g_cad_smooth > 1) on top of the median.
     if (g_cad_smooth > 1) {
-        if (g_cad_arr_s <= 0.5) {
-            g_cad_arr_s = t_in;
-        } else {
+        if (g_cad_arr_s <= 0.5) { g_cad_arr_s = t_in; }
+        else {
             const double a = 2.0 / (static_cast<double>(g_cad_smooth) + 1.0);
             g_cad_arr_s += (t_in - g_cad_arr_s) * a;
         }
         t_in = g_cad_arr_s;
     }
+
     // Target output rate. Without --fg-out-hz this is the panel refresh, i.e. "fill every
-    // vblank" (the historical behaviour). With it the same Bresenham accumulator produces
-    // as many frames as the *target* rate needs for this input interval, so "120 Hz panel,
-    // but I only want 60 fps" becomes 2x instead of 4x for a 30 fps input.
+    // vblank". `want` is how many output frames this input interval is worth - fractional.
     const double panel_hz = (vb > 0.5) ? 1000.0 / vb : 120.0;
     const double out_hz = (g_fg_out_hz > 1.0) ? g_fg_out_hz : panel_hz;
-    g_cad_phase += t_in * out_hz / 1000.0;
+    const double want = t_in * out_hz / 1000.0;
+
+    g_cad_phase += want;
     int k = static_cast<int>(g_cad_phase + 0.5);
+
+    // --vrr: stable count from the moving average, plus a one-shot fill for a genuinely
+    // late input.
+    //
+    // History matters here, because two simpler versions were both worse:
+    //   * k = round(mean/vb), rt = mean            -> smooth normally, but a dropped input
+    //     (56 ms instead of 28.6) was told "this batch covers 28.6 ms" and the picture sat
+    //     still for the rest = a stall ("一 drop 就跳").
+    //   * k = floor(raw_gap/vb), rt = raw_gap      -> follows drops, but 40 fps sits exactly on
+    //     25.0 ms = 3.000 vblanks, so 24.9 ms floors to 2 and 25.1 ms to 3: k and the budget
+    //     wiggled every frame and it was visibly *worse* ("反而变得更卡").
+    //
+    // So: the normal path is driven by the mean (stable), and only a gap that is clearly
+    // abnormal (> 1.4x the mean) is treated as a dropped frame and filled proportionally.
+    if (g_vrr) {
+        int k = static_cast<int>(t_in / vb + 0.5);
+        if (k < 2) { k = 2; }
+        const int vmax = static_cast<int>(g_fg_interp_max) + 1;
+        if (k > vmax) { k = vmax; }
+
+        // Over-refresh guard *only*. An earlier version capped k by floor(gap / vblank) from the
+        // instantaneous gap, which is the wrong quantity: about half of the individual gaps are
+        // shorter than the mean, so the cap kept pulling the count down and the picture fell
+        // back to leaving holes ("变成和之前取中值的时候一样了", 2026-11-10). The guard now only
+        // triggers when the batch would exceed the panel rate by more than 10% (e.g. 240 Hz panel,
+        // 10.5 ms gap, k=3 -> 285 fps); normal alternation (3/4 at 28.1 ms on 120 Hz) is untouched.
+        const double gap = (g_arr_last_raw > 1.0) ? g_arr_last_raw : t_in;
+        auto over_refresh = [&](int kk) {
+            return (static_cast<double>(kk) * vb) > (gap * 1.10);
+        };
+        if (over_refresh(k)) {
+            int kf = static_cast<int>(gap / vb);
+            if (kf < 2) { kf = 2; }
+            k = kf;
+        }
+
+        double rt = t_in;                       // the paced budget for this batch
+        const double ratio = (t_in > 0.5) ? (gap / t_in) : 1.0;
+        // ---- fast path for a load change ------------------------------------------------
+        // The count comes from a ~400 ms moving average, which is right for jitter but wrong
+        // for a *step*: entering a heavy scene (40 -> 20 fps) or leaving it (20 -> 45) leaves
+        // the average stale for about half a second, and every batch in that window is the
+        // wrong size - too small (holes, the picture stalls) or too large (over-generated, the
+        // picture surges). So when the last gap is clearly off (slower or *faster*), size this
+        // one batch from the gap itself. In range (0.7..1.4x) nothing changes: that is the
+        // hysteresis band that keeps 25.0 ms vs 25.1 ms from wiggling the count.
+        // Without this a dropped input keeps the old count and the last generated frame is shown
+        // for the whole extra gap - the stall reported as "一 drop 就跳". Measured again
+        // 2026-11-10: switching it off only made it worse, so the fill is not optional.
+        if (ratio > 1.4 || ratio < 0.7) {
+            int kd = static_cast<int>(gap / vb + 0.5);
+            if (kd < 2) { kd = 2; }
+            if (kd > vmax) {
+                static bool capped = false;
+                if (!capped) {
+                    capped = true;
+                    logf_("[bridge] --vrr: the input just needed %d frames (%.1f ms = %.1f vblanks)"
+                          " but this DLL allows %d - the output will run slower for a moment"
+                          " (raise --interp)\n", kd, gap, gap / vb, vmax);
+                }
+                kd = vmax;
+            }
+            // Same over-refresh guard as above, so a burst of fast frames cannot push the
+            // output over the refresh rate either.
+            if (over_refresh(kd)) {
+                int kf = static_cast<int>(gap / vb);
+                if (kf < 2) { kf = 2; }
+                if (kf < kd) { kd = kf; }
+            }
+            if (kd != k) {
+                static int logs = 8;
+                if (logs > 0) {
+                    --logs;
+                    logf_("[bridge] --vrr: load change (%.1f ms vs %.1f ms average, %.2fx) ->"
+                          " %d frames over %.1f ms (%.2f ms apart)%s\n",
+                          gap, t_in, ratio, kd, gap, gap / static_cast<double>(kd),
+                          (logs == 0) ? " (further changes not logged)" : "");
+                }
+            }
+            k = kd;
+            rt = gap;                       // this batch really covers this gap
+        }
+
+        static bool once = false;
+        if (!once) {
+            once = true;
+            logf_("[bridge] --vrr: %d frame(s) per %.1f ms = %.2f ms apart (%.1f fps out);"
+                  " vblank=%.2fms vmax=%d; late inputs get proportionally more frames\n",
+                  k, t_in, t_in / static_cast<double>(k),
+                  1000.0 * static_cast<double>(k) / t_in, vb, vmax);
+        }
+        g_cad_phase = 0.0;
+        g_cad_last_k = static_cast<UINT>(k);
+        g_cad_last_tin = rt;            // frameRenderTime = the interval this batch covers
+        return static_cast<UINT>(k);
+    }
+
+    // Hard cap: never schedule more frames than the vblanks that actually elapsed (rounded up,
+    // because a fraction of a vblank still needs one frame). Without this the accumulator ran
+    // ahead and the output overshot the panel - the 0.60/0.67 vblank/frame lines above.
+    int cap = static_cast<int>(want + 0.999);
+    if (cap < 2) { cap = 2; }                   // libxess_fg cannot generate zero frames
+    const int kmax = static_cast<int>(g_fg_interp_max) + 1;
+    const bool capped_by_dll = (cap > kmax);
+    if (capped_by_dll) { cap = kmax; }
+    if (k > cap) { k = cap; }
+
     if (k < 2) {
-        // libxess_fg cannot generate zero frames (that is --no-fg), so the floor is 2x.
-        // Warn once: the target rate is unreachable and the output will run faster.
         if (!g_out_hz_floor_warned) {
             g_out_hz_floor_warned = true;
             logf_("[bridge] --fg-out-hz %.0f: a %.1f ms input needs %u generated frame(s),"
                   " but 2x is the minimum here - the output will run at ~%.0f Hz instead."
                   " Use --no-fg for 1:1.\n",
-                  out_hz, t_in, (k < 1) ? 1u : static_cast<UINT>(k), 2000.0 / t_in);
+                  out_hz, t_in, (want < 1.0) ? 1u : static_cast<UINT>(want), 2000.0 / t_in);
         }
         k = 2;
     }
-    const int kmax = static_cast<int>(g_fg_interp_max) + 1;
-    const bool clamped = (k > kmax);
-    if (k > kmax) {
-        k = kmax;
-        if (!g_out_hz_max_warned && g_fg_out_hz > 1.0) {
-            g_out_hz_max_warned = true;
-            logf_("[bridge] --fg-out-hz %.0f needs %d generated frames for a %.1f ms input,"
-                  " but this DLL allows %d (--interp %d) - raise --interp.\n",
-                  out_hz, k, t_in, g_fg_interp_max, g_fg_interp_max);
-        }
-    }
+
+    // Bresenham carry, bounded to one frame: a bounded phase means the *next* k can only move
+    // by one step, so a rate change walks 2->3->4 instead of jumping (the caller additionally
+    // rate-limits the DLL re-configuration, see g_cad_hold_frames).
     g_cad_phase -= static_cast<double>(k);
-    if (clamped) { g_cad_phase = 0.0; }              // do not accumulate a debt
-    if (g_cad_phase < -1.5) { g_cad_phase = -1.5; }
-    if (g_cad_phase > 1.5) { g_cad_phase = 1.5; }
+    if (g_cad_phase > 0.5) { g_cad_phase = 0.5; }
+    if (g_cad_phase < -0.5) { g_cad_phase = -0.5; }
+
     g_cad_last_k = static_cast<UINT>(k);      // frameRenderTime follows this (see fg_render_time_ms)
     g_cad_last_tin = t_in;
     return static_cast<UINT>(k);
@@ -1879,7 +2134,18 @@ static double rt_quant_value()
     // the longer gap: motion is a touch slower for that one interval, but there is no
     // hitch. That is the difference between "the game dipped to 57 fps" and "the picture
     // juddered".
-    if (g_fg_rt_spike && g_arr_last_raw > plan * kSpikeRatio &&
+    //
+    // NOT in cadence mode (2026-11-10). There the batch size comes from the phase accumulator,
+    // and this branch would hand XeFG a *different* interval than the one the batch covers -
+    // the log showed exactly that:
+    //     rt=41.7ms (5 vblanks)  input=25.0ms (3 vblanks)  interp=2 (batch of 3 frames)
+    // i.e. 3 frames told to fill 5 vblanks: some refresh periods get two frames, others none,
+    // and the eye sees the picture "jump". Under an unlocked, fluctuating frame rate this
+    // branch fires on almost every frame (any single extra vblank), so it is not a rare-case
+    // fix any more - the accumulator itself already absorbs rate changes (bounded phase, one
+    // count step per frame). A genuinely isolated hitch in cadence mode is left to
+    // `--fg-rt-spike 1 --fg-cad-rt 0`.
+    if (g_fg_rt_spike && !g_interp_cadence && g_arr_last_raw > plan * kSpikeRatio &&
         g_arr_last_raw < 100.0) {
         int kr = static_cast<int>(g_arr_last_raw / vb + 0.5);
         if (kr < k) { kr = k; }
@@ -1917,8 +2183,41 @@ static const char* fg_rt_feed_name()
 static double fg_render_time_ms()
 {
     if (g_fg_rt_zero) { return 0.0; }
-    // In cadence mode the batch size and the length it covers have to agree, otherwise the
-    // pacer fights the batch and the picture judders whenever the input rate moves.
+    // Cadence mode: feed the *same* interval the batch size was derived from.
+    //
+    // This is the one invariant that matters: `k` frames are handed to XeFG, so the budget it
+    // is told must be the interval those k frames cover - not a snapped plan that can be
+    // several vblanks longer. The 2026-11-10 log had "rt=41.7ms (5 vblanks), input=25.0ms
+    // (3 vblanks), batch of 3 frames": 3 frames told to fill 5 vblanks, so the pacer puts two
+    // in one refresh period and leaves the next empty - the eye reads that as a jump.
+    //
+    // Note this is *not* k*vblank (which was measured to drift: Present() blocks on the
+    // pacer's budget, which inflates the very interval we measure, and the loop has no fixed
+    // point - see the g_fg_cad_rt comment). g_cad_last_tin is the measured median the count
+    // was chosen from, so feeding it back changes nothing about the measurement.
+    if (g_interp_cadence && g_cad_last_k >= 2 && g_cad_last_tin > 0.5) {
+        // --cad-batch-rt: k frames fill exactly k vblanks, so tell XeFG exactly that. Safe now
+        // because the count came from the *producer's* clock (g_cad_batch_rt), so this budget
+        // cannot feed back into the measurement.
+        if (g_cad_batch_rt) {
+            static bool onceb = false;
+            if (!onceb) {
+                onceb = true;
+                logf_("[bridge] cadence: frameRenderTime = %u x %.2f ms (the vblanks this batch"
+                      " fills) - --cad-batch-rt\n", g_cad_last_k, refresh_ms());
+            }
+            return static_cast<double>(g_cad_last_k) * refresh_ms();
+        }
+        static bool once = false;
+        if (!once) {
+            once = true;
+            logf_("[bridge] cadence: frameRenderTime = the interval the batch covers"
+                  " (measured %.1fms for %u frames) - --fg-cad-rt 1 switches to k*vblank,"
+                  " --fg-rt-mode applies when cadence is off\n",
+                  g_cad_last_tin, g_cad_last_k);
+        }
+        return g_cad_last_tin;
+    }
     if (g_interp_cadence && g_fg_cad_rt && g_cad_last_k >= 2) {
         // The batch must be paced over the time it actually covers. Filling every vblank
         // means k frames occupy k vblanks, so the budget is k * vblank - not the median
@@ -2389,6 +2688,13 @@ static bool init_fg()
     ip.maxInterpolatedFrames = want_interp;
     ip.initFlags = g_fg_depth_inv ? XEFG_SWAPCHAIN_INIT_FLAG_INVERTED_DEPTH
                                   : XEFG_SWAPCHAIN_INIT_FLAG_NONE;
+    // NDC velocity must be *declared*: without the flag XeFG reads the field as UV (0..1) and
+    // a [-1,1] source comes out wrong. OptiScaler does exactly this pair - the flag plus
+    // mvScaleY *= size.y * -0.5 (inputs/FG/XeFG_Inputs_Dx12.cpp:521); our producer publishes
+    // the matching (w/2, -h/2) scale along with the kInputFlagMvNdc bit
+    // (docs/findings/OPTISCALER_QUIRKS.md 3.1).
+    const bool ndc_mv = (g_producer_flags & mgpu::kInputFlagMvNdc) != 0;
+    if (ndc_mv) { ip.initFlags |= XEFG_SWAPCHAIN_INIT_FLAG_USE_NDC_VELOCITY; }
     // JITTERED_MV makes the library take the frame's jitter back out of the velocity
     // ("Remove jitter from input velocity", xefg_swapchain.h:95). OptiScaler sets it from
     // the game's DLSS MVJittered flag; UE5 titles do report that flag, so their vectors keep
@@ -2397,9 +2703,9 @@ static bool init_fg()
     // "Deprecated. Setting this flag has no effect." (xefg_swapchain.h:91).
     if (g_fg_jittered_mv) { ip.initFlags |= XEFG_SWAPCHAIN_INIT_FLAG_JITTERED_MV; }
     if (ip.initFlags != XEFG_SWAPCHAIN_INIT_FLAG_NONE) {
-        logf_("[bridge] initFlags=0x%x (inverted_depth=%d jittered_mv=%d)\n",
+        logf_("[bridge] initFlags=0x%x (inverted_depth=%d jittered_mv=%d ndc_velocity=%d)\n",
               static_cast<unsigned>(ip.initFlags), g_fg_depth_inv ? 1 : 0,
-              g_fg_jittered_mv ? 1 : 0);
+              g_fg_jittered_mv ? 1 : 0, ndc_mv ? 1 : 0);
     }
     // AUTO probes for a UI texture we never provide; NONE says it outright.
     ip.uiMode = g_fg_ui_none ? XEFG_SWAPCHAIN_UI_MODE_NONE : XEFG_SWAPCHAIN_UI_MODE_AUTO;
@@ -5606,7 +5912,7 @@ static bool of_selftest()
 // UV field in g_of_mv. The colour must be in COMMON and the caller's list must be open.
 static bool of_record(ID3D12GraphicsCommandList* list)
 {
-    if (!g_fg_of || !g_of_ready) { return false; }
+    if (!g_of_active || !g_of_ready) { return false; }
 
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -6110,6 +6416,15 @@ static void prefetch_next_inputs(UINT next_slot)
     g_pf_fence = g_copy_value;
 }
 
+// Case-insensitive "does the name end with this suffix" - used by the Unreal MV-source policy
+// in the game-window setup (an Unreal shipping build is <Project>-Win64-Shipping.exe).
+static bool wcs_ends_with_ci(const wchar_t* s, const wchar_t* suffix)
+{
+    if (!s || !suffix) { return false; }
+    const size_t ls = wcslen(s), lf = wcslen(suffix);
+    return ls >= lf && _wcsicmp(s + (ls - lf), suffix) == 0;
+}
+
 static void run_frame_ex(ID3D11Texture2D* colour11)
 {
     if (!service_shared_layout()) { return; }
@@ -6259,6 +6574,27 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     if (g_reuse_frame) {
         slot = g_last_slot;
     } else {
+        // A-v3: pick this frame's vector source before anything is tagged or dispatched.
+        // The producer marks its own vectors unusable in `semantics`; we then run our optical
+        // flow for this frame (and keep receiving the producer's MV, so we can switch back).
+        g_of_active = g_fg_of;
+        g_of_fresh = false;
+#if MGPU_FG_OF
+        if (!g_of_active && g_of_fallback && !g_no_mv && g_ctl) {
+            const uint32_t sem = g_ctl->frames[slot].semantics;
+            if ((sem & mgpu::kSemQualityKnown) != 0 && (sem & mgpu::kSemMvUsable) == 0) {
+                g_of_active = true;
+                static bool logged = false;
+                if (!logged) {
+                    logged = true;
+                    logf_("[bridge] producer marked its motion vectors UNUSABLE (quality=%u/255)"
+                          " - falling back to our optical flow until it says otherwise\n",
+                          (sem >> mgpu::kSemMvQualityShift) & 0xFFu);
+                }
+            }
+        }
+        if (g_of_active && !g_of_ready) { of_init(); }
+#endif
         // Round-robin slot walking. Protocol v5 was meant to let us pick the newest
         // GPU-complete slot (frames[].ready), but publishing that "ready" needs a
         // GetCompletedValue() poll on a SHARED_CROSS_ADAPTER fence, which stalls the
@@ -6299,10 +6635,11 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     // convert draw so the colour is still in COMMON for the flow dispatch; of_record
     // restores COMMON on the way out, which is what the barrier above assumes.
 #if MGPU_FG_OF
-    if (g_fg_of) {
+    if (g_of_active) {
         const double o0 = qpc_ms();
         if (!g_of_ready) { of_init(); }
         if (of_record(g_list.Get())) {
+            g_of_fresh = true;
             const double o1 = qpc_ms();
             g_ms_of = g_ms_of * 0.9 + (o1 - o0) * 0.1;
             if (o1 - o0 > g_max_of) { g_max_of = o1 - o0; }
@@ -6423,9 +6760,10 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     // MV and depth can be different sizes (UE5: MVs at render size, depth at full res), so
     // each is tagged with its own stream size - the old code used streams[1] for both.
 #if MGPU_FG_OF
-    if (g_fg_of && g_of_ready) {
+    if (g_of_active && g_of_ready && g_of_fresh) {
         // Our own field: 1/8 resolution, screen-UV units, computed from this frame's
-        // colour on this GPU (the producer's MV stream measured as garbage).
+        // colour on this GPU (the producer's MV stream measured as garbage). Requiring
+        // g_of_fresh keeps a stale field from being tagged when the flow did not run.
         rd.resourceSize = { g_of_out_w, g_of_out_h };
         rd.pResource = g_of_mv.Get();
     } else
@@ -6473,6 +6811,61 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     g_ms_work = g_ms_work * 0.9 + (qpc_ms() - t_work0) * 0.1;
 
     // 5. frame constants: jitter from the producer, approximate matrices
+    // v11: what the producer *measured* about its own inputs, logged on change. The
+    // switches (--mv-flip / --fg-mv-scale / --fg-depth-inv) still win for now; the next
+    // step is to let these drive them, which is why they are transported at all
+    // (docs/findings/INPUT_SEMANTICS.md).
+    {
+        static uint32_t logged_sem = 0xFFFFFFFFu;
+        const uint32_t sem = g_ctl->frames[slot].semantics;
+        if (sem != logged_sem) {
+            logged_sem = sem;
+            const char* unit = "unknown";
+            switch ((sem >> mgpu::kSemMvUnitShift) & 3u) {
+            case 1:  unit = "pixels"; break;
+            case 2:  unit = "uv"; break;
+            case 3:  unit = "ndc"; break;
+            default: break;
+            }
+            const char* sgn = "unknown";
+            switch ((sem >> mgpu::kSemMvSignShift) & 3u) {
+            case 1:  sgn = "prev-cur"; break;
+            case 2:  sgn = "cur-prev"; break;
+            default: break;
+            }
+            const char* dep = "unknown";
+            switch ((sem >> mgpu::kSemDepthShift) & 3u) {
+            case 1:  dep = "reversed"; break;
+            case 2:  dep = "forward"; break;
+            default: break;
+            }
+            const unsigned q = (sem >> mgpu::kSemMvQualityShift) & 0xFFu;
+            const bool q_known = (sem & mgpu::kSemQualityKnown) != 0;
+            // "(declared)" is not "(unknown)": since 2026-11-10 the producer publishes the
+            // API's own declaration for the sign as well (it is the contract), so the probe
+            // suffix now distinguishes *measured* from *declared* and from neither.
+            const char* sign_src = (sem & mgpu::kSemSignMeasured) ? "(measured)"
+                                   : (sgn[0] != 'u' ? "(declared)" : "(unknown)");
+            if (q_known) {
+                logf_("[bridge] producer semantics: mv=%s%s sign=%s%s depth=%s%s quality=%u/255%s"
+                      " valid=%ux%u\n",
+                      unit, (sem & mgpu::kSemMvMeasured) ? "(measured)" : "(declared)",
+                      sgn, sign_src,
+                      dep, (sem & mgpu::kSemDepthMeasured) ? "(measured)" : "(declared)",
+                      q, (sem & mgpu::kSemMvUsable) ? "  [MV usable]" : "  [MV NOT usable]",
+                      g_ctl->frames[slot].valid_w, g_ctl->frames[slot].valid_h);
+            } else {
+                // No sign test has run yet (needs two consecutive frames plus depth):
+                // say so instead of pretending the quality is zero.
+                logf_("[bridge] producer semantics: mv=%s%s sign=%s%s depth=%s%s"
+                      " quality=unknown (sign test has not run yet) valid=%ux%u\n",
+                      unit, (sem & mgpu::kSemMvMeasured) ? "(measured)" : "(declared)",
+                      sgn, sign_src, dep, (sem & mgpu::kSemDepthMeasured) ? "(measured)" : "(declared)",
+                      g_ctl->frames[slot].valid_w, g_ctl->frames[slot].valid_h);
+            }
+        }
+    }
+
     xefg_swapchain_frame_constant_data_t cd{};
     // The projection has to match the aspect the frame was RENDERED at, not the one we
     // capture/present at. They are almost always identical, but the render size is the
@@ -6499,14 +6892,83 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
                         std::isfinite(fr.near_plane) && fr.near_plane > 0.0f &&
                         fr.far_plane > fr.near_plane &&
                         fr.vfov_rad > 0.05f && fr.vfov_rad < 2.5f;
-    const float proj_fov = cam_ok ? fr.vfov_rad : (g_fg_fov_y * 3.14159265f / 180.0f);
+    // ---- v12: the game's own view-to-clip, when the producer had one ----
+    // DLSS-SR exports no camera, so every NGX title used to get a synthesised projection from
+    // --fg-fov (60 deg, 16:9-ish aspect). The add-on now forwards Streamline's sl::Constants,
+    // which is documented as jitter-free, so this is the game's real aspect/FOV/far-plane form
+    // including the infinite reversed-Z. Sanity checks: the matrix must look like a projection
+    // (same shape test OptiScaler uses) and must not be stale.
+    bool have_matrix = false;
+    float mtx_fov = 0.0f;                       // derived vertical FOV, radians
+    float mtx_aspect = const_aspect;            // derived aspect (b/a)
+    {
+        const float* m = fr.view_to_clip;
+        bool finite = true;
+        for (int i = 0; i < 16; ++i) { if (!std::isfinite(m[i])) { finite = false; break; } }
+        const bool shape = std::fabs(m[15]) < 1.0e-2f &&
+                           std::fabs(m[1]) < 1.0e-3f && std::fabs(m[4]) < 1.0e-3f &&
+                           (std::fabs(std::fabs(m[11]) - 1.0f) < 1.0e-3f ||
+                            std::fabs(std::fabs(m[14]) - 1.0f) < 1.0e-3f);
+        const uint64_t now = GetTickCount64();
+        const bool fresh = fr.matrix_tick_ms != 0 && now >= fr.matrix_tick_ms &&
+                           (now - fr.matrix_tick_ms) < 500ull;
+        have_matrix = finite && shape && fresh &&
+                      (g_producer_flags & mgpu::kInputFlagHasMatrix) != 0 && !g_fg_no_proj;
+        if (have_matrix) {
+            // Derive the numbers OptiScaler derives (2*atan(1/b) is the vertical FOV; b/a is the
+            // aspect), and keep near/far from whatever the source declared - the matrix-derived
+            // near/far are the part their code distrusts on UE titles.
+            const float a = std::fabs(fr.view_to_clip[0]);
+            const float b = std::fabs(fr.view_to_clip[5]);
+            if (b > 1.0e-6f) {
+                mtx_fov = 2.0f * std::atan(1.0f / b);
+            }
+            if (a > 1.0e-6f && b > 1.0e-6f) {
+                const float asp = b / a;
+                if (asp > 0.4f && asp < 4.0f) { mtx_aspect = asp; }
+            }
+        }
+        static bool logged_matrix = false;
+        if (have_matrix && !logged_matrix) {
+            logged_matrix = true;
+            logf_("[bridge] projection: from the game's own view-to-clip (v12): fovY=%.2fdeg"
+                  " aspect=%.3f%s\n"
+                  "[bridge]   [%+.4f %+.4f %+.4f %+.4f]\n"
+                  "[bridge]   [%+.4f %+.4f %+.4f %+.4f]\n"
+                  "[bridge]   [%+.4f %+.4f %+.4f %+.4f]\n"
+                  "[bridge]   [%+.4f %+.4f %+.4f %+.4f]\n",
+                  mtx_fov * 57.2957795f, mtx_aspect,
+                  g_fg_use_matrix ? " (used verbatim: --fg-use-matrix)" : " (derived; --fg-fov retired)",
+                  m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7],
+                  m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
+        }
+    }
+    const float proj_fov = (have_matrix && mtx_fov > 0.05f)
+                               ? mtx_fov
+                               : (cam_ok ? fr.vfov_rad : (g_fg_fov_y * 3.14159265f / 180.0f));
+    const float proj_aspect = have_matrix ? mtx_aspect : const_aspect;
+    // The game's own projection wins, unconditionally (decision 2026-11-10). We do *not*
+    // second-guess it against --fg-fov: some integrations hand XeFG a plain 60 deg placeholder,
+    // and that is still the game's own answer for its own FG - overriding it with our guess was
+    // the worse bet. The line below exists so a mismatch is visible instead of silent.
+    if (have_matrix && std::fabs(mtx_fov * 57.2957795f - g_fg_fov_y) > 5.0f) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            logf_("[bridge] note: the game's projection says fovY=%.2fdeg, --fg-fov says %.2f -"
+                  " keeping the game's (its own FG uses it)\n",
+                  mtx_fov * 57.2957795f, g_fg_fov_y);
+        }
+    }
     const float proj_zn  = cam_ok ? fr.near_plane : g_fg_near_z;
     const float proj_zf  = cam_ok ? fr.far_plane : 10000.0f;
     // An infinite far plane (what a reversed-Z game reports) only makes sense in the
     // reversed-Z form; the finite form divides by infinity and produces NaNs.
     const bool use_rz = g_fg_proj_rz || !std::isfinite(proj_zf);
-    if (use_rz) { approx_projection_rz(cd.projectionMatrix, const_aspect, proj_fov, proj_zn); }
-    else { approx_projection(cd.projectionMatrix, const_aspect, proj_fov, proj_zn, proj_zf); }
+    if (have_matrix && g_fg_use_matrix) {
+        for (int i = 0; i < 16; ++i) { cd.projectionMatrix[i] = fr.view_to_clip[i]; }
+    } else if (use_rz) { approx_projection_rz(cd.projectionMatrix, proj_aspect, proj_fov, proj_zn); }
+    else { approx_projection(cd.projectionMatrix, proj_aspect, proj_fov, proj_zn, proj_zf); }
     cd.viewMatrix[0] = 1.0f;
     cd.viewMatrix[5] = 1.0f;
     cd.viewMatrix[10] = 1.0f;
@@ -6560,7 +7022,7 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     // The space is the render/MV one, not the 4K output: every game that reports a usable
     // MV.Scale reports its render size there (CP2077: 2560x1440), and XeFG's definition of
     // "pixels" has to agree with the depth/MV grid it gets.
-    if (own_mv_path()) {
+    if (g_of_active && g_of_fresh) {
         cd.motionVectorScaleX = static_cast<float>(g_ctl->streams[1].width ? g_ctl->streams[1].width : 1u);
         cd.motionVectorScaleY = static_cast<float>(g_ctl->streams[1].height ? g_ctl->streams[1].height : 1u);
     }
@@ -6835,7 +7297,10 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
         // --dyn-mfg runs per real frame in run_frame_ex (its holds count frames).
         if (g_fg_rt_mode != kFgRtEma || g_interp_auto || g_lock_auto || g_lock_fps > 1.0 ||
             g_interp_cadence) {
-            const double t_in = arr_median_ms();
+            // Same estimator the accumulator used (mean of the ring), so this line and `want`
+            // can never disagree again - they did, and it read as "input=3 vblanks but 5x".
+            const double t_in = arr_mean_ms();
+
             const double vb = refresh_ms();
             // In cadence mode the multiplier changes per frame, so report the average
             // this window actually used instead of the last frame's count.
@@ -6862,7 +7327,11 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
                   " interp=%u (avg %.2fx, %.1f fps out = %.2f vblank/frame%s)"
                   " refresh=%uHz lock=%.2f drops=%u%s\n",
                   fg_render_time_ms(), fg_rt_feed_name(), t_in, t_in / vb,
-                  g_fg_interp_actual, mul,
+                  // interp = generated frames for the last real frame (k-1). It used to print
+                  // g_fg_interp_actual, i.e. the *ceiling* (--interp N), which read as "we are
+                  // asking for 2" while the average below was 5x - the most misleading pair of
+                  // numbers in the log (2026-11-10).
+                  (g_cad_last_k > 0) ? (g_cad_last_k - 1) : 0u, mul,
                   (out_ms > 0.0) ? 1000.0 / out_ms : 0.0, out_vb,
                   (frac > 0.06) ? " NOT-EXACT" : "", g_refresh_hz,
                   g_lock_fps, g_lock_drops,
@@ -7040,6 +7509,30 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
             logf_("  n=%u (producer measured)\n", game_total);
             for (int k = 1; k <= 8; ++k) { g_game_hist[k] = 0; }
         }
+        // ---- "interpolation cannot help here" -------------------------------------------
+        // With the WGC throttle gone (2026-11-10) an unlocked title can run well above half the
+        // panel rate. XeFG cannot generate fewer than one frame per input, so 2x of an 80 fps
+        // input asks a 120 Hz panel for 160 - it cannot show that, and the surplus becomes
+        // duplicates: the picture is *worse* than a plain pass-through. Say so once instead of
+        // silently mis-pacing (measured after the throttle fix: 1:1 felt clearly better).
+        {
+            static bool warned = false;
+            const double vb_now = refresh_ms();
+            const double tin_now = arr_mean_ms();
+            if (!warned && tin_now > 0.5 && vb_now > 0.5) {
+                const double per_input = tin_now / vb_now;      // frames needed to fill the panel
+                if (per_input < 1.6) {
+                    warned = true;
+                    logf_("[bridge] note: input ~%.1f fps is already %.0f%% of the %.0f Hz panel"
+                          " (%.2f frames per input) - frame generation cannot help at this rate;"
+                          " its extra frames only become duplicates. Switch the UI mode to"
+                          " \"关闭 (1:1 直通)\" (or add --no-fg).\n",
+                          1000.0 / tin_now, 100.0 / per_input, static_cast<double>(g_refresh_hz),
+                          per_input);
+                }
+            }
+        }
+
         // ---- output side: are the generated frames actually reaching the display? -----
         // Nothing above can see this: `xN` is XeFG's own accounting and `cadence` is derived
         // from the input median. Only the swap chain knows what it really handed to the
@@ -7440,6 +7933,7 @@ int main()
     if (wcsstr(GetCommandLineW(), L"--no-xell")) { g_no_xell = true; }
     if (wcsstr(GetCommandLineW(), L"--fg-jitter-flip")) { g_fg_jitter_flip = true; }
     if (wcsstr(GetCommandLineW(), L"--fg-no-proj")) { g_fg_no_proj = true; }
+    if (wcsstr(GetCommandLineW(), L"--fg-use-matrix")) { g_fg_use_matrix = true; }
     if (wcsstr(GetCommandLineW(), L"--fg-proj-rz")) { g_fg_proj_rz = true; }
     if (const wchar_t* fv = wcsstr(GetCommandLineW(), L"--fg-fov ")) {
         const float v = static_cast<float>(_wtof(fv + 9));
@@ -7682,6 +8176,16 @@ int main()
     }
 #if MGPU_FG_OF
     if (wcsstr(GetCommandLineW(), L"--fg-of")) { g_fg_of = true; }
+    if (wcsstr(GetCommandLineW(), L"--game-mv")) { g_game_mv_forced = true; }
+    if (wcsstr(GetCommandLineW(), L"--vrr")) { g_vrr = true; }
+    if (wcsstr(GetCommandLineW(), L"--cad-batch-rt")) { g_cad_batch_rt = true; }
+    if (const wchar_t* mi = wcsstr(GetCommandLineW(), L"--wgc-minint ")) {
+        g_wgc_minint_ms = _wtoi(mi + 13);
+        if (g_wgc_minint_ms < 0) { g_wgc_minint_ms = 0; }   // 0 = no throttle
+        if (g_wgc_minint_ms > 100) { g_wgc_minint_ms = 100; }
+        logf_("[bridge] --wgc-minint %d ms\n", g_wgc_minint_ms);
+    }
+    if (wcsstr(GetCommandLineW(), L"--no-of-fallback")) { g_of_fallback = false; }
     if (const wchar_t* os_ = wcsstr(GetCommandLineW(), L"--fg-of-sign ")) {
         const double v = _wtof(os_ + 13);
         if (v == 1.0 || v == -1.0) { g_of_sign = static_cast<float>(v); }
@@ -8009,6 +8513,35 @@ int main()
         }
         logf_("[bridge] game window %p\n", (void*)game_wnd);
         g_game_wnd = game_wnd;
+
+        // ---- MV source policy for Unreal titles ----
+        // Measured on 2026-11-10 on this machine: with the game's own motion vectors both
+        // Wuchang: Fallen Feathers and Phantom Blade Zero show edge ghosting that survives
+        // --fg-jittered-mv, while our optical flow on the same frames is clean (the A/B bats
+        // "A - jittered MV" vs "B - optical flow"). So an Unreal shipping build (exe name
+        // *-Win64-Shipping.exe) defaults to optical flow; anything else keeps the game's MV,
+        // which is free and usually better (docs/ops/USAGE.md 6). Explicit --fg-of / --game-mv
+        // always wins.
+        if (!g_fg_of && !g_game_mv_forced) {
+            DWORD gpid = 0;
+            GetWindowThreadProcessId(game_wnd, &gpid);
+            wchar_t image[MAX_PATH]{};
+            DWORD len = MAX_PATH;
+            HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, gpid);
+            if (hp != nullptr) {
+                if (QueryFullProcessImageNameW(hp, 0, image, &len)) {
+                    const wchar_t* bn = wcsrchr(image, L'\\');
+                    bn = (bn != nullptr) ? bn + 1 : image;
+                    if (wcs_ends_with_ci(bn, L"-Win64-Shipping.exe")) {
+                        g_fg_of = true;
+                        logf_("[bridge] %ls is an Unreal shipping build - using our optical flow"
+                              " for the motion vectors (its own MVs ghosted here; override with"
+                              " --game-mv)\n", bn);
+                    }
+                }
+                CloseHandle(hp);
+            }
+        }
 
         {
             // If the game window itself is topmost, that explains why it covered us.

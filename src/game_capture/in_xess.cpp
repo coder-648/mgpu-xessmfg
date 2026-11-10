@@ -323,6 +323,22 @@ public:
         out.flags  = fl;
         out.serial = f.serial;
         out.tick_ms = f.tick_ms;
+        // ---- normalized semantics -------------------------------------------------
+        // XeSS is the one API that says out loud which space its velocities live in:
+        // USE_NDC_VELOCITY => NDC, otherwise the SDK's default is PIXELS (not UV). The first
+        // version declared "uv" for the non-NDC case and the probe caught it on 2026-11-10:
+        // `probe: mv mean|v|=(44.848,3.113) -> unit=pixels  declared=uv  (DISAGREES ...)`,
+        // with mvscale=(1,1) in the same log - 44 px cannot be UV.
+        out.mv_unit = (flags & XESS_INIT_FLAG_USE_NDC_VELOCITY)
+                          ? mgpu::input::MvUnit::ndc
+                          : mgpu::input::MvUnit::pixels;
+        // Every one of these APIs defines its vectors as previous-minus-current; a game that
+        // flipped it would break its own upscaler. MvFlip is the explicit escape hatch.
+        out.mv_sign        = mgpu::input::MvSign::prev_minus_cur;
+        out.camera_source  = mgpu::input::CameraSource::none;
+        out.invalid_marker = 0.0f;
+        out.valid_w = f.render_w;
+        out.valid_h = f.render_h;
         return true;
     }
 };

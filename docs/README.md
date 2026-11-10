@@ -39,6 +39,10 @@
 | [`findings/XESS_FG_NOTES.md`](findings/XESS_FG_NOTES.md) | XeFG 开发指南的提炼 |
 | [`findings/OPTISCALER_NOTES.md`](findings/OPTISCALER_NOTES.md) | XeFG 的 MV 约定 / 相机运动重投影（上游 GPL-3.0） |
 | [`findings/UE5_MV_OPTISCALER.md`](findings/UE5_MV_OPTISCALER.md) | **OptiScaler 怎么处理 UE5**（影之刃/黑猴/明末）+ 我们缺的三步 |
+| [`findings/FG_SNIFF.md`](findings/FG_SNIFF.md) | **只读抓游戏自己的帧生成**（`FgSniff=1`）：投影矩阵 / clipToPrevClip / MV 尺度从哪来、日志怎么读 |
+| [`findings/INPUT_SEMANTICS.md`](findings/INPUT_SEMANTICS.md) | **输入语义的通用做法**：有效区裁切（`crop:`）+ 在线 MV 单位探针（`probe:`）+ 为什么不逐游戏打补丁 |
+| [`findings/PBZ_NOTES.md`](findings/PBZ_NOTES.md) | **影之刃零专项**：FSR 自带 DLL 的 double-free 崩溃、实测输入语义、add-on 侧踩过的坑 |
+| [`findings/OPTISCALER_QUIRKS.md`](findings/OPTISCALER_QUIRKS.md) | **OptiScaler 的 105 条游戏表逐条对照**：哪些能搬（模块发现、FG 输入口径），哪些不能（DXGI 伪装、swapchain 补丁），以及它揭示的两个缺口 |
 | [`findings/RE_ENGINE_NOTES.md`](findings/RE_ENGINE_NOTES.md) | **RE Engine / PRAGMATA**：NGX 入口在游戏自带 `nvngx_dlss.dll` 上（修复待验证） |
 | [`findings/TOOLING_NOTES.md`](findings/TOOLING_NOTES.md) | 工具链与命令行的注意事项 |
 | [`findings/ENV_REPORT.md`](findings/ENV_REPORT.md) | 实测环境记录 |
