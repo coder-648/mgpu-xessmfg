@@ -1,0 +1,49 @@
+﻿lock_frame（WGC 颜色 + marker 配对，v26）PBZ 测试步骤
+=========================================================
+
+部署位置
+  F:\steam\steamapps\common\PBZ\platform\steam\
+
+已部署
+  - dxgi.dll / nvngx_dlssg.dll / fakerFG.dll = 新版 fakerFG（三个名字同一份）
+  - xess_mfg_producer.dll                   = 新版 producer（ColourStream=0，StreamPercent=150）
+  - fakerFG.ini                             = 新配置：Mode=consume、FgInput=Upscaler、
+                                              DepthInverted=1、ColourStream=0、StreamPercent=150
+  - lock_frame\                             = lock_frame.exe / UI / libxess_fg / libxell
+  - 备份：_lock_frame_backup_20261115_140248\nvngx_dlssg.dll.pre_lock_frame
+
+执行步骤
+  1. 启动 PBZ，进入游戏画面。
+  2. 游戏里开启 DLSS（Super Resolution），不要用 FSR/XeSS 做输入；分辨率与桌面一致，
+     窗口化/无边框全屏。
+  3. 把游戏锁到 30 fps（测 30x4）或 40 fps（测 40x3）。本版本不在消费端丢帧。
+  4. 运行 F:\...\PBZ\platform\steam\lock_frame\run_ui.bat：
+       选 PBZ 窗口 -> 选锁帧 30x4 或 40x3 -> 启动
+     或直接双击：
+       run_30x4_pbz.bat / run_40x3_pbz.bat
+
+日志
+  游戏目录：
+    PBZ_fakerFG.log       marker draw / producer start / publish
+    PBZ_mfg_producer.log  StreamPercent=150、shared ... slots=16
+  lock_frame 输出：
+    lock_frame\lock_frame_ui_HHMMSS.txt（UI 启动）
+    lock_frame\lock_frame_30x4.log / lock_frame_40x3.log（bat 启动）
+
+正常应看到
+  [lock] shared: ... slots=16
+  [lock] --upsample: MV/depth rebuilt from ... to 3840x2160
+  [lock] pair: exact=40 no_slot=0 ... lag(avg=..., max=...)
+  [lock] out: presents=160 expected=160   (30x4)
+  [lock] out: presents=120 expected=120   (40x3)
+  marker: seq12=... / marker pair: WGC ... -> slot ...
+
+注意
+  - PBZ/UE5 的游戏 MV 在旧版本上曾被记录为“不可用”；如果画面有明显鬼影，
+    下一轮可以试 `--fg-of`（消费端光流），但 upsample 会跳过。
+  - 不要同时运行其他 consumer；同一时间只跑 lock_frame.exe。
+  - 面板需 120 Hz。
+
+回滚
+  把备份的 nvngx_dlssg.dll.pre_lock_frame 改回 nvngx_dlssg.dll，
+  删除 dxgi.dll / fakerFG.dll / fakerFG.ini / xess_mfg_producer.dll / lock_frame\。

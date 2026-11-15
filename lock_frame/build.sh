@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# ===========================================================================
+#  lock_frame/ 独立构建脚本
+#
+#    ./lock_frame/build.sh            -> build/lock_frame.exe
+#    ./lock_frame/build.sh all        -> 再构建 producer / fakerFG / ui
+#
+#  源文件全部在 lock_frame/ 下，不会写回 src/ 或 scripts/。
+# ===========================================================================
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/.." && pwd)"
+STAGE_ROOT="${MGPU_STAGE:-/mnt/c/temp/mgpu}"
+REPO_WIN="$(wslpath -w "$REPO")"
+FXC_WIN="/mnt/c/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/fxc.exe"
+
+WHAT="${1:-consumer}"
+
+build_consumer() {
+    local stage="$STAGE_ROOT/lock_frame"
+    rm -rf "$stage"
+    mkdir -p "$stage" "$REPO/build"
+    cp "$HERE/lock_frame.cpp" "$stage/"
+    cp "$HERE/build.bat" "$stage/"
+    cp "$HERE/osd_panel.h" "$stage/"
+    cp "$HERE/include/mgpu_shared.h" "$stage/"     # v24: kMaxSlots=6
+    cp -r "$HERE/modules" "$stage/"
+    for dll in libxess_fg.dll libxell.dll; do
+        cp "$REPO/third_party/xess/bin/$dll" "$stage/" 2>/dev/null || true
+    done
+
+    [ -x "$FXC_WIN" ] || { echo "[build] fxc.exe not found"; return 1; }
+    "$FXC_WIN" -nologo -T cs_5_0 -E CSMain \
+        -Fo "$(wslpath -w "$stage/upsample_joint.cso")" \
+        "$(wslpath -w "$HERE/shaders/upsample_joint.hlsl")" \
+        || { echo "[build] fxc failed for upsample_joint"; return 1; }
+    python3 "$REPO/scripts/embed_cso.py" "$stage/upsample_joint.cso" \
+        "$stage/upsample_joint_cso.h" "UpsampleJoint" \
+        || { echo "[build] embed failed"; return 1; }
+
+    python3 "$REPO/scripts/extract_hlsl.py" "$HERE/modules/050_shaders.inc" \
+        "$stage/conv_check.hlsl" || { echo "[build] could not extract k_conv_hlsl"; return 1; }
+    for entry in vs_main:vs_5_0 ps_main:ps_5_0 ps_prep_mv:ps_5_0 ps_prep_depth:ps_5_0; do
+        local name="${entry%%:*}" prof="${entry##*:}"
+        "$FXC_WIN" -nologo -T "$prof" -E "$name" \
+            -Fo "$(wslpath -w "$stage/conv_check.cso")" \
+            "$(wslpath -w "$stage/conv_check.hlsl")" \
+            || { echo "[build] fxc failed for $name"; return 1; }
+    done
+
+    ( cd "$stage" && cmd.exe /c build.bat "$REPO_WIN" > build.log 2>&1 )
+    local rc=$?
+    echo "[build] cl exit code: $rc"
+    iconv -f GBK -t UTF-8 -c "$stage/build.log" 2>/dev/null || cat "$stage/build.log"
+    if [ -f "$stage/lock_frame.exe" ]; then
+        cp "$stage/lock_frame.exe" "$REPO/build/"
+        echo "[build] exe -> $REPO/build/lock_frame.exe"
+    else
+        echo "[build] NO EXE PRODUCED"; return 1
+    fi
+    return $rc
+}
+
+build_producer() {
+    local stage="$STAGE_ROOT/lock_frame_producer"
+    rm -rf "$stage"; mkdir -p "$stage" "$REPO/build"
+    cp "$HERE/producer"/*.cpp "$HERE/producer"/*.h "$stage/"
+    [ -x "$FXC_WIN" ] || { echo "[build] fxc.exe not found"; return 1; }
+    for spec in "downsample_mv:cs_5_0:CSMain:DownsampleMV:downsample_mv" \
+                "downsample_depth:cs_5_0:CSMain:DownsampleDepth:downsample_depth"; do
+        IFS=: read -r base prof entry sym out <<< "$spec"
+        "$FXC_WIN" -nologo -T "$prof" -E "$entry" \
+            -Fo "$(wslpath -w "$stage/$out.cso")" \
+            "$(wslpath -w "$HERE/producer/shaders/$base.hlsl")" || return 1
+        python3 "$REPO/scripts/embed_cso.py" "$stage/$out.cso" "$stage/${out}_cso.h" "$sym" || return 1
+    done
+    cat > "$stage/build.bat" <<'BAT'
+@echo off
+setlocal
+cd /d "%~dp0"
+set "REPO=%~1"
+set "VSDIR=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
+call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
+if not exist obj mkdir obj
+cl /nologo /std:c++17 /EHsc /O2 /MD /W3 /utf-8 /permissive- ^
+  /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX /I"%~dp0." /I"%REPO%\src" /I"%REPO%\src\faker_fg" ^
+  "%~dp0producer.cpp" /Fe:xess_mfg_producer.dll /Fo:obj\ ^
+  /link /DLL d3d12.lib dxgi.lib
+if errorlevel 1 exit /b 1
+exit /b 0
+BAT
+    ( cd "$stage" && cmd.exe /c build.bat "$REPO_WIN" > build.log 2>&1 )
+    local rc=$?
+    iconv -f GBK -t UTF-8 -c "$stage/build.log" 2>/dev/null || cat "$stage/build.log"
+    [ -f "$stage/xess_mfg_producer.dll" ] && cp "$stage/xess_mfg_producer.dll" "$REPO/build/" && \
+        echo "[build] dll -> $REPO/build/xess_mfg_producer.dll"
+    return $rc
+}
+
+build_faker() {
+    local stage="$STAGE_ROOT/lock_frame_faker"
+    rm -rf "$stage"; mkdir -p "$stage" "$REPO/build"
+    cp "$HERE/faker_fg"/*.cpp "$HERE/faker_fg"/*.h "$HERE/faker_fg"/*.def "$stage/"
+    [ -x "$FXC_WIN" ] || { echo "[build] fxc.exe not found"; return 1; }
+    for spec in "mv_resample:cs_5_0:CSMain:MvResample" \
+                "render_ui:vs_5_0:VSMain:RenderUiVS" \
+                "render_ui:ps_5_0:PSMain:RenderUiPS" \
+                "render_ui_pm:ps_5_0:PSMain:RenderUiPmPS" \
+                "hudless_compare:ps_5_0:PSMain:HudlessComparePS" \
+                "hud_copy:cs_5_0:CSMain:HudCopy" \
+                "marker:ps_5_0:PSMain:MarkerPS"; do
+        IFS=: read -r base prof entry sym <<< "$spec"
+        local out="${base}_${entry}"
+        "$FXC_WIN" -nologo -T "$prof" -E "$entry" \
+            -Fo "$(wslpath -w "$stage/$out.cso")" \
+            "$(wslpath -w "$HERE/faker_fg/shaders/$base.hlsl")" || return 1
+        python3 "$REPO/scripts/embed_cso.py" "$stage/$out.cso" "$stage/${out}_cso.h" "$sym" || return 1
+    done
+    cat > "$stage/build.bat" <<'BAT'
+@echo off
+setlocal
+cd /d "%~dp0"
+set "REPO=%~1"
+set "VSDIR=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
+call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
+if not exist obj mkdir obj
+cl /nologo /std:c++17 /EHsc /O2 /MD /W3 /utf-8 /permissive- ^
+  /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX /I"%~dp0." /I"%REPO%\src" /I"%REPO%\src\faker_fg" ^
+  /I"%REPO%\third_party\xess\inc" /I"%REPO%\third_party\streamline\include" ^
+  /I"%REPO%\\third_party\\ffx\\api\\include" ^
+  /I"%REPO%\\third_party\\ffx\\include" ^
+  /I"%REPO%\third_party\dlss\include" /I"%REPO%\third_party\minhook\include" ^
+  /I"%REPO%\third_party\minhook\src" ^
+  /I"%REPO%\third_party\OptiScaler-master\external" ^
+  unity.cpp "%REPO%\third_party\minhook\src\buffer.c" "%REPO%\third_party\minhook\src\hook.c" ^
+  "%REPO%\third_party\minhook\src\trampoline.c" "%REPO%\third_party\minhook\src\hde\hde64.c" ^
+  /Fe:fakerFG.dll /Fo:obj\ /link /DLL /DEF:fakerFG.def /MAP:fakerFG.map d3d12.lib dxgi.lib user32.lib psapi.lib
+if errorlevel 1 exit /b 1
+exit /b 0
+BAT
+    ( cd "$stage" && cmd.exe /c build.bat "$REPO_WIN" > build.log 2>&1 )
+    local rc=$?
+    iconv -f GBK -t UTF-8 -c "$stage/build.log" 2>/dev/null || cat "$stage/build.log"
+    [ -f "$stage/fakerFG.dll" ] && cp "$stage/fakerFG.dll" "$REPO/build/" && \
+        echo "[build] dll -> $REPO/build/fakerFG.dll"
+    return $rc
+}
+
+build_ui() {
+    local stage="$STAGE_ROOT/lock_frame_ui"
+    rm -rf "$stage"; mkdir -p "$stage" "$REPO/build"
+    cp "$HERE/ui/mgpu_ui.cpp" "$stage/lock_frame_ui.cpp"
+    cp "$HERE/include/mgpu_shared.h" "$stage/"     # v24: same version check
+    cat > "$stage/build.bat" <<'BAT'
+@echo off
+setlocal
+cd /d "%~dp0"
+set "REPO=%~1"
+set "VSDIR=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
+call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
+cl /nologo /std:c++17 /EHsc /O2 /MD /W3 /utf-8 /permissive- ^
+  /DUNICODE /D_UNICODE /I"%~dp0." /I"%REPO%\src" "%~dp0lock_frame_ui.cpp" ^
+  /Fe:lock_frame_ui.exe /Fo:lock_frame_ui.obj ^
+  /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib shell32.lib advapi32.lib dwmapi.lib
+if errorlevel 1 exit /b 1
+exit /b 0
+BAT
+    ( cd "$stage" && cmd.exe /c build.bat "$REPO_WIN" > build.log 2>&1 )
+    local rc=$?
+    iconv -f GBK -t UTF-8 -c "$stage/build.log" 2>/dev/null || cat "$stage/build.log"
+    [ -f "$stage/lock_frame_ui.exe" ] && cp "$stage/lock_frame_ui.exe" "$REPO/build/" && \
+        echo "[build] exe -> $REPO/build/lock_frame_ui.exe"
+    return $rc
+}
+
+case "$WHAT" in
+  consumer) build_consumer ;;
+  producer) build_producer ;;
+  faker)    build_faker ;;
+  ui)       build_ui ;;
+  all)
+     build_producer; r1=$?
+     build_faker;    r2=$?
+     build_ui;       r3=$?
+     build_consumer; r4=$?
+     echo "[build] producer=$r1 faker=$r2 ui=$r3 consumer=$r4"
+     exit $((r1|r2|r3|r4)) ;;
+  *) echo "usage: $0 [consumer|producer|faker|ui|all]"; exit 2 ;;
+esac
