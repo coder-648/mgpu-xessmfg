@@ -1,5 +1,6 @@
 // ============================================================================
-//  mgpu_ui.cpp  -  Lossless-Scaling-style front-end for bridge.exe
+//  mgpu_ui.cpp  -  Lossless-Scaling-style front-end for the two-GPU FG consumer
+//  (xess_mfg_consumer.exe: WGC capture on the second GPU + XeFG 2X presentation)
 //
 //  Layout and look follow Lossless Scaling 3.2.2: a dark frameless window with its
 //  own title bar, a profile sidebar on the left, and two columns of cards on the
@@ -128,15 +129,29 @@ struct State
     // 2026-11-10 实测关掉它（0 ms）后输入延迟与流畅度立刻明显改善，而默认的 ~16.6 ms 会把
     // 捕获钉在 ~60 fps。现在由 bridge 默认 = 0（`--wgc-minint 16` 可恢复旧行为，仅命令行）。
     // XeFG 输入
-    // MV source: 0 = off (--no-mv), 1 = the game MV, 2 = the game MV reversed (--mv-flip)
-    int  mv_mode = 0;
+    // 运动矢量不再由 UI 选择：bridge 按 producer 实际发布的记录自动决定（见 bridge 的
+    // "mv: auto -> ..." 日志）。--no-mv / --fg-of 仍是命令行实验开关。
     bool jitter_zero = true;
-    bool proj_rz = true;
     int  fov_sel = 1;          // 55 / 58.7 / 60 / 65
     // Input interval the pacing model assumes: 0 = measured, 1 = 25 ms, 2 = 33 ms.
     // Feeds --input-ms; measured benefit at 3x+MV: slow 17->0, skip 19->13 (docs 5.18).
     int  ivl_sel = 0;
-    bool no_depth = false;
+    bool no_depth = false;      // --no-depth: skip the depth stream (cross-card 28 -> 14 MB/frame)
+    bool no_marker = false;     // --no-marker: no in-frame pairing key (falls back to time/FIFO)
+    // --upsample (A/B): rebuild MV+depth from the StreamPercent size to the game's render
+    // size on the consumer GPU. XeFG requires both to be the same size, so this is one
+    // all-or-nothing switch. Off by default until a real run decides whether it stays
+    // (docs/design/UPSAMPLE_QUALITY.md).
+    bool upsample = false;
+    // --stream-auto: the bridge picks the StreamPercent (both streams) from the measured
+    // WGC hop. --stream-asym: MV stays 1:1, depth is scaled (implies upsample so the
+    // tagged pair is one size). Both are A/B and default off.
+    bool stream_auto = false;
+    bool stream_asym = false;
+    // Input prefetch (default on): the consumer copies the producer's next MV/depth slot
+    // into its own VRAM during the WGC wait; the colour arrival only does a local lookup.
+    // Off = the old "copy after WGC" order (A/B).
+    bool input_prefetch = true;
     // 0 = let bridge choose (monitor rule / avoid the producer); 1+ = position in
     // the enumerated adapter list -> --gpu <index>.
     int  gpu_sel = 0;
@@ -160,7 +175,7 @@ struct State
     bool osd = true;
     // 启动
     int  target_mode = 0;      // 0 = the foreground window (LSFG habit), 1 = the selected one
-    int  lock_fps = 2;         // hint only: 0 off, 30, 24, 40, 60
+    int  lock_fps = 3;         // hint only: 0 off, 30, 24, 40, 60 (40 = 3 vblanks @120Hz)
     int  hotkey = 0;   // index into g_hotkeys (0 = Ctrl+PageUp)
     std::wstring win_title;    // remembered target, matched by title on load
     HWND win_hwnd = nullptr;
@@ -250,8 +265,8 @@ enum Id
     ID_NONE = 0,
     ID_FG_TYPE, ID_FG_MODE, ID_INTERP, ID_OUT, ID_PERF,
     ID_CAP_API, ID_POOL, ID_LAT,
-    ID_NOMV, ID_JITZ, ID_PROJRZ, ID_FOV, ID_NODEPTH, ID_UI, ID_RT, ID_UNLOCK, ID_SLACK, ID_IVL,
-    ID_MV, ID_CADENCE, ID_OUTFPS, ID_HEAD_FIXED, ID_HEAD_DYN,
+    ID_JITZ, ID_FOV, ID_NODEPTH, ID_NOMARKER, ID_UPSAMPLE, ID_STRAUTO, ID_STRASYM, ID_PREFETCH, ID_UI, ID_RT, ID_UNLOCK, ID_SLACK, ID_IVL,
+    ID_CADENCE, ID_OUTFPS, ID_HEAD_FIXED, ID_HEAD_DYN,
     ID_TEAR, ID_SDR, ID_LAYERED, ID_RELAY, ID_OSD,
     ID_GPU, ID_GPUSEL, ID_DISPLAY,
     ID_TMODE, ID_TARGET, ID_HOTKEY, ID_LOCK, ID_CMD,
@@ -275,19 +290,24 @@ static const RowDef kRowsFg[] = {
     { ID_HEAD_DYN,   L"动态逐帧（每帧按 vblank 数决定）", RK_HEAD },
     { ID_OUTFPS,  L"输出帧率 (Hz, 0=面板)", RK_EDIT },
     { ID_OUT,     L"输出",            RK_DD   },
-    { ID_MV,      L"运动矢量",        RK_DD   },
+    { ID_UPSAMPLE, L"升采样 MV/深度 (A/B)", RK_TOG },
+    { ID_STRAUTO,  L"自动 StreamPercent (A/B)", RK_TOG },
+    { ID_STRASYM,  L"MV 全分辨率 / 深度降档 (A/B)", RK_TOG },
     // 抗丢帧 (--slack-auto) removed 2026-11-10: for an *interpolated* stream, holding a
     // capture back makes the two real frames further apart in time, so every generated frame
     // covers a longer gap - the judder got worse and bigger, not better.
     // VRR 均匀间隔 (--vrr) removed the same day: in practice it did not solve the problem
     // (the input rate's own jitter dominates), so the UI keeps the single, well-tested path.
-    // Both remain on bridge.exe as command-line experiments.
+    // Both remain on the consumer as command-line experiments.
 };
 static const RowDef kRowsCap[] = {
     { ID_CAP_API, L"捕获 API",        RK_INFO },
     { ID_SDR,     L"色彩空间",        RK_DD   },
     { ID_POOL,    L"帧池深度",        RK_SPIN },
     { ID_LAT,     L"最大帧延迟数",    RK_SPIN },
+    { ID_PREFETCH, L"输入预拷 (A/B)", RK_TOG },
+    { ID_NODEPTH,  L"不传深度 (省一半带宽)", RK_TOG },
+    { ID_NOMARKER, L"关闭标记配对",   RK_TOG },
 };
 static const RowDef kRowsDev[] = {
     { ID_GPUSEL,  L"帧生成用的 GPU",      RK_DD   },
@@ -305,12 +325,16 @@ static const RowDef kRowsOverlay[] = {
     { ID_OSD,     L"单行 OSD",        RK_TOG },
 };
 
+// Row counts are derived from the arrays, never hard-coded: a stale count reads one
+// RowDef past the end and crashes the paint pass (found 2026-11-13 after removing a row).
+template <int N> constexpr int rows_of(const RowDef (&)[N]) { return N; }
+
 static const CardDef kCards[] = {
-    { L"帧生成",       kRowsFg,     8, 0 },
-    { L"捕获",         kRowsCap,    4, 1 },
-    { L"启动",         kRowsLaunch, 3, 0 },
-    { L"GPU / 显示器", kRowsDev,    2, 1 },
-    { L"叠加层",       kRowsOverlay, 3, 1 },
+    { L"帧生成",       kRowsFg,     rows_of(kRowsFg), 0 },
+    { L"捕获",         kRowsCap,    rows_of(kRowsCap), 1 },
+    { L"启动",         kRowsLaunch, rows_of(kRowsLaunch), 0 },
+    { L"GPU / 显示器", kRowsDev,    rows_of(kRowsDev), 1 },
+    { L"叠加层",       kRowsOverlay, rows_of(kRowsOverlay), 1 },
     // The "高级" card (FOV / 输入间隔) was removed on 2026-11-08: XeFG ignores the
     // synthetic projection, and frameRenderTime is now vblank-snapped (--fg-rt-mode
     // quant), which subsumes what --input-ms was used for. Both stay CLI-only.
@@ -320,7 +344,6 @@ static const int kCardCount = (int)(sizeof(kCards) / sizeof(kCards[0]));
 // ------------------------------------------------------------------ options
 static const wchar_t* kOptFgMode[] = { L"固定", L"动态逐帧", L"关闭 (1:1 直通)" };
 static const wchar_t* kOptOut[]    = { L"1:1 原生", L"5K -> 4K (0.75x)", L"半分辨率" };
-static const wchar_t* kOptMv[]     = { L"关闭", L"游戏 MV", L"AMD 光流" };
 static const wchar_t* kOptFov[]    = { L"55.0", L"58.7", L"60.0", L"65.0" };
 static const wchar_t* kOptIvl[]    = { L"自动（倍数+1 vblank 余量）", L"16.7 ms (60 fps)", L"20 ms (50 fps)",
                                       L"25 ms (40 fps)", L"33 ms (30 fps)", L"41.7 ms (24 fps)" };
@@ -342,7 +365,6 @@ static int opt_count(Id id)
     switch (id) {
     case ID_FG_MODE: return 2;
     case ID_OUT:     return 3;
-    case ID_MV:      return 4;
     case ID_SDR:     return 2;
     case ID_FOV:     return 4;
     case ID_IVL:     return 6;
@@ -362,7 +384,6 @@ static const wchar_t* opt_text(Id id, int i)
     switch (id) {
     case ID_FG_MODE: return kOptFgMode[i % 3];
     case ID_OUT:     return kOptOut[i % 3];
-    case ID_MV:      return kOptMv[i % 3];
     case ID_SDR:     return kOptColor[i % 2];
     case ID_FOV:     return kOptFov[i % 4];
     case ID_IVL:     return kOptIvl[i % 6];
@@ -404,7 +425,6 @@ static int opt_get(Id id)
     switch (id) {
     case ID_FG_MODE: return S().fg_mode;
     case ID_OUT:     return S().out_mode;
-    case ID_MV:      return S().mv_mode;
     case ID_SDR:     return S().sdr ? 1 : 0;
     case ID_FOV:     return S().fov_sel;
     case ID_IVL:     return S().ivl_sel;
@@ -503,7 +523,7 @@ static void uilog(const char* fmt, ...)
     CloseHandle(f);
 }
 
-// Kill any bridge.exe we may have lost track of (stale handle, crashed UI state, ...).
+// Kill any xess_mfg_consumer.exe we may have lost track of (stale handle, crashed UI state, ...).
 static int kill_stray_bridge()
 {
     int killed = 0;
@@ -513,7 +533,7 @@ static int kill_stray_bridge()
     pe.dwSize = sizeof(pe);
     if (Process32FirstW(snap, &pe)) {
         do {
-            if (_wcsicmp(pe.szExeFile, L"bridge.exe") == 0) {
+            if (_wcsicmp(pe.szExeFile, L"xess_mfg_consumer.exe") == 0) {
                 HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pe.th32ProcessID);
                 if (h) {
                     TerminateProcess(h, 0);
@@ -596,11 +616,13 @@ static void save_profile(int i)
     ini_w(sec, L"tmode", s.target_mode);
     ini_w(sec, L"gpu_sel", s.gpu_sel);
     ini_w(sec, L"hotkey3", s.hotkey);
-    ini_w(sec, L"mv_mode", s.mv_mode);
-    ini_w(sec, L"no_mv", s.mv_mode == 0 ? 1 : 0);   // legacy key
     ini_w(sec, L"jitter_zero", s.jitter_zero ? 1 : 0);
-    ini_w(sec, L"proj_rz", s.proj_rz ? 1 : 0);
     ini_w(sec, L"no_depth", s.no_depth ? 1 : 0);
+    ini_w(sec, L"no_marker", s.no_marker ? 1 : 0);
+    ini_w(sec, L"upsample", s.upsample ? 1 : 0);
+    ini_w(sec, L"stream_auto", s.stream_auto ? 1 : 0);
+    ini_w(sec, L"stream_asym", s.stream_asym ? 1 : 0);
+    ini_w(sec, L"input_prefetch", s.input_prefetch ? 1 : 0);
     ini_w(sec, L"ui_none", s.ui_none ? 1 : 0);
     ini_w(sec, L"unlock", s.unlock_mfg ? 1 : 0);
     ini_w(sec, L"slack1", s.slack1 ? 1 : 0);
@@ -635,16 +657,13 @@ static void load_profile(int i)
     s.gpu_sel     = ini_r(sec, L"gpu_sel", s.gpu_sel);
     s.hotkey      = ini_r(sec, L"hotkey3", s.hotkey);
     if (s.hotkey < 0 || s.hotkey >= kHotkeyCount) { s.hotkey = 0; }
-    s.mv_mode     = ini_r(sec, L"mv_mode", ini_r(sec, L"no_mv", 1) != 0 ? 0 : 1);
-    // 0 = off, 1 = game MV, 2 = reversed, 3 = AMD optical flow. The clamp used to stop at 2,
-    // so selecting "AMD 光流" was reset to "关闭" on the next start (found 2026-11-10).
-    // Migration: the list lost its "reversed" entry (2026-11-10), so old ini values shift.
-    if (s.mv_mode == 3) { s.mv_mode = 2; }        // optical flow: index 3 -> 2
-    else if (s.mv_mode == 2) { s.mv_mode = 1; }   // reversed -> plain game MV (flip is obsolete)
-    if (s.mv_mode < 0 || s.mv_mode > 2) { s.mv_mode = 0; }
     s.jitter_zero = ini_r(sec, L"jitter_zero", s.jitter_zero ? 1 : 0) != 0;
-    s.proj_rz     = ini_r(sec, L"proj_rz", s.proj_rz ? 1 : 0) != 0;
     s.no_depth    = ini_r(sec, L"no_depth", s.no_depth ? 1 : 0) != 0;
+    s.no_marker   = ini_r(sec, L"no_marker", s.no_marker ? 1 : 0) != 0;
+    s.upsample    = ini_r(sec, L"upsample", s.upsample ? 1 : 0) != 0;
+    s.stream_auto = ini_r(sec, L"stream_auto", s.stream_auto ? 1 : 0) != 0;
+    s.stream_asym = ini_r(sec, L"stream_asym", s.stream_asym ? 1 : 0) != 0;
+    s.input_prefetch = ini_r(sec, L"input_prefetch", s.input_prefetch ? 1 : 0) != 0;
     s.ui_none     = ini_r(sec, L"ui_none", s.ui_none ? 1 : 0) != 0;
     s.unlock_mfg  = ini_r(sec, L"unlock", s.unlock_mfg ? 1 : 0) != 0;
     s.slack1      = ini_r(sec, L"slack1", s.slack1 ? 1 : 0) != 0;
@@ -754,8 +773,8 @@ static void rescan_windows()
 // ------------------------------------------------------------ bridge process
 static std::wstring build_cmdline(HWND target, bool display)
 {
-    std::wstring cmd = display ? std::wstring(L"bridge.exe")
-                               : (L"\"" + exe_dir() + L"\\bridge.exe\"");
+    std::wstring cmd = display ? std::wstring(L"xess_mfg_consumer.exe")
+                               : (L"\"" + exe_dir() + L"\\xess_mfg_consumer.exe\"");
     if (target) {
         wchar_t b[64]{};
         _snwprintf_s(b, _TRUNCATE, L" --hwnd 0x%llX",
@@ -767,6 +786,10 @@ static std::wstring build_cmdline(HWND target, bool display)
 
     static const wchar_t* kOut[] = { L" --den 1", L" --scale 0.75", L" --den 2" };
     cmd += kOut[(S().out_mode >= 0 && S().out_mode <= 2) ? S().out_mode : 0];
+    if (S().upsample) { cmd += L" --upsample"; }
+    if (S().stream_auto) { cmd += L" --stream-auto"; }
+    if (S().stream_asym) { cmd += L" --stream-asym"; }
+    if (!S().input_prefetch) { cmd += L" --no-prefetch-inputs"; }
 
     // WGC 交付节流：开 = 16 ms（Windows 默认量级，捕获上限 ~60 fps）；关 = 0（解除节流，
     // 捕获能超过 60，代价是拷贝更频繁）。显式发参数，避免不同 Windows 版本默认值不一致。
@@ -820,25 +843,22 @@ static std::wstring build_cmdline(HWND target, bool display)
     // 在 HDR 显示器上会明显发灰 —— 那是模式本身，不是链路出错。
     if (S().sdr) { cmd += L" --sdr"; }
     // 抗丢帧（--slack-auto）已从 UI 移除（2026-11-10）：对插帧它是负优化，见 kRowsFg 的注释。
-    // 参数仍保留在 bridge.exe 上供 A/B。
-    cmd += L" --unlock-mfg --fg-ui none --fg-proj-rz --fg-rt-mode auto";
+    // 参数仍保留在 xess_mfg_consumer.exe 上供 A/B。
+    // --fg-proj-rz is NOT emitted any more: XeFG 1.3.1 ignores projectionMatrix (it only
+    // reprojects with the motion vectors - docs/findings/FINAL_CONFIG.md 5.16), and the flag
+    // only affects the synthetic matrix our own --fg-warp/--fg-of paths would use.
+    // Current pipeline: publications are consumed in order and the in-frame marker is the
+    // pairing key (see docs/findings/PERF_ROUND_HANDOVER.md). --report 40 keeps the log
+    // readable while still showing every phase of a slow frame.
+    cmd += L" --unlock-mfg --fg-ui none --fg-rt-mode auto --pub-fifo --report 40";
+    if (S().no_depth)  { cmd += L" --no-depth"; }
+    if (S().no_marker) { cmd += L" --no-marker"; }
     // FOV and 输入间隔 are no longer exposed in the UI (2026-11-08): FOV only feeds the
     // synthetic projection, which the XeFG frame-generation path ignores (5.16), and
     // --input-ms no longer matters for pacing now that frameRenderTime is vblank-snapped.
-    // Both remain available as bridge.exe command-line switches.
-    // MV: 0 = off, 1 = the game's vectors (default; the add-on must run with SkipMv=0),
-    // 2 = AMD optical flow. "reversed" (--mv-flip) used to be a third entry: with the
-    // declaration-first semantics the sign is fixed by the API contract (previous minus
-    // current), so a flip is never the answer - it was removed 2026-11-10. The bridge flag
-    // stays for experiments.
-    if (S().mv_mode == 0) {
-        cmd += L" --no-mv";
-    } else if (S().mv_mode == 2) {
-        // AMD optical flow from the captured colour (FidelityFX). Uses only the colour plus
-        // the game's native depth as an edge-guided upsample weight - no reprojection
-        // matrix, no synthetic camera (docs FINAL_CONFIG 5.19).
-        cmd += L" --fg-of";
-    }
+    // Both remain available as consumer command-line switches.
+    // 运动矢量：UI 不再选择。bridge 每帧读取 producer 的 ProducerInfo/StreamShared 自动决定
+    // （游戏 MV / 光流 / 零矢量），日志一行 "mv: auto -> ..."。命令行开关仍然保留。
     // --fg-jitter-zero is deprecated and no longer emitted at all: the game's jitter is
     // always passed. Its motion vectors are computed on the jittered render, so XeFG needs
     // the real jitter to align history - measured 2026-11-08 (PBZ, 2x@40, real MV): that
@@ -887,10 +907,10 @@ static DWORD WINAPI reader_thread(LPVOID)
     SYSTEMTIME st{};
     GetLocalTime(&st);
     wchar_t name[64]{};
-    _snwprintf_s(name, _TRUNCATE, L"\\bridge_ui_%02u%02u%02u.txt",
+    _snwprintf_s(name, _TRUNCATE, L"\\mgpu_ui_%02u%02u%02u.txt",
                  st.wHour, st.wMinute, st.wSecond);
     const std::wstring log_path = exe_dir() + name;
-    uilog("bridge stdout -> %ls", name + 1);
+    uilog("consumer stdout -> %ls", name + 1);
     HANDLE log = CreateFileW(log_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     for (;;) {
@@ -912,7 +932,7 @@ static DWORD WINAPI reader_thread(LPVOID)
 
 // bridge clears the game's WS_EX_TOPMOST itself on every exit path (hard_exit); this
 // is the safety net for the paths it cannot cover - the TerminateProcess fallback
-// above, a crash, or the user killing bridge.exe from Task Manager.
+// above, a crash, or the user killing the consumer from Task Manager.
 static void clear_target_topmost()
 {
     HWND h = g_last_target;
@@ -977,9 +997,9 @@ static void stop_bridge()
             }
         }
     } else {
-        // We lost track of the process (stale state): kill whatever bridge.exe is left.
+        // We lost track of the process (stale state): kill whatever consumer is left.
         const int k = kill_stray_bridge();
-        uilog("stop: no pid, killed %d stray bridge.exe", k);
+        uilog("stop: no pid, killed %d stray xess_mfg_consumer.exe", k);
     }
 
     if (g_stdout_rd) { CloseHandle(g_stdout_rd); g_stdout_rd = nullptr; }
@@ -991,7 +1011,7 @@ static void stop_bridge()
 }
 
 // A target only makes sense if it is the process that created the shared mailbox,
-// i.e. the one with the game_capture add-on loaded. Without this check, pressing the
+// i.e. the one running fakerFG + xess_mfg_producer.dll. Without this check, pressing the
 // hotkey over a browser starts bridge, which then waits forever for the mapping -
 // "selecting a browser does nothing".
 static bool target_is_producer(HWND wnd, DWORD* out_pid, DWORD* out_producer,
@@ -1068,16 +1088,16 @@ static void start_bridge()
             _snwprintf_s(m, _TRUNCATE,
                          L"目标进程 (pid %lu) 还没有抓到第一帧：确认游戏里超分（DLSS / XeSS）"
                          L"已开启、且已进入游戏画面，再按热键；若一直如此，把该目录的 "
-                         L"game_capture.ini 里 Log 改成 1 后重开游戏看日志",
+                         L"fakerFG.ini 里 Log=1 后重开游戏，看 <exe>_mfg_producer.log",
                          (unsigned long)tpid);
         }
         set_msg(m);
         return;
     }
-    const std::wstring bridge = exe_dir() + L"\\bridge.exe";
-    if (GetFileAttributesW(bridge.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        set_msg(L"mgpu_ui.exe 旁边找不到 bridge.exe");
-        uilog("start: bridge.exe missing next to %ls", exe_dir().c_str());
+    const std::wstring consumer = exe_dir() + L"\\xess_mfg_consumer.exe";
+    if (GetFileAttributesW(consumer.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        set_msg(L"mgpu_ui.exe 旁边找不到 xess_mfg_consumer.exe");
+        uilog("start: xess_mfg_consumer.exe missing next to %ls", exe_dir().c_str());
         return;
     }
     SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
@@ -1100,7 +1120,7 @@ static void start_bridge()
     std::vector<wchar_t> mc(cmd.begin(), cmd.end());
     mc.push_back(0);
 
-    const BOOL ok = CreateProcessW(bridge.c_str(), mc.data(), nullptr, nullptr, TRUE,
+    const BOOL ok = CreateProcessW(consumer.c_str(), mc.data(), nullptr, nullptr, TRUE,
                                    CREATE_NO_WINDOW, nullptr, exe_dir().c_str(), &si, &pi);
     CloseHandle(wr);
     if (!ok) {
@@ -1128,20 +1148,16 @@ static void start_bridge()
     // Point out the one combination that pays for MV without seeing the benefit: at 3x the
     // generated frames come from the patched 2x model applied twice, and that model-edge
     // ghosting dominates whatever the motion vectors fix (measured 2026-11-08).
-    if (S().mv_mode == 1 && S().interp >= 2) {
-        // Only the GAME's vectors flicker at 3x (jitter-relative, misaligned with the
-        // resolved colour). --fg-of estimates them from that colour, so it is fine at 3x
-        // and is in fact the recommended 3x choice (docs 5.19).
-        set_msg(L"已启动 · 提示：3x + 游戏 MV 会闪烁，建议改 2x 或把运动矢量换成「AMD 光流」");
+    if (false) {
     } else {
-        set_msg(L"bridge 已启动");
+        set_msg(L"消费端已启动（xess_mfg_consumer.exe）");
     }
 }
 
 static void toggle_bridge()
 {
     uilog("hotkey/button: running=%d child_pid=%lu", (int)g_running, (unsigned long)g_child_pid);
-    if (g_running) { stop_bridge(); set_msg(L"bridge 已停止"); }
+    if (g_running) { stop_bridge(); set_msg(L"消费端已停止"); }
     else           { start_bridge(); }
     if (g_hwnd) { InvalidateRect(g_hwnd, nullptr, FALSE); }
 }
@@ -1212,8 +1228,12 @@ static void layout_items(std::vector<Item>& out, int* content_h)
             it.rc = RECT{ x + 16, ry, x + colw - 16, ry + hh };
             ry += hh;
             it.on = (it.id == ID_JITZ) ? S().jitter_zero
-                  : (it.id == ID_PROJRZ) ? S().proj_rz
                   : (it.id == ID_NODEPTH) ? S().no_depth
+                  : (it.id == ID_NOMARKER) ? S().no_marker
+                  : (it.id == ID_UPSAMPLE) ? S().upsample
+                  : (it.id == ID_STRAUTO) ? S().stream_auto
+                  : (it.id == ID_STRASYM) ? S().stream_asym
+                  : (it.id == ID_PREFETCH) ? S().input_prefetch
                   : (it.id == ID_UNLOCK) ? S().unlock_mfg
                   : (it.id == ID_SLACK) ? S().slack1
                   : (it.id == ID_TEAR) ? S().tearing
@@ -1370,14 +1390,6 @@ static std::wstring dd_caption(Id id)
     // Cadence + motion vectors, measured 2026-11-09:
     //   --fg-of  = one more full GPU pass on the card that also generates. A 30 s segment
     //              looked clean, sustained play drops clearly more often (the user caught
-    //              this after the matrix) - so warn instead of recommending it.
-    //   game MV  = no extra cost, but the 3x/4x path reuses one MV set per time fraction
-    //              (FINAL_CONFIG 5.17) -> flicker.
-    //   off      = cheapest and the smoothest of the three per the same test.
-    if (id == ID_MV && S().fg_mode == 1) {
-        if (S().mv_mode == 2) { return L"AMD 光流（动态逐帧更易 drop）"; }
-        if (S().mv_mode == 1) { return L"游戏 MV（动态逐帧可能闪烁）"; }
-    }
     return opt_text(id, opt_get(id));
 }
 
@@ -1691,8 +1703,46 @@ static void toggle_field(Id id)
 {
     switch (id) {
     case ID_JITZ:    S().jitter_zero = !S().jitter_zero; break;
-    case ID_PROJRZ:  S().proj_rz = !S().proj_rz; break;
-    case ID_NODEPTH: S().no_depth = !S().no_depth; break;
+    case ID_NODEPTH:
+        S().no_depth = !S().no_depth;
+        set_msg(S().no_depth ? L"不传深度：跨卡 28.1 -> 14.1 MB/帧（XeFG 少了遮挡判断）"
+                             : L"传深度（默认）");
+        break;
+    case ID_NOMARKER:
+        S().no_marker = !S().no_marker;
+        set_msg(S().no_marker
+                    ? L"关闭标记配对：退回时间戳/FIFO，可能偶发错配"
+                    : L"标记配对开启（默认，推荐）");
+        break;
+    case ID_UPSAMPLE:
+        S().upsample = !S().upsample;
+        set_msg(S().upsample
+                    ? L"升采样：副卡把 MV/深度重建到渲染尺寸（实验，A/B）"
+                    : L"升采样关闭：MV/深度按流尺寸直接交给 XeFG");
+        break;
+    case ID_STRAUTO:
+        S().stream_auto = !S().stream_auto;
+        set_msg(S().stream_auto
+                    ? L"自动档位：按 WGC 延迟自动选 StreamPercent（慢速、逐窗口）"
+                    : L"自动档位关闭：沿用 fakerFG.ini 的 StreamPercent");
+        break;
+    case ID_STRASYM:
+        S().stream_asym = !S().stream_asym;
+        if (S().stream_asym && !S().upsample) {
+            S().upsample = true;      // XeFG 要求 MV/深度同尺寸
+            set_msg(L"MV 全分辨率：已同时打开升采样（depth 会重建到 MV 尺寸）");
+        } else {
+            set_msg(S().stream_asym
+                        ? L"MV 全分辨率 / 深度降档（A/B）"
+                        : L"恢复同档：MV 与深度使用同一个 StreamPercent");
+        }
+        break;
+    case ID_PREFETCH:
+        S().input_prefetch = !S().input_prefetch;
+        set_msg(S().input_prefetch
+                    ? L"输入预拷：等 WGC 时并行把 MV/深度拷进本地显存（默认）"
+                    : L"输入预拷关闭：WGC 到达后再拷（旧顺序）");
+        break;
     case ID_UNLOCK:  S().unlock_mfg = !S().unlock_mfg; break;
     case ID_SLACK:   S().slack1 = !S().slack1; break;
     case ID_TEAR:    S().tearing = !S().tearing; break;
@@ -1736,7 +1786,6 @@ static void set_opt(Id id, int idx)
     switch (id) {
     case ID_FG_MODE: S().fg_mode = idx % 3; S().cadence = (S().fg_mode == 1); break;
     case ID_OUT:     S().out_mode = idx % 3; break;
-    case ID_MV:      S().mv_mode = idx % 3; break;
     case ID_SDR:
         S().sdr = (idx % 2) == 1;
         set_msg(S().sdr ? L"SDR 输出（BT.709）：HDR 显示器上会发灰，属正常"
@@ -1978,7 +2027,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             DWORD code = 0;
             if (GetExitCodeProcess(g_child, &code) && code != STILL_ACTIVE) {
                 stop_bridge();
-                set_msg(L"bridge 已退出");
+                set_msg(L"消费端已退出");
             }
         }
         InvalidateRect(h, nullptr, FALSE);

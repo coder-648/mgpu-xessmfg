@@ -1,3 +1,10 @@
+> **2026-11-14 状态**：游戏侧已改为 `fakerFG.dll` + `xess_mfg_producer.dll`（无 ReShade、
+> 无 add-on），消费端当前是 **`xess_mfg_consumer.exe`**（`bridge.exe` 为 legacy）。
+> 本文件里的条目大量来自 add-on/bridge 时代，**当前 backlog 以
+> [`docs/PROJECT_STATUS_2026-11-14.md`](docs/PROJECT_STATUS_2026-11-14.md) §5 为准**。
+> 现行链路见 `docs/design/XEFG_CHAIN_STANDARD.md`、`docs/design/CONSUMER_ARCH.md`
+> 与 `docs/design/XESS_MFG_PRODUCER.md`。
+
 # ROADMAP
 
 只列**还没做、且想清楚了怎么做**的事。历史结论见
@@ -52,7 +59,12 @@
 （`consumed[]`）才是正解。文档里已标注为遗留开关
 （`docs/ops/CONFIG.md` §3），代码里保留（协议兼容），但**不再推荐**。
 
-### 5. 严格配对校验：`frame_id` ↔ WGC `SystemRelativeTime`（优先做这个）
+### 5. 严格配对校验：`frame_id` ↔ WGC `SystemRelativeTime` ✅ 协议 v13 已实现
+
+> 结果：`FrameShared.frame_qpc_ms` + `frame_key`；bridge 用 WGC
+> `SystemRelativeTime` 选“最新且不晚于它”的槽位，窗口外回退轮转。
+> 实测 `frame-key pair: WGC ... -> slot N`，`wait=0` / `timeouts=0`。
+> 说明见 `docs/findings/FG_INPUT_V13_2077.md`；`--no-pair-key` 可关闭。
 
 **问题**：颜色来自 WGC（晚一帧，10–70 ms 浮动），MV/深度来自共享槽，两者按
 **轮转槽位**近似配对，没有帧号级保证（详见 `docs/design/PROTOCOL.md` 的
@@ -107,6 +119,25 @@ RTSS 锁 40 fps，同场景跑 ≥60 s；对照组是 `--interp 3 --den 2`（4x@
 
 顺带两个几乎零成本的对照（同一次会话里跑）：`--capture-monitor`（看 `game->wgc` 是否下降）、
 `--overlay-layered` 开/关（分层窗口是否多走一次 DWM 合成）。
+
+### 8. FG 契约优先：claim + harvest + own-present（**新方向，取代逐游戏探 SR**）
+
+三款实测（RED4 / UE4.27 / RE Engine）证明：SR 路径各引擎都不一样，**FG 契约才是稳定的**。
+方案见 `docs/design/FG_CLAIM.md`。分四阶段：
+
+| 阶段 | 内容 | 现在的状态 |
+|---|---|---|
+| A. Harvest + Validate | 在 FG evaluate 处抓齐 DEPTH/HUDLESS/UI/SCALING 的能力位，配一份通用校验器（尺寸只信资源、占位检测、lifecycle 决定拷贝时机） | ✅ 已实现（build `8a3b081a…`，日志 `harvest:` 一行） |
+| B. 颜色入槽 | HUDless / SCALING_OUTPUT 跨卡进镜像，替掉 WGC | ⏸ **本轮放弃**：4K 上 +2.2~5.0 ms ≈ +10~25 点渲染卡占用（`docs/design/FG_CLAIM.md` §9） |
+| C. Claim | 伪造 `slDLSSGGetState/SetOptions` + NGX `DLSSG.*`，让游戏以为在出帧；输出交"重复帧" | 依赖 B（否则就是 CP2077 那次黑屏） |
+| D. 多帧 | 游戏请求 N 帧 ⇒ 我们出 N 帧 | 依赖 C |
+
+> 关键约束（已用 CP2077 的失败换来的）：**claim 必须与"我们交得出帧"绑定**，
+> 不能只抑制不接管。协议到 v14 时要加 `harvest_flags`（数据面体检位图）和颜色槽。
+
+**四条 FG 车道（2026-11-10 定稿）**：运行时识别"谁在出帧"，从它那里动态取数，出口统一。
+DLSS-G ✅（在用）/ XeSS-FG ⚠️（钩子已在，最便宜）/ FSR-FG ⚠️（钩子已在，待解析）/
+无 FG ✅（现状）。详见 `docs/design/FG_CLAIM.md` §12。
 
 ## 工程债
 

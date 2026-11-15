@@ -37,6 +37,7 @@
 
 #include "xess_fg/xefg_swapchain.h"
 #include "xess_fg/xefg_swapchain_d3d12.h"
+#include "xess_fg/xefg_swapchain_debug.h"
 
 namespace xefg_dyn {
 
@@ -131,11 +132,15 @@ inline bool Load(Api& api, const std::wstring& override_path, std::string* err)
 {
     api = Api{};
 
-    std::wstring tries[2];
+    // Vendor DLLs live in our own folder first, exactly like OptiScaler's `streamline\`
+    // (proxies/Streamline_Proxy.h:88-105): <exe>\fakerFG\libxess_fg.dll before the
+    // title's copy, so an install does not depend on what the game ships where.
+    std::wstring tries[3];
     int n = 0;
     if (!override_path.empty()) {
         tries[n++] = override_path;
     } else {
+        tries[n++] = detail::exe_dir() + L"fakerFG\\libxess_fg.dll";
         tries[n++] = detail::exe_dir() + L"libxess_fg.dll";
         tries[n++] = L"libxess_fg.dll";
     }

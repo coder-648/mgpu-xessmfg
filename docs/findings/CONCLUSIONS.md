@@ -1,5 +1,11 @@
 # 结论先行
 
+> ⚠️ **语境说明**：本文多数结论来自 add-on/早期 bridge 实验，**结论本身仍然成立**，
+> 但当前链路的颜色源、配对方式、诊断字段已经变化：颜色仍走 WGC；配对主键改为
+> 游戏侧四角 marker；消费端为 `xess_mfg_consumer.exe`。当前形态见
+> [`../design/CONSUMER_ARCH.md`](../design/CONSUMER_ARCH.md) 与
+> [`PERF_ROUND_HANDOVER.md`](PERF_ROUND_HANDOVER.md)。
+
 > 这一页只放**已经被实测确认**的结论。每条都能追溯到
 > `docs/findings/FINAL_CONFIG.md`（§5.x 踩坑清单 / §9.x 实验档案）或
 > `docs/findings/HANDOFF.md` §8.6 的实验记录。

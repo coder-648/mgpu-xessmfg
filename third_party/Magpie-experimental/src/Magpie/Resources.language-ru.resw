@@ -1,0 +1,1457 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <!-- 
+    Microsoft ResX Schema 
+    
+    Version 2.0
+    
+    The primary goals of this format is to allow a simple XML format 
+    that is mostly human readable. The generation and parsing of the 
+    various data types are done through the TypeConverter classes 
+    associated with the data types.
+    
+    Example:
+    
+    ... ado.net/XML headers & schema ...
+    <resheader name="resmimetype">text/microsoft-resx</resheader>
+    <resheader name="version">2.0</resheader>
+    <resheader name="reader">System.Resources.ResXResourceReader, System.Windows.Forms, ...</resheader>
+    <resheader name="writer">System.Resources.ResXResourceWriter, System.Windows.Forms, ...</resheader>
+    <data name="Name1"><value>this is my long string</value><comment>this is a comment</comment></data>
+    <data name="Color1" type="System.Drawing.Color, System.Drawing">Blue</data>
+    <data name="Bitmap1" mimetype="application/x-microsoft.net.object.binary.base64">
+        <value>[base64 mime encoded serialized .NET Framework object]</value>
+    </data>
+    <data name="Icon1" type="System.Drawing.Icon, System.Drawing" mimetype="application/x-microsoft.net.object.bytearray.base64">
+        <value>[base64 mime encoded string representing a byte array form of the .NET Framework object]</value>
+        <comment>This is a comment</comment>
+    </data>
+                
+    There are any number of "resheader" rows that contain simple 
+    name/value pairs.
+    
+    Each data row contains a name, and value. The row also contains a 
+    type or mimetype. Type corresponds to a .NET class that support 
+    text/value conversion through the TypeConverter architecture. 
+    Classes that don't support this are serialized and stored with the 
+    mimetype set.
+    
+    The mimetype is used for serialized objects, and tells the 
+    ResXResourceReader how to depersist the object. This is currently not 
+    extensible. For a given mimetype the value must be set accordingly:
+    
+    Note - application/x-microsoft.net.object.binary.base64 is the format 
+    that the ResXResourceWriter will generate, however the reader can 
+    read any of the formats listed below.
+    
+    mimetype: application/x-microsoft.net.object.binary.base64
+    value   : The object must be serialized with 
+            : System.Runtime.Serialization.Formatters.Binary.BinaryFormatter
+            : and then encoded with base64 encoding.
+    
+    mimetype: application/x-microsoft.net.object.soap.base64
+    value   : The object must be serialized with 
+            : System.Runtime.Serialization.Formatters.Soap.SoapFormatter
+            : and then encoded with base64 encoding.
+
+    mimetype: application/x-microsoft.net.object.bytearray.base64
+    value   : The object must be serialized into a byte array 
+            : using a System.ComponentModel.TypeConverter
+            : and then encoded with base64 encoding.
+    -->
+  <xsd:schema xmlns="" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:msdata="urn:schemas-microsoft-com:xml-msdata" id="root">
+    <xsd:import namespace="http://www.w3.org/XML/1998/namespace" />
+    <xsd:element name="root" msdata:IsDataSet="true">
+      <xsd:complexType>
+        <xsd:choice maxOccurs="unbounded">
+          <xsd:element name="metadata">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" />
+              </xsd:sequence>
+              <xsd:attribute name="name" use="required" type="xsd:string" />
+              <xsd:attribute name="type" type="xsd:string" />
+              <xsd:attribute name="mimetype" type="xsd:string" />
+              <xsd:attribute ref="xml:space" />
+            </xsd:complexType>
+          </xsd:element>
+          <xsd:element name="assembly">
+            <xsd:complexType>
+              <xsd:attribute name="alias" type="xsd:string" />
+              <xsd:attribute name="name" type="xsd:string" />
+            </xsd:complexType>
+          </xsd:element>
+          <xsd:element name="data">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" msdata:Ordinal="1" />
+                <xsd:element name="comment" type="xsd:string" minOccurs="0" msdata:Ordinal="2" />
+              </xsd:sequence>
+              <xsd:attribute name="name" type="xsd:string" use="required" msdata:Ordinal="1" />
+              <xsd:attribute name="type" type="xsd:string" msdata:Ordinal="3" />
+              <xsd:attribute name="mimetype" type="xsd:string" msdata:Ordinal="4" />
+              <xsd:attribute ref="xml:space" />
+            </xsd:complexType>
+          </xsd:element>
+          <xsd:element name="resheader">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" msdata:Ordinal="1" />
+              </xsd:sequence>
+              <xsd:attribute name="name" type="xsd:string" use="required" />
+            </xsd:complexType>
+          </xsd:element>
+        </xsd:choice>
+      </xsd:complexType>
+    </xsd:element>
+  </xsd:schema>
+  <resheader name="resmimetype">
+    <value>text/microsoft-resx</value>
+  </resheader>
+  <resheader name="version">
+    <value>2.0</value>
+  </resheader>
+  <resheader name="reader">
+    <value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <resheader name="writer">
+    <value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <data name="About_PageFrame.Title" xml:space="preserve">
+    <value>О программе</value>
+  </data>
+  <data name="Home_Activation.Header" xml:space="preserve">
+    <value>Активация</value>
+  </data>
+  <data name="ScalingModes_Parameters.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve">
+    <value>Параметры</value>
+  </data>
+  <data name="ScalingModes_MoreOptions.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve">
+    <value>Больше настроек</value>
+  </data>
+  <data name="ScalingModes_MoreOptionsFlyout_Delete.Text" xml:space="preserve">
+    <value>Удалить</value>
+  </data>
+  <data name="ScalingModes_MoreOptionsFlyout_MoveDown.Text" xml:space="preserve">
+    <value>Опустить</value>
+  </data>
+  <data name="ScalingModes_MoreOptionsFlyout_MoveUp.Text" xml:space="preserve">
+    <value>Поднять</value>
+  </data>
+  <data name="ScalingModes_Rename.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve">
+    <value>Переименовать</value>
+  </data>
+  <data name="ScalingModes_ScaleFlyout_Type_Fill" xml:space="preserve">
+    <value>Заполнение</value>
+  </data>
+  <data name="About_Version_UpdateToDate_Installing.Text" xml:space="preserve">
+    <value>Установка</value>
+  </data>
+  <data name="Profile_Advanced.Header" xml:space="preserve">
+    <value>Расширенные</value>
+  </data>
+  <data name="Profile_Cursor.Header" xml:space="preserve">
+    <value>Курсор</value>
+  </data>
+  <data name="Profile_Cursor_DrawCursor_ScaleFactor.Header" xml:space="preserve">
+    <value>Множитель масштабирования</value>
+  </data>
+  <data name="Profile_Cursor_DrawCursor_ScaleFactor_Custom.Content" xml:space="preserve">
+    <value>Пользовательский</value>
+  </data>
+  <data name="AppSettings_ErrorDialog_ReadFailed" xml:space="preserve">
+    <value>Не удалось прочитать файл настроек</value>
+  </data>
+  <data name="NotifyIcon_Exit" xml:space="preserve">
+    <value>Выйти</value>
+  </data>
+  <data name="NotifyIcon_MainWindow" xml:space="preserve">
+    <value>Главное окно</value>
+  </data>
+  <data name="Settings_General_RequireRestart.Title" xml:space="preserve">
+    <value>Для вступления изменений в силу требуется перезапуск</value>
+  </data>
+  <data name="Settings_General_RequireRestart_ActionButton.Content" xml:space="preserve">
+    <value>Перезапустить Magpie</value>
+  </data>
+  <data name="Home_PageFrame.Title" xml:space="preserve">
+    <value>Главная</value>
+  </data>
+  <data name="Home_Activation_Timer.Header" xml:space="preserve">
+    <value>Отложенное масштабирование</value>
+  </data>
+  <data name="Home_Activation_Timer_Cancel" xml:space="preserve">
+    <value>Отмена</value>
+  </data>
+  <data name="Home_Activation_Timer_Delay.Header" xml:space="preserve">
+    <value>Задержка в секундах</value>
+  </data>
+  <data name="ShortcutDialog_Cancel" xml:space="preserve">
+    <value>Отмена</value>
+  </data>
+  <data name="ShortcutDialog_Description.Text" xml:space="preserve">
+    <value>Нажмите комбинацию клавиш для изменения горячей клавиши</value>
+  </data>
+  <data name="ShortcutDialog_InUse" xml:space="preserve">
+    <value>Уже используется</value>
+  </data>
+  <data name="ShortcutDialog_InvalidShortcut" xml:space="preserve">
+    <value>Недопустимая горячая клавиша</value>
+  </data>
+  <data name="ShortcutDialog_Save" xml:space="preserve">
+    <value>Сохранить</value>
+  </data>
+  <data name="ShortcutDialog_Tip.Text" xml:space="preserve">
+    <value>Действительны горячие клавиши начинающиеся с клавиши Windows, Ctrl, Alt или Shift.</value>
+  </data>
+  <data name="Root_About.Content" xml:space="preserve">
+    <value>О программе</value>
+  </data>
+  <data name="Root_Defaults.Content" xml:space="preserve">
+    <value>Профиль по умолчанию</value>
+  </data>
+  <data name="Root_Home.Content" xml:space="preserve">
+    <value>Главная</value>
+  </data>
+  <data name="Root_NewProfile.Content" xml:space="preserve">
+    <value>Новый профиль</value>
+  </data>
+  <data name="Root_NewProfileFlyout_ComboBox.PlaceholderText" xml:space="preserve">
+    <value>Выберите окно</value>
+  </data>
+  <data name="Root_NewProfileFlyout_CopyFrom.Text" xml:space="preserve">
+    <value>Копировать из</value>
+  </data>
+  <data name="Root_NewProfileFlyout_Create.Content" xml:space="preserve">
+    <value>Создать</value>
+  </data>
+  <data name="Root_NewProfileFlyout_Name.Text" xml:space="preserve">
+    <value>Название</value>
+  </data>
+  <data name="Root_NewProfileFlyout_NoCandidateWindow.Text" xml:space="preserve">
+    <value>Откройте новое окно для создания профиля</value>
+  </data>
+  <data name="Root_NewProfileFlyout_Title.Text" xml:space="preserve">
+    <value>Новый профиль</value>
+  </data>
+  <data name="Root_Profiles.Content" xml:space="preserve">
+    <value>Профили</value>
+  </data>
+  <data name="Root_ScalingModes.Content" xml:space="preserve">
+    <value>Настройки масштабирования</value>
+  </data>
+  <data name="ScalingModes_PageFrame.Title" xml:space="preserve">
+    <value>Настройки масштабирования</value>
+  </data>
+  <data name="Home_Advanced.Header" xml:space="preserve">
+    <value>Расширенные</value>
+  </data>
+  <data name="Settings_General.Header" xml:space="preserve">
+    <value>Общие</value>
+  </data>
+  <data name="Settings_General_Language.Header" xml:space="preserve">
+    <value>Язык</value>
+  </data>
+  <data name="Settings_General_Language_System" xml:space="preserve">
+    <value>Windows (по умолчанию)</value>
+  </data>
+  <data name="Settings_General_PortableMode.Header" xml:space="preserve">
+    <value>Портативный режим</value>
+  </data>
+  <data name="Settings_General_PortableMode_Locate.Content" xml:space="preserve">
+    <value>Открыть расположение файла настроек</value>
+  </data>
+  <data name="Settings_Launch_RunAtStartup.Header" xml:space="preserve">
+    <value>Запускать при включении системы</value>
+  </data>
+  <data name="Settings_General_ShowNotifyIcon.Description" xml:space="preserve">
+    <value>Magpie продолжит работать в фоне после закрытия главного окна</value>
+  </data>
+  <data name="Settings_General_ShowNotifyIcon.Header" xml:space="preserve">
+    <value>Отображение приложения в области уведомлений</value>
+  </data>
+  <data name="Settings_General_Theme.Header" xml:space="preserve">
+    <value>Тема</value>
+  </data>
+  <data name="Settings_General_Theme_Dark.Content" xml:space="preserve">
+    <value>Тёмная</value>
+  </data>
+  <data name="Settings_General_Theme_System.Content" xml:space="preserve">
+    <value>Windows (по умолчанию)</value>
+  </data>
+  <data name="Settings_General_Theme_Light.Content" xml:space="preserve">
+    <value>Светлая</value>
+  </data>
+  <data name="Settings_Launch.Header" xml:space="preserve">
+    <value>Запуск</value>
+  </data>
+  <data name="ScalingModes_General_Export.Text" xml:space="preserve">
+    <value>Экспорт</value>
+  </data>
+  <data name="ScalingModes_General_Import.Text" xml:space="preserve">
+    <value>Импорт</value>
+  </data>
+  <data name="ScalingModes_General_MoreOptions.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve">
+    <value>Больше настроек</value>
+  </data>
+  <data name="Settings_Launch_AlwaysRunAsAdmin.Description" xml:space="preserve">
+    <value>Для использования этой настройки нужно запустить приложение от имени администратора</value>
+  </data>
+  <data name="Settings_Launch_AlwaysRunAsAdmin.Header" xml:space="preserve">
+    <value>Всегда запускать приложение от имени администратора</value>
+  </data>
+  <data name="Home_UpdateCard_AutoCheckForUpdates.Content" xml:space="preserve">
+    <value>Периодически проверять наличие обновлений</value>
+  </data>
+  <data name="Home_UpdateCard_DownloadAndInstall.Content" xml:space="preserve">
+    <value>Скачать и установить</value>
+  </data>
+  <data name="Home_UpdateCard_ReleaseNotes.Content" xml:space="preserve">
+    <value>Информация о версии</value>
+  </data>
+  <data name="Home_UpdateCard_RemindMeLater.Content" xml:space="preserve">
+    <value>Напомнить позже</value>
+  </data>
+  <data name="Home_UpdateCard_Title" xml:space="preserve">
+    <value>{} доступно</value>
+  </data>
+  <data name="About_OtherLinks.Header" xml:space="preserve">
+    <value>Другие ссылки</value>
+  </data>
+  <data name="About_OtherLinks_ContributionGuidelines.Text" xml:space="preserve">
+    <value>Руководство по содействию</value>
+  </data>
+  <data name="About_OtherLinks_FAQ.Text" xml:space="preserve">
+    <value>ЧаВо</value>
+  </data>
+  <data name="About_OtherLinks_License.Text" xml:space="preserve">
+    <value>Лицензия</value>
+  </data>
+  <data name="About_OtherLinks_Repository.Text" xml:space="preserve">
+    <value>Github репозиторий</value>
+  </data>
+  <data name="ScalingModes_RenameFlyout_OK.Content" xml:space="preserve">
+    <value>Отлично</value>
+  </data>
+  <data name="ScalingModes_RenameFlyout_Title.Text" xml:space="preserve">
+    <value>Переименовать</value>
+  </data>
+  <data name="ScalingModes_AddEffect.Text" xml:space="preserve">
+    <value>Добавить эффект</value>
+  </data>
+  <data name="ScalingModes_Delete.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve">
+    <value>Удалить</value>
+  </data>
+  <data name="ScalingModes_DeleteFlyout_Delete.Text" xml:space="preserve">
+    <value>Удалить</value>
+  </data>
+  <data name="ScalingModes_DeleteFlyout_Description.Text" xml:space="preserve">
+    <value>Его используют следующие профили:</value>
+  </data>
+  <data name="ScalingModes_DeleteFlyout_Title.Text" xml:space="preserve">
+    <value>Вы уверены, что хотите удалить этот режим масштабирования?</value>
+  </data>
+  <data name="ScalingModes_DragNotSupported.Text" xml:space="preserve">
+    <value>Перетаскивание не поддерживается при работе от имени администратора</value>
+  </data>
+  <data name="ScalingModes_DragToReorder.Text" xml:space="preserve">
+    <value>Перетащите, чтобы переупорядочить</value>
+  </data>
+  <data name="ScalingModes_MoveDown.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve">
+    <value>Опустить</value>
+  </data>
+  <data name="ScalingModes_MoveUp.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve">
+    <value>Поднять</value>
+  </data>
+  <data name="ScalingModes_NewScalingMode.Text" xml:space="preserve">
+    <value>Новый режим масштабирования</value>
+  </data>
+  <data name="ScalingModes_NewScalingModeFlyout_Title.Text" xml:space="preserve">
+    <value>Новый режим масштабирования</value>
+  </data>
+  <data name="ScalingModes_Scale.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve">
+    <value>Масштабирование</value>
+  </data>
+  <data name="ScalingModes_NewScalingModeFlyout_CopyFrom.Text" xml:space="preserve">
+    <value>Копировать из</value>
+  </data>
+  <data name="ScalingModes_NewScalingModeFlyout_CopyFrom_None" xml:space="preserve">
+    <value>Ничего</value>
+  </data>
+  <data name="ScalingModes_NewScalingModeFlyout_Create.Content" xml:space="preserve">
+    <value>Создать</value>
+  </data>
+  <data name="ScalingModes_NewScalingModeFlyout_Name.Text" xml:space="preserve">
+    <value>Название</value>
+  </data>
+  <data name="ScalingModes_ScaleFlyout_HeightFactor.Text" xml:space="preserve">
+    <value>Высота (множитель масштабирования)</value>
+  </data>
+  <data name="ScalingModes_ScaleFlyout_HeightPixels.Text" xml:space="preserve">
+    <value>Высота (пиксели)</value>
+  </data>
+  <data name="ScalingModes_ScaleFlyout_WidthFactor.Text" xml:space="preserve">
+    <value>Ширина (множитель масштабирования)</value>
+  </data>
+  <data name="ScalingModes_ScaleFlyout_Type_Fill_Description" xml:space="preserve">
+    <value>Заполняет экран, изображение может быть растянуто</value>
+  </data>
+  <data name="ScalingModes_ScaleFlyout_Type_Fit" xml:space="preserve">
+    <value>Вписывание</value>
+  </data>
+  <data name="ScalingModes_ScaleFlyout_WidthPixels.Text" xml:space="preserve">
+    <value>Ширина (пиксели)</value>
+  </data>
+  <data name="ScalingModes_ScaleFlyout_Type.Text" xml:space="preserve">
+    <value>Тип</value>
+  </data>
+  <data name="ScalingModes_ScaleFlyout_Type_Absolute" xml:space="preserve">
+    <value>Абсолютно</value>
+  </data>
+  <data name="ScalingModes_ScaleFlyout_Type_Absolute_Description" xml:space="preserve">
+    <value>Установить размер после масштабирования</value>
+  </data>
+  <data name="ScalingModes_ScaleFlyout_Type_Factor" xml:space="preserve">
+    <value>Множитель</value>
+  </data>
+  <data name="ScalingModes_ScaleFlyout_Type_Factor_Description" xml:space="preserve">
+    <value>Выставить множитель масштабирования относительно входного изображения</value>
+  </data>
+  <data name="Profile_General_Multimonitor_All.Content" xml:space="preserve">
+    <value>Все мониторы</value>
+  </data>
+  <data name="ScalingModes_ScaleFlyout_Type_Fit_Description" xml:space="preserve">
+    <value>Выставить множитель масштабирования после заполнения экрана пропорциональным масштабированием</value>
+  </data>
+  <data name="Profile_General.Header" xml:space="preserve">
+    <value>Общие</value>
+  </data>
+  <data name="Profile_General_3DGameMode.Header" xml:space="preserve">
+    <value>Режим 3D игры</value>
+  </data>
+  <data name="Profile_General_HdrCompatibility.Header" xml:space="preserve">
+    <value>HDR compatibility</value>
+  </data>
+  <data name="Profile_General_AutoScale.Header" xml:space="preserve">
+    <value>Автоматическое масштабирование когда на переднем плане</value>
+  </data>
+  <data name="Profile_General_CaptureMethod.Header" xml:space="preserve">
+    <value>Способ захвата</value>
+  </data>
+  <data name="Profile_General_Multimonitor.Header" xml:space="preserve">
+    <value>Предпочтительные мониторы</value>
+  </data>
+  <data name="Profile_General_Multimonitor_Closest.Content" xml:space="preserve">
+    <value>Ближайший монитор к исходному окну</value>
+  </data>
+  <data name="Profile_General_Multimonitor_Intersected.Content" xml:space="preserve">
+    <value>Пересекаемые исходным окном мониторы</value>
+  </data>
+  <data name="Profile_General_ScalingMode.Header" xml:space="preserve">
+    <value>Режим масштабирования</value>
+  </data>
+  <data name="Profile_Launch.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve">
+    <value>Запуск</value>
+  </data>
+  <data name="Profile_MoreOptions.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve">
+    <value>Больше настроек</value>
+  </data>
+  <data name="Profile_MoreOptions_Delete.Text" xml:space="preserve">
+    <value>Удалить</value>
+  </data>
+  <data name="Profile_MoreOptions_DeleteFlyout_Delete.Text" xml:space="preserve">
+    <value>Удалить</value>
+  </data>
+  <data name="Profile_MoreOptions_DeleteFlyout_Title.Text" xml:space="preserve">
+    <value>Вы уверены, что хотите удалить этот профиль?</value>
+  </data>
+  <data name="Profile_MoreOptions_OpenProgramLocation.Text" xml:space="preserve">
+    <value>Открыть расположение программы</value>
+  </data>
+  <data name="Profile_MoreOptions_Rename.Text" xml:space="preserve">
+    <value>Переименовать</value>
+  </data>
+  <data name="Profile_MoreOptions_RenameFlyout_OK.Content" xml:space="preserve">
+    <value>Отлично</value>
+  </data>
+  <data name="Profile_MoreOptions_RenameFlyout_Title.Text" xml:space="preserve">
+    <value>Переименовать</value>
+  </data>
+  <data name="Profile_MoreOptions_Reorder.Text" xml:space="preserve">
+    <value>Переупорядочить</value>
+  </data>
+  <data name="Profile_MoreOptions_ReorderFlyout_MoveDown.Text" xml:space="preserve">
+    <value>Опустить</value>
+  </data>
+  <data name="Profile_MoreOptions_ReorderFlyout_MoveUp.Text" xml:space="preserve">
+    <value>Поднять</value>
+  </data>
+  <data name="Profile_MoreOptions_ReorderFlyout_Title.Text" xml:space="preserve">
+    <value>Переупорядочить</value>
+  </data>
+  <data name="Profile_General_ScalingMode_None" xml:space="preserve">
+    <value>Ничего</value>
+  </data>
+  <data name="Profile_Performance.Header" xml:space="preserve">
+    <value>Производительность</value>
+  </data>
+  <data name="Profile_Performance_GraphicsCard.Header" xml:space="preserve">
+    <value>Видеокарта</value>
+  </data>
+  <data name="About_Feedback.Header" xml:space="preserve">
+    <value>Обратная связь</value>
+  </data>
+  <data name="About_Feedback_Discussion.Header" xml:space="preserve">
+    <value>Обсуждения</value>
+  </data>
+  <data name="About_Feedback_ReportBug.Header" xml:space="preserve">
+    <value>Сообщить об ошибке</value>
+  </data>
+  <data name="About_Feedback_RequestFeature.Header" xml:space="preserve">
+    <value>Запросить функцию</value>
+  </data>
+  <data name="About_Version_UpdateSettings_CheckForPreviewUpdates.Header" xml:space="preserve">
+    <value>Проверять предварительные обновления</value>
+  </data>
+  <data name="About_Version_UpdateSettings_AutoCheckForUpdates.Header" xml:space="preserve">
+    <value>Автоматически проверять наличие обновлений</value>
+  </data>
+  <data name="About_Version_CheckForUpdates.Text" xml:space="preserve">
+    <value>Проверить наличие обновлений</value>
+  </data>
+  <data name="About_Version_CheckForUpdatesFailed.Title" xml:space="preserve">
+    <value>Не удалось проверить наличие обновлений, повторите попытку позже</value>
+  </data>
+  <data name="About_Version_CheckingForUpdates.Text" xml:space="preserve">
+    <value>Проверяем наличие обновлений</value>
+  </data>
+  <data name="About_Version_UpdateCard_Cancel.Content" xml:space="preserve">
+    <value>Отмена</value>
+  </data>
+  <data name="About_Version_UpdateCard_DownloadAndInstall.Content" xml:space="preserve">
+    <value>Скачать и установить</value>
+  </data>
+  <data name="About_Version_UpdateCard_ReleaseNotes.Content" xml:space="preserve">
+    <value>Информация о версии</value>
+  </data>
+  <data name="About_Version_UpdateCard_Retry.Content" xml:space="preserve">
+    <value>Повторить попытку</value>
+  </data>
+  <data name="About_Version_UpdateCard_Title" xml:space="preserve">
+    <value>{} доступно</value>
+  </data>
+  <data name="About_Version_UpdateToDate.Title" xml:space="preserve">
+    <value>Magpie уже актуально</value>
+  </data>
+  <data name="About_Version_UpdateToDate_DownloadFailed.Text" xml:space="preserve">
+    <value>Скачивание не удалось</value>
+  </data>
+  <data name="About_Version_UpdateToDate_Downloading.Text" xml:space="preserve">
+    <value>Скачивание</value>
+  </data>
+  <data name="Profile_Advanced_DisableDirectFlip.Header" xml:space="preserve">
+    <value>Отключить DirectFlip</value>
+  </data>
+  <data name="Profile_Cursor_DrawCursor_AdjustCursorSpeed.Header" xml:space="preserve">
+    <value>Подогнать скорость курсора при масштабировании</value>
+  </data>
+  <data name="Profile_Cursor_DrawCursor_Interpolation.Header" xml:space="preserve">
+    <value>Алгоритм интерполяции</value>
+  </data>
+  <data name="Profile_Cursor_DrawCursor_Interpolation_Bilinear.Content" xml:space="preserve">
+    <value>Билинейный</value>
+  </data>
+  <data name="Profile_Cursor_DrawCursor_Interpolation_NearestNeighbor.Content" xml:space="preserve">
+    <value>Ближайший сосед</value>
+  </data>
+  <data name="Profile_Cursor_DrawCursor_ScaleFactor_NoScaling.Content" xml:space="preserve">
+    <value>Не масштабировать</value>
+  </data>
+  <data name="Profile_Cursor_DrawCursor_ScaleFactor_SameAsSourceWindow.Content" xml:space="preserve">
+    <value>Как в исходном окне</value>
+  </data>
+  <data name="Profile_General_CaptureMethod_Default" xml:space="preserve">
+    <value>По умолчанию</value>
+  </data>
+  <data name="Profile_SourceWindow.Header" xml:space="preserve">
+    <value>Исходное окно</value>
+  </data>
+  <data name="Profile_SourceWindow_CaptureTitleBar.Description" xml:space="preserve">
+    <value>Ограничено Graphics Capture и Desktop Duplication</value>
+  </data>
+  <data name="Profile_SourceWindow_CaptureTitleBar.Header" xml:space="preserve">
+    <value>Захват заголовка окна</value>
+  </data>
+  <data name="Profile_SourceWindow_CustomCropping.Header" xml:space="preserve">
+    <value>Пользовательская обрезка</value>
+  </data>
+  <data name="Profile_SourceWindow_CustomCropping_Bottom.Header" xml:space="preserve">
+    <value>Снизу</value>
+  </data>
+  <data name="Profile_SourceWindow_CustomCropping_Left.Header" xml:space="preserve">
+    <value>Слева</value>
+  </data>
+  <data name="Profile_SourceWindow_CustomCropping_Pixels.Text" xml:space="preserve">
+    <value>пкс.</value>
+  </data>
+  <data name="Profile_SourceWindow_CustomCropping_Right.Header" xml:space="preserve">
+    <value>Справа</value>
+  </data>
+  <data name="Profile_SourceWindow_CustomCropping_Top.Header" xml:space="preserve">
+    <value>Сверху</value>
+  </data>
+  <data name="Home_Advanced_InlineParams.Description" xml:space="preserve">
+    <value>Даёт небольшой прирост производительности. Однако эффекты должны быть перекомпилированы при каждом изменении их параметров</value>
+  </data>
+  <data name="Home_Advanced_InlineParams.Header" xml:space="preserve">
+    <value>Сделать параметры эффекта встроенными</value>
+  </data>
+  <data name="Home_Advanced_SimulateExclusiveFullscreen.Description" xml:space="preserve">
+    <value>Применяется только к полноэкранному масштабированию. При включении подавляет определенные уведомления и всплывающие окна приложений</value>
+  </data>
+  <data name="Home_Advanced_SimulateExclusiveFullscreen.Header" xml:space="preserve">
+    <value>Симуляция эксклюзивного полного экрана при масштабировании</value>
+  </data>
+  <data name="AppSettings_Dialog_Error" xml:space="preserve">
+    <value>Ошибка</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions.Description" xml:space="preserve">
+    <value>Эти настройки предназначены только для разработчиков</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions.Header" xml:space="preserve">
+    <value>Настройки разработчика</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_DebugMode.Content" xml:space="preserve">
+    <value>Режим отладки</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_DisableEffectCache.Content" xml:space="preserve">
+    <value>Отключить кэш эффектов</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_SaveEffectSources.Content" xml:space="preserve">
+    <value>Сохранение исходного кода при анализе эффектов</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_WarningsAreErrors.Content" xml:space="preserve">
+    <value>Рассматривать предупреждения как ошибки при компиляции эффектов</value>
+  </data>
+  <data name="AppSettings_Dialog_Exit" xml:space="preserve">
+    <value>Выйти</value>
+  </data>
+  <data name="AppSettings_ErrorDialog_ConfigLocation" xml:space="preserve">
+    <value>Расположение файла настроек:
+{}</value>
+  </data>
+  <data name="AppSettings_ErrorDialog_NotValidJson" xml:space="preserve">
+    <value>Файл настроек не является правильным JSON</value>
+  </data>
+  <data name="AppSettings_ErrorDialog_ParseFailed" xml:space="preserve">
+    <value>Не удалось анализировать файл настроек</value>
+  </data>
+  <data name="ToggleSwitch.OffContent" xml:space="preserve">
+    <value>Выкл.</value>
+  </data>
+  <data name="ToggleSwitch.OnContent" xml:space="preserve">
+    <value>Вкл.</value>
+  </data>
+  <data name="Dialog_Export_Title" xml:space="preserve">
+    <value>Экспорт режимов масштабирования</value>
+  </data>
+  <data name="Dialog_Import_Title" xml:space="preserve">
+    <value>Импорт режимов масштабирования</value>
+  </data>
+  <data name="ScalingModes_HasUnkownEffects.Title" xml:space="preserve">
+    <value>Некоторые эффекты нельзя анализировать</value>
+  </data>
+  <data name="ScalingModes_Description_UnknownEffect" xml:space="preserve">
+    <value>Неизвестный эффект</value>
+  </data>
+  <data name="About_Version_Version" xml:space="preserve">
+    <value>Версия</value>
+  </data>
+  <data name="About_Version_UpdateSettings.Header" xml:space="preserve">
+    <value>Обновить настройки</value>
+  </data>
+  <data name="Profile_Advanced_LaunchParameters.Header" xml:space="preserve">
+    <value>Параметры запуска</value>
+  </data>
+  <data name="Overlay_FPS_Opacity" xml:space="preserve">
+    <value>Непрозрачность</value>
+  </data>
+  <data name="Overlay_Profiler" xml:space="preserve">
+    <value>Профилировщик</value>
+  </data>
+  <data name="Overlay_Profiler_CaptureMethod" xml:space="preserve">
+    <value>Способ захвата</value>
+  </data>
+  <data name="Overlay_FPS_Lock" xml:space="preserve">
+    <value>Заблокировать</value>
+  </data>
+  <data name="Overlay_Profiler_Timings" xml:space="preserve">
+    <value>Тайминги</value>
+  </data>
+  <data name="Overlay_Profiler_Timings_Total" xml:space="preserve">
+    <value>Итого</value>
+  </data>
+  <data name="Overlay_FPS_Unlock" xml:space="preserve">
+    <value>Разблокировать</value>
+  </data>
+  <data name="Overlay_Profiler_Timings_SwitchToEffects" xml:space="preserve">
+    <value>Переключиться на эффекты</value>
+  </data>
+  <data name="Overlay_Profiler_Timings_SwitchToPasses" xml:space="preserve">
+    <value>Переключиться на проходы</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_DisableFontCache.Content" xml:space="preserve">
+    <value>Выключить кэш шрифтов</value>
+  </data>
+  <data name="Home_Advanced_AllowScalingMaximized.Header" xml:space="preserve">
+    <value>Разрешить масштабирование развёрнутых или полноэкранных окон</value>
+  </data>
+  <data name="Dialog_JsonFile" xml:space="preserve">
+    <value>JSON файл</value>
+  </data>
+  <data name="Profile_MoreOptions_ChangeExecutableForLaunching.Text" xml:space="preserve">
+    <value>Изменить исполняемый файл для запуска</value>
+  </data>
+  <data name="Dialog_ExeFile" xml:space="preserve">
+    <value>Исполняемый файл</value>
+  </data>
+  <data name="Dialog_SelectLauncher_Title" xml:space="preserve">
+    <value>Выберите исполняемый файл для запуска программы</value>
+  </data>
+  <data name="About_Version_CommitId" xml:space="preserve">
+    <value>Коммит</value>
+  </data>
+  <data name="About_DeveloperModeEnabled" xml:space="preserve">
+    <value>Включен режим разработчика.</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_DuplicateFrameDetection.Header" xml:space="preserve">
+    <value>Обнаружение повторых кадров</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_DuplicateFrameDetection_Always.Content" xml:space="preserve">
+    <value>Всегда</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_DuplicateFrameDetection_Dynamic.Content" xml:space="preserve">
+    <value>Динамически</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_EnableStatisticsForDynamicDetection.Content" xml:space="preserve">
+    <value>Включить статистику для динамического обнаружения</value>
+  </data>
+  <data name="Overlay_Profiler_DynamicDetection" xml:space="preserve">
+    <value>Динамическое обнаружение</value>
+  </data>
+  <data name="Profile_Performance_FrameRateLimiter.Header" xml:space="preserve">
+    <value>Ограничитель частоты кадров</value>
+  </data>
+  <data name="Profile_Performance_FrameRateLimiter_MaxFrameRate.Header" xml:space="preserve">
+    <value>Максимальная частота кадров</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_DuplicateFrameDetection_Never.Content" xml:space="preserve">
+    <value>Никогда</value>
+  </data>
+  <data name="Overlay_Profiler_FrameRate" xml:space="preserve">
+    <value>Частота кадров</value>
+  </data>
+  <data name="Home_TouchSupport_EnableTouchSupport_LearnMore.Content" xml:space="preserve">
+    <value>Подробнее</value>
+  </data>
+  <data name="Home_TouchSupport.Header" xml:space="preserve">
+    <value>Поддержка сенсорного ввода</value>
+  </data>
+  <data name="Home_TouchSupport_EnableTouchSupport.Header" xml:space="preserve">
+    <value>Включить поддержку сенсорного ввода</value>
+  </data>
+  <data name="Home_TouchSupport_Info.Title" xml:space="preserve">
+    <value>Если сенсорная поддержка не работает, Magpie может запросить права администратора перед увеличением для восстановления.</value>
+  </data>
+  <data name="Home_TouchSupport_EnableTouchSupport_Description.Text" xml:space="preserve">
+    <value>Чтобы изменить эту настройку вам понадобятся права администратора</value>
+  </data>
+  <data name="Home_Advanced_SimulateExclusiveFullscreen_InfoBar.Title" xml:space="preserve">
+    <value>Эта настройка несовместима с рядом старых игр. Используйте с осторожностью.</value>
+  </data>
+  <data name="Message_TouchSupport" xml:space="preserve">
+    <value>Не удалось включить поддержку сенсорного ввода.</value>
+  </data>
+  <data name="Message_LowIntegrityLevel" xml:space="preserve">
+    <value>Magpie нужно быть запущенной от администратора для масштабирования этого окна.</value>
+  </data>
+  <data name="Message_ScalingFailedGeneral" xml:space="preserve">
+    <value>Более подробную информацию можно найти в журналах.</value>
+  </data>
+  <data name="Message_CaptureFailed" xml:space="preserve">
+    <value>При захвате этого окна произошла ошибка. Пожалуйста, попробуйте использовать другой метод захвата.</value>
+  </data>
+  <data name="Message_CreateFenceFailed" xml:space="preserve">
+    <value>Текущая видеокарта не поддерживает ID3D11Device5::CreateFence. Попробуйте сменить видеокарту или обновить драйверы.</value>
+  </data>
+  <data name="Message_ScalingFailed" xml:space="preserve">
+    <value>Масштабирование не удалось</value>
+  </data>
+  <data name="Message_InvalidScalingMode" xml:space="preserve">
+    <value>Режим масштабирования неверен.</value>
+  </data>
+  <data name="Message_InvalidSourceWindow" xml:space="preserve">
+    <value>Масштабирование этого окна не поддерживается.</value>
+  </data>
+  <data name="Message_Maximized" xml:space="preserve">
+    <value>Масштабирование максимизированных или полноэкранных окон отключено. Эту настройку можно изменить на главной странице.</value>
+  </data>
+  <data name="Home_Advanced_MinFrameRate.Header" xml:space="preserve">
+    <value>Минимальная частота кадров</value>
+  </data>
+  <data name="Home_Advanced_MinFrameRate.Description" xml:space="preserve">
+    <value>Стабилизирует частоту GPU для уменьшения подвисания, но может привести к повышенному энергопотреблению</value>
+  </data>
+  <data name="Profile_Performance_NoGraphicsCard.Title" xml:space="preserve">
+    <value>Не найдено совместимой видеокарты, так что вместо нее будет использоваться отрисовка на ЦП. Производительность может не соответствовать ожиданиям.</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_DisableFP16.Content" xml:space="preserve">
+    <value>Не использовать FP16 в шейдерах</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_BenchmarkMode.Content" xml:space="preserve">
+    <value>Режим бенчмарка</value>
+  </data>
+  <data name="Root_NewProfileFlyout_NameContextFlyout_AppName" xml:space="preserve">
+    <value>Заполнить имем приложения</value>
+  </data>
+  <data name="Root_NewProfileFlyout_NameContextFlyout_ProcessName" xml:space="preserve">
+    <value>Заполнить названием процесса</value>
+  </data>
+  <data name="Root_NewProfileFlyout_NameContextFlyout_WindowTitle" xml:space="preserve">
+    <value>Заполнить заголовком окна</value>
+  </data>
+  <data name="TextMenuFlyout_Copy" xml:space="preserve">
+    <value>Копировать</value>
+  </data>
+  <data name="TextMenuFlyout_Cut" xml:space="preserve">
+    <value>Вырезать</value>
+  </data>
+  <data name="TextMenuFlyout_Paste" xml:space="preserve">
+    <value>Вставить</value>
+  </data>
+  <data name="TextMenuFlyout_Redo" xml:space="preserve">
+    <value>Повтор</value>
+  </data>
+  <data name="TextMenuFlyout_SelectAll" xml:space="preserve">
+    <value>Выбрать всё</value>
+  </data>
+  <data name="TextMenuFlyout_Undo" xml:space="preserve">
+    <value>Откат</value>
+  </data>
+  <data name="Message_BannedInWindowedMode" xml:space="preserve">
+    <value>Масштабирование для этого окна не поддерживается.</value>
+  </data>
+  <data name="Message_InvalidCropping" xml:space="preserve">
+    <value>Не удалось применить пользовательское обрезание.</value>
+  </data>
+  <data name="Home_TouchSupport.Description" xml:space="preserve">
+    <value>Из-за ограничений безопасности системы, Magpie требуются права UIAccess для поддержки сенсорного ввода.</value>
+  </data>
+  <data name="Home_Activation.Description" xml:space="preserve">
+    <value>Нажмите сочетание клавиш, чтобы масштабировать или остановить масштабирование окна переднего плана.</value>
+  </data>
+  <data name="Home_Activation_FullscreenScaling.Header" xml:space="preserve">
+    <value>Сочетание для полноэкранного масштабирования</value>
+  </data>
+  <data name="Home_Activation_FullscreenScaling_ShortcutControl.Title" xml:space="preserve">
+    <value>Сочетание для полноэкранного масштабирования</value>
+  </data>
+  <data name="Home_Activation_WindowedScaling.Header" xml:space="preserve">
+    <value>Сочетание для оконного масштабирования</value>
+  </data>
+  <data name="Home_Activation_WindowedScaling_ShortcutControl.Title" xml:space="preserve">
+    <value>Сочетание для оконного масштабирования</value>
+  </data>
+  <data name="Home_Advanced_AllowScalingMaximized.Description" xml:space="preserve">
+    <value>Применимо только к полноэкранному масштабированию</value>
+  </data>
+  <data name="Home_Toolbar.Description" xml:space="preserve">
+    <value>Панель инструментов отображается в верхней части масштабируемого окна, предоставляя такие функции, как отображение FPS и захват скриншотов. В оконном режиме она также позволяет перетаскивать масштабируемое окно.</value>
+  </data>
+  <data name="Home_Toolbar.Header" xml:space="preserve">
+    <value>Панель инструментов</value>
+  </data>
+  <data name="Home_Toolbar_InitialState.Header" xml:space="preserve">
+    <value>Исходное состояние панели инструментов</value>
+  </data>
+  <data name="Home_Toolbar_InitialState_AlwaysShow.Content" xml:space="preserve">
+    <value>Всегда показывать</value>
+  </data>
+  <data name="Home_Toolbar_InitialState_AutoHide.Content" xml:space="preserve">
+    <value>Автоскрытие</value>
+  </data>
+  <data name="Home_Toolbar_InitialState_Off.Content" xml:space="preserve">
+    <value>Выкл</value>
+  </data>
+  <data name="Home_Toolbar_StateToggle.Header" xml:space="preserve">
+    <value>Сочетание переключения состояния панели инструментов</value>
+  </data>
+  <data name="Home_Toolbar_StateToggle_ShortcutControl.Title" xml:space="preserve">
+    <value>Сочетание переключения состояния панели инструментов</value>
+  </data>
+  <data name="Message_ToolbarIn3DGameMode" xml:space="preserve">
+    <value>Панель инструментов не поддерживается в режиме 3D-игры.</value>
+  </data>
+  <data name="Message_ToolbarNewState" xml:space="preserve">
+    <value>Панель инструментов: {}</value>
+  </data>
+  <data name="Overlay_Toolbar_Demo" xml:space="preserve">
+    <value>Демо окно ImGui</value>
+  </data>
+  <data name="Overlay_Toolbar_Pin" xml:space="preserve">
+    <value>Прикрепить панель инструментов</value>
+  </data>
+  <data name="Overlay_Toolbar_TakeScreenshot" xml:space="preserve">
+    <value>Сделать скриншот</value>
+  </data>
+  <data name="Overlay_Toolbar_Profiler" xml:space="preserve">
+    <value>Окно профилирования</value>
+  </data>
+  <data name="Message_Windowed3DGameMode" xml:space="preserve">
+    <value>В режиме 3D-игры оконное масштабирование не поддерживается.</value>
+  </data>
+  <data name="Profile_General_3DGameMode.Description" xml:space="preserve">
+    <value>Включает оптимизации под 3D-игры, но несовместимо с панелью инструментов и масштабированием окна</value>
+  </data>
+  <data name="Profile_General_HdrCompatibility.Description" xml:space="preserve">
+    <value>Enable the experimental HDR capture-to-effect compatibility path. Keep disabled unless you are testing HDR support</value>
+  </data>
+  <data name="Home_Toolbar_ScreenshotSaveDirectory.Header" xml:space="preserve">
+    <value>Директория сохранения скриншотов</value>
+  </data>
+  <data name="Home_Toolbar_ScreenshotSaveDirectory_Change.Content" xml:space="preserve">
+    <value>Изменить</value>
+  </data>
+  <data name="Dialog_SetlectScreenshotSaveDirectory_Title" xml:space="preserve">
+    <value>Выбрать директорию сохранения скриншотов</value>
+  </data>
+  <data name="Message_ScreenshotSaved" xml:space="preserve">
+    <value>Скриншот сохранён как {}</value>
+  </data>
+  <data name="Message_ScreenshotFailed" xml:space="preserve">
+    <value>Скриншот не удался.</value>
+  </data>
+  <data name="Overlay_Toolbar_TakeScreenshot_Description" xml:space="preserve">
+    <value>ПКМ чтобы экспортировать промежуточный результат</value>
+  </data>
+  <data name="Overlay_Toolbar_TakeScreenshot_PopupTitle" xml:space="preserve">
+    <value>Экспорт промежуточного результата</value>
+  </data>
+  <data name="Profile_WindowedScaling.Header" xml:space="preserve">
+    <value>Оконное мастабирование</value>
+  </data>
+  <data name="Profile_WindowedScaling_InitialScaleFactor.Header" xml:space="preserve">
+    <value>Начальный множитель масштабирования</value>
+  </data>
+  <data name="Profile_WindowedScaling_InitialScaleFactor_Auto.Content" xml:space="preserve">
+    <value>Авто</value>
+  </data>
+  <data name="Profile_WindowedScaling_InitialScaleFactor_Custom.Content" xml:space="preserve">
+    <value>Пользовательский</value>
+  </data>
+  <data name="Profile_Advanced_DisableDirectFlip.Description" xml:space="preserve">
+    <value>Помогает избежать определенных проблем совместимости, но может значительно увеличить задержку</value>
+  </data>
+  <data name="Profile_General_AutoScale_Disabled.Content" xml:space="preserve">
+    <value>Выключено</value>
+  </data>
+  <data name="Profile_General_AutoScale_Fullscreen.Content" xml:space="preserve">
+    <value>Полноэкранное мастабирование</value>
+  </data>
+  <data name="Profile_General_AutoScale_Windowed.Content" xml:space="preserve">
+    <value>Оконное мастабирование</value>
+  </data>
+  <data name="Profile_General_Multimonitor.Description" xml:space="preserve">
+    <value>Применимо только к полноэкранному масштабированию</value>
+  </data>
+  <data name="Home_TouchSupport_Warn.Title" xml:space="preserve">
+    <value>Панель инструментов несовместима с сенсорным вводом.</value>
+  </data>
+  <data name="Overlay_Toolbar_Close" xml:space="preserve">
+    <value>Остановить масштабирование</value>
+  </data>
+  <data name="Overlay_Toolbar_Close_Description" xml:space="preserve">
+    <value>ПКМ для закрытия панели инструментов</value>
+  </data>
+  <data name="Overlay_Toolbar_SwitchToFullscreen" xml:space="preserve">
+    <value>Переключиться к полноэкранному масштабированию</value>
+  </data>
+  <data name="Overlay_Toolbar_SwitchToWindowed" xml:space="preserve">
+    <value>Переключиться к оконному масштабированию</value>
+  </data>
+  <data name="Home_Toolbar_InitialState_Fullscreen.Header" xml:space="preserve">
+    <value>Полноэкранное масштабирование</value>
+  </data>
+  <data name="Home_Toolbar_InitialState_Windowed.Header" xml:space="preserve">
+    <value>Оконное масштабирование</value>
+  </data>
+  <data name="Message_ExportScalingModesFailed" xml:space="preserve">
+    <value>Не удалось экспортировать режимы масштабирования.</value>
+  </data>
+  <data name="Message_ImportScalingModesFailed" xml:space="preserve">
+    <value>Не удалось импортировать режимы масштабирования.</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_LocateLogs.Header" xml:space="preserve">
+    <value>Открыть местонахождение логов</value>
+  </data>
+  <data name="Message_WindowedDesktopDuplication" xml:space="preserve">
+    <value>Оконное масштабирование не поддерживается захватом Desktop Duplication.</value>
+  </data>
+  <data name="Profile_General_DesktopDuplicationWarning.Title" xml:space="preserve">
+    <value>Этот метод захвата несовместим с оконным масштабированием.</value>
+  </data>
+  <data name="Settings_Launch_RunAtStartup.Description" xml:space="preserve">
+    <value>Главное окно не будет отображаться если включена опция «Отображать приложение в системном лотке»</value>
+  </data>
+  <data name="Home_Activation_Timer_Description" xml:space="preserve">
+    <value>Масштабировать переднее окно после {}с</value>
+  </data>
+  <data name="Home_Activation_Timer_Start" xml:space="preserve">
+    <value>Начать</value>
+  </data>
+  <data name="NotifyIcon_Timer_Fullscreen" xml:space="preserve">
+    <value>Масшабировать после {}с (полноэкранно)</value>
+  </data>
+  <data name="NotifyIcon_Timer_Windowed" xml:space="preserve">
+    <value>Масштабировать после {}с (оконно)</value>
+  </data>
+  <data name="Overlay_Toolbar_Minimize" xml:space="preserve">
+    <value>Свернуть</value>
+  </data>
+  <data name="Profile_Cursor_AutoHide.Header" xml:space="preserve">
+    <value>Автоскрытие курсора при неактивности</value>
+  </data>
+  <data name="Profile_Cursor_AutoHide_Delay.Header" xml:space="preserve">
+    <value>Время до скрытия в секундах</value>
+  </data>
+  <data name="Profile_Advanced_DestAlignment.Description" xml:space="preserve">
+    <value>Действует только для полноэкранного масштабирования</value>
+  </data>
+  <data name="Profile_Advanced_DestAlignment.Header" xml:space="preserve">
+    <value>Выравнивание вывода</value>
+  </data>
+  <data name="Profile_Advanced_DestAlignment_BottomCenter.Content" xml:space="preserve">
+    <value>Внизу по центру</value>
+  </data>
+  <data name="Profile_Advanced_DestAlignment_BottomLeft.Content" xml:space="preserve">
+    <value>Внизу слева</value>
+  </data>
+  <data name="Profile_Advanced_DestAlignment_BottomRight.Content" xml:space="preserve">
+    <value>Внизу справа</value>
+  </data>
+  <data name="Profile_Advanced_DestAlignment_Center.Content" xml:space="preserve">
+    <value>Центр</value>
+  </data>
+  <data name="Profile_Advanced_DestAlignment_Left.Content" xml:space="preserve">
+    <value>Лево</value>
+  </data>
+  <data name="Profile_Advanced_DestAlignment_Right.Content" xml:space="preserve">
+    <value>Право</value>
+  </data>
+  <data name="Profile_Advanced_DestAlignment_TopCenter.Content" xml:space="preserve">
+    <value>Сверху по центру</value>
+  </data>
+  <data name="Profile_Advanced_DestAlignment_TopLeft.Content" xml:space="preserve">
+    <value>Сверху слева</value>
+  </data>
+  <data name="Profile_Advanced_DestAlignment_TopRight.Content" xml:space="preserve">
+    <value>Сверху справа</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_DisableTopmost.Content" xml:space="preserve">
+    <value>Отключить функцию «Всегда поверх всех окон»</value>
+  </data>
+  <data name="ScalingModes_General_ConfigFolder.Text" xml:space="preserve">
+    <value>Папка настроек</value>
+  </data>
+  <data name="ScalingModes_General_Reset.Text" xml:space="preserve">
+    <value>Сброс</value>
+  </data>
+  <data name="Profile_General_GraphicsCard.Header" xml:space="preserve">
+    <value>Видеокарта для рендеринга</value>
+  </data>
+  <data name="Profile_General_GraphicsCard_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve">
+    <value>Видеокарта для рендеринга</value>
+  </data>
+  <data name="Profile_General_GraphicsCard_Auto" xml:space="preserve">
+    <value>Автоматически</value>
+  </data>
+  <data name="Profile_General_GraphicsCard_None" xml:space="preserve">
+    <value>Доступная видеокарта не найдена</value>
+  </data>
+  <data name="Profile_General_GraphicsCard_Unavailable" xml:space="preserve">
+    <value>Выбранная видеокарта временно недоступна</value>
+  </data>
+  <data name="Profile_General_NoGraphicsCard.Title" xml:space="preserve">
+    <value>Доступная видеокарта не найдена</value>
+  </data>
+  <data name="Profile_General_NoGraphicsCard.Message" xml:space="preserve">
+    <value>При включении эффектов будет предпринята попытка рендеринга на CPU. Проверьте графический драйвер.</value>
+  </data>
+  <data name="Profile_General_GraphicsCardUnavailable.Title" xml:space="preserve">
+    <value>Выбранная видеокарта временно недоступна</value>
+  </data>
+  <data name="Profile_General_GraphicsCardUnavailable.Message" xml:space="preserve">
+    <value>Эффекты автоматически используют доступную видеокарту. Выбранная карта будет использоваться снова, когда станет доступна.</value>
+  </data>
+
+  <data name="ScalingModes_General_MoreOptions.Content" xml:space="preserve"><value>Больше настроек</value></data>
+  <!-- RTSS target application linkage; English fallback outside zh-Hans. -->
+
+  <data name="HdrParameter_InvalidInput" xml:space="preserve"><value>Enter a number in the shown range; integer parameters require whole numbers.</value></data>
+  <data name="HdrParameter_PreciseInputHelp" xml:space="preserve"><value>Type an exact value; Shift + arrow or wheel uses the coarse step.</value></data>
+  <data name="EffectParam_Color_SDR_to_HDR_nativeWhiteNits_Label" xml:space="preserve"><value>SDR white brightness (nits)</value></data>
+  <data name="EffectParam_Color_SDR_to_HDR_nativeWhiteNits_Description" xml:space="preserve"><value>Higher values brighten the entire image. Default 203; new edits use 80–4000 nits. Existing dim values remain unchanged until edited.</value></data>
+  <data name="ScalingModes_HdrMigrationInvalid_Description" xml:space="preserve"><value>The saved HDR configuration could not be safely restored. Its original data is retained. Restore the original group or fix its saved configuration before starting.</value></data>
+  <data name="HdrParameter_PairSource" xml:space="preserve"><value>Restores settings from HDR -&gt; SDR at effect #{}.</value></data>
+
+  <data name="Rtss_TargetLimit.Header" xml:space="preserve"><value>Target application frame rate limit</value></data>
+  <data name="Rtss_Takeover.Description" xml:space="preserve"><value>Limit application frame rate using RTSS.</value></data>
+  <data name="Rtss_Scope_None.Content" xml:space="preserve"><value>Do not manage RTSS profiles</value></data>
+  <data name="Rtss_Scope_Global.Content" xml:space="preserve"><value>Modify global profile</value></data>
+  <data name="Rtss_Scope_Target.Content" xml:space="preserve"><value>Modify target application profile</value></data>
+  <data name="Rtss_Status.Header" xml:space="preserve"><value>RTSS status</value></data>
+  <data name="Rtss_Tools.Content" xml:space="preserve"><value>Launch tools</value></data>
+  <data name="Rtss_Recheck.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Recheck RTSS</value></data>
+  <data name="Rtss_Recheck.ToolTipService.ToolTip" xml:space="preserve"><value>Recheck RTSS and retry the current request</value></data>
+  <data name="Rtss_GlobalNotice.Text" xml:space="preserve"><value>Applications using the global profile share this limit.</value></data>
+  <data name="Rtss_RateMode.Header" xml:space="preserve"><value>Frame rate setting</value></data>
+  <data name="Rtss_Rate_Custom.Content" xml:space="preserve"><value>Custom frame rate</value></data>
+  <data name="Rtss_Rate_Sync.Content" xml:space="preserve"><value>Sync content frame rate</value></data>
+  <data name="Rtss_CustomRate.Header" xml:space="preserve"><value>Frame rate limit</value></data>
+  <data name="Rtss_ExitPolicy.Header" xml:space="preserve"><value>When scaling stops</value></data>
+  <data name="Rtss_Exit_Keep.Content" xml:space="preserve"><value>Keep changes</value></data>
+  <data name="Rtss_Exit_Restore.Content" xml:space="preserve"><value>Restore original value</value></data>
+  <data name="Rtss_UnmanagedNotice" xml:space="preserve"><value>Magpie is not managing RTSS profiles.</value></data>
+  <data name="Rtss_Status_Checking" xml:space="preserve"><value>Checking RTSS</value></data>
+  <data name="Rtss_Status_NotInstalled" xml:space="preserve"><value>RTSS is not installed</value></data>
+  <data name="Rtss_Status_NotRunning" xml:space="preserve"><value>RTSS is not running.</value></data>
+  <data name="Rtss_Status_Incompatible" xml:space="preserve"><value>Required RTSS profile interface is unavailable.</value></data>
+  <data name="Rtss_Status_Failed" xml:space="preserve"><value>RTSS integration incomplete</value></data>
+  <data name="Rtss_Status_WaitingTarget" xml:space="preserve"><value>Waiting for scaling to start</value></data>
+  <data name="Rtss_Status_Read" xml:space="preserve"><value>Profile read successfully.</value></data>
+  <data name="Rtss_Status_MissingProfile" xml:space="preserve"><value>A target profile will be created when scaling starts.</value></data>
+  <data name="Rtss_Status_WaitingContent" xml:space="preserve"><value>Waiting for a fixed content frame rate · Sync paused</value></data>
+  <data name="Rtss_Status_Applying" xml:space="preserve"><value>Loading frame rate limit</value></data>
+  <data name="Rtss_Status_Written" xml:space="preserve"><value>RTSS is ready</value></data>
+  <data name="Rtss_Status_Conflict" xml:space="preserve"><value>The profile was changed externally.</value></data>
+  <data name="Rtss_Status_Kept" xml:space="preserve"><value>Changes kept.</value></data>
+  <data name="Rtss_Status_Restored" xml:space="preserve"><value>Original frame rate settings restored.</value></data>
+  <data name="Rtss_Status_RestoreFailed" xml:space="preserve"><value>Restoration failed.</value></data>
+  <data name="Rtss_Status_StartingTool" xml:space="preserve"><value>Starting RTSS</value></data>
+  <data name="Rtss_Status_ToolStartFailed" xml:space="preserve"><value>RTSS integration incomplete</value></data>
+  <data name="Rtss_DetectionDisabled" xml:space="preserve"><value>RTSS application detection is disabled.</value></data>
+  <data name="Rtss_TargetOverridesGlobal" xml:space="preserve"><value>The target uses its own profile.</value></data>
+  <data name="Rtss_NoLimit" xml:space="preserve"><value>No frame rate limit</value></data>
+  <data name="Rtss_TimeLimit" xml:space="preserve"><value>The original profile uses a frame time limit.</value></data>
+  <data name="Rtss_SyncUnavailable" xml:space="preserve"><value>Sync is unavailable when content follows the source.</value></data>
+  <data name="Rtss_SyncAtStart" xml:space="preserve"><value>Sync with the current content frame rate.</value></data>
+  <data name="Rtss_CustomAtStart" xml:space="preserve"><value>Apply when scaling starts.</value></data>
+  <data name="Rtss_LaunchRtss" xml:space="preserve"><value>Launch RTSS</value></data>
+  <data name="Rtss_LaunchRtssMissing" xml:space="preserve"><value>RTSS is not installed</value></data>
+  <data name="Rtss_LaunchRtssRunning" xml:space="preserve"><value>RTSS is running</value></data>
+  <data name="Rtss_LaunchAfterburner" xml:space="preserve"><value>Launch MSI Afterburner</value></data>
+  <data name="Rtss_LaunchAfterburnerMissing" xml:space="preserve"><value>MSI Afterburner is not installed</value></data>
+  <data name="Rtss_LaunchAfterburnerRunning" xml:space="preserve"><value>MSI Afterburner is running</value></data>
+  <data name="Rtss_Failure_Access" xml:space="preserve"><value>The RTSS profile interface is unavailable.</value></data>
+  <data name="Rtss_Failure_Target" xml:space="preserve"><value>Could not identify the target application.</value></data>
+  <data name="Rtss_Failure_Read" xml:space="preserve"><value>Could not read the profile.</value></data>
+  <data name="Rtss_Failure_Write" xml:space="preserve"><value>Could not save the profile.</value></data>
+  <data name="Rtss_Failure_Restore" xml:space="preserve"><value>Could not restore the profile.</value></data>
+  <data name="Rtss_Scope_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>RTSS profile management</value></data>
+  <data name="Rtss_RateMode_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>RTSS frame rate setting</value></data>
+  <data name="Rtss_CustomRate_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>RTSS integer frame rate limit</value></data>
+  <data name="Rtss_ExitPolicy_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>RTSS stop policy</value></data>
+  <data name="Rtss_Failure_Interface" xml:space="preserve"><value>The RTSS interface faulted. Restart Magpie.</value></data>
+  <data name="Rtss_Failure_StartTimeout" xml:space="preserve"><value>Tool launch timed out.</value></data>
+  <data name="Rtss_Failure_LibraryMissing" xml:space="preserve"><value>The RTSS profile interface library is missing.</value></data>
+  <data name="Rtss_Failure_Permission" xml:space="preserve"><value>Access denied.</value></data>
+  <data name="Rtss_SyncedRate_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>RTSS synced frame rate limit</value></data>
+  <data name="Rtss_Failure_Set" xml:space="preserve"><value>Could not set the frame rate.</value></data>
+  <data name="Rtss_Failure_Verify" xml:space="preserve"><value>Could not verify the profile.</value></data>
+  <data name="Rtss_Failure_Reload" xml:space="preserve"><value>Could not reload the profile.</value></data>
+  <data name="Rtss_Failure_TimeMode" xml:space="preserve"><value>Could not switch from frame time mode.</value></data>
+  <data name="Rtss_InitializeMagpie" xml:space="preserve">
+    <value>Initialize</value>
+  </data>
+  <data name="Rtss_InitializingMagpie" xml:space="preserve">
+    <value>Initializing…</value>
+  </data>
+  <data name="Rtss_InitializeMagpieButton.ToolTipService.ToolTip" xml:space="preserve">
+    <value>Create an unlimited RTSS profile for Magpie.</value>
+  </data>
+  <data name="Rtss_InitializeMagpieButton.AutomationProperties.Name" xml:space="preserve">
+    <value>Initialize the RTSS profile for Magpie</value>
+  </data>
+  <data name="Rtss_Status_InitializingMagpie" xml:space="preserve">
+    <value>Initializing Magpie</value>
+  </data>
+  <data name="Rtss_Status_MagpieInitialized" xml:space="preserve">
+    <value>Profile initialized.</value>
+  </data>
+  <data name="Rtss_Status_MagpieAlreadyUnlimited" xml:space="preserve">
+    <value>Already unlimited.</value>
+  </data>
+  <data name="Rtss_Failure_ProfileFormat" xml:space="preserve">
+    <value>Could not process the profile format.</value>
+  </data>
+  <data name="Rtss_Failure_MissingInterface" xml:space="preserve"><value>An interface required for this operation is missing.</value></data>
+  <data name="Rtss_Failure_Property" xml:space="preserve"><value>A property required for this operation could not be read.</value></data>
+  <data name="Rtss_Failure_Architecture" xml:space="preserve"><value>Profile library architecture does not match.</value></data>
+  <data name="Rtss_Failure_ProfileObject" xml:space="preserve"><value>Could not confirm the initialization target.</value></data>
+  <data name="Rtss_Failure_SelfProfileConflict" xml:space="preserve"><value>The target and Magpie share the same profile name.</value></data>
+  <data name="Rtss_Failure_InstallationChanged" xml:space="preserve"><value>RTSS profile directory has changed.</value></data>
+  <data name="Rtss_ProfileRate" xml:space="preserve"><value>Configured limit: {} FPS</value></data>
+  <data name="Rtss_RateUnknown" xml:space="preserve"><value>Profile limit could not be read.</value></data>
+  <data name="Rtss_Reloaded" xml:space="preserve"><value>Profile reload requested.</value></data>
+  <data name="Rtss_ProfileSaved" xml:space="preserve"><value>Profile saved.</value></data>
+  <data name="Home_Toolbar_ScreenshotContent.Description" xml:space="preserve"><value>Choose what the toolbar button and screenshot shortcut save.</value></data>
+  <data name="Home_Toolbar_ScreenshotContent.Header" xml:space="preserve"><value>Screenshot content</value></data>
+  <data name="Home_Toolbar_ScreenshotContent_InputAndOutput.Content" xml:space="preserve"><value>Capture original input and final output</value></data>
+  <data name="Home_Toolbar_ScreenshotContent_InputOnly.Content" xml:space="preserve"><value>Capture original input only</value></data>
+  <data name="Home_Toolbar_ScreenshotContent_OutputOnly.Content" xml:space="preserve"><value>Capture final output only</value></data>
+  <data name="Message_ScreenshotBusy" xml:space="preserve"><value>A screenshot is being saved. Try again when it finishes.</value></data>
+  <data name="Message_ScreenshotPairSaved" xml:space="preserve"><value>Screenshots saved: {0} and {1}</value></data>
+  <data name="Message_ScreenshotPartialSaved" xml:space="preserve"><value>Saved {0}; {1} could not be saved. See error details.</value></data>
+  <data name="FrameRefresh_Mode.Header" xml:space="preserve"><value>Режим настроек</value></data>
+  <data name="FrameRefresh_Mode.Description" xml:space="preserve"><value>Простой режим управляет остальными настройками обновления. Применяется ко всем профилям после перезапуска масштабирования.</value></data>
+  <data name="FrameRefresh_Mode_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Режим настроек</value></data>
+  <data name="FrameRefresh_Mode_Simple.Content" xml:space="preserve"><value>Простой</value></data>
+  <data name="FrameRefresh_Mode_Advanced.Content" xml:space="preserve"><value>Расширенный</value></data>
+  <data name="FrameRefresh_Title.Text" xml:space="preserve">
+    <value>Frame rate and refresh</value>
+  </data>
+  <data name="FrameRefresh_RateGroup.Header" xml:space="preserve">
+    <value>Frame rate control</value>
+  </data>
+  <data name="FrameRefresh_RateGroup.Description" xml:space="preserve">
+    <value>Set content frame rate and pacing.</value>
+  </data>
+  <data name="FrameRefresh_StaticGroup.Header" xml:space="preserve">
+    <value>Static content</value>
+  </data>
+  <data name="FrameRefresh_StaticGroup.Description" xml:space="preserve">
+    <value>Control refresh when content is unchanged.</value>
+  </data>
+  <data name="Rtss_SimpleSync.Header" xml:space="preserve">
+    <value>Sync target application limit</value>
+  </data>
+  <data name="Rtss_SimpleSync.Description" xml:space="preserve">
+    <value>Match the content frame rate and restore the original configuration when scaling stops.</value>
+  </data>
+  <data name="Rtss_SimpleSync_Input.OnContent" xml:space="preserve">
+    <value>On</value>
+  </data>
+  <data name="Rtss_SimpleSync_Input.OffContent" xml:space="preserve">
+    <value>Off</value>
+  </data>
+  <data name="Rtss_SimpleSync_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve">
+    <value>Sync target application frame rate limit</value>
+  </data>
+  <data name="Rtss_Mode_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve">
+    <value>Target application frame rate limit mode</value>
+  </data>
+  <data name="Rtss_ScopeLabel.Text" xml:space="preserve">
+    <value>Applies to</value>
+  </data>
+  <data name="Rtss_ExitLabel.Text" xml:space="preserve">
+    <value>When scaling stops</value>
+  </data>
+  <data name="Rtss_Download.Content" xml:space="preserve">
+    <value>Get RTSS</value>
+  </data>
+  <data name="Rtss_Retry.Content" xml:space="preserve">
+    <value>Retry</value>
+  </data>
+  <data name="Rtss_Manage.Content" xml:space="preserve">
+    <value>Manage</value>
+  </data>
+  <data name="Rtss_RecheckMenu.Text" xml:space="preserve">
+    <value>Check again</value>
+  </data>
+  <data name="Rtss_Status_Disabled" xml:space="preserve">
+    <value>RTSS integration is off</value>
+  </data>
+  <data name="Rtss_ScalingContinues" xml:space="preserve">
+    <value>Scaling continues</value>
+  </data>
+  <data name="Rtss_Failure_Launch" xml:space="preserve">
+    <value>Could not start RTSS</value>
+  </data>
+  <data name="Home_FrameRefresh_SimpleSummary" xml:space="preserve">
+    <value>Content: {} · Idle: {} · VRR: {}</value>
+  </data>
+  <data name="FrameRefresh_Content.Description" xml:space="preserve">
+    <value>Set the content processing frame rate.</value>
+  </data>
+  <data name="FrameRefresh_Idle.Description" xml:space="preserve">
+    <value>Redraw unchanged content at the selected frame rate.</value>
+  </data>
+  <data name="FrameRefresh_Cursor.Description" xml:space="preserve">
+    <value>Choose how the cursor refreshes.</value>
+  </data>
+  <data name="FrameRefresh_VRR.Description" xml:space="preserve">
+    <value>Let the display refresh rate follow the output frame rate.</value>
+  </data>
+  <data name="Rtss_Failure_ProcessExited" xml:space="preserve"><value>RTSS has exited</value></data>
+  <data name="Rtss_Status_StartingAfterburner" xml:space="preserve"><value>Starting MSI Afterburner</value></data>
+  <data name="Rtss_Status_AfterburnerStartFailed" xml:space="preserve"><value>MSI Afterburner could not start</value></data>
+  <data name="FrameRefresh_CursorStrategy.Header" xml:space="preserve"><value>Refresh strategy</value></data>
+  <data name="Rtss_Management.Header" xml:space="preserve"><value>Manage</value></data>
+  <data name="Rtss_Recheck.Content" xml:space="preserve"><value>Check again</value></data>
+  <data name="Rtss_ProgramLabel.Text" xml:space="preserve"><value>RTSS</value></data>
+  <data name="Rtss_SelfLabel.Text" xml:space="preserve"><value>Magpie configuration</value></data>
+  <data name="Rtss_Title_WaitingContent" xml:space="preserve"><value>Waiting for a fixed content rate</value></data>
+  <data name="Rtss_Detail_Disabled" xml:space="preserve"><value>Target frame rate is not managed.</value></data>
+  <data name="Rtss_Detail_WaitingContent" xml:space="preserve"><value>Content follows the source; synchronized limiting is paused.</value></data>
+  <data name="Rtss_Detail_WaitingTarget" xml:space="preserve"><value>RTSS is prepared automatically when scaling starts.</value></data>
+  <data name="Rtss_Detail_Checking" xml:space="preserve"><value>Checking the program and configuration interface.</value></data>
+  <data name="Rtss_Detail_Starting" xml:space="preserve"><value>Waiting for RTSS to start.</value></data>
+  <data name="Rtss_Detail_Initializing" xml:space="preserve"><value>Removing the frame cap from Magpie’s own configuration.</value></data>
+  <data name="Rtss_Detail_Applying" xml:space="preserve"><value>Applying the target program’s frame cap.</value></data>
+  <data name="Rtss_Detail_NotInstalled" xml:space="preserve"><value>Install RTSS, then check again.</value></data>
+  <data name="Rtss_Detail_Global" xml:space="preserve"><value>RTSS global configuration</value></data>
+  <data name="Rtss_Detail_Target" xml:space="preserve"><value>Current target program</value></data>
+  <data name="Rtss_Inventory_Checking" xml:space="preserve"><value>Checking</value></data>
+  <data name="Rtss_Inventory_Missing" xml:space="preserve"><value>Not installed</value></data>
+  <data name="Rtss_Inventory_Running" xml:space="preserve"><value>Running</value></data>
+  <data name="Rtss_Inventory_Stopped" xml:space="preserve"><value>Installed, not running</value></data>
+  <data name="Rtss_Inventory_Initializing" xml:space="preserve"><value>Initializing</value></data>
+  <data name="Rtss_Inventory_Unlimited" xml:space="preserve"><value>Unlimited</value></data>
+  <data name="Rtss_Inventory_Uninitialized" xml:space="preserve"><value>Needs initialization</value></data>
+  <data name="Rtss_Inventory_Unknown" xml:space="preserve"><value>Not checked</value></data>
+  <data name="Rtss_Management_Failed" xml:space="preserve"><value>Magpie initialization failed</value></data>
+  <data name="Rtss_Management_LaunchFailed" xml:space="preserve"><value>RTSS did not start</value></data>
+  <data name="Rtss_Management_Started" xml:space="preserve"><value>Started</value></data>
+  <data name="Rtss_Detail_RetryReady" xml:space="preserve"><value>RTSS is available. Retry to apply the frame cap.</value></data>
+  <data name="Rtss_Takeover.Header" xml:space="preserve"><value>RTSS configuration management</value></data>
+  <data name="Rtss_ManageText.Text" xml:space="preserve"><value>Manage</value></data>
+  <data name="Rtss_ManagementToggle.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Manage</value></data>
+  <data name="Rtss_OptionalAfterburner.Header" xml:space="preserve"><value>MSI Afterburner</value></data>
+  <data name="Rtss_OptionalAfterburner.Description" xml:space="preserve"><value>Optional tool</value></data>
+  <data name="Rtss_LaunchOptional.Content" xml:space="preserve"><value>Launch</value></data>
+  <data name="Rtss_LaunchOptional.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Launch MSI Afterburner</value></data>
+  <data name="Profile_CropLeftLabel.Text" xml:space="preserve"><value>Слева</value></data>
+  <data name="Profile_CropLeft_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Слева</value></data>
+  <data name="Profile_CropRightLabel.Text" xml:space="preserve"><value>Справа</value></data>
+  <data name="Profile_CropRight_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Справа</value></data>
+  <data name="Profile_CropTopLabel.Text" xml:space="preserve"><value>Сверху</value></data>
+  <data name="Profile_CropTop_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Сверху</value></data>
+  <data name="Profile_CropBottomLabel.Text" xml:space="preserve"><value>Снизу</value></data>
+  <data name="Profile_CropBottom_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Снизу</value></data>
+  <data name="Rtss_ManagementExpanded" xml:space="preserve"><value>Management details expanded</value></data>
+  <data name="Rtss_ManagementCollapsed" xml:space="preserve"><value>Management details collapsed</value></data>
+  <data name="Profile_InitialScale_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Начальный множитель масштабирования</value></data>
+  <data name="Profile_CursorScale_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Множитель масштабирования</value></data>
+  <data name="DlssNr_State_Disabled" xml:space="preserve">
+    <value>DLSSNR is not running (effect group is closed).</value>
+  </data>
+  <data name="DlssNr_State_Starting" xml:space="preserve">
+    <value>DLSSNR is starting; waiting for a successfully processed frame.</value>
+  </data>
+  <data name="DlssNr_State_Running" xml:space="preserve">
+    <value>DLSSNR is running.</value>
+  </data>
+  <data name="DlssNr_State_Skipped" xml:space="preserve">
+    <value>DLSSNR has been skipped; the effect group continues without DLSSNR processing.</value>
+  </data>
+  <data name="DlssNr_State_Stopped" xml:space="preserve">
+    <value>The effect group has stopped; DLSSNR is not processing frames.</value>
+  </data>
+  <data name="DlssNr_Reason_Adapter" xml:space="preserve">
+    <value>The selected rendering GPU is not an NVIDIA adapter.</value>
+  </data>
+  <data name="DlssNr_Reason_Missing" xml:space="preserve">
+    <value>nvngx_dlssnr.dll was not found in the program directory.</value>
+  </data>
+  <data name="DlssNr_Reason_Load" xml:space="preserve">
+    <value>The DLSSNR library could not be loaded. The library or one of its dependencies may be incompatible.</value>
+  </data>
+  <data name="DlssNr_Reason_Exports" xml:space="preserve">
+    <value>The loaded DLSSNR library lacks required interfaces.</value>
+  </data>
+  <data name="DlssNr_Reason_Compatibility" xml:space="preserve">
+    <value>NGX rejected this combination of system, graphics API, GPU and library. The result does not identify which component is incompatible.</value>
+  </data>
+  <data name="DlssNr_Reason_Version" xml:space="preserve">
+    <value>NGX requires a newer driver or feature library; it did not identify which one.</value>
+  </data>
+  <data name="DlssNr_Reason_Memory" xml:space="preserve">
+    <value>The graphics API or NGX reported insufficient memory.</value>
+  </data>
+  <data name="DlssNr_Reason_Access" xml:space="preserve">
+    <value>Access failed at the operation shown in the details. This does not by itself mean Magpie needs administrator rights.</value>
+  </data>
+  <data name="DlssNr_Reason_Fault" xml:space="preserve">
+    <value>NGX encountered an exception and is disabled for the rest of this Magpie process.</value>
+  </data>
+  <data name="DlssNr_Reason_Build" xml:space="preserve">
+    <value>This Magpie build does not include DLSSNR support.</value>
+  </data>
+  <data name="DlssNr_Reason_Unknown" xml:space="preserve">
+    <value>DLSSNR failed at the step shown in the details. The available result does not establish the cause.</value>
+  </data>
+  <data name="DlssNr_Advice_Restart" xml:space="preserve">
+    <value>Exit Magpie completely from the system tray, reopen it, then enable the effect group. Disabling and enabling the group alone cannot reset NGX. Confirm that DLSSNR shows “running”; if it fails again, copy the diagnostics for a report.</value>
+  </data>
+  <data name="DlssNr_Advice_Files" xml:space="preserve">
+    <value>Open the program directory and recovery guide. Exit Magpie, restore the complete matching runtime from the package for this version, then reopen Magpie and enable the group. Confirm “DLSSNR is running”; if it still fails, copy the diagnostics.</value>
+  </data>
+  <data name="DlssNr_Advice_Adapter" xml:space="preserve">
+    <value>Open the affected profile and inspect Rendering GPU. Select a compatible NVIDIA GPU only if one is available; otherwise remove DLSSNR from this effect group. Enable the group again and check its status.</value>
+  </data>
+  <data name="DlssNr_Advice_Version" xml:space="preserve">
+    <value>Check the detected GPU, driver and DLL version in the details against the requirements of this version’s runtime package. Update only the component that does not meet those requirements, reopen Magpie and enable the group. If the requirements are unclear or the failure persists, copy the diagnostics.</value>
+  </data>
+  <data name="DlssNr_Advice_Memory" xml:space="preserve">
+    <value>Close other GPU-intensive applications, lower the source resolution, or open this effect group and reduce DLSSNR Multi Pass to 1 if it is higher. Enable the group again and confirm “running”. If it still fails, copy the diagnostics.</value>
+  </data>
+  <data name="DlssNr_Advice_Access" xml:space="preserve">
+    <value>Check the operation and path in the details. For library reads, restore readable runtime files; for NGX data writes, use a user-writable program directory. Reopen Magpie and enable the group. If no path or cause is identified, copy the diagnostics instead of changing permissions blindly.</value>
+  </data>
+  <data name="DlssNr_Advice_Unknown" xml:space="preserve">
+    <value>Open the details and check the actual GPU and runtime file against this version’s package instructions. Enable the group once more and confirm “DLSSNR is running”. If it fails again, copy the diagnostics and report the failing step; temporarily remove DLSSNR to use the other effects.</value>
+  </data>
+  <data name="DlssNr_Parameter_HdrRestricted" xml:space="preserve">
+    <value>This parameter is available only in the SDR DLSSNR path. HDR processing can still be running; see the status above.</value>
+  </data>
+  <data name="Overlay_EffectParameters_Restricted" xml:space="preserve">
+    <value>This parameter is not available for the current effect or processing mode, or is controlled by a paired HDR component. This is not a backend failure.</value>
+  </data>
+  <data name="Overlay_EffectParameters_BackendUnavailable" xml:space="preserve">
+    <value>The effect is not processing frames. See its status and next steps above; parameter edits cannot restore it.</value>
+  </data>
+  <data name="Message_DlssNrUnavailable" xml:space="preserve">
+    <value>DLSSNR has been skipped while the effect group continues. Open the details for the detected reason and recovery steps; confirm “DLSSNR is running” after recovery.</value>
+  </data>
+  <data name="Message_DlssNrStopped" xml:space="preserve">
+    <value>The effect group stopped because DLSSNR failed. Open the details, follow the detected recovery steps, then enable the group again and confirm its status.</value>
+  </data>
+  <data name="Message_WindowIntegrityQueryFailed" xml:space="preserve">
+    <value>Magpie could not query the source window’s permissions, so the effect group was not started. Return to the target application, wait until it is responsive, then enable the group again. If it still fails, copy the diagnostics and logs; higher target permissions have not been confirmed.</value>
+  </data>
+  <data name="Home_DlssNrStatus.Title" xml:space="preserve">
+    <value>Current DLSSNR session</value>
+  </data>
+  <data name="ErrorDetails_OpenEffectsButton.Content" xml:space="preserve">
+    <value>Open affected effect group</value>
+  </data>
+  <data name="DlssNr_OpenHelp" xml:space="preserve">
+    <value>Open status and recovery steps</value>
+  </data>
+  <data name="DlssNr_OpenGuide" xml:space="preserve">
+    <value>Open recovery guide</value>
+  </data>
+  <data name="DlssNr_OpenDirectory" xml:space="preserve">
+    <value>Open program directory</value>
+  </data>
+  <data name="DlssNr_OpenFailed" xml:space="preserve">
+    <value>Could not open the location. Use the path below to open it manually.</value>
+  </data>
+  <data name="ErrorDetails_EffectsChanged" xml:space="preserve">
+    <value>The recorded effect group or its effect order has changed, or its name is ambiguous. The list is open; locate the group using the name in the diagnostics. No other group was selected.</value>
+  </data>
+  <data name="ErrorDetails_EffectsLocated" xml:space="preserve">
+    <value>Affected effect group: {}{}</value>
+  </data>
+  <data name="Overlay_EffectParameters_RestrictedBadge" xml:space="preserve"><value>Restricted</value></data>
+</root>

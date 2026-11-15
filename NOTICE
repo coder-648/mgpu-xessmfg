@@ -24,7 +24,7 @@ Copyright (C) 2026 bilibili夕阳虹舞
    - OptiScaler 的 Dynamic MFG 设计思路也影响了 --dyn-mfg 的接线方式
 
    这几处是本仓库选择 GPL-3.0 的直接原因：OptiScaler 是 copyleft，
-   而 xefg_dynamic_count.h 被编译进了 bridge.exe。
+   而 xefg_dynamic_count.h 被编译进了 bridge.exe 与 xess_mfg_consumer.exe。
 
 2) AMD FidelityFX SDK 1.1.4                              MIT
    https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
@@ -47,16 +47,16 @@ Copyright (C) 2026 bilibili夕阳虹舞
 ===============================================================================
 
 ReShade 6.8.0                        BSD-3-Clause   https://github.com/crosire/reshade
-  add-on 的宿主（ABI 必须与它对齐）。部署包里会带一份 ReShade64.dll，
-  因此发布二进制包时要同时附上它的 LICENSE.md。
+  **旧 add-on 的宿主（历史）**。当前 fakerFG 链路不再需要 ReShade
+  （`InjectReshade=0`）；只有继续使用旧 add-on 部署包时才需要它的 LICENSE.md。
 
 MinHook                              BSD-2-Clause   https://github.com/TsudaKageyu/minhook
-  add-on 用来钩 Present / upscaler 入口。
+  fakerFG 的模块/加载器钩子使用（旧 add-on 也用过）。
 
 Intel XeSS SDK 3.0.2                 Intel 专有许可  https://github.com/intel/xess
-  含 libxess_fg.dll / libxell.dll / libxess.dll。**本仓库不提交这些 DLL**
-  （.gitignore 已排除 third_party/xess/bin/），发布二进制包前必须先读它的
-  LICENSE.txt。见 docs/ops/LEGAL.md。
+  含 libxess_fg.dll / libxell.dll / libxess.dll。当前 consumer 运行 XeFG 时使用；
+  **本仓库不提交这些 DLL**（.gitignore 已排除 third_party/xess/bin/），
+  发布二进制包前必须先读它的 LICENSE.txt。见 docs/ops/LEGAL.md。
 
 NVIDIA DLSS SDK                      NVIDIA 专有许可
   只作 DLSS 输入约定的参考，不参与编译。

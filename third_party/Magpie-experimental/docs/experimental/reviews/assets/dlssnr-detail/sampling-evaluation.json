@@ -1,0 +1,11 @@
+{
+  "evidence": "Offline float64, synthetic step/gradient; not GPU or perceived video quality",
+  "catmullStepMin": -0.003703703675925008,
+  "catmullStepMax": 0.053703703675925016,
+  "catmullOvershoot8bitCodes": 0.9444444373608784,
+  "linearStepOvershoot": 0,
+  "ditherMeanBeforeQuantization": 0.0,
+  "plainQuantizationRMSErrorCodes": 0.28853400765673043,
+  "orderedQuantizationRMSErrorCodes": 0.4077954810704954,
+  "decision": "Retain Catmull-Rom and no added dither; compare real content before changing defaults"
+}

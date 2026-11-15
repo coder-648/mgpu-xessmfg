@@ -4,7 +4,8 @@
 —— 全文见根目录 `LICENSE`，第三方组件的逐项署名见 `NOTICE`。
 
 > 为什么是 GPL-3.0 而不是 MIT：`src/xefg_dynamic_count.h` 是 OptiScaler
-> （GPL-3.0）`XeFG_DynamicCount.h` 的逐字移植，而且它被编译进了 `bridge.exe`。
+> （GPL-3.0）`XeFG_DynamicCount.h` 的逐字移植，而且它被编译进了 `bridge.exe`
+> 与 `xess_mfg_consumer.exe`。
 > `third_party/optiscaler/` 下另有 6 个逐字保留的参考文件。
 > 想改成宽松许可，必须先把这两处去掉（见本文末尾）。
 
@@ -12,8 +13,9 @@
 
 | 场景 | 义务 |
 |---|---|
-| 分发 `game_capture.addon64` / `bridge.exe` / `mgpu_ui.exe` | GPL-3.0：附上或指向完整对应源码 |
-| 分发 `docs/ops/DEPLOY.md` 生成的部署包（含 `ReShade64.dll`） | 再加上 ReShade 的 **BSD-3-Clause** 许可证文本 |
+| 分发当前链路产物（`fakerFG.dll` / `xess_mfg_producer.dll` / `xess_mfg_consumer.exe` / `mgpu_ui.exe`） | GPL-3.0：附上或指向完整对应源码 |
+| 分发旧产物（`game_capture.addon64` / `bridge.exe` / `mgpu_ui.exe`） | GPL-3.0：附上或指向完整对应源码 |
+| 分发 `docs/ops/DEPLOY.md` 生成的旧部署包（含 `ReShade64.dll`） | 再加上 ReShade 的 **BSD-3-Clause** 许可证文本 |
 | 分发时把 `libxess_fg.dll` / `libxell.dll` 一起打包 | **先读 Intel XeSS SDK 的许可**（见 §3） |
 
 本仓库**不**包含任何 Intel / NVIDIA 的 DLL：`.gitignore` 排除了

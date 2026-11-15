@@ -33,6 +33,15 @@ set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STAGE_ROOT="${MGPU_STAGE:-/mnt/c/temp/mgpu}"
 
+# The ReShade add-on (and therefore this release layout) was retired on 2026-11-14:
+# the game side is now fakerFG.dll + xess_mfg_producer.dll, no add-on, no ReShade.
+# This script is kept for history only; do not run it until it is rewritten.
+printf '[release] retired: the game side is now fakerFG.dll + xess_mfg_producer.dll\n' >&2
+printf '[release] build: ./scripts/build_faker_fg.sh && ./scripts/build_producer.sh\n' >&2
+printf '[release] deploy: ./scripts/deploy_faker_fg.sh "<game exe dir>"\n' >&2
+printf '[release] see docs/design/XESS_MFG_PRODUCER.md\n' >&2
+exit 2
+
 BRIDGE="$REPO/build/bridge.exe"
 ADDON="$REPO/build/game_capture.addon64"
 UI="$REPO/build/mgpu_ui.exe"

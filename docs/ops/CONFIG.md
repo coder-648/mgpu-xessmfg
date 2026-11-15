@@ -1,122 +1,166 @@
-# 配置速查：占位符、环境变量、ini 键
+# 配置速查（当前链路，2026-11-14）
 
-这份文档解释 `docs/` 与脚本里出现的占位符和可调项。**仓库里没有任何本机路径**
-—— 看到 `<GAME_DIR>` 这类尖括号就是要你填自己的位置。
+本文只讲**当前链路**的可配置项：
+
+- 游戏侧：`fakerFG.ini`（fakerFG 与 producer 都读它）
+- 消费端：`xess_mfg_consumer.exe` 命令行 / `mgpu_ui.exe`
+- 构建：环境变量（`MGPU_STAGE` 等）
+
+旧 `game_capture.ini`（ReShade add-on）已归档到
+[`archive/CONFIG_game_capture.md`](archive/CONFIG_game_capture.md)。
+
+---
 
 ## 1. 路径占位符
 
 | 占位符 | 含义 | 例 |
 |---|---|---|
-| `<GAME_DIR>` | **直接包含游戏 exe** 的那一层目录 | `D:\Games\XXX\bin\x64` |
-| `<TOOLS_DIR>` | `bridge.exe` + `mgpu_ui.exe` + 两个 XeSS DLL 放一起的目录 | `D:\mgpu\bin` |
-| `<STAGE_DIR>` | WSL 侧构建的中转目录，**必须是 Windows 可见的路径**（`cl.exe` 不能用 UNC 路径当工作目录） | `C:\temp\mgpu`（默认） |
-| `<DUMP_DIR>` | `bridge.exe --dump` 写 `.raw` 的目录 | `<TOOLS_DIR>\dump` |
-| `<PYTHON>` | 带 numpy 的 python（`scripts/analyse_dump.sh` 用） | `C:\Python\Python310\python.exe` |
-| `<RTSS_DIR>` | RivaTuner Statistics Server 安装目录（限帧器） | 见 §4 |
-| `<BUILDTOOLS_DIR>` / `<MINGW64_DIR>` | MSVC Build Tools / 可选的 mingw 工具链 | 见 `docs/ops/BUILD.md` |
+| `<GAME_DIR>` | **直接包含游戏 exe** 的目录 | `D:\Games\XXX\bin\x64` |
+| `<TOOLS_DIR>` | consumer + UI + Intel DLL 同目录 | `D:\mgpu\bin` |
+| `<STAGE_DIR>` | WSL 构建中转目录，必须 Windows 可见 | `C:\temp\mgpu`（默认） |
+| `<DUMP_DIR>` | `--dump` 输出的 `.raw` 目录 | `<TOOLS_DIR>\dump` |
+| `<RTSS_DIR>` | RivaTuner Statistics Server 安装目录 | — |
 
-`<GAME_DIR>` 一定要指向 exe 所在层，不是上一级：`...\Cyberpunk 2077\bin\x64`、
-`...\PBZ\platform\steam` 都是"exe 所在层"的例子。
+---
 
-## 2. 环境变量
+## 2. 环境变量（构建/打包）
 
 | 变量 | 作用 | 默认 |
 |---|---|---|
-| `MGPU_STAGE` | 覆盖 `<STAGE_DIR>`（构建脚本与打包脚本共用） | `/mnt/c/temp/mgpu` |
-| `RESHADE_SRC` | 打包时指定 ReShade 6.8 x64 DLL 的路径 | 依次找 `$MGPU_STAGE/ReShade64.dll` |
-| `SKIP_TOOLS` | `=1` 表示打包只要 add-on，不带 `bridge.exe` / `mgpu_ui.exe` | `0` |
-| `REBUILD` | `=1` 强制重新编译 add-on 再打包 | `0` |
-| `MGPU_CAPTURE_LOG` | `=1` 打开 add-on 日志（等价于 ini 里 `Log=1`） | 关 |
+| `MGPU_STAGE` | 构建暂存目录（cl 不能用 UNC 工作目录） | `/mnt/c/temp/mgpu` |
+| `REBUILD` | `make_release_fg.sh`：`1` = 先重编四件产物 | `0` |
+| `MGPU_VERSION` | 发布版本号 | `0.11-<sha>` |
+| `SKIP_XESS_DLLS` | `1` = 发布包不带 Intel 的 `libxess_fg.dll` / `libxell.dll` | `0` |
 
-```bash
-MGPU_STAGE=/mnt/d/mgpu_stage ./scripts/build_bridge.sh
-RESHADE_SRC=/mnt/d/ReShade64.dll ./scripts/make_addon_package.sh
-```
+---
 
-## 3. `game_capture.ini`（放在 add-on 旁边，游戏目录里）
+## 3. `fakerFG.ini`
 
-| 键 | 取值 | 说明 |
+位置：游戏 exe 同目录。**只在启动时读一次**；改完要重开游戏。
+
+### 3.1 必看键
+
+| 键 | 默认 | 说明 |
 |---|---|---|
-| `Color` | `0` / `1` | `0`（默认）= 不做颜色跨卡拷贝，颜色由 bridge 用 WGC 从屏幕抓；`1` = 从后台缓冲拷贝 |
-| `StreamHeight` | `0`…`4320` | **跨卡流（MV+深度）的高度上限，默认 `1440`** ⇒ 4K 游戏传 2560x1440（28 MB/帧，而不是 63）。`0` = 不限制（跟随渲染尺寸，旧行为）；`2160` = 恢复全分辨率；`1080` = 再降一档 |
-| `StreamPercent` | `100`…`400` | 在 `StreamHeight` 结果之上**再**按比例缩小（相对渲染尺寸算；`150` = 渲染的 2/3）。默认 `100` |
-| `StreamAlign` | `0` / `1` | 行对齐处理，默认 `1`，别乱改 |
-| `SkipMv` | `0` / `1` | `1` = 永不产出 MV；`0` = 听 bridge 的请求位（协议 v7） |
-| `DepthConvert` | `0` / `1` | **默认 `1`**：把深度转成 R32_FLOAT 再共享。缺这个键时旧版本会静默失效 |
-| `Input` | `auto` / `ngx` / `ffx` / `xess` / `depth` | 输入源；`auto` 先到先用。见 `docs/design/INPUT_SOURCES.md` |
-| `Log` | `0` / `1` | 默认关，排查时开 |
-| `FgSniff` | `0`（默认）/ `1` | **只读**地钩住游戏自己的帧生成（Streamline `slSetConstants`/`slSetTag*`、`nvngx_dlssg` 的 `DLSSG.*` 参数、`libxess_fg` 的 `xefgSwapChainTagFrameConstants`），把游戏**自己声明**的投影矩阵 / `clipToPrevClip` / MV 尺度 / jitter / 深度方向打进 add-on 日志。不发布任何数据、不改参数、不会成为 `Input` 源。需同时 `Log=1`。见 `docs/findings/FG_SNIFF.md` |
-| `LoaderHook` | `1`（默认）/ `0` | `1` = 钩住 `kernel32!LoadLibrary*`，游戏一加载 `nvngx`/`amd_fidelityfx`/`libxess` 就立刻发现；`0` = **不碰游戏的加载器**，改为每 120 帧扫一次模块表（发现晚一点）。**排查"装上 add-on 后游戏加载变慢"时先试 `0`**（RE Engine / PRAGMATA 案例见 `docs/findings/RE_ENGINE_NOTES.md` §6） |
-| `SlotPolicy` | `0` / `1` | `0` = 没空槽就丢这一帧（实时默认）；`1` = 最多等 `SlotWaitUs` 微秒。**实测 `1` 没有收益**，当遗留开关看 |
-| `SlotWaitUs` | 微秒 | 仅 `SlotPolicy=1` 时生效，默认 `2000` |
-| `RenderWidth` / `RenderHeight` | ≥256 才生效 | 强制渲染分辨率（只在游戏上报错时用） |
-| `MvNormalize` / `MvFlip` | `0` / `1` | MV 单位/符号修正。`MvNormalize=auto` 会按**声明**的单位自动换算（pixels→÷流宽、ndc→×0.5）；默认 `0` = 原样透传，因为换算会改变 bridge 收到的数据，必须显式开 |
-| `StreamlineCamera` | `1`（默认）/ `0` | 把 Streamline `sl::Constants` 里的**真实投影矩阵**（不含 TAA jitter）发给 bridge（协议 v12），让它不再靠 `--fg-fov` 猜。DLSS 不导出相机，这是唯一拿到真 FOV/aspect/无限远 reversed-Z 的途径；源自己声明相机时（FSR 3.1）不生效 |
+| `Mode` | `consume` | `off` / `observe` / `idle` / `local` / `consume`（`bridge` = consume 别名） |
+| `StreamPercent` | `150` | 跨卡流尺寸：150≈2/3（4K→2560×1440，28.1 MB）；100=1:1（63.3 MB）；200=1/2；400=1/4。COPY-only 列表会自动回退到 100 |
+| `Interpolated` | `1` | `local` 模式每真帧生成几张（1 = 2x）；上限见启动日志 |
+| `Publish` | `1` | `0` = 完全不发布/不传输（只用于测量发布路径开销） |
+| `Log` | `1` | 写 `<游戏exe>_fakerFG.log`（每行 flush） |
+| `InjectReshade` | `0` | 当前链路不需要 ReShade；只有想加别的 shader 时才设 1 |
 
-## 4. bridge 侧
+### 3.2 FG 链路（一般不用动）
 
-参数全集见 `docs/findings/FINAL_CONFIG.md` §4，日常只用三份配方脚本
-（`scripts/recipes/`，见 `README.md`）。最容易被误调的三个：
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `OwnSwapchain` | `1` | 接管交换链（本链路前提） |
+| `RealSwapchainObject` | `1` | 交还 libxess 真链 + vtable 钩子 |
+| `FakeDlssgFeature` | `0` | 0 = 拒绝标题自己的 DLSS-G，整帧渲进我们交出的链（链路模式） |
+| `WriteOutputReal` | `0` | provider 模式才设 1 |
+| `MvResample` | `1` | 全分辨率 MV → depth 尺寸（已同尺寸时自动跳过） |
+| `TagAtEvaluate` | `1` | tag 在 Evaluate 上；`MvResample` 只在路径里执行 |
+| `ForceBorderless` | `1` | 必须为 1，否则 libxess 判全屏并拒绝插帧 |
+| `FgInput` / `FgOutput` | `Upscaler` / `XeFG` | 输入取 DLSS-SR 参数块，输出由 XeFG 呈递 |
+| `Passthrough` | `0` | 1 = 不回答、不接管（等效没装） |
+| `ArchSpoof` | `1` | 向 Streamline 回答 sm_80+，让 30 系菜单出现 FG |
+
+### 3.3 输入声明 / 诊断
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `MvState` / `DepthState` | `0` | 资源声明状态（0 = 64 = NON_PIXEL_SHADER_RESOURCE） |
+| `MvJittered` / `HighResMv` / `DepthInverted` | `0` / `0` / `1` | 覆盖 XeFG init flags（一般不用动） |
+| `TagHudless` / `TagUi` | `0` | 是否把 HUDless/UI 交给 XeFG（Upscaler 车道不发） |
+| `CameraNear` / `CameraFar` / `VerticalFov` | `0.1` / `100000` / `60` | 合成投影参数（有游戏真矩阵时不用） |
+| `DebugView` | `0` | 在画面标记插值帧 |
+| `DebugOnlyGenerated` | `0` | 只显示生成帧（最强“是否在生成”的验证） |
+| `IgnoreInitChecks` | `0` | 跳过 XeFG 初始化检查（排障用） |
+
+### 3.4 producer 相关
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `StreamPercentMv` | = `StreamPercent` | 只覆盖 MV 流（协议 v15） |
+| `StreamPercentDepth` | = `StreamPercent` | 只覆盖深度流 |
+| `Mode=consume` | — | 生产端只发布、不在本卡补帧 |
+
+> `StreamPercentMv=100` + `StreamPercentDepth=200` 是“MV 全分辨率 + 深度半分辨率”，
+> 消费端需加 `--upsample`（XeFG 要求两流同尺寸）。
+
+---
+
+## 4. 消费端参数
+
+完整列表以源码为准（`main.cpp` / `state_overlay.cpp`）；这里按用途分组。
+
+### 4.1 产品路径
 
 | 参数 | 说明 |
 |---|---|
-| `--input-ms X` | 把"输入间隔"当成 X ms（**仅影响 `load`/`slow` 统计**；`--fg-rt-mode quant` 下不再参与 pacing）。界面已不开放这一项 |
-| `--no-mv` / `--fg-of` | 前者完全不产 MV，后者改用 AMD 光流算 MV。**两者互斥** |
-| `--fg-jittered-mv` / `--fg-no-jittered-mv` | 置/清 `XEFG_SWAPCHAIN_INIT_FLAG_JITTERED_MV`（SDK 原文："Remove jitter from input velocity"）。**通常不用手动加**：add-on 会把游戏在 DLSS `CreateFeature` 里声明的 `MVJittered`（以及 `DepthInverted`）上报，bridge 自动跟随（日志 `dlss feature flags 0x..: ...` + `initFlags=0x..`）。PBZ 实测声明 `MVJittered=0`，所以那里**不该**置。自动路径**只管"游戏 MV"**：`--fg-of` 与 `--no-mv` 不受影响（要试就显式加 `--fg-jittered-mv`） |
-| `--fg-mv-scale raw\|px\|<float>` | 交给 XeFG 的 `motionVectorScaleX/Y`。`raw`（默认）= 游戏自己的 `MV.Scale`；`px` = 游戏 scale × MV 纹理尺寸（把"UV 空间矢量"折算成 XeFG 文档要求的**像素**）；`<float>` = 强制该值。PBZ 报 `(1,1)`、CP2077 报 `(2560,1440)`，所以这条要用 `--dump` + `scripts/analyse_dump.py` 的 units fit 量出来再定（详见 `docs/findings/UE5_MV_OPTISCALER.md` §7.3） |
+| `--game <exe>` / `--hwnd 0x…` | 目标窗口 |
+| `--interp N` | 固定倍率：N=1 → 2x |
+| `--interp-cadence` | 动态逐帧，N 为容量上限 |
+| `--fg-out-hz N` | 输出上限（0 = 面板） |
+| `--fg-rt-mode …` | `frameRenderTime` 来源（默认 `auto`，UI 用 `auto`） |
+| `--pool N` / `--latency N` | WGC 帧池 / 最大延迟 |
+| `--den N` / `--scale F` | 生成分辨率 |
+| `--sdr` | SDR 输出 |
+| `--gpu N` | 指定插帧卡 |
+| `--no-osd` | 关闭 OSD |
+| `--unlock-mfg` | 解锁 3x–6x（个人研究） |
+| `--fg-ui none` | 不合成 UI 纹理 |
 
-### 4.1 上屏放哪块屏（2026-11-08 新增）
+### 4.2 输入/画质 A/B
 
 | 参数 | 说明 |
 |---|---|
-| `--overlay-monitor N` | 把覆盖窗口（也就是 XeFG 的上屏）放到**第 N 块显示器**（`EnumDisplayMonitors` 顺序，0 起）。默认跟随游戏窗口所在屏。它的镜像参数是 `--capture-monitor`（抓哪块屏）—— **抓屏和上屏是两个独立的决定**，可以抓屏 1 上屏 2 |
-| `--overlay-hidden` | 只做测量：交换链照建、Present 照跑，但窗口不显示。用来分辨"抖动是我们这层覆盖窗口造成的"还是"WGC/合成器本来就抖"（实测见 `docs/findings/PERF_BASELINE.md` §3.12） |
+| `--upsample` | 消费卡重建 MV/深度到渲染尺寸 |
+| `--stream-auto` | 自动每流 `StreamPercent` |
+| `--stream-asym` | MV 1:1 + 深度降档（隐含 `--upsample`） |
+| `--no-depth` | 不传深度 |
+| `--no-marker` | 关闭 marker 配对 |
+| `--no-prefetch-inputs` | 关闭输入预拷 |
+| `--pub-fifo` / `--no-pub-fifo` | 默认开：按发布队列顺序消费；关掉后仍拷贝，但按 publication 值匹配 |
+| `--no-mv` / `--fg-of` / `--mv-flip` | MV 来源覆盖（排障） |
 
-两条硬性前提：
+### 4.3 诊断
 
-1. **显示器必须接在"跑 XeFG 的那张卡"上**。`--overlay-monitor` 指向的那块屏如果不由消费卡驱动，
-   `CreateSwapChainForHwnd` 会 `E_ACCESSDENIED`，所以 bridge 会**先校验再回落**到游戏窗口所在屏，
-   并在日志里写明原因。
-2. **两块屏接同一张卡才有意义**。如果第二块屏接在渲染卡上，自动选卡会为了"驱动上屏屏"把
-   XeFG 换到渲染卡（日志会出现 `note: same GPU as the producer`），此时插帧和游戏抢同一张 GPU，
-   `gpu` 会从个位数涨到 60+ ms（实测）。正确形态是**两块屏都接帧生成卡**。
+`--report N`、`--log-flush`、`--dump N`、`--marker-probe`、`--probe-colour`、
+`--list-modes`、`--no-capture-thread`、`--colour-queue N`、`--mv-shadow`、
+`--fg-probe`、`--exit-on-focus-loss` 等。默认不要开。
 
-### 4.2 覆盖窗口在 Alt+Tab / Win+Tab 里只算一个"游戏"
+动态逐帧相关（2026-11-14 第三轮）：锚点是 **交给 XeFG 的时点**，每批在 tag 前等待
+vblank 槽位（`target_{n+1}=target_n+k×vblank`），批次首尾相接；`--no-fg-pace` 关闭该
+pacer 做 A/B。`frameRenderTime` 默认 `k × vblank`（`--fg-cad-rt 0` 回到输入均值）。
 
-覆盖窗口是**另一个进程里的另一个窗口**，一不小心就会在 Alt+Tab / Win+Tab 里变成第二个条目
-（而且那个缩略图是**成品画面**，游戏的缩略图是**原始画面**，看起来像"两张图"）。
-bridge 在窗口显示之后做四件事，日志里各占一行：
+**默认策略是 `--cad-policy locked`**（2026-11-15 起）：`k = ceil(target/输入率)`，
+每批预算恒为 `k × vblank`，vblank 周期由 DWM 的 `qpcRefreshPeriod` 实测
+（本机 8.3332 ms = 120.002 Hz）。配合把游戏锁到 `120/k`（40→3x、30→4x、60→2x），
+间距误差约 0.4%、k 恒定、相位 std ≈0.16 ms。
+`--pool 2` / `--colour-queue 1` / `--latency 1` 是默认值。
 
-| 手段 | 日志 | 作用 |
-|---|---|---|
-| **创建时** `WS_EX_TOOLWINDOW` | 无 | 从源头就不登记为应用窗口（不进任务栏 / Alt+Tab / Task View） |
-| `DWMWA_EXCLUDED_FROM_PEEK` / `DWMWA_DISALLOW_PEEK` | `switcher: peek excl hr=...` | 不进 Aero Peek / 缩略图预览 |
-| `ITaskbarList::DeleteTab` | `switcher: ... DeleteTab hr=0x00000000` | 删掉可能已登记的条目 |
-
-> ⚠️ **不要**用 `SetWindowLongPtr(GWLP_HWNDPARENT, 游戏窗口)` 把覆盖窗口变成游戏的"被拥有窗口"。
-> 它确实能让 Task View 分组，但**实测会让游戏的鼠标输入完全失效（键盘仍正常）**：
-> `click probe` 显示点击仍然落在游戏上（不是 hit-test 吃掉的），是 owner 关系改变了输入/激活语义。
-> 覆盖窗口必须保持普通顶层窗口。
-
-另外 **Task View / Alt+Tab / Win+D 不再算"焦点丢失"**：`explorer.exe` 的
-`XamlExplorerHostIslandWindow` / `Windows.UI.Core.CoreWindow` / `TaskSwitcherWnd` /
-`ForegroundStaging` / `Progman` / `WorkerW` / `Shell_TrayWnd` 这些窗口被显式排除，
-所以按 Win+Tab 待 8 秒 bridge 也不会退出（实测 `alive after 8 s in Task View: True`）。
-真正的其他应用（浏览器、另一个游戏）仍然会触发 `--exit-on-focus-loss`。
-
-输入是否被吃掉，看这行（整场会话持续采样，前 12 次每 3 s、之后每 30 s）：
-
-```
-[bridge] click probe: cursor 1920,1079 under=...pid=22084 root=...game=...  (ok)
-[bridge] click probe: ... <== OUR OVERLAY eats this click      ← 我们吃了点击
-[bridge] click probe: ... <== the OSD window eats it           ← OSD 吃了点击
-[bridge] click probe: ... <-- NOT the game                     ← 别的程序在前面（如 VS Code）
-```
+A/B 用的 carry 入口 = `--cad-policy fill --cadence-hold N`：相位进位 + 死区，`N` 就是控制器的
+`minDwell`（默认 4，carry A/B 用 8/12/15）。`--cad-switch-loss measure|auto` 默认
+`measure`：每个报告窗口用 `expected` vs `GetLastPresentCount` 算出“每次计数切换丢几张”，
+只写日志；`auto` 才让控制器据此增减 dwell（真机验证前不要开）。日志里的 `out=` 是
+**诚实输出率**，cap-limited（输入低于 target/J）时会低于目标并明确报 `regime=cap-limited`。
+固定 3x（锁 40）/4x（锁 30）仍是产品对照入口。
 
 
+---
 
-| `--fg-jitter-zero` | **已弃用**：只打一行提示，不再生效。jitter 必须用游戏自己的 |
+## 5. 调试文件（放游戏目录，重启游戏生效）
 
-限帧器（`<RTSS_DIR>`）：**必须用外部限帧器把游戏锁到目标输入帧率**，
-消费者侧锁帧（`--lock` / `--lock-auto`）做不到这件事，原因见
-`docs/findings/FINAL_CONFIG.md` §9.16。
+| 文件 | 作用 |
+|---|---|
+| `marker_disable.on` | 生产端不画四角 marker（A/B 画质/开销） |
+| `marker_repair_off.on` | 消费端不回填 marker（标记留在画面上） |
+| `dump_frame.on` | 整帧回读 `frame_dump.raw` / `marker_corners.raw` |
+
+---
+
+## 6. `mgpu_ui.ini`
+
+与 `mgpu_ui.exe` 同目录，保存每个游戏配置档的全部设置与目标窗口；
+每次改动即时写盘。旧的 `jitter_zero` / `tearing` / `sdr` / `no_mv` 等键仅用于迁移，
+界面不再暴露。详见 [`UI.md`](UI.md)。

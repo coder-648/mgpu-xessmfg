@@ -1,15 +1,21 @@
 # mgpu —— 把"渲染"和"帧生成"拆到两块 GPU 上
 
+> **当前链路（2026-11-14）**：`fakerFG.dll` → `xess_mfg_producer.dll` →
+> **`xess_mfg_consumer.exe`**（本页旧段落里的 `bridge.exe` 是它的前身，已冻结）。
+> 安装/启动看 [`docs/ops/USAGE.md`](docs/ops/USAGE.md)，
+> 架构看 [`docs/design/ARCHITECTURE.md`](docs/design/ARCHITECTURE.md)，
+> 全仓现状与优化清单看 [`docs/PROJECT_STATUS_2026-11-14.md`](docs/PROJECT_STATUS_2026-11-14.md)。
+
 > 游戏照常用**自己的卡**渲染 + 超分（DLSS / FSR / XeSS），
 > 运动矢量与深度走共享显存，另一块卡专职用 **XeSS-FG** 插帧，再通过覆盖窗口上屏。
 > 实测环境：**RTX 3080 Ti 渲染 + RX 6750 GRE 插帧，4K / 120 Hz**。
 > A 卡 + N 卡混插能用，**单卡也能用**（插帧和渲染落在同一块卡上）。
 
 ```
-游戏 ──► 超分 ──► game_capture.addon64 ──► 共享显存 + 跨卡 fence ──► bridge.exe ──► 屏幕
-       (DLSS/FSR/XeSS)  (D3D12, 渲染卡)                              (XeSS-FG, 另一块卡)
-                                                                          ▲
-                                                                mgpu_ui.exe（前端 / 热键 / 状态）
+游戏 ──► 超分 ──► fakerFG.dll ─────────► xess_mfg_producer.dll ──► 共享显存 + 跨卡 fence ──► xess_mfg_consumer.exe ──► 屏幕
+       (DLSS/FSR/XeSS)  (拥有 XeFG 链与 FG 输入)   (颜色 + MV/深度 同槽发布)              (XeSS-FG, 另一块卡)
+                                                                                              ▲
+                                                                                    mgpu_ui.exe（前端 / 热键 / 状态）
 ```
 
 ---
@@ -22,81 +28,97 @@
 | **2x – 6x 倍率** | 2x 是原生；3x–6x 靠 `--unlock-mfg`（**内存补丁，仅供个人研究**，见 §许可）。40 → 120、30 → 120 都能整拍 |
 | **两种模式** | **固定倍数**（稳定、可预测）与**动态逐帧**（每帧按实际经过的 vblank 数取倍率，输入 35–45 fps 抖动时也能把 120 Hz 填满，实测空刷新 **1.3%**） |
 | **整流输出** | 输出恒定 1 帧/vblank；`--fg-out-hz` 还能把"120 Hz 面板但只想要 60 fps"变成 2x 而不是 4x |
-| **不碰你的画质设置** | 不改游戏文件、不从渲染管线取色（颜色走 WGC 抓屏），add-on 只**读**超分阶段已经算好的 MV/深度 |
-| **带宽自己会喊** | MV + 深度默认压到 1440p（**28 MB/帧**，而不是 63），把渲染卡的余量留给游戏；日志 `bus:` / `headroom:` 直接告诉你超没超 |
+| **颜色与运动数据同源** | 游戏 backbuffer 的整帧颜色由 producer 与 MV/深度**同一次发布**送过来（协议 v22），consumer 不再抓屏；一条发布 = 一帧，槽号就是配对身份 |
+| **带宽自己会喊** | 发布 ini 默认 `StreamPercent=150`：4K 的 MV + 深度压到 1440p（**28 MB/帧**，而不是 63），把渲染卡的余量留给游戏；日志 `bus:` 直接告诉你超没超 |
 | **延迟有账可算** | `click→photons`（按下 → 像素发光）**填满面板时 = 2 × 输入间隔 + DWM hop**：2x@60 ≈ 40–48 ms、3x@40 ≈ 55–65、4x@30 ≈ 73–82（实测）。日志两行把它拆成 `game->wgc` / `bridge` / `scanout`，[§延迟](#延迟clickphotons-是什么有多少) 有公式与各档数据 |
 | **可诊断** | `breakdown` / `bus:` / `arr(vb):` / `out:` 一整套计数器，`--dump` 抓成对帧做离线逐像素分析；每个结论都有实测出处（`docs/findings/`） |
-| **纯本地、无服务** | 三个产物（两个 exe + 一个 add-on DLL），无驱动、不注入其他进程、无网络；全部可逆卸载 |
+| **纯本地、无服务** | 四个产物（`fakerFG.dll`、`xess_mfg_producer.dll`、`xess_mfg_consumer.exe`、`mgpu_ui.exe`），无驱动、不注入其他进程、无网络；全部可逆卸载 |
 | **GPL-3.0** | 协议、shader、实验记录全在仓库里，欢迎改和提 |
 
 > 不吹的部分写在下面「已知限制」里 —— 这个项目对"做不到的事"的记录比对"能做到的事"更详细。
 
 ---
 
-## 三个组件，各管一段
+## 四个产物，各管一段
 
-### 1. `game_capture.addon64` —— 游戏侧（ReShade add-on）
+### 1. 游戏侧：`fakerFG.dll` + `xess_mfg_producer.dll`
 
-跑在**游戏进程**里（也就是渲染卡上），挂在超分库（NGX / FfxApi / XeSS）的输出阶段，
-把这一帧的**运动矢量 + 深度**（可选颜色）写进共享显存，并用跨卡 fence 通知另一侧。
+**`fakerFG.dll`**（部署成 `dxgi.dll` + `nvngx_dlssg.dll`，注入方式与 OptiScaler 同构）拥有整条 FG
+管线：接管交换链、回答/转发 DLSS-G、把这一帧的输入整理成一条记录、用 **XeFG** 输出。链路标准见
+`docs/design/XEFG_CHAIN_STANDARD.md`。
 
-- 依赖 **ReShade 6.8**（`dxgi.dll`），且必须**启用至少一个效果**（部署包带的
-  `MGPU_DepthTap.fx` 就是干这个的，空转不耗性能）；
-- 零配置可用：部署包会放一份调好的 `game_capture.ini`。
+**`xess_mfg_producer.dll`** 由 fakerFG 加载，只做传输：订阅记录 → 在标题仍然打开的命令表上
+`barrier + CopyTextureRegion`（MV/深度 1:1，不缩放、不转换）→ Present 之后 signal 跨卡 fence。
 
-**`game_capture.ini`（放在 add-on 旁边，即游戏 exe 同级目录）**
+- **不再需要 ReShade，也没有 add-on**（2026-11-14 起，旧的 `game_capture` 实现已删除）。只有想加
+  别的 shader 时才把 `InjectReshade=1`。
+- 零配置可用：部署脚本会放一份 `fakerFG.ini`。
 
-| 键 | 默认 | 作用 | 建议 |
-|---|---|---|---|
-| `Input` | `auto` | 输入源：`auto` / `ngx`(DLSS) / `ffx`(FSR) / `xess` / `depth` | 保持 `auto` |
-| `StreamHeight` | **`1440`** | 跨卡流（MV+深度）的**高度上限**，宽度按宽高比算 | 4K 游戏别改。`0` = 跟随渲染尺寸（63 MB/帧，容易 drop）；`1080` 再省一半；`2160` = 全分辨率 |
-| `StreamPercent` | `100` | 在 `StreamHeight` 之上再按比例缩（`150` = 渲染的 2/3） | 一般不用动 |
-| `SkipMv` | `0` | `1` = 永不产出 MV；`0` = 听 bridge 的请求（选"游戏 MV"必须 `0`） | 保持 `0` |
-| `DepthConvert` | `1` | 深度转 R32_FLOAT 再共享 | **别设 0**，缺这个键旧版会静默失效 |
-| `Color` | `0` | `1` = 额外把后台缓冲也拷过去 | 保持 `0`（颜色由 bridge 抓屏，开 1 是纯成本） |
-| `StreamAlign` / `MvNormalize` / `MvFlip` | `1` / `0` / `0` | 对齐与 MV 单位/符号修正 | 别乱改 |
-| `Log` | `0` | 写 `game_capture.log` | 排查时设 `1` |
+**`fakerFG.ini`（游戏 exe 同级目录）** 关键键：
 
-### 2. `bridge.exe` —— 帧生成侧（真正干活的进程）
+| 键 | 默认 | 作用 |
+|---|---|---|
+| `Mode` | `consume` | `local` = 自检平台（fakerFG 在本卡跑完整 FG）；`consume` = 双卡（拿全输入、拒绝补帧、原生帧上屏，副卡出帧）；`idle` = 只出原生帧；`observe` = 转发真运行时做 A/B |
+| `InjectReshade` | `0` | 传输不再依赖 ReShade；只想加别的 shader 时才设 `1` |
+| `OwnSwapchain` / `RealSwapchainObject` | `1` / `1` | 接管交换链、交还 libxess 真链（链路前提） |
+| `FakeDlssgFeature` | `0` | 链路模式：标题关掉自己的 FG，整帧渲进我们交出去的链 |
+| `MvResample` | `1` | 全分辨率 MV 重采样到 depth 尺寸（已同尺寸时自动跳过） |
+| `TagAtEvaluate` / `ForceBorderless` | `1` / `1` | tag 在 Evaluate 上；XeFG 只在无边框下插帧 |
+| `FgInput` / `FgOutput` | `Upscaler` / `XeFG` | 输入取 DLSS-SR 参数块，输出由 XeFG 呈递 |
+| `StreamPercent` | `100` | 跨卡流尺寸：100=1:1（63.3 MB/帧）；150≈2/3（4K→2560x1440，28.1 MB）；200=1/2；400=1/4 |
+| `Publish` | `1` | `0` 只用于测量：完全不发布/不传输 |
 
-WGC 抓帧 → 跨卡取 MV/深度 → **XeSS-FG** 插帧 → DirectComposition 覆盖窗口上屏。
-同时负责节拍（整 vblank）、OSD、热键响应和全部诊断输出。
+跨卡流量由 `StreamPercent` 控制（默认 100 = 1:1，4K ≈ 63 MB/帧；150 → 2560x1440 ≈ 28 MB；200 → 1080p ≈ 16 MB）。
 
-**日常会用到的参数**
+### 2. `xess_mfg_consumer.exe` —— 帧生成侧（真正干活的进程）
+
+WGC 已删除（协议 v22）：consumer 直接读取 producer 发布的 **stream 0 颜色**（与 MV/深度同一槽、同一 fence），
+配对就是槽号；**XeSS-FG** 插帧 → DirectComposition 覆盖窗口上屏。同时负责节拍、OSD、热键和全部诊断输出。
+
+**日常会用到的参数**（完整表见 [`docs/ops/USAGE.md`](docs/ops/USAGE.md) §6）
 
 | 参数 | 作用 | 备注 |
 |---|---|---|
-| `--game Game.exe` / `--hwnd 0x…` | 指定目标窗口 | 配方脚本传第一个参数；前端传 hwnd |
-| `--interp N` | 两帧真实帧之间插 N 帧（`2` = 3x、`1` = 2x） | 3x 以上需 `--unlock-mfg` |
-| `--interp-cadence` | **动态逐帧**：按实际经过的 vblank 数逐帧决定倍率 | 把 `--interp` 当容量上限用（推荐 `--interp 5`） |
-| `--cadence-smooth N` | 决定倍率前先对"到达间隔"做 N 帧 EMA（默认 `8`） | 输入抖动大时**别关**（关了倍率会跟着抖 1:1） |
-| `--fg-out-hz N` | 输出帧率上限（`0` = 面板刷新） | 最低 2x；够不到会打 warning |
-| `--fg-rt-mode ema\|raw\|median\|quant\|auto` | 喂给 XeFG 的 `frameRenderTime` 用哪种估计 | 默认 `quant`（吸附整 vblank）；前端用 `auto` |
-| `--mv-flip` / `--no-mv` | 游戏 MV 反向 / 不用 MV | UI 里对应"运动矢量"下拉 |
-| `--fg-of` | 用 **AMD 光流**代替游戏 MV | 固定 3x/4x 首选（不闪）；**动态逐帧别用**（同卡多一个 pass ⇒ drop 更多） |
-| `--no-depth` | 不传深度 | **别用**：disocclusion 会渗色 |
-| `--unlock-mfg` | 内存里改 `libxess_fg` 打开 3x–6x | 仅供个人研究，见 §许可 |
-| `--den N` / `--scale F` | 生成分辨率 = 抓到的 1/N / 上屏缩放 F | `--den 2` 省算力；`--scale 0.75` 是 5K 的折衷 |
-| `--gpu N` | 指定插帧用哪块卡 | 不传则自动（按输出显示器 / 避开游戏卡） |
-| `--pool N` / `--latency N` | 帧池深度 / 最大帧延迟数 | 默认 4 / 1；延迟敏感就保持 `1` |
-| `--overlay-monitor N` / `--overlay-hidden` | 覆盖窗口放到指定显示器 / 只跑不上屏 | 后者用来隔离"同屏覆盖窗口"造成的抖动 |
+| `--game Game.exe` / `--hwnd 0x…` | 指定目标窗口 | UI 传 hwnd |
+| `--interp N` | 固定倍率：`1`=2x、`2`=3x、`3`=4x… | 3x 以上需 `--unlock-mfg` |
+| `--interp-cadence` | **动态逐帧**：按实际 vblank 数决定倍率 | `--interp` 变成容量上限（推荐 5） |
+| `--fg-out-hz N` | 输出帧率上限（0 = 面板刷新） | 最低 2x |
+| `--fg-rt-mode …` | 喂给 XeFG 的 `frameRenderTime` 估计 | UI 用 `auto` |
+| `--latency N` | Present 队列深度 | 默认 1（WGC 已删除，`--pool/--colour-queue` 仅兼容旧 bat） |
+| `--den N` / `--scale F` | 生成分辨率 = 抓到的 1/N / 上屏缩放 F | `--den 2` 省算力；`--scale 0.75` 是 5K 折衷 |
+| `--gpu N` | 指定插帧卡 | 不传则自动 |
+| `--upsample` | 消费卡重建 MV/深度到渲染尺寸 | A/B |
+| `--stream-auto` / `--stream-asym` | 自动/非对称流档位 | A/B |
+| `--no-depth` / `--no-marker` | 不传深度 / 关闭 marker 配对 | 都**不推荐**，仅在排障时用 |
+| `--unlock-mfg` | 内存补丁打开 3x–6x | 仅供个人研究，见 §许可 |
 | `--overlay-layered` / `--relay-input` | 分层窗口（菜单可点击）/ 输入转发 | 二选一 |
-| `--no-osd` | 关掉左上角单行 OSD | |
-| `--dump N` | 抓成对帧（颜色/深度/MV）到磁盘 | 排障与 A/B 量化用 |
-| `--report N` / `--log-flush` | 统计窗口长度（帧）/ 立刻刷日志 | 调性能时用 |
+| `--no-osd` | 关掉单行 OSD | |
+| `--dump N` / `--report N` | 抓成对帧 / 统计窗口长度 | 排障与 A/B 量化 |
 
-完整开关（含实验性）在 `docs/findings/FINAL_CONFIG.md` §4。
+> 运动矢量来源不再由用户选择：consumer 按 producer 发布的记录自动决定
+> （`--mv-flip` / `--no-mv` / `--fg-of` 只留给排障）。
+> marker 是当前的配对主键；时间戳/FIFO 只在解不出 marker 时兜底。
 
 ### 3. `mgpu_ui.exe` —— 前端
 
 选窗口 → 选模式/倍数/输出 → 开始；热键开关（默认 `Ctrl+PageUp`），状态栏显示关键日志。
-界面上每一行都对应一个 bridge 参数，卡片底部"启动命令"是**实时回显**，所见即所传。
+界面上每一行都对应一个 consumer 参数，卡片底部「启动命令」是**实时回显**，所见即所传。
 支持多个单游戏配置档，每档独立保存设置与目标窗口。详见 `docs/ops/UI.md`。
 
-### 4. `game-pack/` —— 安装器
+### 4. 构建与部署
 
-把游戏 `.exe` **拖到 `install.bat` 上**即可：装 ReShade 6.8 + add-on + 调好的 ini + 空转效果，
-`uninstall.bat` 一键还原。三个必踩的坑写在 `docs/ops/DEPLOY.md`。
+```bash
+./scripts/build_faker_fg.sh          # fakerFG.dll
+./scripts/build_producer.sh          # xess_mfg_producer.dll
+./scripts/build_consumer.sh          # xess_mfg_consumer.exe
+./scripts/build_ui.sh                # mgpu_ui.exe
+./scripts/deploy_faker_fg.sh "<game exe dir>"
+./scripts/make_release_fg.sh         # dist/mgpu-<ver>/ + .zip
+```
+
+装完游戏目录里是 `dxgi.dll` / `nvngx_dlssg.dll` / `fakerFG.dll`（同一份 fakerFG）+
+`xess_mfg_producer.dll` + `fakerFG.ini`；不再需要 ReShade 或 add-on。
+`--uninstall` 可逆。消费端与 UI 放在独立目录（两者必须同目录）。
 
 ---
 
@@ -114,8 +136,9 @@ WGC 抓帧 → 跨卡取 MV/深度 → **XeSS-FG** 插帧 → DirectComposition 
 | **只有一块显卡** | 一样能跑 | — | 插帧与渲染同卡，收益比双卡小很多 | 更长（`gpu` 66–72 ms 级） |
 | **要抓数据做离线分析** | `--dump 200` | — | 输出 `f<NN>_colour/depth/mv.raw` + `_meta.txt` | — |
 
-现成配方在 `scripts/recipes/`；发布包里是 `bin\` 里的 `.bat`，双击即可
-（`5 - smoothest (cadence).bat` 就是上表第一行）。
+现成配方脚本多为 bridge 时代（`scripts/recipes/`），仅作参数参考；
+当前链路直接用 `game\run_consumer.bat` 或 `mgpu_ui.exe`，参数含义见
+[`docs/ops/USAGE.md`](docs/ops/USAGE.md) §6。
 
 ### 延迟：`click→photons` 是什么、有多少
 
@@ -165,7 +188,7 @@ click→photons ≈ 输入采样→合成(≥1 个输入帧) + game->wgc(age) + 
 ⚠ **唯一还没跑过的低延迟点**：3x@40 + 1440p 插值，同样 120 fps，比 4x@30 低约 20 ms：
 
 ```bat
-bridge.exe --game <exe> --den 2 --interp 2 --unlock-mfg --pool 4 --fg-ui none
+xess_mfg_consumer.exe --game <exe> --den 2 --interp 2 --unlock-mfg --fg-ui none
 ```
 
 RTSS 锁 40，跑 ≥60 s，用 `scripts/latstats.py <日志>` 看 `compose->photons` / `est. click->photons`，
@@ -199,7 +222,11 @@ pacer 抢）。XeFG 内部时间、`Present()` 的 vblank 对齐、DWM hop 都�
 
 UE5 各版本 / 各游戏把 MV 交给 NGX 的方式不一样（单位、符号、有没有抖动都不统一），所以这张表是**按游戏逐个实测**记下来的，**换游戏或换 UE5 版本都要重测**：
 
-| 游戏 | 运动矢量选择 | UI 里选 | 依据 |
+> **2026-11-14 起**：UI 不再提供"运动矢量"选项，consumer 每帧读取 producer 发布的记录自动决定
+> （有 MV 就用游戏 MV，没有就退到光流/零矢量）。下表只在需要**手动覆盖**
+> 时才用得上：`--no-mv` / `--fg-of` / `--mv-flip` 仍是 consumer 的命令行开关。
+
+| 游戏 | 运动矢量（手动覆盖时） | 命令行 | 依据 |
 |---|---|---|---|
 | **影之刃：零** | **AMD 光流** | 运动矢量 → `AMD 光流` | 游戏 MV 流是坏数据（NaN/饱和/无相关性）⇒ 喂它就闪，光流才干净 |
 | **明末：渊虚之羽** | **游戏 MV（反向）** | 运动矢量 → `游戏 MV (反向)` | MV 本身正确，只是符号与 XeFG 的 `previous-current` 约定相反 ⇒ 反向即干净 |
@@ -212,11 +239,11 @@ UE5 各版本 / 各游戏把 MV 交给 NGX 的方式不一样（单位、符号�
 
 ## 5 分钟上手
 
-1. **装进游戏**：把游戏 exe 拖到 `game-pack\install.bat` 上（或先跑 `./scripts/make_addon_package.sh`）；
+1. **装进游戏**：`./scripts/deploy_faker_fg.sh "<game exe dir>"`（先跑 §4 的四个 build 脚本）；
 2. **游戏内设置**：关掉游戏自带帧生成；超分选 **DLSS / FSR2+ / XeSS**；用外部限帧器（RTX 驱动的
    Max Frame Rate / RTSS）锁到"目标上屏帧率 ÷ 倍数" —— 不想锁就直接用动态逐帧；
-3. **起 bridge**：双击 `bin\5 - smoothest (cadence).bat`，或打开 `mgpu_ui.exe` 选窗口 → 开始；
-4. **确认通了**：OSD 显示 `x3` 且 `drop` 不涨；日志 `gen 3/3`（生成帧成对）。
+3. **起消费端**：双击 `game\run_consumer.bat`，或打开 `mgpu_ui.exe` 选窗口 → 启动；
+4. **确认通了**：OSD 显示 `x2`/`x3`，日志 `marker: decoded` 增长、`HITCH` 不持续上涨。
 
 判读与排障：`docs/ops/USAGE.md` §8–§9。
 
@@ -250,7 +277,7 @@ UE5 各版本 / 各游戏把 MV 交给 NGX 的方式不一样（单位、符号�
 - **换硬件验证**：A 卡渲染 + N 卡输出、Intel Arc、核显、双 A 卡……任何组合的实测都值钱
   （`docs/findings/ENV_REPORT.md` 是登记处）；
 - **打包 / 前端 / 文档**：UI 是纯 Win32 + GDI（无第三方库），加一行开关很容易；
-- **提 bug 请带三样**：`bridge` 日志（含 `breakdown` 与 `bus:` 行）、`game_capture.ini` 内容、
+- **提 bug 请带三样**：consumer 日志（含 `breakdown` 与 `bus:` 行）、`fakerFG.ini` + `<exe>_mfg_producer.log`、
   游戏内的超分设置。有这三样基本能复现。
 
 不要提交：`libxess_fg.dll` / `libxell.dll`（Intel 的，见 `docs/ops/LEGAL.md` §3）、
@@ -281,16 +308,18 @@ UE5 各版本 / 各游戏把 MV 交给 NGX 的方式不一样（单位、符号�
 | `CHANGELOG.md` | **每个版本的变化 + 实测依据** |
 | `docs/README.md` | **文档索引 —— 从这进** |
 | `docs/ops/USAGE.md` | 完整使用说明（安装 / 游戏内设置 / 配方 / 判读 / 排障 / 卸载），也是发布包里的 `README.md` |
-| `docs/design/` | 架构、协议 v10、输入源、厂商兼容计划 |
-| `docs/ops/` | 构建、部署、配置（占位符 / ini）、UI、依赖、合规 |
+| `docs/design/` | 架构（当前）、consumer 架构、协议 v17、输入源、历史设计 |
+| `docs/ops/` | 使用、构建、部署、配置（`fakerFG.ini` / consumer）、UI、依赖、合规 |
 | `docs/findings/` | 结论先行、画质变量、性能基线、踩坑清单、实验档案、里程碑 |
-| `src/game_capture/` | add-on：钩超分 API，写共享槽 |
-| `src/bridge/` | 消费端：XeFG + XeLL + WGC + 覆盖窗口 |
+| `src/faker_fg/` | FG 管线：注入、DLSS-G 契约、XeFG 链、记录（`MgpuFgGetApi`） |
+| `src/xess_mfg_producer/` | 传输：订阅记录 → 降采样 → 拷贝进共享槽 → fence 发布 |
+| `src/xess_mfg_consumer/` | 当前消费端：WGC + marker 配对 + XeFG + 覆盖窗口 |
+| `src/bridge/` | 旧消费端（legacy，仅 A/B） |
 | `src/mgpu_ui/` | 前端（Win32 + GDI，无第三方库） |
-| `scripts/recipes/` | 能直接跑的配方脚本 |
-| `packaging/` | 部署包源文件（安装器 / 卸载器 / 预设） |
+| `scripts/recipes/` | 旧配方脚本（bridge 时代，参考用） |
+| `packaging/` | 当前只保留 `fakerFG.ini`；旧安装器已归档 |
 | `tests/` | 各里程碑的验证程序（不参与正式构建） |
 
 > 贡献前建议先读 `docs/findings/TOOLING_NOTES.md`（本仓库的命令行约定）和
-> `docs/ops/BUILD.md`（三件产物怎么编）。
+> `docs/ops/BUILD.md`（四件产物怎么编）。
 

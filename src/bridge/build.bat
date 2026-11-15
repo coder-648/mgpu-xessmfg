@@ -14,6 +14,11 @@ if errorlevel 1 ( echo [build] vcvars64 failed & exit /b 1 )
 echo [build] compiler:
 where cl
 
+if not exist "%~dp0modules" (
+  echo [build] modules\ is missing - bridge.cpp is only the module index
+  exit /b 1
+)
+
 cl /nologo /std:c++17 /EHsc /O2 /MD /W3 /utf-8 /permissive- ^
   /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX /DMGPU_FG_OF=1 ^
   /I"%REPO%\src" ^

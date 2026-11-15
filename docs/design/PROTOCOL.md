@@ -1,7 +1,12 @@
-# 共享内存协议（v10）
+# 共享内存协议（v17）
 
-定义文件：`src/mgpu_shared.h`（两端共用）。版本号 `kSharedVersion = 10`，
+定义文件：`src/mgpu_shared.h`（两端共用）。版本号 `kSharedVersion = 17`，
 **不匹配时两端拒绝通信**（旧版配新版会静默读垃圾，所以故意做成硬拒绝）。
+
+> 本文的 §1–§3 已对齐当前头文件；§4 起的标题仍保留 "v10" 的历史语境，
+> 但其中的信用窗口、seqlock 语义至今有效。当前完整链路见
+> `docs/PROJECT_STATUS_2026-11-14.md`，marker 的最终形态见
+> `docs/findings/PERF_ROUND_HANDOVER.md`。
 
 ## 1. 载体
 
@@ -45,6 +50,13 @@ SharedControl
 | v8 | `generation` + 重建布局（尺寸变化不重启游戏） | **已被 v9 取代**：重建需要 magic/ack 握手 + 渲染线程上的有界停顿 |
 | **v9** | **解耦**：槽位按 3840×2160 一次性放好，尺寸变化只改两个整数 | 零握手、零停顿。生产端只做"拷 + 发信号"，消费端只做"读" |
 | **v10** | (a) `consumed[]` per-slot ACK 信用窗口 (b) `FrameShared.published` (c) `StreamShared.seq` seqlock (d) 生产端诊断计数 | 槽位覆盖从"4 槽碰运气"变成**有保证**；元数据从"读两次碰运气 + clamp"变成 seqlock |
+| **v11** | `FrameShared.semantics` + `valid_w/h` | 生产端**实测**的 MV 单位 / 符号 / 深度方向；API 声明缺失或错误时消费端有兜底。见 `docs/findings/INPUT_SEMANTICS.md` |
+| **v12** | `FrameShared.view_to_clip` + `matrix_tick_ms` | 游戏自己的 view→clip（Streamline `sl::Constants`），`--fg-fov` 退役 |
+| **v13** | `clip_to_prev_clip` / `prev_clip_to_clip` / `frame_key` / `frame_qpc_ms` / `present_id` / `fg_flags` / `mv_invalid_value` / camera vectors | FG 路径的其余声明；**只追加元数据，不新增纹理流**。`resetHistory`、MV 语义、`frame_key`↔WGC 配对；见 `docs/design/FG_INPUT_PLAN.md` |
+| **v14** | `ProducerInfo.declared_frames` / `ProducerInfo.harvest_flags`；新增 flag `kInputFlagMvSuspect (1<<14)` | 只追加两个 `uint32` + 一个 flag 位，**不新增纹理流**。`declared_frames` = 游戏请求的 `numFramesToGenerate`（0=没说过），`harvest_flags` = `kHarvest*` 位图（mv/depth/camera/clip/token/reset/hudless/ui/scaling_in/out/exposure/placeholder）。同时 add-on 增加**新鲜度门控**：源超过 250 ms 没有新帧就置 `kInputFlagMvSuspect` 并打 `input: source ... STALE`，消费端据此回退（`--fg-of` / `--no-mv`），不再把上一帧当新帧重放。见 `docs/design/FG_CLAIM.md` §7/§11 |
+| **v15** | `SharedControl.requested_percent_mv/depth` + `active_percent_mv/depth` | 消费端可在运行时请求每流 `StreamPercent`（0 = 用 `fakerFG.ini`），生产端回声实际值；只移动固定槽内的 content 矩形，不重建布局。见 `docs/design/STREAM_AUTOSCALE.md` |
+| **v16** | `FrameShared.marker_valid/format/x/y/tile` + `streams[kStreamScar]` | marker 的 pre-marker 16×16 图块与 MV/深度走同一条 publication（曾用 CPU tile 传输） |
+| **v17** | 当前形态：marker 改为四角 **32-bit 短雪花 + CRC-8**（画在颜色里），scar 槽与 `marker_tile` 字段保留但不再读写 | 消费端用 marker 作为**配对主键**；pre-marker 回填在转换 pass 内完成。见 `docs/findings/PERF_ROUND_HANDOVER.md` §2 |
 
 ## 4. v10 的三条语义
 

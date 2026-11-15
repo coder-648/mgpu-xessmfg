@@ -266,6 +266,29 @@ mgpu_ui: start: pid=24128 cmd="bridge.exe" --hwnd 0x340B74 ... --interp 5 --inte
 `perf` 那行同时给"加载慢"结了案：我们的回调合计 **0.17 ms/帧**（barrier 0.02 ms/帧、
 约 400 次/帧），所以慢确实来自 `LoadLibrary` 钩子本身，回调里没有活。
 
+## 8. 2026-11-10：v13 + `LoaderHook=0` 的 Streamline 钩子全失败（已修）
+
+把 PRAGMATA 当 v13 的场景 3 重跑时，第一次得到的是"SL 一个钩子都没装上"：
+
+```text
+fg: hook slSetConstants FAILED / slSetTagForFrame FAILED / slSetTag FAILED
+fg: hook slEvaluateFeature FAILED / slGetFeatureFunction FAILED
+fg: Streamline hooks active (0 installed, 1 not exported).
+NGX provider: ...\_nvngx.dll  ->  hooked NVSDK_NGX_D3D12_EvaluateFeature OK   ← 只有这个成功
+```
+
+根因不在 RE Engine，而在我方：**`src/game_capture/in_fg.cpp` 从不调用
+`mgpu::input::ensure_minhook()`**。`LoaderHook=1` 时宿主在 AddonInit 里先初始化了
+MinHook（所以前两作没暴露）；`LoaderHook=0`（RE Engine 推荐的设置）走"启动时扫模块表"，
+那一刻 MinHook 还没初始化 ⇒ 所有 `MH_CreateHook` 返回 `MH_ERROR_NOT_INITIALIZED`。
+
+修法：`consider_module()` 里先 `ensure_minhook()`（所有 SL / DLSS-G / XeSS-FG 的安装
+路径都经过这个函数），并把失败原因打进日志（`fg: hook %s FAILED (MH status %d)`）。
+
+修完 PRAGMATA 变成**第一个真正走 `sl` 输入源**的游戏：
+`input source: sl (api 5)`、`camera: using the input source's own view-to-clip`、
+`frame-key pair` 生效、`reset=1` 抓到。细节见 `docs/findings/FG_INPUT_V13_PRAGMATA.md`。
+
 ## 7. 同一个坑可能影响谁
 
 任何"**把 NGX 运行时放进游戏目录并直接调用**"的题目，例如 RE Engine 全家

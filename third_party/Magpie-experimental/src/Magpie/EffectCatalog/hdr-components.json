@@ -1,0 +1,58 @@
+{
+  "category": {
+    "id": "hdr-components",
+    "name": "HDR 组件",
+    "description": "设置 HDR／SDR 的转换顺序。兼容配对用于中间 SDR 处理，白点映射呈现 SDR 内容，TrueHDR 用 AI 重塑亮度与颜色；HDR 捕获或输出需对应屏幕开启 Windows HDR。",
+    "subcategories": []
+  },
+  "effects": [
+    {
+      "id": "Color\\HDR_to_SDR",
+      "name": "HDR → SDR",
+      "category": "hdr-components",
+      "subcategory": "",
+      "purposes": [
+        "hdr-components"
+      ],
+      "summary": "将 HDR 亮度映射为 SDR，供处理或观看。",
+      "details": "压缩 HDR 的亮度范围，保持输入尺寸。直接观看可选 SDR 显示模式；交给 SDR 效果处理后再恢复 HDR，可选兼容配对模式，并在该段后放置 SDR → HDR。源屏幕须开启 Windows HDR，捕获方式须为 Graphics Capture。",
+      "level": "advanced",
+      "recommendation": "进阶／实验",
+      "search": "Color\\HDR_to_SDR HDR → SDR HDR 组件 Color\\HDR_to_SDR Mapping SDR white (nits) HDR peak (nits) Exposure Shoulder 将 HDR 亮度映射为 SDR，供处理或观看。 压缩 HDR 的亮度范围，保持输入尺寸。直接观看可选 SDR 显示模式；交给 SDR 效果处理后再恢复 HDR，可选兼容配对模式，并在该段后放置 SDR → HDR。源屏幕须开启 Windows HDR，捕获方式须为 Graphics Capture。",
+      "family": null,
+      "subfamily": null
+    },
+    {
+      "id": "Color\\SDR_to_HDR",
+      "name": "SDR → HDR",
+      "category": "hdr-components",
+      "subcategory": "",
+      "purposes": [
+        "hdr-components"
+      ],
+      "summary": "将 SDR 映射到 HDR，或恢复上游兼容映射。",
+      "details": "将 SDR 白色映射到指定的 HDR 亮度，适合在 HDR 屏幕上呈现 SDR 内容，保持输入尺寸。自动模式也会恢复上游 HDR → SDR 的兼容配对；此时放在 SDR 处理段之后。输出屏幕须开启 Windows HDR。",
+      "level": "advanced",
+      "recommendation": "进阶／实验",
+      "search": "Color\\SDR_to_HDR SDR → HDR nativeWhiteNits Native SDR white brightness Legacy exposure 将 SDR 映射到 HDR，或恢复上游兼容映射。 将 SDR 白色映射到指定的 HDR 亮度，适合在 HDR 屏幕上呈现 SDR 内容，保持输入尺寸。自动模式也会恢复上游 HDR → SDR 的兼容配对；此时放在 SDR 处理段之后。输出屏幕须开启 Windows HDR。",
+      "family": null,
+      "subfamily": null
+    },
+    {
+      "id": "RTXVideo\\RTXVideo_HDR",
+      "name": "Nvidia VFX TrueHDR",
+      "category": "hdr-components",
+      "subcategory": "",
+      "purposes": [
+        "hdr-components"
+      ],
+      "summary": "用 AI 将 SDR 画面扩展为 HDR 亮度与颜色。",
+      "details": "重新塑造 SDR 画面的亮度和颜色，适合在 HDR 屏幕上观看视频与游戏，保持画面尺寸。先按显示器能力设置峰值亮度，再调节对比度与饱和度。需要 SDR 输入、受支持的 NVIDIA 渲染 GPU 与配套 VFX 运行库，输出屏幕须开启 Windows HDR。",
+      "level": "situational",
+      "recommendation": "特定场景推荐",
+      "search": "RTXVideo\\RTXVideo_HDR RTXVideo_HDR RTX Video HDR RTXVideo_HDR TrueHDR contrast Contrast saturation Saturation middleGray Middle gray peakNits Peak brightness (nits) debanding Debanding Nvidia VFX TrueHDR HDR 组件 用 AI 将 SDR 画面扩展为 HDR 亮度与颜色。 重新塑造 SDR 画面的亮度和颜色，适合在 HDR 屏幕上观看视频与游戏，保持画面尺寸。先按显示器能力设置峰值亮度，再调节对比度与饱和度。需要 SDR 输入、受支持的 NVIDIA 渲染 GPU 与配套 VFX 运行库，输出屏幕须开启 Windows HDR。",
+      "family": null,
+      "subfamily": null
+    }
+  ]
+}

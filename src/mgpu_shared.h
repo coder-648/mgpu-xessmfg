@@ -69,7 +69,40 @@ inline constexpr uint32_t kSharedMagic   = 0x55475047u;   // 'GPUM'
 //      view-to-clip matrix from Streamline's sl::Constants, so the consumer stops
 //      synthesising a projection from an FOV guess (docs/findings/INPUT_SEMANTICS.md).
 //      Appended at the end - offsets up to v11 are unchanged.
-inline constexpr uint32_t kSharedVersion = 12;
+// v13: FrameShared gains the rest of the frame-generation declaration: the previous-frame
+//      clip matrices, a frame key for pairing, resetHistory and the MV/depth/camera flags
+//      Streamline's sl::Constants or DLSS-G's parameter block carries. This is metadata
+//      only - no new texture streams. See docs/design/FG_INPUT_PLAN.md.
+// v15: per-stream StreamPercent requests (consumer -> producer) + the producer's echo.
+//      Lets the bridge run a slow controller (or the MV-100/depth-200 A/B mode) without
+//      editing fakerFG.ini; a change only moves content inside fixed-capacity slots.
+// v20: **8 slots**. The 43 fps dynamic run measured colour lag max = 6 publications,
+// 332 `no_slot` and 211 `overflow` with 4 slots: the publication a colour needs was
+// already overwritten. 8 slots cover lag 6 with margin. Capacity = render size x 4 B x
+// 2 streams x slots (2227x1253 -> ~190 MB, 4K -> ~531 MB). Startup cost is accepted by
+// the user (their slow launch was local CPU contention, not this). Both sides must be
+// rebuilt together.
+// v22: 16 slots. The colour path is inherently later than the MV path, so publications
+// pile up; with 8 slots the 43 fps run showed colour lag max 14 and 332 `no_slot`. 16
+// covers the measured p100 with margin at the current render size (~377 MB mapping).
+// v23: 32 slots, and slot capacity follows the CONTENT size (see producer). The colour
+// path lags the publisher; the ring is where that backlog lives. 32 x 1480x832 x 2 x 4 B
+// is ~314 MB, which fits the consumer's free VRAM.
+// v24: producer slots are TRANSIT ONLY (8). The colour backlog lives in the consumer's
+// own ring (--input-ring, up to 256 publications), so the render card no longer pays for
+// the depth of the queue.
+// v20 (restored): the stable 8-slot asynchronous WGC+MV point. The consumer keeps a
+// small local ring (8) so the colour/MV backlog stays bounded; dynamic rates are outside
+// this design point (see docs).
+// v22: the colour stream becomes a first-class member of the publication.
+//       stream 0 was laid out as "reserved / WGC" until v21; from v22 the producer
+//       places it at the frame's OUTPUT size and copies the game's own back buffer
+//       into it (source format, no conversion). One publication therefore carries
+//       colour + MV + depth + metadata with a single fence, and the consumer no
+//       longer captures the window (docs/design/COLOUR_TRANSPORT_V22.md).
+//       kMaxSlots 8 -> 4: the colour no longer lags the motion data, so the deep
+//       transit ring (sized for WGC's one-to-two-frame colour delay) is not needed.
+inline constexpr uint32_t kSharedVersion = 23;
 
 // The mapping is created once, at a size that fits the largest stream we support
 // (see kStreamMaxW/H), so a layout rebuild never has to recreate it - that would
@@ -87,6 +120,14 @@ inline constexpr uint32_t kInputApiNgx   = 1;   // DLSS-SR (NVSDK_NGX_EvaluateFe
 inline constexpr uint32_t kInputApiFfx   = 2;   // FSR 2.2 / 3.x (ffxDispatch)
 inline constexpr uint32_t kInputApiXess  = 3;   // XeSS (xessD3D12Execute)
 inline constexpr uint32_t kInputApiDepth = 4;   // ReShade depth only (no upscaler)
+inline constexpr uint32_t kInputApiSl    = 5;   // Streamline sl::Constants / sl::ResourceTag
+inline constexpr uint32_t kInputApiNvngxFg = 6; // DLSS-G NVSDK_NGX_Parameter (DLSSG.*)
+inline constexpr uint32_t kInputApiXefg  = 7;   // the game's own XeSS-FG (xefgSwapChain* tags)
+inline constexpr uint32_t kInputApiFfxFg = 8;   // the game's own FSR-FG (ffxDispatchDescFrameGenerationPrepare)
+// fakerFG's own record (src/faker_fg/, MgpuFgGetApi). The FG pipeline owner hands the
+// frame over as an explicit record, so the capture no longer has to guess which API
+// produced it; this id is the label for that lane (docs/design/FAKER_FG.md 5).
+inline constexpr uint32_t kInputApiFaker = 9;
 
 // What the frame's motion vectors / depth / camera actually are.
 inline constexpr uint32_t kInputFlagInvertedDepth = 1u << 0;  // reversed/infinite Z
@@ -99,9 +140,42 @@ inline constexpr uint32_t kInputFlagMvActive      = 1u << 6;  // the MV stream i
 // v12: FrameShared carries a real view-to-clip matrix (Streamline sl::Constants). With it the
 // consumer uses the game's own projection instead of synthesising one from --fg-fov.
 inline constexpr uint32_t kInputFlagHasMatrix     = 1u << 7;
+// v13: additional declarations from the FG path. They are metadata, not new streams.
+inline constexpr uint32_t kInputFlagHasPrevClip   = 1u << 8;  // clip_to_prev/prev_clip valid
+inline constexpr uint32_t kInputFlagResetHistory  = 1u << 9;  // this frame invalidates FG history
+inline constexpr uint32_t kInputFlagMvDilated     = 1u << 10; // MV already dilated by the game
+inline constexpr uint32_t kInputFlagMv3D          = 1u << 11; // MV are 3D (not screen-space 2D)
+inline constexpr uint32_t kInputFlagCameraMotion  = 1u << 12; // camera motion included in MV
+inline constexpr uint32_t kInputFlagFgInput       = 1u << 13; // data came from the FG path
+// The producer's own probe thinks the MV field is not usable (all-zero while the scene is
+// demonstrably changing). The consumer may fall back to optical flow instead of feeding a
+// dead field to XeFG. Game-agnostic on purpose: it is a statement about the DATA, not
+// about which title produced it (docs/design/FG_CLAIM.md §3).
+inline constexpr uint32_t kInputFlagMvSuspect     = 1u << 14;
+// v22: this publication actually carries stream 0 colour. The consumer reuses the previous
+// sink (and does not advance cadence) when it is missing; it must never read a stale slot.
+inline constexpr uint32_t kInputFlagColourActive  = 1u << 15;
 
-// consumer -> producer requests (SharedControl.consumer_request)
-inline constexpr uint32_t kRequestMv = 1u << 0;
+// consumer -> producer requests (SharedControl.consumer_request / v14 request_mask)
+//
+// v14 turns the "produce only what the consumer will use" rule into a per-stream switch
+// board. The *capacity* of every slot stays reserved (it is placed once and never moves),
+// so switching a stream off costs nothing but also breaks nothing: the next switch-on
+// writes the same rectangle again. That is what makes cost/quality experiments cheap -
+// they change bytes on the wire, not the layout.
+inline constexpr uint32_t kRequestMv    = 1u << 0;  // motion vectors
+inline constexpr uint32_t kRequestDepth = 1u << 1;  // depth
+inline constexpr uint32_t kRequestColor = 1u << 2;  // HUDless colour
+inline constexpr uint32_t kRequestUi    = 1u << 3;  // UI colour+alpha (or its mask)
+inline constexpr uint32_t kRequestMeta  = 1u << 4;  // camera/matrix/jitter metadata (else)
+// v15: "dumb producer". These do not add data, they change WHO processes it: the producer
+// then does a 1:1 copy at source resolution/format and the consumer resamples/converts on
+// its own GPU (see docs/design/TRANSFER_V2.md section 11). Off by default, because each one
+// trades main-GPU time for cross-adapter bytes: MV +51 MB/frame, depth +14.8 MB/frame.
+inline constexpr uint32_t kRequestRawMv    = 1u << 5;
+inline constexpr uint32_t kRequestRawDepth = 1u << 6;
+inline constexpr uint32_t kRequestAll   = 0x1Fu;
+inline constexpr uint32_t kRequestAllV15 = 0x7Fu;
 
 // ---- v11: measured semantics (FrameShared.semantics) --------------------------------
 // Packed so the whole verdict fits in one word. `Measured` tells the consumer whether the
@@ -142,10 +216,136 @@ struct ProducerInfo
     uint32_t output_w;       // upscaler output size (the presented frame)
     uint32_t output_h;
     uint64_t device_luid;    // ID3D12Device::GetAdapterLuid() of the game's device
+    // v14 (append-only): what the FG declaration says about pacing. `declared_frames` is
+    // DLSSGOptions.numFramesToGenerate (0 = the game never called SetOptions), so a
+    // consumer can tell "the game is already generating 2/3 frames" from "we are the only
+    // generator"; `harvest_flags` is the kHarvest* bitmap the source could fill.
+    uint32_t declared_frames;
+    uint32_t harvest_flags;
 };
 
-inline constexpr uint32_t kMaxStreams = 4;
+inline constexpr uint32_t kMaxStreams = 5;
+// v22: 4 transit slots. Colour + MV + depth share the slot, so a publication is one
+// frame in every stream; 4 slots = two in flight plus two buffered. (The old 8 was
+// sized for WGC's late colour, which no longer exists.)
 inline constexpr uint32_t kMaxSlots   = 4;
+
+// v22 stream roles. 0/1/2 are placed and published; 3 (UI) and 4 (scar) are reserved
+// and not placed by the current producer.
+inline constexpr uint32_t kStreamColour = 0;
+inline constexpr uint32_t kStreamMv     = 1;
+inline constexpr uint32_t kStreamDepth  = 2;
+inline constexpr uint32_t kStreamUi     = 3;
+
+// v17 reserved a 16x16 R10 tile per publication for the pre-marker patch. From v22 the
+// marker mechanism is gone with WGC (slot identity replaces it), so this stream is no
+// longer laid out or published. The constant stays so the StreamShared array keeps its
+// historical indices.
+inline constexpr uint32_t kStreamScar = 4;
+inline constexpr uint32_t kScarSide   = 16u;
+
+// Marker geometry: a 32-bit SHORT SNOWFLAKE code is SPLIT over FOUR 6x6 blocks, one
+// per screen corner. Each block is 3x3 cells of 2x2 px: 8 data bits + 1 reference cell
+// that is white unless the data bits are all white (then black), so a block always has
+// both levels for the min/max decoder. The four corners together carry payload24+CRC-8.
+//
+// Why 6x6: 4x6x6 = 144 px total instead of 256, i.e. 44% less area to patch back, and
+// 2x2-px cells keep the bits readable if the capture ever goes through a filter. The
+// blocks hug the four screen corners (margin = 1/32 of the frame).
+inline constexpr uint32_t kMarkerSide     = 6u;
+inline constexpr uint32_t kMarkerCorners  = 4u;
+inline constexpr uint32_t kMarkerCellPx   = 2u;               // cells are 2x2 px
+inline constexpr uint32_t kMarkerCells    = kMarkerSide / kMarkerCellPx;  // 3
+inline constexpr uint32_t kMarkerCellsPerBlock = kMarkerCells * kMarkerCells;  // 9
+inline constexpr uint32_t kMarkerBits     = 8u;               // data bits per block
+inline constexpr uint32_t kMarkerPayloadBits = 24u;           // seq12 | ms12
+inline constexpr uint32_t kMarkerSeqBits  = 12u;              // snowflake sequence bits
+inline constexpr uint32_t kMarkerCodeBits = 32u;              // payload24 + CRC-8
+inline constexpr uint32_t kMarkerMargin   = 32u;              // margin = 1/32 of the frame
+// Every block's 8 data bits are XORed with this before drawing and after decoding, so
+// a chunk of zeros does not turn the block into a solid square (the decoder needs two
+// distinct levels; the always-white cell covers the all-zero case, this covers the
+// rest and makes the pattern look like noise rather than a block).
+inline constexpr uint32_t kMarkerXor      = 0x5Au;
+// Legacy (unused) 16x16 tile byte count kept for the shared record layout.
+inline constexpr uint32_t kFrameMarkerBytes = 16u * 16u * 8u;
+// Diagnostics that still refer to the top-left block.
+inline uint32_t marker_origin_x(uint32_t width)  { return (width  / kMarkerMargin) & ~3u; }
+inline uint32_t marker_origin_y(uint32_t height) { return (height / kMarkerMargin) & ~3u; }
+
+// ---------------------------------------------------------------- short snowflake
+// A full 64-bit snowflake is (41-bit ms | 10-bit worker | 12-bit sequence). Two thirds
+// of it are useless inside a 144-px marker: the ms timestamp is already known on both
+// sides, and the worker id is fixed here. What the marker needs is a value that is
+// different on every frame and cheap to check, so the payload is
+//     payload24 = sequence12 | low12(ms)
+// and the marker carries payload24 plus a CRC-8. The consumer resolves the full frame
+// id from the present ring, so 24 bits never has to be globally unique.
+inline constexpr uint64_t kSnowflakeEpochMs = 1600000000000ull;   // 2020-09-13
+inline constexpr uint32_t kSnowflakeWorkerMask = 0x3FFu;
+
+inline uint64_t snowflake_id(uint64_t ms_since_epoch, uint32_t sequence,
+                            uint32_t worker = 0u)
+{
+    const uint64_t ts = (ms_since_epoch > kSnowflakeEpochMs)
+                            ? (ms_since_epoch - kSnowflakeEpochMs) : ms_since_epoch;
+    return ((ts & 0x1FFFFFFFFFFull) << 22) |
+           ((static_cast<uint64_t>(worker) & kSnowflakeWorkerMask) << 12) |
+           (static_cast<uint64_t>(sequence) & 0xFFFu);
+}
+
+// The 24-bit payload a marker block set carries for this id.
+inline uint32_t marker_payload_from_id(uint64_t id)
+{
+    const uint32_t seq = static_cast<uint32_t>(id & 0xFFFu);              // sequence12
+    const uint32_t ms = static_cast<uint32_t>((id >> 22) & 0xFFFu);       // low12(ms)
+    return seq | (ms << kMarkerSeqBits);
+}
+
+inline uint32_t marker_seq_from_payload(uint32_t payload)
+{
+    return payload & 0xFFFu;
+}
+
+// CRC-8 (poly 0x07) over the 24-bit payload: a misread corner must never be turned
+// into a wrong pairing, and 8 bits is plenty next to the full-id comparison.
+inline uint8_t marker_crc8(uint32_t payload24)
+{
+    uint32_t v = (payload24 & 0xFFFFFFu) << 8;
+    uint8_t crc = 0u;
+    for (int i = 0; i < 32; ++i) {
+        const uint8_t bit = static_cast<uint8_t>(((v >> 31) & 1u) ^ (crc >> 7));
+        crc = static_cast<uint8_t>(crc << 1);
+        if (bit != 0u) { crc ^= 0x07u; }
+        v <<= 1;
+    }
+    return crc;
+}
+
+inline uint32_t marker_code32(uint32_t payload24)
+{
+    return (payload24 & 0xFFFFFFu) |
+           (static_cast<uint32_t>(marker_crc8(payload24)) << 24);
+}
+
+// i = 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right.
+// Margins are a FRACTION of the frame (w/32, h/32, 4-px aligned) rather than absolute
+// pixels, so the producer (chain buffer) and the consumer (WGC copy, possibly at a
+// different scale) compute the same spot. At 3840x2160 that is (120, 64) from each
+// edge - still literally "the corner of the picture", never a hard-coded pixel.
+inline void marker_corner(uint32_t i, uint32_t w, uint32_t h, uint32_t* x, uint32_t* y)
+{
+    const bool right  = (i & 1u) != 0u;
+    const bool bottom = (i & 2u) != 0u;
+    const uint32_t mx = (w / kMarkerMargin) & ~3u;
+    const uint32_t my = (h / kMarkerMargin) & ~3u;
+    if (x != nullptr) {
+        *x = right ? (w - mx - kMarkerSide) : mx;
+    }
+    if (y != nullptr) {
+        *y = bottom ? (h - my - kMarkerSide) : my;
+    }
+}
 
 // Fixed layout, written once by the producer before magic is set.
 struct StreamShared
@@ -206,6 +406,12 @@ struct FrameShared
     // queried from the consuming node, so this header field is the only way it can name
     // "which publication I am done with".
     uint64_t published;
+    // ---- v23: global publication sequence ----
+    // Every PUBLICATION increments this (one per publish_frame), so it is unique and
+    // monotonic across slots. `published` above is a per-SLOT fence value and repeats
+    // across slots (1,1,1,1,2,2,2,2...), which made a single watermark skip 3 of every 4
+    // publications. The consumer orders by pub_seq; `published` stays the ACK token.
+    uint64_t pub_seq;
     // ---- v11 ----
     // What the producer *measured* about its own inputs, as opposed to what the API
     // declared (that stays in ProducerInfo.input_flags). The add-on's online probe fills
@@ -225,6 +431,38 @@ struct FrameShared
     // detectable the same way a stale source is.
     float    view_to_clip[16];
     uint64_t matrix_tick_ms;
+    // ---- v13 ----
+    // Previous-frame clip matrices from sl::Constants / DLSSG.ClipToPrevClip. They are
+    // *not* handed to XeFG verbatim; the consumer may use them for its own reprojection
+    // guide or for diagnostics. `frame_key` is the Streamline frame token / DLSS-G
+    // BackbufferFrameID and is only a pairing key.
+    float    clip_to_prev_clip[16];
+    float    prev_clip_to_clip[16];
+    uint64_t frame_key;
+    // QPC milliseconds (same machine clock as WGC's SystemRelativeTime) when the
+    // producer captured this frame. Used to pair the late WGC colour with the right
+    // MV/depth slot instead of relying on slot rotation.
+    uint64_t frame_qpc_ms;
+    uint32_t present_id;
+    // Packed FG declaration: kInputFlagResetHistory / kInputFlagMvDilated /
+    // kInputFlagMv3D / kInputFlagCameraMotion / kInputFlagInvertedDepth / ...
+    uint32_t fg_flags;
+    float    mv_invalid_value;
+    float    camera_pos[3];
+    float    camera_up[3];
+    float    camera_right[3];
+    float    camera_fwd[3];
+    float    camera_pinhole[2];
+    // ---- v16/v17: pre-marker 16x16 sidecar, same frame_id and same slot as MV/depth ----
+    // fakerFG records a 16x16 copy of the chain buffer (before it draws the marker)
+    // into streams[kStreamScar] of THE SAME publication slot. The consumer restores
+    // it after its own HDR conversion; `marker_valid` says the copy was recorded for
+    // this publication. The pixels are not stored here (v17) - only the geometry.
+    uint32_t marker_valid;
+    uint32_t marker_format;   // DXGI_FORMAT of the tile in the scar slot
+    uint32_t marker_x;
+    uint32_t marker_y;
+    uint8_t  marker_tile[kFrameMarkerBytes];   // legacy (v16 CPU path), unused
 };
 
 struct SharedControl
@@ -267,8 +505,38 @@ struct SharedControl
     // Producer diagnostics, so "were we ever starved?" stops being a guess.
     uint32_t producer_overrun;   // publications dropped: no free slot
     uint32_t producer_waits;     // times it had to spin for a slot (policy=wait)
-    uint32_t slot_policy;        // 0 = drop, 1 = wait (mirrors [capture] SlotPolicy)
+    uint32_t slot_policy;        // Reserved: the producer always writes 0 (drop). A wait
+                                 // policy was never implemented and producer_waits stays 0.
     uint32_t _pad_v10;
+    // ---- v14: per-stream switch board ----
+    // Written by the consumer at any time (no handshake, no restart): which non-essential
+    // streams it wants. `active_mask` is the producer's echo of what it actually wrote in
+    // the last published frame, and `stream_bytes` is what that cost, so the consumer can
+    // report "mv=66.4 MB depth=14.7 MB" instead of guessing.
+    uint32_t request_mask;
+    uint32_t active_mask;
+    uint32_t stream_bytes[kMaxStreams];
+    uint32_t _pad_v14;
+    // ---- v15: per-stream StreamPercent requests (consumer -> producer) ----
+    // 0 = no override: the producer keeps the value read from fakerFG.ini. Values are
+    // 100..400 and are applied on the producer's next record. A change bumps `generation`
+    // (the content rectangles move inside fixed-capacity slots), so the consumer rebuilds
+    // its local copies. `active_*` echo what the producer is actually using, which is what
+    // the controller and the A/B UI read back. This is a one-way hint like v7/v14: the
+    // producer never waits on it.
+    uint32_t requested_percent_mv;
+    uint32_t requested_percent_depth;
+    uint32_t active_percent_mv;
+    uint32_t active_percent_depth;
+    // ---- v21: colour-driven flow control ----
+    // The consumer's most recently PRESENTED publication id. The producer uses it to
+    // decide which slot may be overwritten: anything at or below this id has already been
+    // consumed by the colour path, anything above it is still waiting for its colour.
+    // When every slot is above it, the producer SKIPS this publication instead of
+    // overwriting data the colour still needs (`producer_skipped` counts that).
+    uint64_t colour_seq;
+    uint32_t producer_skipped;
+    uint32_t _pad_v21;
 };
 
 // The textures start after the control block, on a 64 KB boundary.
@@ -277,5 +545,10 @@ inline constexpr uint64_t align64k(uint64_t v) { return (v + 65535ull) & ~65535u
 
 // Name used by both sides. "Local\\" keeps it inside the user session.
 inline constexpr const char* kMappingName = "Local\\mgpu_mailbox_v1";
+// Created and set by the consumer at startup. The producer refuses to create the mapping
+// / heap / placed textures until this event exists, so launching the game WITHOUT the
+// consumer costs the transport layer nothing (the old behaviour created 90-540 MB of
+// cross-adapter resources during the game's black loading screen).
+inline constexpr const wchar_t* kConsumerPresentEvent = L"Local\\mgpu_consumer_present_v1";
 
 } // namespace mgpu

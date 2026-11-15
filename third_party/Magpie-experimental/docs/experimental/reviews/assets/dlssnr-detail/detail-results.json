@@ -1,0 +1,1 @@
+{"runtime":"D3D11 WARP, production HLSL, float/FP16 UAV","grayMaxAdjacent":7.21216e-06,"grayFP16MaxAdjacent":0.00012207,"signMaxAdjacent":1.93715e-06,"sliderBoundaryMaxJump":9.29832e-06,"oklabZeroLGreen":0.392487,"grayOutput":[0.393441,0.500463,0.698694],"cpuGrayOutput":[0.393441,0.500463,0.698694]}

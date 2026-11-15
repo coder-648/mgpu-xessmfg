@@ -5,8 +5,8 @@ vectors from the same game frame?
     python3 scripts/analyse_dump.py <dump-dir>
 
 The bridge writes, per frame, <dir>/fNN_colour.raw / _depth.raw / _mv.raw plus
-_meta.txt (see dump_frame() in src/bridge/bridge.cpp).  Each .raw starts with
-4 x uint32 { width, height, dxgiFormat, rowPitchBytes } and then the rows.
+_meta.txt (see dump_record() in src/bridge/modules/110_pair_dump.inc).  Each .raw
+starts with 4 x uint32 { width, height, dxgiFormat, rowPitchBytes } and then the rows.
 
 What it answers
 ---------------

@@ -9,7 +9,6 @@
 | `m0b_transport/` | 两块卡之间的 fence 能不能等到 | M0 |
 | `m0c_payload/` | 真的往跨卡堆里搬一张纹理 | M0.3 |
 | `m1_transport/` | 命名映射 + 循环 fence 的完整搬运 | M1 |
-| `wgc_probe/` | Windows.Graphics.Capture 抓帧的格式/时序/帧池行为 | M4 |
 | `bridge_probe/` | 消费端空转（只拿帧、不插帧）的基线 | M4 |
 | `../src/m2_probe/` | ReShade add-on 里读 NGX 参数（MV/深度/jitter） | M2 |
 | `../src/m3_depth/` | ReShade 深度纹理的格式与时效 | M3 |
@@ -21,6 +20,19 @@
 ./scripts/build_m0.sh m0c_payload      # -> build/m0c_payload.addon64 或 .exe
 ./scripts/build_osd_test.sh            # -> build/osd_test.exe
 ```
+
+## 纯计算仿真（参与回归）
+
+`cadence_core/` 不是探针，而是动态逐帧控制律的**确定性回归**：不依赖 Windows，
+覆盖 `J=2..9` 任意上限、fillable / cap-limited / input-limited 三种 regime、
+切换成本 0/1/2 与双卡成本上限。
+
+```bash
+tests/cadence_core/run.sh        # Linux / WSL：g++ -std=c++17
+tests\cadence_core\build.bat     # Windows：VS 开发者命令行
+```
+
+设计与参数见 [`../docs/design/DYNAMIC_CADENCE_ANY_CAP.md`](../docs/design/DYNAMIC_CADENCE_ANY_CAP.md)。
 
 结论对应表：
 

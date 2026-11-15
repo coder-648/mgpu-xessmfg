@@ -1,0 +1,1398 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <xsd:schema xmlns="" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:msdata="urn:schemas-microsoft-com:xml-msdata" id="root">
+    <xsd:import namespace="http://www.w3.org/XML/1998/namespace" />
+    <xsd:element name="root" msdata:IsDataSet="true">
+      <xsd:complexType>
+        <xsd:choice maxOccurs="unbounded">
+          <xsd:element name="metadata">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" />
+              </xsd:sequence>
+              <xsd:attribute name="name" use="required" type="xsd:string" />
+              <xsd:attribute name="type" type="xsd:string" />
+              <xsd:attribute name="mimetype" type="xsd:string" />
+              <xsd:attribute ref="xml:space" />
+            </xsd:complexType>
+          </xsd:element>
+          <xsd:element name="assembly">
+            <xsd:complexType>
+              <xsd:attribute name="alias" type="xsd:string" />
+              <xsd:attribute name="name" type="xsd:string" />
+            </xsd:complexType>
+          </xsd:element>
+          <xsd:element name="data">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" msdata:Ordinal="1" />
+                <xsd:element name="comment" type="xsd:string" minOccurs="0" msdata:Ordinal="2" />
+              </xsd:sequence>
+              <xsd:attribute name="name" type="xsd:string" use="required" msdata:Ordinal="1" />
+              <xsd:attribute name="type" type="xsd:string" msdata:Ordinal="3" />
+              <xsd:attribute name="mimetype" type="xsd:string" msdata:Ordinal="4" />
+              <xsd:attribute ref="xml:space" />
+            </xsd:complexType>
+          </xsd:element>
+          <xsd:element name="resheader">
+            <xsd:complexType>
+              <xsd:sequence>
+                <xsd:element name="value" type="xsd:string" minOccurs="0" msdata:Ordinal="1" />
+              </xsd:sequence>
+              <xsd:attribute name="name" type="xsd:string" use="required" />
+            </xsd:complexType>
+          </xsd:element>
+        </xsd:choice>
+      </xsd:complexType>
+    </xsd:element>
+  </xsd:schema>
+  <resheader name="resmimetype">
+    <value>text/microsoft-resx</value>
+  </resheader>
+  <resheader name="version">
+    <value>2.0</value>
+  </resheader>
+  <resheader name="reader">
+    <value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <resheader name="writer">
+    <value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <data name="About_PageFrame.Title" xml:space="preserve">
+    <value>Tietoja</value>
+  </data>
+  <data name="Home_Activation.Header" xml:space="preserve">
+    <value>Aktivointi</value>
+  </data>
+  <data name="Home_PageFrame.Title" xml:space="preserve">
+    <value>Koti</value>
+  </data>
+  <data name="Home_Activation_Timer.Header" xml:space="preserve">
+    <value>Viivästetty skaalaus</value>
+  </data>
+  <data name="Home_Activation_Timer_Cancel" xml:space="preserve">
+    <value>Peruuta</value>
+  </data>
+  <data name="Home_Activation_Timer_Delay.Header" xml:space="preserve">
+    <value>Viive sekunneissa</value>
+  </data>
+  <data name="ShortcutDialog_Cancel" xml:space="preserve">
+    <value>Peruuta</value>
+  </data>
+  <data name="ShortcutDialog_Description.Text" xml:space="preserve">
+    <value>Paina näppäinyhdistelmä vaihtaaksesi tämän pikanäppäimen</value>
+  </data>
+  <data name="ShortcutDialog_InUse" xml:space="preserve">
+    <value>Käytössä muualla</value>
+  </data>
+  <data name="ShortcutDialog_InvalidShortcut" xml:space="preserve">
+    <value>Virheellinen pikanäppäin</value>
+  </data>
+  <data name="ShortcutDialog_Save" xml:space="preserve">
+    <value>Tallenna</value>
+  </data>
+  <data name="ShortcutDialog_Tip.Text" xml:space="preserve">
+    <value>Vain Windows-, Ctrl-, Alt, ja Shift-näppäimillä alkavat pikanäppäimet ovat sallittuja.</value>
+  </data>
+  <data name="Root_About.Content" xml:space="preserve">
+    <value>Tietoja</value>
+  </data>
+  <data name="Root_Defaults.Content" xml:space="preserve">
+    <value>Oletusasetukset</value>
+  </data>
+  <data name="Root_Home.Content" xml:space="preserve">
+    <value>Koti</value>
+  </data>
+  <data name="Root_NewProfile.Content" xml:space="preserve">
+    <value>Uusi profiili</value>
+  </data>
+  <data name="Root_NewProfileFlyout_ComboBox.PlaceholderText" xml:space="preserve">
+    <value>Valitse ikkuna</value>
+  </data>
+  <data name="Root_NewProfileFlyout_CopyFrom.Text" xml:space="preserve">
+    <value>Kopioi kohteesta</value>
+  </data>
+  <data name="Root_NewProfileFlyout_Create.Content" xml:space="preserve">
+    <value>Luo</value>
+  </data>
+  <data name="Root_NewProfileFlyout_Name.Text" xml:space="preserve">
+    <value>Nimi</value>
+  </data>
+  <data name="Root_NewProfileFlyout_NoCandidateWindow.Text" xml:space="preserve">
+    <value>Avaa uusi ikkuna luodaksesi profiilin</value>
+  </data>
+  <data name="Root_NewProfileFlyout_Title.Text" xml:space="preserve">
+    <value>Uusi profiili</value>
+  </data>
+  <data name="Root_Profiles.Content" xml:space="preserve">
+    <value>Profiilit</value>
+  </data>
+  <data name="Root_ScalingModes.Content" xml:space="preserve">
+    <value>Skaalaustilat</value>
+  </data>
+  <data name="ScalingModes_PageFrame.Title" xml:space="preserve">
+    <value>Skaalaustilat</value>
+  </data>
+  <data name="Home_Advanced.Header" xml:space="preserve">
+    <value>Lisäasetukset</value>
+  </data>
+  <data name="Settings_General.Header" xml:space="preserve">
+    <value>Yleiset</value>
+  </data>
+  <data name="Settings_General_Language.Header" xml:space="preserve">
+    <value>Kieli</value>
+  </data>
+  <data name="Settings_General_Language_System" xml:space="preserve">
+    <value>Windowsin oletus</value>
+  </data>
+  <data name="Settings_General_PortableMode.Header" xml:space="preserve">
+    <value>Siirrettävä tila</value>
+  </data>
+  <data name="Settings_General_PortableMode_Locate.Content" xml:space="preserve">
+    <value>Avaa asetustiedoston sijainti</value>
+  </data>
+  <data name="Settings_Launch_RunAtStartup.Header" xml:space="preserve">
+    <value>Aja käynnistyksessä</value>
+  </data>
+  <data name="Settings_General_ShowNotifyIcon.Description" xml:space="preserve">
+    <value>Magpie ajetaan taustalla kun pääikkuna suljetaan</value>
+  </data>
+  <data name="Settings_General_ShowNotifyIcon.Header" xml:space="preserve">
+    <value>Näytä ohjelma tehtäväpalkissa</value>
+  </data>
+  <data name="Settings_General_Theme.Header" xml:space="preserve">
+    <value>Teema</value>
+  </data>
+  <data name="Settings_General_Theme_Dark.Content" xml:space="preserve">
+    <value>Tumma</value>
+  </data>
+  <data name="Settings_General_Theme_System.Content" xml:space="preserve">
+    <value>Windowsin oletus</value>
+  </data>
+  <data name="Settings_General_Theme_Light.Content" xml:space="preserve">
+    <value>Vaalea</value>
+  </data>
+  <data name="ToggleSwitch.OffContent" xml:space="preserve">
+    <value>Pois</value>
+  </data>
+  <data name="ToggleSwitch.OnContent" xml:space="preserve">
+    <value>Päällä</value>
+  </data>
+  <data name="Settings_Launch.Header" xml:space="preserve">
+    <value>Käynnistä</value>
+  </data>
+  <data name="ScalingModes_General_Export.Text" xml:space="preserve">
+    <value>Vienti</value>
+  </data>
+  <data name="ScalingModes_General_Import.Text" xml:space="preserve">
+    <value>Tuonti</value>
+  </data>
+  <data name="ScalingModes_General_MoreOptions.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve">
+    <value>Lisää asetuksia</value>
+  </data>
+  <data name="Settings_Launch_AlwaysRunAsAdmin.Description" xml:space="preserve">
+    <value>Tarvitset järjestelmänvalvojan oikeudet tämän asetuksen käyttöön</value>
+  </data>
+  <data name="Settings_Launch_AlwaysRunAsAdmin.Header" xml:space="preserve">
+    <value>Aja aina järjestelmänvalvojana</value>
+  </data>
+  <data name="Home_UpdateCard_AutoCheckForUpdates.Content" xml:space="preserve">
+    <value>Tarkista päivityksiä säännöllisesti</value>
+  </data>
+  <data name="Home_UpdateCard_DownloadAndInstall.Content" xml:space="preserve">
+    <value>Lataa ja asenna</value>
+  </data>
+  <data name="Home_UpdateCard_ReleaseNotes.Content" xml:space="preserve">
+    <value>Versiotiedot</value>
+  </data>
+  <data name="Home_UpdateCard_RemindMeLater.Content" xml:space="preserve">
+    <value>Muistuta myöhemmin</value>
+  </data>
+  <data name="Home_UpdateCard_Title" xml:space="preserve">
+    <value>{} on saatavilla</value>
+  </data>
+  <data name="About_OtherLinks.Header" xml:space="preserve">
+    <value>Muita linkkejä</value>
+  </data>
+  <data name="About_OtherLinks_ContributionGuidelines.Text" xml:space="preserve">
+    <value>Ohjeita ohjelman kehityksen auttamiseen</value>
+  </data>
+  <data name="About_OtherLinks_FAQ.Text" xml:space="preserve">
+    <value>UKK</value>
+  </data>
+  <data name="About_OtherLinks_License.Text" xml:space="preserve">
+    <value>Lisenssi</value>
+  </data>
+  <data name="About_OtherLinks_Repository.Text" xml:space="preserve">
+    <value>Github repositorio</value>
+  </data>
+  <data name="ScalingModes_Parameters.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve">
+    <value>Parametrit</value>
+  </data>
+  <data name="ScalingModes_MoreOptions.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve">
+    <value>Lisää asetuksia</value>
+  </data>
+  <data name="ScalingModes_MoreOptionsFlyout_Delete.Text" xml:space="preserve">
+    <value>Poista</value>
+  </data>
+  <data name="ScalingModes_MoreOptionsFlyout_MoveDown.Text" xml:space="preserve">
+    <value>Siirrä alas</value>
+  </data>
+  <data name="ScalingModes_MoreOptionsFlyout_MoveUp.Text" xml:space="preserve">
+    <value>Siirrä ylös</value>
+  </data>
+  <data name="ScalingModes_Rename.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve">
+    <value>Nimeä uudelleen</value>
+  </data>
+  <data name="ScalingModes_RenameFlyout_OK.Content" xml:space="preserve">
+    <value>OK</value>
+  </data>
+  <data name="ScalingModes_RenameFlyout_Title.Text" xml:space="preserve">
+    <value>Nimeä uudelleen</value>
+  </data>
+  <data name="ScalingModes_AddEffect.Text" xml:space="preserve">
+    <value>Lisää efekti</value>
+  </data>
+  <data name="ScalingModes_Delete.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve">
+    <value>Poista</value>
+  </data>
+  <data name="ScalingModes_DeleteFlyout_Delete.Text" xml:space="preserve">
+    <value>Poista</value>
+  </data>
+  <data name="ScalingModes_DeleteFlyout_Description.Text" xml:space="preserve">
+    <value>Seuraavien profiilien käytössä:</value>
+  </data>
+  <data name="ScalingModes_DeleteFlyout_Title.Text" xml:space="preserve">
+    <value>Haluatko varmasti poistaa tämän skaalaustilan?</value>
+  </data>
+  <data name="ScalingModes_DragNotSupported.Text" xml:space="preserve">
+    <value>Raahausta ja pudotusta ei tueta järjestelmänvalvontatilassa</value>
+  </data>
+  <data name="ScalingModes_DragToReorder.Text" xml:space="preserve">
+    <value>Raahaa uudelleenjärjestääksesi</value>
+  </data>
+  <data name="ScalingModes_MoveDown.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve">
+    <value>Siirrä alas</value>
+  </data>
+  <data name="ScalingModes_MoveUp.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve">
+    <value>Siirrä ylös</value>
+  </data>
+  <data name="ScalingModes_NewScalingMode.Text" xml:space="preserve">
+    <value>Uusi skaalaustila</value>
+  </data>
+  <data name="ScalingModes_NewScalingModeFlyout_Title.Text" xml:space="preserve">
+    <value>Uusi skaalaustila</value>
+  </data>
+  <data name="ScalingModes_Scale.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve">
+    <value>Skaalaus</value>
+  </data>
+  <data name="ScalingModes_NewScalingModeFlyout_CopyFrom.Text" xml:space="preserve">
+    <value>Kopioi kohteesta</value>
+  </data>
+  <data name="ScalingModes_NewScalingModeFlyout_CopyFrom_None" xml:space="preserve">
+    <value>Ei mitään</value>
+  </data>
+  <data name="ScalingModes_NewScalingModeFlyout_Create.Content" xml:space="preserve">
+    <value>Luo</value>
+  </data>
+  <data name="ScalingModes_NewScalingModeFlyout_Name.Text" xml:space="preserve">
+    <value>Nimi</value>
+  </data>
+  <data name="ScalingModes_ScaleFlyout_HeightFactor.Text" xml:space="preserve">
+    <value>Korkeus (skaalauskerroin)</value>
+  </data>
+  <data name="ScalingModes_ScaleFlyout_HeightPixels.Text" xml:space="preserve">
+    <value>Korkeus (pikseleitä)</value>
+  </data>
+  <data name="ScalingModes_ScaleFlyout_WidthFactor.Text" xml:space="preserve">
+    <value>Leveys (skaalauskerroin)</value>
+  </data>
+  <data name="ScalingModes_ScaleFlyout_WidthPixels.Text" xml:space="preserve">
+    <value>Leveys (pikseleitä)</value>
+  </data>
+  <data name="ScalingModes_ScaleFlyout_Type.Text" xml:space="preserve">
+    <value>Tyyppi</value>
+  </data>
+  <data name="ScalingModes_ScaleFlyout_Type_Absolute" xml:space="preserve">
+    <value>Absoluuttinen</value>
+  </data>
+  <data name="ScalingModes_ScaleFlyout_Type_Absolute_Description" xml:space="preserve">
+    <value>Aseta koko skaalauksen jälkeen</value>
+  </data>
+  <data name="ScalingModes_ScaleFlyout_Type_Factor" xml:space="preserve">
+    <value>Kerroin</value>
+  </data>
+  <data name="ScalingModes_ScaleFlyout_Type_Factor_Description" xml:space="preserve">
+    <value>Aseta skaalauskerroin suhteessa kuvaan</value>
+  </data>
+  <data name="ScalingModes_ScaleFlyout_Type_Fill" xml:space="preserve">
+    <value>Täyttö</value>
+  </data>
+  <data name="ScalingModes_ScaleFlyout_Type_Fill_Description" xml:space="preserve">
+    <value>Täyttää ruudun, kuva voi venyä</value>
+  </data>
+  <data name="ScalingModes_ScaleFlyout_Type_Fit" xml:space="preserve">
+    <value>Sovita</value>
+  </data>
+  <data name="ScalingModes_ScaleFlyout_Type_Fit_Description" xml:space="preserve">
+    <value>Sovittaa skaalakertoimen ruuduntäytön jälkeen suhteellisella skaalauksella</value>
+  </data>
+  <data name="Profile_General.Header" xml:space="preserve">
+    <value>Yleiset</value>
+  </data>
+  <data name="Profile_General_3DGameMode.Header" xml:space="preserve">
+    <value>3D pelitila</value>
+  </data>
+  <data name="Profile_General_HdrCompatibility.Header" xml:space="preserve">
+    <value>HDR compatibility</value>
+  </data>
+  <data name="Profile_General_AutoScale.Header" xml:space="preserve">
+    <value>Aktiivisen ruudun automaattinen skaalaus</value>
+  </data>
+  <data name="Profile_General_CaptureMethod.Header" xml:space="preserve">
+    <value>Kaappaustapa</value>
+  </data>
+  <data name="Profile_General_Multimonitor.Header" xml:space="preserve">
+    <value>Suositut monitorit</value>
+  </data>
+  <data name="Profile_General_Multimonitor_All.Content" xml:space="preserve">
+    <value>Kaikki monitorit</value>
+  </data>
+  <data name="Profile_General_Multimonitor_Closest.Content" xml:space="preserve">
+    <value>Lähdeikkunaa lähin monitori</value>
+  </data>
+  <data name="Profile_General_Multimonitor_Intersected.Content" xml:space="preserve">
+    <value>Lähdeikkunan kanssa risteävät monitorit</value>
+  </data>
+  <data name="Profile_General_ScalingMode.Header" xml:space="preserve">
+    <value>Skaalaustila</value>
+  </data>
+  <data name="Profile_Launch.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve">
+    <value>Käynnistä</value>
+  </data>
+  <data name="Profile_MoreOptions.[using:Windows.UI.Xaml.Controls]ToolTipService.ToolTip" xml:space="preserve">
+    <value>Lisää asetuksia</value>
+  </data>
+  <data name="Profile_MoreOptions_Delete.Text" xml:space="preserve">
+    <value>Poista</value>
+  </data>
+  <data name="Profile_MoreOptions_DeleteFlyout_Delete.Text" xml:space="preserve">
+    <value>Poista</value>
+  </data>
+  <data name="Profile_MoreOptions_DeleteFlyout_Title.Text" xml:space="preserve">
+    <value>Haluatko varmasti poistaa tämän profiilin?</value>
+  </data>
+  <data name="Profile_MoreOptions_OpenProgramLocation.Text" xml:space="preserve">
+    <value>Avaa ohjelman sijainti</value>
+  </data>
+  <data name="Profile_MoreOptions_Rename.Text" xml:space="preserve">
+    <value>Nimeä uudelleen</value>
+  </data>
+  <data name="Profile_MoreOptions_RenameFlyout_OK.Content" xml:space="preserve">
+    <value>OK</value>
+  </data>
+  <data name="Profile_MoreOptions_RenameFlyout_Title.Text" xml:space="preserve">
+    <value>Nimeä uudelleen</value>
+  </data>
+  <data name="Profile_MoreOptions_Reorder.Text" xml:space="preserve">
+    <value>Järjestele uudelleen</value>
+  </data>
+  <data name="Profile_MoreOptions_ReorderFlyout_MoveDown.Text" xml:space="preserve">
+    <value>Siirrä alas</value>
+  </data>
+  <data name="Profile_MoreOptions_ReorderFlyout_MoveUp.Text" xml:space="preserve">
+    <value>Siirrä ylös</value>
+  </data>
+  <data name="Profile_MoreOptions_ReorderFlyout_Title.Text" xml:space="preserve">
+    <value>Järjestele uudelleen</value>
+  </data>
+  <data name="Profile_General_ScalingMode_None" xml:space="preserve">
+    <value>Ei mitään</value>
+  </data>
+  <data name="Profile_Performance.Header" xml:space="preserve">
+    <value>Suorituskyky</value>
+  </data>
+  <data name="Profile_Performance_GraphicsCard.Header" xml:space="preserve">
+    <value>Näytönohjain</value>
+  </data>
+  <data name="About_Feedback.Header" xml:space="preserve">
+    <value>Palaute</value>
+  </data>
+  <data name="About_Feedback_Discussion.Header" xml:space="preserve">
+    <value>Keskustelut</value>
+  </data>
+  <data name="About_Feedback_ReportBug.Header" xml:space="preserve">
+    <value>Ilmoita bugista</value>
+  </data>
+  <data name="About_Feedback_RequestFeature.Header" xml:space="preserve">
+    <value>Pyydä ominaisuutta</value>
+  </data>
+  <data name="About_Version_UpdateSettings_CheckForPreviewUpdates.Header" xml:space="preserve">
+    <value>Tarkastele esikatselupäivityksiä</value>
+  </data>
+  <data name="About_Version_UpdateSettings_AutoCheckForUpdates.Header" xml:space="preserve">
+    <value>Tarkista päivitykset automaattisesti</value>
+  </data>
+  <data name="About_Version_CheckForUpdates.Text" xml:space="preserve">
+    <value>Tarkista päivitykset</value>
+  </data>
+  <data name="About_Version_CheckForUpdatesFailed.Title" xml:space="preserve">
+    <value>Päivitysten haku epäonnistui, yritä myöhemmin uudelleen</value>
+  </data>
+  <data name="About_Version_CheckingForUpdates.Text" xml:space="preserve">
+    <value>Haetaan päivityksiä</value>
+  </data>
+  <data name="About_Version_UpdateCard_Cancel.Content" xml:space="preserve">
+    <value>Peruuta</value>
+  </data>
+  <data name="About_Version_UpdateCard_DownloadAndInstall.Content" xml:space="preserve">
+    <value>Lataa ja asenna</value>
+  </data>
+  <data name="About_Version_UpdateCard_ReleaseNotes.Content" xml:space="preserve">
+    <value>Versiotiedot</value>
+  </data>
+  <data name="About_Version_UpdateCard_Retry.Content" xml:space="preserve">
+    <value>Yritä uudelleen</value>
+  </data>
+  <data name="About_Version_UpdateCard_Title" xml:space="preserve">
+    <value>{} on saatavilla</value>
+  </data>
+  <data name="About_Version_UpdateToDate.Title" xml:space="preserve">
+    <value>Magpie on ajantasalla</value>
+  </data>
+  <data name="About_Version_UpdateToDate_DownloadFailed.Text" xml:space="preserve">
+    <value>Lataaminen epäonnistui</value>
+  </data>
+  <data name="About_Version_UpdateToDate_Downloading.Text" xml:space="preserve">
+    <value>Ladataan</value>
+  </data>
+  <data name="About_Version_UpdateToDate_Installing.Text" xml:space="preserve">
+    <value>Asennetaan</value>
+  </data>
+  <data name="Profile_Advanced.Header" xml:space="preserve">
+    <value>Lisäasetukset</value>
+  </data>
+  <data name="Profile_Advanced_DisableDirectFlip.Header" xml:space="preserve">
+    <value>Poista DirectFlip käytöstä</value>
+  </data>
+  <data name="Profile_Cursor.Header" xml:space="preserve">
+    <value>Kursori</value>
+  </data>
+  <data name="Profile_Cursor_DrawCursor_AdjustCursorSpeed.Header" xml:space="preserve">
+    <value>Säädä kursorin nopeutta kun skaalattu</value>
+  </data>
+  <data name="Profile_Cursor_DrawCursor_Interpolation.Header" xml:space="preserve">
+    <value>Interpolaatioalgoritmi</value>
+  </data>
+  <data name="Profile_Cursor_DrawCursor_Interpolation_Bilinear.Content" xml:space="preserve">
+    <value>Bilineaarinen</value>
+  </data>
+  <data name="Profile_Cursor_DrawCursor_Interpolation_NearestNeighbor.Content" xml:space="preserve">
+    <value>Lähin-naapuri</value>
+  </data>
+  <data name="Profile_Cursor_DrawCursor_ScaleFactor.Header" xml:space="preserve">
+    <value>Skaalauskerroin</value>
+  </data>
+  <data name="Profile_Cursor_DrawCursor_ScaleFactor_Custom.Content" xml:space="preserve">
+    <value>Muu</value>
+  </data>
+  <data name="Profile_Cursor_DrawCursor_ScaleFactor_NoScaling.Content" xml:space="preserve">
+    <value>Ei skaalausta</value>
+  </data>
+  <data name="Profile_Cursor_DrawCursor_ScaleFactor_SameAsSourceWindow.Content" xml:space="preserve">
+    <value>Sama kuin lähdeikkunalla</value>
+  </data>
+  <data name="Profile_General_CaptureMethod_Default" xml:space="preserve">
+    <value>Oletus</value>
+  </data>
+  <data name="Profile_SourceWindow.Header" xml:space="preserve">
+    <value>Lähdeikkuna</value>
+  </data>
+  <data name="Profile_SourceWindow_CaptureTitleBar.Description" xml:space="preserve">
+    <value>Rajoitettu grafiikan kaappaukseen ja työpöydän monistukseen</value>
+  </data>
+  <data name="Profile_SourceWindow_CaptureTitleBar.Header" xml:space="preserve">
+    <value>Kaappaa otsikkopalkki</value>
+  </data>
+  <data name="Profile_SourceWindow_CustomCropping.Header" xml:space="preserve">
+    <value>Muu rajaus</value>
+  </data>
+  <data name="Profile_SourceWindow_CustomCropping_Bottom.Header" xml:space="preserve">
+    <value>Ala</value>
+  </data>
+  <data name="Profile_SourceWindow_CustomCropping_Left.Header" xml:space="preserve">
+    <value>Vasen</value>
+  </data>
+  <data name="Profile_SourceWindow_CustomCropping_Pixels.Text" xml:space="preserve">
+    <value>px</value>
+  </data>
+  <data name="Profile_SourceWindow_CustomCropping_Right.Header" xml:space="preserve">
+    <value>Oikea</value>
+  </data>
+  <data name="Profile_SourceWindow_CustomCropping_Top.Header" xml:space="preserve">
+    <value>Ylä</value>
+  </data>
+  <data name="Home_Advanced_InlineParams.Description" xml:space="preserve">
+    <value>Parantaa hieman suorituskykyä, mutta efektit on käännettävä uudelleen aina kun parametrit muuttuvat</value>
+  </data>
+  <data name="Home_Advanced_InlineParams.Header" xml:space="preserve">
+    <value>Rivitä efektien parametrit</value>
+  </data>
+  <data name="Home_Advanced_SimulateExclusiveFullscreen.Description" xml:space="preserve">
+    <value>Vain kokoruudun skaalauksessa. Vaimentaa tietyt ohjelmailmoitukset ja ponnahdusikkunat jos päällä</value>
+  </data>
+  <data name="Home_Advanced_SimulateExclusiveFullscreen.Header" xml:space="preserve">
+    <value>Simuloi kokoruudun tilaa skaalatessa</value>
+  </data>
+  <data name="AppSettings_Dialog_Error" xml:space="preserve">
+    <value>Virhe</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions.Description" xml:space="preserve">
+    <value>Nämä asetukset ovat vain kehitystä varten</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions.Header" xml:space="preserve">
+    <value>Kehitysasetukset</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_DebugMode.Content" xml:space="preserve">
+    <value>Virheenkorjaustila</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_DisableEffectCache.Content" xml:space="preserve">
+    <value>Poista efektivälimuisti käytöstä</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_SaveEffectSources.Content" xml:space="preserve">
+    <value>Tallenna varjostimien lähdekoodi efektejä jäsennettäessä</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_WarningsAreErrors.Content" xml:space="preserve">
+    <value>Käsittele varoituksia virheinä kun efektejä käännetään</value>
+  </data>
+  <data name="AppSettings_Dialog_Exit" xml:space="preserve">
+    <value>Poistu</value>
+  </data>
+  <data name="AppSettings_ErrorDialog_ConfigLocation" xml:space="preserve">
+    <value>Asetustiedoston sijainti
+{}</value>
+  </data>
+  <data name="AppSettings_ErrorDialog_NotValidJson" xml:space="preserve">
+    <value>Asetustiedosto ei ole JSON-pätevä</value>
+  </data>
+  <data name="AppSettings_ErrorDialog_ParseFailed" xml:space="preserve">
+    <value>Asetustiedoston jäsennys epäonnistui</value>
+  </data>
+  <data name="AppSettings_ErrorDialog_ReadFailed" xml:space="preserve">
+    <value>Asetustiedoston luku epäonnistui</value>
+  </data>
+  <data name="NotifyIcon_Exit" xml:space="preserve">
+    <value>Poistu</value>
+  </data>
+  <data name="NotifyIcon_MainWindow" xml:space="preserve">
+    <value>Pääikkuna</value>
+  </data>
+  <data name="Settings_General_RequireRestart.Title" xml:space="preserve">
+    <value>Uudelleenkäynnistys vaaditaan asetusten aktivointia varten</value>
+  </data>
+  <data name="Settings_General_RequireRestart_ActionButton.Content" xml:space="preserve">
+    <value>Käynnistä Magpie uudelleen</value>
+  </data>
+  <data name="ScalingModes_Description_UnknownEffect" xml:space="preserve">
+    <value>Tuntematon efekti</value>
+  </data>
+  <data name="ScalingModes_HasUnkownEffects.Title" xml:space="preserve">
+    <value>Joitain efektejä ei voitu jäsentää</value>
+  </data>
+  <data name="Dialog_Export_Title" xml:space="preserve">
+    <value>Vie skaalaustilat</value>
+  </data>
+  <data name="Dialog_Import_Title" xml:space="preserve">
+    <value>Tuo skaalaustilat</value>
+  </data>
+  <data name="About_Version_UpdateSettings.Header" xml:space="preserve">
+    <value>Päivitä asetukset</value>
+  </data>
+  <data name="About_Version_Version" xml:space="preserve">
+    <value>Versio</value>
+  </data>
+  <data name="Profile_Advanced_LaunchParameters.Header" xml:space="preserve">
+    <value>Käynnistysparametrit</value>
+  </data>
+  <data name="Overlay_Profiler" xml:space="preserve">
+    <value>Profiloija</value>
+  </data>
+  <data name="Overlay_Profiler_CaptureMethod" xml:space="preserve">
+    <value>Kaappaustapa</value>
+  </data>
+  <data name="Overlay_FPS_Lock" xml:space="preserve">
+    <value>Lukitus</value>
+  </data>
+  <data name="Overlay_FPS_Opacity" xml:space="preserve">
+    <value>Läpinäkymättömyys</value>
+  </data>
+  <data name="Overlay_FPS_Unlock" xml:space="preserve">
+    <value>Poista lukitus</value>
+  </data>
+  <data name="Overlay_Profiler_Timings" xml:space="preserve">
+    <value>Ajoitukset</value>
+  </data>
+  <data name="Overlay_Profiler_Timings_SwitchToEffects" xml:space="preserve">
+    <value>Vaihda efekteihin</value>
+  </data>
+  <data name="Overlay_Profiler_Timings_SwitchToPasses" xml:space="preserve">
+    <value>Vaihda pyyhkäisyihin</value>
+  </data>
+  <data name="Overlay_Profiler_Timings_Total" xml:space="preserve">
+    <value>Kaikkiaan</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_DisableFontCache.Content" xml:space="preserve">
+    <value>Poista fonttivälimuisti käytöstä</value>
+  </data>
+  <data name="Home_Advanced_AllowScalingMaximized.Header" xml:space="preserve">
+    <value>Salli suurennettujen tai kokoruutuikkunoiden skaalaus</value>
+  </data>
+  <data name="Dialog_JsonFile" xml:space="preserve">
+    <value>JSON-tiedosto</value>
+  </data>
+  <data name="Profile_MoreOptions_ChangeExecutableForLaunching.Text" xml:space="preserve">
+    <value>Vaihda ohjelman käynnistystiedosto</value>
+  </data>
+  <data name="Dialog_ExeFile" xml:space="preserve">
+    <value>Käynnistystiedosto</value>
+  </data>
+  <data name="Dialog_SelectLauncher_Title" xml:space="preserve">
+    <value>Valitse käynnistystiedosto avataksesi ohjelman</value>
+  </data>
+  <data name="Profile_Performance_FrameRateLimiter.Header" xml:space="preserve">
+    <value>Ruudunpäivityksen rajoitin</value>
+  </data>
+  <data name="Profile_Performance_FrameRateLimiter_MaxFrameRate.Header" xml:space="preserve">
+    <value>Suurin sallittu ruudunpäivitysnopeus</value>
+  </data>
+  <data name="About_Version_CommitId" xml:space="preserve">
+    <value>Kommitoi</value>
+  </data>
+  <data name="About_DeveloperModeEnabled" xml:space="preserve">
+    <value>Kehittäjätila on aktivoitu.</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_DuplicateFrameDetection.Header" xml:space="preserve">
+    <value>Ruutuduplikaattien tunnistus</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_DuplicateFrameDetection_Always.Content" xml:space="preserve">
+    <value>Aina</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_DuplicateFrameDetection_Dynamic.Content" xml:space="preserve">
+    <value>Dynaaminen</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_DuplicateFrameDetection_Never.Content" xml:space="preserve">
+    <value>Ei koskaan</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_EnableStatisticsForDynamicDetection.Content" xml:space="preserve">
+    <value>Salli tilastot dynaamista tunnistamista varten</value>
+  </data>
+  <data name="Overlay_Profiler_DynamicDetection" xml:space="preserve">
+    <value>Dynaaminen tunnistus</value>
+  </data>
+  <data name="Overlay_Profiler_FrameRate" xml:space="preserve">
+    <value>Ruudunpäivitysnopeus</value>
+  </data>
+  <data name="Home_TouchSupport_EnableTouchSupport.Header" xml:space="preserve">
+    <value>Aktivoi tuki kosketukselle</value>
+  </data>
+  <data name="Home_TouchSupport_EnableTouchSupport_Description.Text" xml:space="preserve">
+    <value>Tarvitset järjestelmänvalvojanoikeudet tämän asetuksen muuttamiseen</value>
+  </data>
+  <data name="Home_TouchSupport_EnableTouchSupport_LearnMore.Content" xml:space="preserve">
+    <value>Lue lisää</value>
+  </data>
+  <data name="Home_TouchSupport.Header" xml:space="preserve">
+    <value>Tuki kosketukselle</value>
+  </data>
+  <data name="Home_TouchSupport_Info.Title" xml:space="preserve">
+    <value>Jos kosketustuki epäonnistuu, Magpie saattaa pyytää järjestelmänvalvojan oikeuksia korjausta varten ennen skaalausta.</value>
+  </data>
+  <data name="Home_Advanced_SimulateExclusiveFullscreen_InfoBar.Title" xml:space="preserve">
+    <value>Jotkin vanhemmat pelit eivät tue tätä asetusta. Käytä varoen.</value>
+  </data>
+  <data name="Message_InvalidScalingMode" xml:space="preserve">
+    <value>Virheellinen skaalaustila.</value>
+  </data>
+  <data name="Message_TouchSupport" xml:space="preserve">
+    <value>Kosketustuen aktivointi epäonnistui.</value>
+  </data>
+  <data name="Message_InvalidSourceWindow" xml:space="preserve">
+    <value>Tämän ikkunan skaalausta ei tueta.</value>
+  </data>
+  <data name="Message_Maximized" xml:space="preserve">
+    <value>Suurennettujen ja kokoruudun ikkunoiden skaalaus on estetty. Voit vaihtaa tätä asetusta Koti-sivulta.</value>
+  </data>
+  <data name="Message_LowIntegrityLevel" xml:space="preserve">
+    <value>Magpie täytyy ajaa järjestelmänvalvojan oikeuksilla tämän ikkunan skaalaamiseksi.</value>
+  </data>
+  <data name="Message_ScalingFailedGeneral" xml:space="preserve">
+    <value>Lue lisätietoja lokista.</value>
+  </data>
+  <data name="Message_CaptureFailed" xml:space="preserve">
+    <value>Virhe tätä ikkunaa kaapatessa. Kokeile toista kaapaustapaa.</value>
+  </data>
+  <data name="Message_CreateFenceFailed" xml:space="preserve">
+    <value>Valittu näytönohjain ei tue funktiota ID3D11Device5::CreateFence. Yritä päivittää ajurit, tai vaihtaa näytönohjainta.</value>
+  </data>
+  <data name="Message_ScalingFailed" xml:space="preserve">
+    <value>Skaalaus epäonnistui</value>
+  </data>
+  <data name="Profile_Performance_NoGraphicsCard.Title" xml:space="preserve">
+    <value>Tuettua näytönohjainta ei löytynyt joten käytetään keskussuoritinta renderöintiin. Suorituskyky ei ehkä vastaa odotuksia.</value>
+  </data>
+  <data name="Home_Advanced_MinFrameRate.Header" xml:space="preserve">
+    <value>Pienin ruudunpäivitysnopeus</value>
+  </data>
+  <data name="Home_Advanced_MinFrameRate.Description" xml:space="preserve">
+    <value>Vakauttaa näytönohjaimen taajuuden nykimisen vähentämiseksi, mutta saattaa lisätä virrankulutusta</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_DisableFP16.Content" xml:space="preserve">
+    <value>Estä FP16-formaatin käytön varjostimissa</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_BenchmarkMode.Content" xml:space="preserve">
+    <value>Suorituskyvyn mittaustila</value>
+  </data>
+  <data name="Root_NewProfileFlyout_NameContextFlyout_AppName" xml:space="preserve">
+    <value>Täytä ohjelman nimellä</value>
+  </data>
+  <data name="Root_NewProfileFlyout_NameContextFlyout_ProcessName" xml:space="preserve">
+    <value>Täytä prosessin nimellä</value>
+  </data>
+  <data name="Root_NewProfileFlyout_NameContextFlyout_WindowTitle" xml:space="preserve">
+    <value>Täytä ikkunan nimellä</value>
+  </data>
+  <data name="TextMenuFlyout_Copy" xml:space="preserve">
+    <value>Kopioi</value>
+  </data>
+  <data name="TextMenuFlyout_Cut" xml:space="preserve">
+    <value>Leikkaa</value>
+  </data>
+  <data name="TextMenuFlyout_Paste" xml:space="preserve">
+    <value>Liitä</value>
+  </data>
+  <data name="TextMenuFlyout_Redo" xml:space="preserve">
+    <value>Tee uudelleen</value>
+  </data>
+  <data name="TextMenuFlyout_SelectAll" xml:space="preserve">
+    <value>Valitse kaikki</value>
+  </data>
+  <data name="TextMenuFlyout_Undo" xml:space="preserve">
+    <value>Peru toiminto</value>
+  </data>
+  <data name="Message_BannedInWindowedMode" xml:space="preserve">
+    <value>Tämän ikkunan ikkunoitua skaalausta ei tueta.</value>
+  </data>
+  <data name="Message_InvalidCropping" xml:space="preserve">
+    <value>Rajausta ei voitu suorittaa.</value>
+  </data>
+  <data name="Home_TouchSupport.Description" xml:space="preserve">
+    <value>Järjestelmän turvarajoitusten vuoksi, Magpie tarvitsee UIAccess-oikeuden kosketustukea varten.</value>
+  </data>
+  <data name="Home_Activation.Description" xml:space="preserve">
+    <value>Paina pikanäppäintä etualan-ikkunan skaalaamiseksi tai skaalauksen lopettamiseksi.</value>
+  </data>
+  <data name="Home_Activation_FullscreenScaling.Header" xml:space="preserve">
+    <value>Kokoruudun skaalauksen pikanäppäin</value>
+  </data>
+  <data name="Home_Activation_FullscreenScaling_ShortcutControl.Title" xml:space="preserve">
+    <value>Kokoruudun skaalauksen pikanäppäin</value>
+  </data>
+  <data name="Home_Activation_WindowedScaling.Header" xml:space="preserve">
+    <value>Ikkunoidun skaalauksen pikanäppäin</value>
+  </data>
+  <data name="Home_Activation_WindowedScaling_ShortcutControl.Title" xml:space="preserve">
+    <value>Ikkunoidun skaalauksen pikanäppäin</value>
+  </data>
+  <data name="Home_Advanced_AllowScalingMaximized.Description" xml:space="preserve">
+    <value>Soveltuu vain kokoruudun skaalaukseen</value>
+  </data>
+  <data name="Home_Toolbar.Description" xml:space="preserve">
+    <value>Työkalupalkki löytyy skaalatun ikkunan yläosasta. Se tarjoaa valintoja kuten ruudunpäivitysnopeuden näytön ja ruudunkaappauksien oton. Ikkunatilassa sen avulla voi raahata skaalattua ikkunaa.</value>
+  </data>
+  <data name="Home_Toolbar.Header" xml:space="preserve">
+    <value>Työkalupalkki</value>
+  </data>
+  <data name="Home_Toolbar_InitialState.Header" xml:space="preserve">
+    <value>Työkalupalkin alkutila</value>
+  </data>
+  <data name="Home_Toolbar_InitialState_AlwaysShow.Content" xml:space="preserve">
+    <value>Näytä aina</value>
+  </data>
+  <data name="Home_Toolbar_InitialState_AutoHide.Content" xml:space="preserve">
+    <value>Piilota automaattisesti</value>
+  </data>
+  <data name="Home_Toolbar_InitialState_Off.Content" xml:space="preserve">
+    <value>Pois</value>
+  </data>
+  <data name="Home_Toolbar_StateToggle.Header" xml:space="preserve">
+    <value>Työkalupalkin tilanvaihdon pikanäppäin</value>
+  </data>
+  <data name="Home_Toolbar_StateToggle_ShortcutControl.Title" xml:space="preserve">
+    <value>Työkalupalkin tilanvaihdon pikanäppäin</value>
+  </data>
+  <data name="Message_ToolbarIn3DGameMode" xml:space="preserve">
+    <value>Työkalupalkkia ei tueta 3D pelitilassa.</value>
+  </data>
+  <data name="Message_ToolbarNewState" xml:space="preserve">
+    <value>Työkalupalkki: {}</value>
+  </data>
+  <data name="Overlay_Toolbar_Close" xml:space="preserve">
+    <value>Lopeta skaalaus</value>
+  </data>
+  <data name="Overlay_Toolbar_Demo" xml:space="preserve">
+    <value>ImGui Demo-ikkuna</value>
+  </data>
+  <data name="Overlay_Toolbar_Pin" xml:space="preserve">
+    <value>Kiinnitä työkalupalkki</value>
+  </data>
+  <data name="Overlay_Toolbar_TakeScreenshot" xml:space="preserve">
+    <value>Ota kuvaruudunkaappaus</value>
+  </data>
+  <data name="Overlay_Toolbar_Profiler" xml:space="preserve">
+    <value>Profilointi-ikkuna</value>
+  </data>
+  <data name="Message_Windowed3DGameMode" xml:space="preserve">
+    <value>Ikkunoitua skaalausta ei tueta 3D-pelitilassa.</value>
+  </data>
+  <data name="Profile_General_3DGameMode.Description" xml:space="preserve">
+    <value>Mahdollistaa 3D-pelien optimoinnit, mutta ei ole yhteensopiva työkalupalkin ja ikkunoidun skaalauksen kanssa</value>
+  </data>
+  <data name="Profile_General_HdrCompatibility.Description" xml:space="preserve">
+    <value>Enable the experimental HDR capture-to-effect compatibility path. Keep disabled unless you are testing HDR support</value>
+  </data>
+  <data name="Home_Toolbar_ScreenshotSaveDirectory.Header" xml:space="preserve">
+    <value>Kuvaruudunkaappausten tallennushakemisto</value>
+  </data>
+  <data name="Home_Toolbar_ScreenshotSaveDirectory_Change.Content" xml:space="preserve">
+    <value>Muuta</value>
+  </data>
+  <data name="Dialog_SetlectScreenshotSaveDirectory_Title" xml:space="preserve">
+    <value>Valitse hakemisto kuvaruudunkaappauksille</value>
+  </data>
+  <data name="Message_ScreenshotSaved" xml:space="preserve">
+    <value>Kaappaus tallennettu nimellä {}</value>
+  </data>
+  <data name="Message_ScreenshotFailed" xml:space="preserve">
+    <value>Kaappaus epäonnistui.</value>
+  </data>
+  <data name="Overlay_Toolbar_TakeScreenshot_Description" xml:space="preserve">
+    <value>Paina hiiren kakkospainiketta viedäksesi väliaikatilan tuloksen</value>
+  </data>
+  <data name="Overlay_Toolbar_TakeScreenshot_PopupTitle" xml:space="preserve">
+    <value>Vie väliaikatilan tulos</value>
+  </data>
+  <data name="Profile_WindowedScaling.Header" xml:space="preserve">
+    <value>Ikkunoitu skaalaus</value>
+  </data>
+  <data name="Profile_WindowedScaling_InitialScaleFactor.Header" xml:space="preserve">
+    <value>Lähtöskaalakerroin</value>
+  </data>
+  <data name="Profile_WindowedScaling_InitialScaleFactor_Auto.Content" xml:space="preserve">
+    <value>Automaattinen</value>
+  </data>
+  <data name="Profile_WindowedScaling_InitialScaleFactor_Custom.Content" xml:space="preserve">
+    <value>Muu</value>
+  </data>
+  <data name="Profile_Advanced_DisableDirectFlip.Description" xml:space="preserve">
+    <value>Auttaa välttämään joitain yhteensopivuusongelmia, mutta saattaa huomattavasti lisätä latenssia</value>
+  </data>
+  <data name="Profile_General_AutoScale_Disabled.Content" xml:space="preserve">
+    <value>Poissa käytöstä</value>
+  </data>
+  <data name="Profile_General_AutoScale_Fullscreen.Content" xml:space="preserve">
+    <value>Kokoruudun skaalaus</value>
+  </data>
+  <data name="Profile_General_AutoScale_Windowed.Content" xml:space="preserve">
+    <value>Ikkunoitu skaalaus</value>
+  </data>
+  <data name="Profile_General_Multimonitor.Description" xml:space="preserve">
+    <value>Soveltuu vain kokoruudun skaalaukseen</value>
+  </data>
+  <data name="Home_TouchSupport_Warn.Title" xml:space="preserve">
+    <value>Työkalupalkki ei ole kosketusyhteensopiva.</value>
+  </data>
+  <data name="Overlay_Toolbar_Close_Description" xml:space="preserve">
+    <value>Sulje työkalupalkki hiiren kakkospainikkeella</value>
+  </data>
+  <data name="Overlay_Toolbar_SwitchToFullscreen" xml:space="preserve">
+    <value>Vaihda kokoruudun skaalaukseen</value>
+  </data>
+  <data name="Overlay_Toolbar_SwitchToWindowed" xml:space="preserve">
+    <value>Vaihda ikkunoituun skaalaukseen</value>
+  </data>
+  <data name="Home_Toolbar_InitialState_Fullscreen.Header" xml:space="preserve">
+    <value>Kokoruudun skaalaus</value>
+  </data>
+  <data name="Home_Toolbar_InitialState_Windowed.Header" xml:space="preserve">
+    <value>Ikkunoitu skaalaus</value>
+  </data>
+  <data name="Message_ExportScalingModesFailed" xml:space="preserve">
+    <value>Skaalaustilojen vienti epäonnistui.</value>
+  </data>
+  <data name="Message_ImportScalingModesFailed" xml:space="preserve">
+    <value>Skaalaustilojen tuonti epäonnistui.</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_LocateLogs.Header" xml:space="preserve">
+    <value>Avaa lokien sijainti</value>
+  </data>
+  <data name="Message_WindowedDesktopDuplication" xml:space="preserve">
+    <value>Työpöydän duplikointi ei tue ikkunoiden skaalausta.</value>
+  </data>
+  <data name="Profile_General_DesktopDuplicationWarning.Title" xml:space="preserve">
+    <value>Ikkunoitu skaalaus ei tue tätä kaappausmenetelmää.</value>
+  </data>
+  <data name="Settings_Launch_RunAtStartup.Description" xml:space="preserve">
+    <value>Pääikkunaa ei näytetä jos "Näytä ohjelma tehtäväpalkissa" on päällä</value>
+  </data>
+  <data name="Home_Activation_Timer_Description" xml:space="preserve">
+    <value>Skaalaa etualan ikkuna {} jälkeen</value>
+  </data>
+  <data name="Home_Activation_Timer_Start" xml:space="preserve">
+    <value>Aloita</value>
+  </data>
+  <data name="NotifyIcon_Timer_Fullscreen" xml:space="preserve">
+    <value>Skaalaa {}:n jälkeen (Kokoruutu)</value>
+  </data>
+  <data name="NotifyIcon_Timer_Windowed" xml:space="preserve">
+    <value>Skaalaa {}:n jälkeen (Ikkunoitu)</value>
+  </data>
+  <data name="Overlay_Toolbar_Minimize" xml:space="preserve">
+    <value>Minimoi</value>
+  </data>
+  <data name="Profile_Cursor_AutoHide.Header" xml:space="preserve">
+    <value>Piiloita käyttämätön kursori automaattisesti</value>
+  </data>
+  <data name="Profile_Cursor_AutoHide_Delay.Header" xml:space="preserve">
+    <value>Piilotuksen viive sekunneissa</value>
+  </data>
+  <data name="Profile_Advanced_DestAlignment.Description" xml:space="preserve">
+    <value>Soveltuu vain kokoruudun skaalaukseen</value>
+  </data>
+  <data name="Profile_Advanced_DestAlignment.Header" xml:space="preserve">
+    <value>Ulostulon tasaus</value>
+  </data>
+  <data name="Profile_Advanced_DestAlignment_BottomCenter.Content" xml:space="preserve">
+    <value>Alhaalla-keskellä</value>
+  </data>
+  <data name="Profile_Advanced_DestAlignment_BottomLeft.Content" xml:space="preserve">
+    <value>Ala-vasen</value>
+  </data>
+  <data name="Profile_Advanced_DestAlignment_BottomRight.Content" xml:space="preserve">
+    <value>Ala-oikea</value>
+  </data>
+  <data name="Profile_Advanced_DestAlignment_Center.Content" xml:space="preserve">
+    <value>Keskellä</value>
+  </data>
+  <data name="Profile_Advanced_DestAlignment_Left.Content" xml:space="preserve">
+    <value>Vasen</value>
+  </data>
+  <data name="Profile_Advanced_DestAlignment_Right.Content" xml:space="preserve">
+    <value>Oikea</value>
+  </data>
+  <data name="Profile_Advanced_DestAlignment_TopCenter.Content" xml:space="preserve">
+    <value>Ylhäällä-keskellä</value>
+  </data>
+  <data name="Profile_Advanced_DestAlignment_TopLeft.Content" xml:space="preserve">
+    <value>Ylävasen</value>
+  </data>
+  <data name="Profile_Advanced_DestAlignment_TopRight.Content" xml:space="preserve">
+    <value>Yläoikea</value>
+  </data>
+  <data name="Home_Advanced_DeveloperOptions_DisableTopmost.Content" xml:space="preserve">
+    <value>Poista "aina-päällä" -toiminto käytöstä</value>
+  </data>
+  <data name="ScalingModes_General_ConfigFolder.Text" xml:space="preserve">
+    <value>Asetuskansio</value>
+  </data>
+  <data name="ScalingModes_General_Reset.Text" xml:space="preserve">
+    <value>Palauta</value>
+  </data>
+  <data name="Profile_General_GraphicsCard.Header" xml:space="preserve">
+    <value>Renderöinnin näytönohjain</value>
+  </data>
+  <data name="Profile_General_GraphicsCard_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve">
+    <value>Renderöinnin näytönohjain</value>
+  </data>
+  <data name="Profile_General_GraphicsCard_Auto" xml:space="preserve">
+    <value>Automaattinen</value>
+  </data>
+  <data name="Profile_General_GraphicsCard_None" xml:space="preserve">
+    <value>Käytettävissä olevaa näytönohjainta ei löytynyt</value>
+  </data>
+  <data name="Profile_General_GraphicsCard_Unavailable" xml:space="preserve">
+    <value>Valittu näytönohjain ei ole tilapäisesti käytettävissä</value>
+  </data>
+  <data name="Profile_General_NoGraphicsCard.Title" xml:space="preserve">
+    <value>Käytettävissä olevaa näytönohjainta ei löytynyt</value>
+  </data>
+  <data name="Profile_General_NoGraphicsCard.Message" xml:space="preserve">
+    <value>Tehosteita käynnistettäessä yritetään renderöintiä suorittimella. Tarkista näytönohjaimen ajuri.</value>
+  </data>
+  <data name="Profile_General_GraphicsCardUnavailable.Title" xml:space="preserve">
+    <value>Valittu näytönohjain ei ole tilapäisesti käytettävissä</value>
+  </data>
+  <data name="Profile_General_GraphicsCardUnavailable.Message" xml:space="preserve">
+    <value>Tehosteet käyttävät automaattisesti käytettävissä olevaa näytönohjainta. Valittua ohjainta käytetään jälleen, kun se on saatavilla.</value>
+  </data>
+
+  <data name="ScalingModes_General_MoreOptions.Content" xml:space="preserve"><value>Lisää asetuksia</value></data>
+  <!-- RTSS target application linkage; English fallback outside zh-Hans. -->
+
+  <data name="HdrParameter_InvalidInput" xml:space="preserve"><value>Enter a number in the shown range; integer parameters require whole numbers.</value></data>
+  <data name="HdrParameter_PreciseInputHelp" xml:space="preserve"><value>Type an exact value; Shift + arrow or wheel uses the coarse step.</value></data>
+  <data name="EffectParam_Color_SDR_to_HDR_nativeWhiteNits_Label" xml:space="preserve"><value>SDR white brightness (nits)</value></data>
+  <data name="EffectParam_Color_SDR_to_HDR_nativeWhiteNits_Description" xml:space="preserve"><value>Higher values brighten the entire image. Default 203; new edits use 80–4000 nits. Existing dim values remain unchanged until edited.</value></data>
+  <data name="ScalingModes_HdrMigrationInvalid_Description" xml:space="preserve"><value>The saved HDR configuration could not be safely restored. Its original data is retained. Restore the original group or fix its saved configuration before starting.</value></data>
+  <data name="HdrParameter_PairSource" xml:space="preserve"><value>Restores settings from HDR -&gt; SDR at effect #{}.</value></data>
+
+  <data name="Rtss_TargetLimit.Header" xml:space="preserve"><value>Target application frame rate limit</value></data>
+  <data name="Rtss_Takeover.Description" xml:space="preserve"><value>Limit application frame rate using RTSS.</value></data>
+  <data name="Rtss_Scope_None.Content" xml:space="preserve"><value>Do not manage RTSS profiles</value></data>
+  <data name="Rtss_Scope_Global.Content" xml:space="preserve"><value>Modify global profile</value></data>
+  <data name="Rtss_Scope_Target.Content" xml:space="preserve"><value>Modify target application profile</value></data>
+  <data name="Rtss_Status.Header" xml:space="preserve"><value>RTSS status</value></data>
+  <data name="Rtss_Tools.Content" xml:space="preserve"><value>Launch tools</value></data>
+  <data name="Rtss_Recheck.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Recheck RTSS</value></data>
+  <data name="Rtss_Recheck.ToolTipService.ToolTip" xml:space="preserve"><value>Recheck RTSS and retry the current request</value></data>
+  <data name="Rtss_GlobalNotice.Text" xml:space="preserve"><value>Applications using the global profile share this limit.</value></data>
+  <data name="Rtss_RateMode.Header" xml:space="preserve"><value>Frame rate setting</value></data>
+  <data name="Rtss_Rate_Custom.Content" xml:space="preserve"><value>Custom frame rate</value></data>
+  <data name="Rtss_Rate_Sync.Content" xml:space="preserve"><value>Sync content frame rate</value></data>
+  <data name="Rtss_CustomRate.Header" xml:space="preserve"><value>Frame rate limit</value></data>
+  <data name="Rtss_ExitPolicy.Header" xml:space="preserve"><value>When scaling stops</value></data>
+  <data name="Rtss_Exit_Keep.Content" xml:space="preserve"><value>Keep changes</value></data>
+  <data name="Rtss_Exit_Restore.Content" xml:space="preserve"><value>Restore original value</value></data>
+  <data name="Rtss_UnmanagedNotice" xml:space="preserve"><value>Magpie is not managing RTSS profiles.</value></data>
+  <data name="Rtss_Status_Checking" xml:space="preserve"><value>Checking RTSS</value></data>
+  <data name="Rtss_Status_NotInstalled" xml:space="preserve"><value>RTSS is not installed</value></data>
+  <data name="Rtss_Status_NotRunning" xml:space="preserve"><value>RTSS is not running.</value></data>
+  <data name="Rtss_Status_Incompatible" xml:space="preserve"><value>Required RTSS profile interface is unavailable.</value></data>
+  <data name="Rtss_Status_Failed" xml:space="preserve"><value>RTSS integration incomplete</value></data>
+  <data name="Rtss_Status_WaitingTarget" xml:space="preserve"><value>Waiting for scaling to start</value></data>
+  <data name="Rtss_Status_Read" xml:space="preserve"><value>Profile read successfully.</value></data>
+  <data name="Rtss_Status_MissingProfile" xml:space="preserve"><value>A target profile will be created when scaling starts.</value></data>
+  <data name="Rtss_Status_WaitingContent" xml:space="preserve"><value>Waiting for a fixed content frame rate · Sync paused</value></data>
+  <data name="Rtss_Status_Applying" xml:space="preserve"><value>Loading frame rate limit</value></data>
+  <data name="Rtss_Status_Written" xml:space="preserve"><value>RTSS is ready</value></data>
+  <data name="Rtss_Status_Conflict" xml:space="preserve"><value>The profile was changed externally.</value></data>
+  <data name="Rtss_Status_Kept" xml:space="preserve"><value>Changes kept.</value></data>
+  <data name="Rtss_Status_Restored" xml:space="preserve"><value>Original frame rate settings restored.</value></data>
+  <data name="Rtss_Status_RestoreFailed" xml:space="preserve"><value>Restoration failed.</value></data>
+  <data name="Rtss_Status_StartingTool" xml:space="preserve"><value>Starting RTSS</value></data>
+  <data name="Rtss_Status_ToolStartFailed" xml:space="preserve"><value>RTSS integration incomplete</value></data>
+  <data name="Rtss_DetectionDisabled" xml:space="preserve"><value>RTSS application detection is disabled.</value></data>
+  <data name="Rtss_TargetOverridesGlobal" xml:space="preserve"><value>The target uses its own profile.</value></data>
+  <data name="Rtss_NoLimit" xml:space="preserve"><value>No frame rate limit</value></data>
+  <data name="Rtss_TimeLimit" xml:space="preserve"><value>The original profile uses a frame time limit.</value></data>
+  <data name="Rtss_SyncUnavailable" xml:space="preserve"><value>Sync is unavailable when content follows the source.</value></data>
+  <data name="Rtss_SyncAtStart" xml:space="preserve"><value>Sync with the current content frame rate.</value></data>
+  <data name="Rtss_CustomAtStart" xml:space="preserve"><value>Apply when scaling starts.</value></data>
+  <data name="Rtss_LaunchRtss" xml:space="preserve"><value>Launch RTSS</value></data>
+  <data name="Rtss_LaunchRtssMissing" xml:space="preserve"><value>RTSS is not installed</value></data>
+  <data name="Rtss_LaunchRtssRunning" xml:space="preserve"><value>RTSS is running</value></data>
+  <data name="Rtss_LaunchAfterburner" xml:space="preserve"><value>Launch MSI Afterburner</value></data>
+  <data name="Rtss_LaunchAfterburnerMissing" xml:space="preserve"><value>MSI Afterburner is not installed</value></data>
+  <data name="Rtss_LaunchAfterburnerRunning" xml:space="preserve"><value>MSI Afterburner is running</value></data>
+  <data name="Rtss_Failure_Access" xml:space="preserve"><value>The RTSS profile interface is unavailable.</value></data>
+  <data name="Rtss_Failure_Target" xml:space="preserve"><value>Could not identify the target application.</value></data>
+  <data name="Rtss_Failure_Read" xml:space="preserve"><value>Could not read the profile.</value></data>
+  <data name="Rtss_Failure_Write" xml:space="preserve"><value>Could not save the profile.</value></data>
+  <data name="Rtss_Failure_Restore" xml:space="preserve"><value>Could not restore the profile.</value></data>
+  <data name="Rtss_Scope_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>RTSS profile management</value></data>
+  <data name="Rtss_RateMode_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>RTSS frame rate setting</value></data>
+  <data name="Rtss_CustomRate_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>RTSS integer frame rate limit</value></data>
+  <data name="Rtss_ExitPolicy_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>RTSS stop policy</value></data>
+  <data name="Rtss_Failure_Interface" xml:space="preserve"><value>The RTSS interface faulted. Restart Magpie.</value></data>
+  <data name="Rtss_Failure_StartTimeout" xml:space="preserve"><value>Tool launch timed out.</value></data>
+  <data name="Rtss_Failure_LibraryMissing" xml:space="preserve"><value>The RTSS profile interface library is missing.</value></data>
+  <data name="Rtss_Failure_Permission" xml:space="preserve"><value>Access denied.</value></data>
+  <data name="Rtss_SyncedRate_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>RTSS synced frame rate limit</value></data>
+  <data name="Rtss_Failure_Set" xml:space="preserve"><value>Could not set the frame rate.</value></data>
+  <data name="Rtss_Failure_Verify" xml:space="preserve"><value>Could not verify the profile.</value></data>
+  <data name="Rtss_Failure_Reload" xml:space="preserve"><value>Could not reload the profile.</value></data>
+  <data name="Rtss_Failure_TimeMode" xml:space="preserve"><value>Could not switch from frame time mode.</value></data>
+  <data name="Rtss_InitializeMagpie" xml:space="preserve">
+    <value>Initialize</value>
+  </data>
+  <data name="Rtss_InitializingMagpie" xml:space="preserve">
+    <value>Initializing…</value>
+  </data>
+  <data name="Rtss_InitializeMagpieButton.ToolTipService.ToolTip" xml:space="preserve">
+    <value>Create an unlimited RTSS profile for Magpie.</value>
+  </data>
+  <data name="Rtss_InitializeMagpieButton.AutomationProperties.Name" xml:space="preserve">
+    <value>Initialize the RTSS profile for Magpie</value>
+  </data>
+  <data name="Rtss_Status_InitializingMagpie" xml:space="preserve">
+    <value>Initializing Magpie</value>
+  </data>
+  <data name="Rtss_Status_MagpieInitialized" xml:space="preserve">
+    <value>Profile initialized.</value>
+  </data>
+  <data name="Rtss_Status_MagpieAlreadyUnlimited" xml:space="preserve">
+    <value>Already unlimited.</value>
+  </data>
+  <data name="Rtss_Failure_ProfileFormat" xml:space="preserve">
+    <value>Could not process the profile format.</value>
+  </data>
+  <data name="Rtss_Failure_MissingInterface" xml:space="preserve"><value>An interface required for this operation is missing.</value></data>
+  <data name="Rtss_Failure_Property" xml:space="preserve"><value>A property required for this operation could not be read.</value></data>
+  <data name="Rtss_Failure_Architecture" xml:space="preserve"><value>Profile library architecture does not match.</value></data>
+  <data name="Rtss_Failure_ProfileObject" xml:space="preserve"><value>Could not confirm the initialization target.</value></data>
+  <data name="Rtss_Failure_SelfProfileConflict" xml:space="preserve"><value>The target and Magpie share the same profile name.</value></data>
+  <data name="Rtss_Failure_InstallationChanged" xml:space="preserve"><value>RTSS profile directory has changed.</value></data>
+  <data name="Rtss_ProfileRate" xml:space="preserve"><value>Configured limit: {} FPS</value></data>
+  <data name="Rtss_RateUnknown" xml:space="preserve"><value>Profile limit could not be read.</value></data>
+  <data name="Rtss_Reloaded" xml:space="preserve"><value>Profile reload requested.</value></data>
+  <data name="Rtss_ProfileSaved" xml:space="preserve"><value>Profile saved.</value></data>
+  <data name="Home_Toolbar_ScreenshotContent.Description" xml:space="preserve"><value>Choose what the toolbar button and screenshot shortcut save.</value></data>
+  <data name="Home_Toolbar_ScreenshotContent.Header" xml:space="preserve"><value>Screenshot content</value></data>
+  <data name="Home_Toolbar_ScreenshotContent_InputAndOutput.Content" xml:space="preserve"><value>Capture original input and final output</value></data>
+  <data name="Home_Toolbar_ScreenshotContent_InputOnly.Content" xml:space="preserve"><value>Capture original input only</value></data>
+  <data name="Home_Toolbar_ScreenshotContent_OutputOnly.Content" xml:space="preserve"><value>Capture final output only</value></data>
+  <data name="Message_ScreenshotBusy" xml:space="preserve"><value>A screenshot is being saved. Try again when it finishes.</value></data>
+  <data name="Message_ScreenshotPairSaved" xml:space="preserve"><value>Screenshots saved: {0} and {1}</value></data>
+  <data name="Message_ScreenshotPartialSaved" xml:space="preserve"><value>Saved {0}; {1} could not be saved. See error details.</value></data>
+  <data name="FrameRefresh_Mode.Header" xml:space="preserve"><value>Asetustila</value></data>
+  <data name="FrameRefresh_Mode.Description" xml:space="preserve"><value>Yksinkertainen tila hallitsee muita päivitysasetuksia. Koskee kaikkia profiileja skaalauksen uudelleenkäynnistyksen jälkeen.</value></data>
+  <data name="FrameRefresh_Mode_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Asetustila</value></data>
+  <data name="FrameRefresh_Mode_Simple.Content" xml:space="preserve"><value>Yksinkertainen</value></data>
+  <data name="FrameRefresh_Mode_Advanced.Content" xml:space="preserve"><value>Edistynyt</value></data>
+  <data name="FrameRefresh_Title.Text" xml:space="preserve">
+    <value>Frame rate and refresh</value>
+  </data>
+  <data name="FrameRefresh_RateGroup.Header" xml:space="preserve">
+    <value>Frame rate control</value>
+  </data>
+  <data name="FrameRefresh_RateGroup.Description" xml:space="preserve">
+    <value>Set content frame rate and pacing.</value>
+  </data>
+  <data name="FrameRefresh_StaticGroup.Header" xml:space="preserve">
+    <value>Static content</value>
+  </data>
+  <data name="FrameRefresh_StaticGroup.Description" xml:space="preserve">
+    <value>Control refresh when content is unchanged.</value>
+  </data>
+  <data name="Rtss_SimpleSync.Header" xml:space="preserve">
+    <value>Sync target application limit</value>
+  </data>
+  <data name="Rtss_SimpleSync.Description" xml:space="preserve">
+    <value>Match the content frame rate and restore the original configuration when scaling stops.</value>
+  </data>
+  <data name="Rtss_SimpleSync_Input.OnContent" xml:space="preserve">
+    <value>On</value>
+  </data>
+  <data name="Rtss_SimpleSync_Input.OffContent" xml:space="preserve">
+    <value>Off</value>
+  </data>
+  <data name="Rtss_SimpleSync_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve">
+    <value>Sync target application frame rate limit</value>
+  </data>
+  <data name="Rtss_Mode_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve">
+    <value>Target application frame rate limit mode</value>
+  </data>
+  <data name="Rtss_ScopeLabel.Text" xml:space="preserve">
+    <value>Applies to</value>
+  </data>
+  <data name="Rtss_ExitLabel.Text" xml:space="preserve">
+    <value>When scaling stops</value>
+  </data>
+  <data name="Rtss_Download.Content" xml:space="preserve">
+    <value>Get RTSS</value>
+  </data>
+  <data name="Rtss_Retry.Content" xml:space="preserve">
+    <value>Retry</value>
+  </data>
+  <data name="Rtss_Manage.Content" xml:space="preserve">
+    <value>Manage</value>
+  </data>
+  <data name="Rtss_RecheckMenu.Text" xml:space="preserve">
+    <value>Check again</value>
+  </data>
+  <data name="Rtss_Status_Disabled" xml:space="preserve">
+    <value>RTSS integration is off</value>
+  </data>
+  <data name="Rtss_ScalingContinues" xml:space="preserve">
+    <value>Scaling continues</value>
+  </data>
+  <data name="Rtss_Failure_Launch" xml:space="preserve">
+    <value>Could not start RTSS</value>
+  </data>
+  <data name="Home_FrameRefresh_SimpleSummary" xml:space="preserve">
+    <value>Content: {} · Idle: {} · VRR: {}</value>
+  </data>
+  <data name="FrameRefresh_Content.Description" xml:space="preserve">
+    <value>Set the content processing frame rate.</value>
+  </data>
+  <data name="FrameRefresh_Idle.Description" xml:space="preserve">
+    <value>Redraw unchanged content at the selected frame rate.</value>
+  </data>
+  <data name="FrameRefresh_Cursor.Description" xml:space="preserve">
+    <value>Choose how the cursor refreshes.</value>
+  </data>
+  <data name="FrameRefresh_VRR.Description" xml:space="preserve">
+    <value>Let the display refresh rate follow the output frame rate.</value>
+  </data>
+  <data name="Rtss_Failure_ProcessExited" xml:space="preserve"><value>RTSS has exited</value></data>
+  <data name="Rtss_Status_StartingAfterburner" xml:space="preserve"><value>Starting MSI Afterburner</value></data>
+  <data name="Rtss_Status_AfterburnerStartFailed" xml:space="preserve"><value>MSI Afterburner could not start</value></data>
+  <data name="FrameRefresh_CursorStrategy.Header" xml:space="preserve"><value>Refresh strategy</value></data>
+  <data name="Rtss_Management.Header" xml:space="preserve"><value>Manage</value></data>
+  <data name="Rtss_Recheck.Content" xml:space="preserve"><value>Check again</value></data>
+  <data name="Rtss_ProgramLabel.Text" xml:space="preserve"><value>RTSS</value></data>
+  <data name="Rtss_SelfLabel.Text" xml:space="preserve"><value>Magpie configuration</value></data>
+  <data name="Rtss_Title_WaitingContent" xml:space="preserve"><value>Waiting for a fixed content rate</value></data>
+  <data name="Rtss_Detail_Disabled" xml:space="preserve"><value>Target frame rate is not managed.</value></data>
+  <data name="Rtss_Detail_WaitingContent" xml:space="preserve"><value>Content follows the source; synchronized limiting is paused.</value></data>
+  <data name="Rtss_Detail_WaitingTarget" xml:space="preserve"><value>RTSS is prepared automatically when scaling starts.</value></data>
+  <data name="Rtss_Detail_Checking" xml:space="preserve"><value>Checking the program and configuration interface.</value></data>
+  <data name="Rtss_Detail_Starting" xml:space="preserve"><value>Waiting for RTSS to start.</value></data>
+  <data name="Rtss_Detail_Initializing" xml:space="preserve"><value>Removing the frame cap from Magpie’s own configuration.</value></data>
+  <data name="Rtss_Detail_Applying" xml:space="preserve"><value>Applying the target program’s frame cap.</value></data>
+  <data name="Rtss_Detail_NotInstalled" xml:space="preserve"><value>Install RTSS, then check again.</value></data>
+  <data name="Rtss_Detail_Global" xml:space="preserve"><value>RTSS global configuration</value></data>
+  <data name="Rtss_Detail_Target" xml:space="preserve"><value>Current target program</value></data>
+  <data name="Rtss_Inventory_Checking" xml:space="preserve"><value>Checking</value></data>
+  <data name="Rtss_Inventory_Missing" xml:space="preserve"><value>Not installed</value></data>
+  <data name="Rtss_Inventory_Running" xml:space="preserve"><value>Running</value></data>
+  <data name="Rtss_Inventory_Stopped" xml:space="preserve"><value>Installed, not running</value></data>
+  <data name="Rtss_Inventory_Initializing" xml:space="preserve"><value>Initializing</value></data>
+  <data name="Rtss_Inventory_Unlimited" xml:space="preserve"><value>Unlimited</value></data>
+  <data name="Rtss_Inventory_Uninitialized" xml:space="preserve"><value>Needs initialization</value></data>
+  <data name="Rtss_Inventory_Unknown" xml:space="preserve"><value>Not checked</value></data>
+  <data name="Rtss_Management_Failed" xml:space="preserve"><value>Magpie initialization failed</value></data>
+  <data name="Rtss_Management_LaunchFailed" xml:space="preserve"><value>RTSS did not start</value></data>
+  <data name="Rtss_Management_Started" xml:space="preserve"><value>Started</value></data>
+  <data name="Rtss_Detail_RetryReady" xml:space="preserve"><value>RTSS is available. Retry to apply the frame cap.</value></data>
+  <data name="Rtss_Takeover.Header" xml:space="preserve"><value>RTSS configuration management</value></data>
+  <data name="Rtss_ManageText.Text" xml:space="preserve"><value>Manage</value></data>
+  <data name="Rtss_ManagementToggle.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Manage</value></data>
+  <data name="Rtss_OptionalAfterburner.Header" xml:space="preserve"><value>MSI Afterburner</value></data>
+  <data name="Rtss_OptionalAfterburner.Description" xml:space="preserve"><value>Optional tool</value></data>
+  <data name="Rtss_LaunchOptional.Content" xml:space="preserve"><value>Launch</value></data>
+  <data name="Rtss_LaunchOptional.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Launch MSI Afterburner</value></data>
+  <data name="Profile_CropLeftLabel.Text" xml:space="preserve"><value>Vasen</value></data>
+  <data name="Profile_CropLeft_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Vasen</value></data>
+  <data name="Profile_CropRightLabel.Text" xml:space="preserve"><value>Oikea</value></data>
+  <data name="Profile_CropRight_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Oikea</value></data>
+  <data name="Profile_CropTopLabel.Text" xml:space="preserve"><value>Ylä</value></data>
+  <data name="Profile_CropTop_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Ylä</value></data>
+  <data name="Profile_CropBottomLabel.Text" xml:space="preserve"><value>Ala</value></data>
+  <data name="Profile_CropBottom_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Ala</value></data>
+  <data name="Rtss_ManagementExpanded" xml:space="preserve"><value>Management details expanded</value></data>
+  <data name="Rtss_ManagementCollapsed" xml:space="preserve"><value>Management details collapsed</value></data>
+  <data name="Profile_InitialScale_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Lähtöskaalakerroin</value></data>
+  <data name="Profile_CursorScale_Input.[using:Windows.UI.Xaml.Automation]AutomationProperties.Name" xml:space="preserve"><value>Skaalauskerroin</value></data>
+  <data name="DlssNr_State_Disabled" xml:space="preserve">
+    <value>DLSSNR is not running (effect group is closed).</value>
+  </data>
+  <data name="DlssNr_State_Starting" xml:space="preserve">
+    <value>DLSSNR is starting; waiting for a successfully processed frame.</value>
+  </data>
+  <data name="DlssNr_State_Running" xml:space="preserve">
+    <value>DLSSNR is running.</value>
+  </data>
+  <data name="DlssNr_State_Skipped" xml:space="preserve">
+    <value>DLSSNR has been skipped; the effect group continues without DLSSNR processing.</value>
+  </data>
+  <data name="DlssNr_State_Stopped" xml:space="preserve">
+    <value>The effect group has stopped; DLSSNR is not processing frames.</value>
+  </data>
+  <data name="DlssNr_Reason_Adapter" xml:space="preserve">
+    <value>The selected rendering GPU is not an NVIDIA adapter.</value>
+  </data>
+  <data name="DlssNr_Reason_Missing" xml:space="preserve">
+    <value>nvngx_dlssnr.dll was not found in the program directory.</value>
+  </data>
+  <data name="DlssNr_Reason_Load" xml:space="preserve">
+    <value>The DLSSNR library could not be loaded. The library or one of its dependencies may be incompatible.</value>
+  </data>
+  <data name="DlssNr_Reason_Exports" xml:space="preserve">
+    <value>The loaded DLSSNR library lacks required interfaces.</value>
+  </data>
+  <data name="DlssNr_Reason_Compatibility" xml:space="preserve">
+    <value>NGX rejected this combination of system, graphics API, GPU and library. The result does not identify which component is incompatible.</value>
+  </data>
+  <data name="DlssNr_Reason_Version" xml:space="preserve">
+    <value>NGX requires a newer driver or feature library; it did not identify which one.</value>
+  </data>
+  <data name="DlssNr_Reason_Memory" xml:space="preserve">
+    <value>The graphics API or NGX reported insufficient memory.</value>
+  </data>
+  <data name="DlssNr_Reason_Access" xml:space="preserve">
+    <value>Access failed at the operation shown in the details. This does not by itself mean Magpie needs administrator rights.</value>
+  </data>
+  <data name="DlssNr_Reason_Fault" xml:space="preserve">
+    <value>NGX encountered an exception and is disabled for the rest of this Magpie process.</value>
+  </data>
+  <data name="DlssNr_Reason_Build" xml:space="preserve">
+    <value>This Magpie build does not include DLSSNR support.</value>
+  </data>
+  <data name="DlssNr_Reason_Unknown" xml:space="preserve">
+    <value>DLSSNR failed at the step shown in the details. The available result does not establish the cause.</value>
+  </data>
+  <data name="DlssNr_Advice_Restart" xml:space="preserve">
+    <value>Exit Magpie completely from the system tray, reopen it, then enable the effect group. Disabling and enabling the group alone cannot reset NGX. Confirm that DLSSNR shows “running”; if it fails again, copy the diagnostics for a report.</value>
+  </data>
+  <data name="DlssNr_Advice_Files" xml:space="preserve">
+    <value>Open the program directory and recovery guide. Exit Magpie, restore the complete matching runtime from the package for this version, then reopen Magpie and enable the group. Confirm “DLSSNR is running”; if it still fails, copy the diagnostics.</value>
+  </data>
+  <data name="DlssNr_Advice_Adapter" xml:space="preserve">
+    <value>Open the affected profile and inspect Rendering GPU. Select a compatible NVIDIA GPU only if one is available; otherwise remove DLSSNR from this effect group. Enable the group again and check its status.</value>
+  </data>
+  <data name="DlssNr_Advice_Version" xml:space="preserve">
+    <value>Check the detected GPU, driver and DLL version in the details against the requirements of this version’s runtime package. Update only the component that does not meet those requirements, reopen Magpie and enable the group. If the requirements are unclear or the failure persists, copy the diagnostics.</value>
+  </data>
+  <data name="DlssNr_Advice_Memory" xml:space="preserve">
+    <value>Close other GPU-intensive applications, lower the source resolution, or open this effect group and reduce DLSSNR Multi Pass to 1 if it is higher. Enable the group again and confirm “running”. If it still fails, copy the diagnostics.</value>
+  </data>
+  <data name="DlssNr_Advice_Access" xml:space="preserve">
+    <value>Check the operation and path in the details. For library reads, restore readable runtime files; for NGX data writes, use a user-writable program directory. Reopen Magpie and enable the group. If no path or cause is identified, copy the diagnostics instead of changing permissions blindly.</value>
+  </data>
+  <data name="DlssNr_Advice_Unknown" xml:space="preserve">
+    <value>Open the details and check the actual GPU and runtime file against this version’s package instructions. Enable the group once more and confirm “DLSSNR is running”. If it fails again, copy the diagnostics and report the failing step; temporarily remove DLSSNR to use the other effects.</value>
+  </data>
+  <data name="DlssNr_Parameter_HdrRestricted" xml:space="preserve">
+    <value>This parameter is available only in the SDR DLSSNR path. HDR processing can still be running; see the status above.</value>
+  </data>
+  <data name="Overlay_EffectParameters_Restricted" xml:space="preserve">
+    <value>This parameter is not available for the current effect or processing mode, or is controlled by a paired HDR component. This is not a backend failure.</value>
+  </data>
+  <data name="Overlay_EffectParameters_BackendUnavailable" xml:space="preserve">
+    <value>The effect is not processing frames. See its status and next steps above; parameter edits cannot restore it.</value>
+  </data>
+  <data name="Message_DlssNrUnavailable" xml:space="preserve">
+    <value>DLSSNR has been skipped while the effect group continues. Open the details for the detected reason and recovery steps; confirm “DLSSNR is running” after recovery.</value>
+  </data>
+  <data name="Message_DlssNrStopped" xml:space="preserve">
+    <value>The effect group stopped because DLSSNR failed. Open the details, follow the detected recovery steps, then enable the group again and confirm its status.</value>
+  </data>
+  <data name="Message_WindowIntegrityQueryFailed" xml:space="preserve">
+    <value>Magpie could not query the source window’s permissions, so the effect group was not started. Return to the target application, wait until it is responsive, then enable the group again. If it still fails, copy the diagnostics and logs; higher target permissions have not been confirmed.</value>
+  </data>
+  <data name="Home_DlssNrStatus.Title" xml:space="preserve">
+    <value>Current DLSSNR session</value>
+  </data>
+  <data name="ErrorDetails_OpenEffectsButton.Content" xml:space="preserve">
+    <value>Open affected effect group</value>
+  </data>
+  <data name="DlssNr_OpenHelp" xml:space="preserve">
+    <value>Open status and recovery steps</value>
+  </data>
+  <data name="DlssNr_OpenGuide" xml:space="preserve">
+    <value>Open recovery guide</value>
+  </data>
+  <data name="DlssNr_OpenDirectory" xml:space="preserve">
+    <value>Open program directory</value>
+  </data>
+  <data name="DlssNr_OpenFailed" xml:space="preserve">
+    <value>Could not open the location. Use the path below to open it manually.</value>
+  </data>
+  <data name="ErrorDetails_EffectsChanged" xml:space="preserve">
+    <value>The recorded effect group or its effect order has changed, or its name is ambiguous. The list is open; locate the group using the name in the diagnostics. No other group was selected.</value>
+  </data>
+  <data name="ErrorDetails_EffectsLocated" xml:space="preserve">
+    <value>Affected effect group: {}{}</value>
+  </data>
+  <data name="Overlay_EffectParameters_RestrictedBadge" xml:space="preserve"><value>Restricted</value></data>
+</root>

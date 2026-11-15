@@ -1,5 +1,8 @@
 # 依赖组件（third_party）
 
+> ⚠️ **部分过时**：当前链路的构建依赖（XeSS / FFX / MinHook / Streamline / DLSS 头）
+> 见 [`BUILD.md`](BUILD.md) §2；本文里 ReShade / add-on 相关的版本与构建步骤属于历史。
+
 记录**已拉入仓库**的依赖、版本、取用方式与更新命令。
 
 > **版本控制（2026-11-07）**：本目录现在是 git 仓库根（`git init` 之后首次提交）。
