@@ -342,7 +342,9 @@ int main()
         // is false it defaults to 3 (4x) and overwrites g_fg_interp. That is exactly
         // why 40x3 used to run 4x: mode set 2, then the patch reset it to 3.
         g_fg_interp_set = true;
-        g_interp_cadence = false;
+        // Do NOT force g_interp_cadence off here: --interp-cadence is parsed earlier and
+        // the UI's optional low-fps mode must survive --mode. With no such flag it is
+        // already false, so the fixed path stays fixed.
         g_dyn_mfg = false;
         g_lock_auto = false;
     }

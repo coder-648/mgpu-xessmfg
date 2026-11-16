@@ -115,8 +115,9 @@ struct State
     // 因为 40fps 的输入会抖到 4 vblank、30fps 会到 5-6 vblank, 上限不够就填不满。
     // 详见 docs/findings/PERF_BASELINE.md 3.17-3.21。
     // (旧的 --dyn-mfg 实验档已从界面移除: 同场景空刷新 7.6%, 见 3.19。)
-    // cadence 只用于迁移旧 ini。
-    bool cadence = true;
+    // cadence = 低帧自适应：输入因复杂场景低于锁帧上限时，按实际经过的 vblank
+    // 动态增加插帧数，尽量保持模式的目标输出（40x3/30x4 都是 120）。默认关闭。
+    bool cadence = false;
     // 输出帧率上限 (Hz)，直接手输：0 = 面板刷新（填满每个 vblank，不发 --fg-out-hz）；
     // 5..1000 = 上限（--fg-out-hz N）。只在"动态倍率"开启时有意义：它决定每帧要几张，
     // 所以"120Hz 面板但只要 60fps"就是填 60（输入 30 时正好 2x）。最低仍是 2x，
@@ -288,6 +289,7 @@ static const RowDef kRowsFg[] = {
     { ID_FG_TYPE, L"类型",            RK_INFO },
     { ID_FG_MODE, L"锁帧模式",        RK_DD   },
     { ID_OUT,     L"输出",            RK_DD   },
+    { ID_CADENCE, L"低帧自适应（动态补帧）", RK_TOG },
     { ID_UPSAMPLE_INFO, L"MV/深度重建", RK_INFO },
     // 锁帧版把 MV/depth 的 StreamPercent 固定为 150（producer 默认），
     // 颜色走 WGC；消费端默认把 150% 的 MV/depth 联合重建到输入画面尺寸。
@@ -616,6 +618,7 @@ static void save_profile(int i)
     ini_w(sec, L"relay_input", s.relay_input ? 1 : 0);
     ini_w(sec, L"osd", s.osd ? 1 : 0);
     ini_w(sec, L"perf", s.perf_no_throttle ? 1 : 0);
+    ini_w(sec, L"cadence", s.cadence ? 1 : 0);
     // 锁帧版只保存模式本身；cadence/outfps 是旧版本的字段，不再写。
     ini_ws(sec, L"win_title", s.win_title);
 }
@@ -656,9 +659,9 @@ static void load_profile(int i)
     s.relay_input = ini_r(sec, L"relay_input", s.relay_input ? 1 : 0) != 0;
     s.osd = ini_r(sec, L"osd", s.osd ? 1 : 0) != 0;
     s.perf_no_throttle = ini_r(sec, L"perf", s.perf_no_throttle ? 1 : 0) != 0;
-    // 锁帧版只有两个模式；旧 ini 里的动态/cadence 字段一律忽略。
+    s.cadence     = ini_r(sec, L"cadence", s.cadence ? 1 : 0) != 0;
+    // 锁帧版只有两个固定模式；cadence 是低帧自适应补偿开关。
     if (s.fg_mode < 0 || s.fg_mode > 1) { s.fg_mode = 0; }
-    s.cadence     = false;
     s.out_fps     = 0;
     s.win_title   = ini_rs(sec, L"win_title", L"");
     s.interp      = (s.fg_mode == 1) ? 3 : 4;
@@ -774,6 +777,11 @@ static std::wstring build_cmdline(HWND target, bool display)
                  S().pool, S().latency,
                  (S().fg_mode == 1) ? L"--mode 40x3" : L"--mode 30x4");
     cmd += b;
+    // 低帧自适应：输入低于锁帧上限时，按实际 vblank 动态增加插帧数，目标仍是
+    // 40x3/30x4 的 120 fps。只作为可选补偿，不改变正常固定倍率路径。
+    if (S().cadence) {
+        cmd += L" --interp-cadence --fg-out-hz 120";
+    }
     // Which GPU runs the frame generation (A card rendering + N card output, or the
     // other way round). 0 = let bridge decide from the window monitor / producer LUID.
     if (S().gpu_sel > 0 && S().gpu_sel <= (int)g_adapters.size()) {
