@@ -268,10 +268,10 @@ static ULONGLONG     g_lock_miss_since_ms = 0;
 // Pairing health is a RATE over a sliding window, not a consecutive-miss streak.
 // A sequence such as success -> miss -> success -> success -> miss -> miss is already
 // unhealthy even though it never contains a long consecutive run. Keep the last 64
-// outcomes; after at least 16 samples, >= 40% misses means the queues have diverged.
+// outcomes; after at least 16 samples, >= 30% misses means the queues have diverged.
 static constexpr UINT kPairWindow       = 64;
 static constexpr UINT kPairMinSamples   = 16;
-static constexpr UINT kPairMissPercent  = 40;
+static constexpr UINT kPairMissPercent  = 30;
 static uint8_t g_lock_pair_outcome[kPairWindow] = {};   // 1 = miss, 0 = success
 static UINT    g_lock_pair_outcome_pos = 0;
 static UINT    g_lock_pair_outcome_n   = 0;
