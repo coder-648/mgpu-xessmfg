@@ -142,6 +142,12 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
         // Loading/menu/pause：同一帧身份被 WGC 重复交付。直接丢掉，不 Present，
         // 也不参与命中率统计（记在 pair: 的 dup 里）。
         if (lp.duplicate) { return; }
+        // Every real pairing attempt contributes to the sliding health window. A
+        // duplicate is not a new attempt, so it is deliberately excluded.
+        lock_note_pair_outcome(!lp.verified);
+        if (lock_pair_rate_unhealthy() && lock_request_session_reset()) {
+            return;
+        }
         pair_ok = lp.verified;
         pair_slot = lp.slot;
         if (!pair_ok) {
@@ -219,13 +225,6 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
             // The watermark was already re-anchored above on the first miss; doing it
             // again after the drain only repeated the same movement.
             g_lock_no_slot_streak++;
-            ++g_lock_consecutive_miss;
-            if (g_lock_consecutive_miss >= kResetAfterMisses &&
-                lock_request_session_reset()) {
-                // The next colour is decoded against a fresh producer generation. Do not
-                // reuse/tag this frame's stale publication.
-                return;
-            }
             if (g_lock_no_slot_streak > 8) {
                 // Keep the picture alive if the link stays broken: one 1X frame, then try
                 // to re-anchor again. Normal gameplay never gets here.
@@ -236,7 +235,6 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
             }
         } else {
             g_lock_no_slot_streak = 0;
-            g_lock_consecutive_miss = 0;
             // Watermark for the producer: this is the last colour identity we can actually
             // use. The producer stays within kMaxSlots/2 of it instead of running ahead at
             // the game's publication rate.

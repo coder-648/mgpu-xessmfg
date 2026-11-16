@@ -265,14 +265,51 @@ static uint32_t      g_lock_last_seq12 = 0xFFFFFFFFu;
 static bool          g_lock_last_seq12_exact = false;
 static uint64_t      g_lock_last_exact_pub = 0;
 static ULONGLONG     g_lock_miss_since_ms = 0;
-// Consecutive pairing misses in the CURRENT session. A single miss is normal; a long
-// run of misses means the publication/colour queues have diverged and no amount of
-// per-frame re-anchoring will recover them. After kResetAfterMisses we ask the producer
-// for a fresh session (new consumer_session token) and drop all local pairing state.
-static UINT          g_lock_consecutive_miss = 0;
+// Pairing health is a RATE over a sliding window, not a consecutive-miss streak.
+// A sequence such as success -> miss -> success -> success -> miss -> miss is already
+// unhealthy even though it never contains a long consecutive run. Keep the last 64
+// outcomes; after at least 16 samples, >= 40% misses means the queues have diverged.
+static constexpr UINT kPairWindow       = 64;
+static constexpr UINT kPairMinSamples   = 16;
+static constexpr UINT kPairMissPercent  = 40;
+static uint8_t g_lock_pair_outcome[kPairWindow] = {};   // 1 = miss, 0 = success
+static UINT    g_lock_pair_outcome_pos = 0;
+static UINT    g_lock_pair_outcome_n   = 0;
+static UINT    g_lock_pair_outcome_miss = 0;
+
+static void lock_reset_pair_window()
+{
+    memset(g_lock_pair_outcome, 0, sizeof(g_lock_pair_outcome));
+    g_lock_pair_outcome_pos = 0;
+    g_lock_pair_outcome_n = 0;
+    g_lock_pair_outcome_miss = 0;
+}
+
+static void lock_note_pair_outcome(bool miss)
+{
+    if (g_lock_pair_outcome_n < kPairWindow) {
+        if (miss) { ++g_lock_pair_outcome_miss; }
+        g_lock_pair_outcome[g_lock_pair_outcome_pos] = miss ? 1u : 0u;
+        g_lock_pair_outcome_pos = (g_lock_pair_outcome_pos + 1) % kPairWindow;
+        ++g_lock_pair_outcome_n;
+        return;
+    }
+    const UINT old = g_lock_pair_outcome[g_lock_pair_outcome_pos];
+    if (old != 0u) { --g_lock_pair_outcome_miss; }
+    g_lock_pair_outcome[g_lock_pair_outcome_pos] = miss ? 1u : 0u;
+    if (miss) { ++g_lock_pair_outcome_miss; }
+    g_lock_pair_outcome_pos = (g_lock_pair_outcome_pos + 1) % kPairWindow;
+}
+
+static bool lock_pair_rate_unhealthy()
+{
+    if (g_lock_pair_outcome_n < kPairMinSamples) { return false; }
+    return g_lock_pair_outcome_miss * 100u >=
+           g_lock_pair_outcome_n * kPairMissPercent;
+}
+
 static ULONGLONG     g_lock_last_session_reset_ms = 0;
 static uint32_t      g_lock_session_reset_serial = 0;
-static constexpr UINT kResetAfterMisses = 16;
 
 static bool lock_request_session_reset()
 {
@@ -291,17 +328,19 @@ static bool lock_request_session_reset()
     g_ctl->consumer_session = token != 0 ? token : 1;
     MemoryBarrier();
 
+    const UINT miss_before = g_lock_pair_outcome_miss;
+    const UINT total_before = g_lock_pair_outcome_n;
     g_lock_last_seq12 = 0xFFFFFFFFu;
     g_lock_last_seq12_exact = false;
     g_lock_last_exact_pub = 0;
     g_lock_miss_since_ms = 0;
     g_lock_no_slot_streak = 0;
-    g_lock_consecutive_miss = 0;
+    lock_reset_pair_window();
     g_lock_last_marker_ms = -1.0;
     g_lock_last_session_reset_ms = now;
 
-    logf_("[lock] session reset #%u after %u consecutive misses - producer state reset\n",
-          g_lock_session_reset_serial, kResetAfterMisses);
+    logf_("[lock] session reset #%u (pair miss rate %u/%u, window %u) - producer state reset\n",
+          g_lock_session_reset_serial, miss_before, total_before, kPairWindow);
     return true;
 }
 
