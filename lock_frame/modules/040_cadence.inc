@@ -1402,6 +1402,17 @@ static bool open_shared()
                 if (c->magic == mgpu::kSharedMagic) {
                     if (c->version == mgpu::kSharedVersion) {
                         g_ctl = const_cast<mgpu::SharedControl*>(c);
+                        // A new consumer process owns a new session. The producer
+                        // compares this token and clears all per-session ACK/frame
+                        // state before publishing, so an old colour_seq can never
+                        // hold the new session at a stale watermark.
+                        const uint64_t session =
+                            (static_cast<uint64_t>(GetCurrentProcessId()) << 32) ^
+                            static_cast<uint64_t>(GetTickCount64());
+                        g_ctl->consumer_session = session != 0 ? session : 1;
+                        MemoryBarrier();
+                        logf_("[lock] new consumer session 0x%llX - producer state will reset\n",
+                              static_cast<unsigned long long>(g_ctl->consumer_session));
                         break;
                     }
                     // A live mapping that speaks another protocol: waiting cannot

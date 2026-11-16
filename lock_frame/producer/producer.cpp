@@ -216,6 +216,15 @@ bool copy_formats_ok(DXGI_FORMAT a, DXGI_FORMAT b)
     return format_family(a) == format_family(b);
 }
 
+// Wide depth (R32G8X24 / D32_FLOAT_S8X24) is 8 bytes per pixel and cannot be copied
+// directly into the R32 slot. The downscale shader reads its R32 plane and writes
+// R32_FLOAT; it must run even when StreamPercent=100 (where no scaling was requested).
+bool wide_depth_format(DXGI_FORMAT f)
+{
+    return f == DXGI_FORMAT_R32G8X24_TYPELESS ||
+           f == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+}
+
 // ---------------------------------------------------------------- shared block
 // Same v9/v14 shape the add-on used: one named mapping, capacity-sized slots that
 // never move, a 64 KB-aligned data start, per-slot placed resources and two
@@ -1216,6 +1225,28 @@ bool consumer_present()
     return seen;
 }
 
+// A new consumer must not inherit the previous consumer's ACK/frame history.
+void reset_consumer_session(mgpu::SharedControl* c, uint64_t session)
+{
+    if (c == nullptr) { return; }
+    c->colour_seq   = 0;
+    c->producer_skipped = 0;
+    c->frame_published = 0;
+    c->active_mask = 0;
+    for (uint32_t i = 0; i < mgpu::kMaxSlots; ++i) {
+        c->consumed[i] = 0;
+        memset(&c->frames[i], 0, sizeof(c->frames[i]));
+    }
+    for (uint32_t i = 0; i < mgpu::kMaxStreams; ++i) { c->stream_bytes[i] = 0; }
+    c->generation += 1;
+    g_next_slot = 0;
+    g_last_publish_frame_qpc = 0;
+    g_last_publish_qpc = 0;
+    MemoryBarrier();
+    logf("producer: NEW consumer session 0x%llX - ACK/frame state reset (generation %u)\n",
+         static_cast<unsigned long long>(session), c->generation);
+}
+
 uint32_t ini_int(const wchar_t* key, uint32_t def)
 {
     wchar_t path[MAX_PATH]{};
@@ -1259,6 +1290,19 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
              g_want_colour_session ? 1 : 0);
     }
     if (g_fg == nullptr || f == nullptr || f->mode == MGPU_FG_MODE_OFF) { return; }
+
+    // A consumer restart writes a fresh session token. Clear the previous session's
+    // ACK/frame state before this record is allowed to publish; otherwise a stale
+    // colour_seq can skip every publication in the new session.
+    {
+        static uint64_t s_seen_session = 0;
+        mgpu::SharedControl* c = ctl();
+        if (c != nullptr && c->consumer_session != 0 &&
+            c->consumer_session != s_seen_session) {
+            s_seen_session = c->consumer_session;
+            reset_consumer_session(c, s_seen_session);
+        }
+    }
 
     const MgpuFgResource& mv = f->stream[MGPU_FG_STREAM_MV];
     const MgpuFgResource& dp = f->stream[MGPU_FG_STREAM_DEPTH];
@@ -1429,7 +1473,15 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
         // as no_slot (74% hit). Keep two slots as safety: the window now covers the real
         // lag, and only a genuine overflow drops an MV frame.
         const uint64_t limit = mgpu::kMaxSlots - 2;
-        if (ack != 0 && f->seq > ack + limit) {
+        // An ACK beyond the ring is not a usable watermark: the slot it refers to has
+        // already been recycled, and a consumer restart can leave colour_seq far above
+        // the new producer's frame ids (measured: ack=226 while seq was 8k+). Skipping
+        // forever in that state starves the consumer, so treat it as stale and publish.
+        const bool ack_in_window = (ack != 0 && f->seq >= ack &&
+                                    (f->seq - ack) <= mgpu::kMaxSlots);
+        const bool ack_stale = (ack != 0 && f->seq >= ack &&
+                                (f->seq - ack) > mgpu::kMaxSlots);
+        if (ack_in_window && f->seq > ack + limit) {
             ++g_publish_skips;
             static uint32_t rate_skips = 0;
             if (++rate_skips <= 3 || (rate_skips % 300u) == 0u) {
@@ -1439,6 +1491,15 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
                      (unsigned long long)(f->seq - ack), (unsigned long long)limit);
             }
             return;
+        }
+        if (ack_stale) {
+            static uint32_t rate_stale = 0;
+            if (++rate_stale <= 3 || (rate_stale % 300u) == 0u) {
+                logf("producer: stale colour ACK seq=%llu ack=%llu (ahead=%llu > ring %u)"
+                     " - ACK ignored, publishing so the consumer can re-anchor\n",
+                     (unsigned long long)f->seq, (unsigned long long)ack,
+                     (unsigned long long)(f->seq - ack), mgpu::kMaxSlots);
+            }
         }
     }
 
@@ -1472,7 +1533,11 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
     // v22: colour needs a barrier (the game's back buffer is not in COPY_SOURCE), and a
     // COPY list cannot express one. One list carries all three streams so a publication
     // is one fence.
-    if (!g_force_inline && g_dma_enabled && !want_colour) {
+    // Wide depth also needs the conversion Dispatch, which a COPY list cannot execute;
+    // keep those frames on the DIRECT copy queue even when StreamPercent=100.
+    const bool depth_convert = want_depth && dp.resource != nullptr &&
+                               wide_depth_format(static_cast<DXGI_FORMAT>(dp.format));
+    if (!g_force_inline && g_dma_enabled && !want_colour && !depth_convert) {
         const bool mv_ok = !want_mv || g_scaled[1] ||
             static_cast<D3D12_RESOURCE_STATES>(mv.state) == D3D12_RESOURCE_STATE_COPY_SOURCE;
         const bool dp_ok = !want_depth || g_scaled[2] ||
@@ -1497,8 +1562,12 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
     // then copy what the pass wrote. Both streams must end up at the SAME size (XeFG
     // rejects mismatched inputs), so a failed dispatch skips the whole frame instead of
     // sending one scaled and one full-size texture.
+    // Wide depth additionally needs the pass at any percent, including 100: the source
+    // is R32G8X24 (8 B/px) and the slot is R32 (4 B/px).
     bool scaled_mv = false, scaled_depth = false;
-    if (g_scaled[1] || g_scaled[2]) {
+    const bool need_depth_convert = want_depth && dp.resource != nullptr &&
+                                    wide_depth_format(static_cast<DXGI_FORMAT>(dp.format));
+    if (g_scaled[1] || g_scaled[2] || need_depth_convert) {
         const bool can_dispatch =
             list != nullptr && (list->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT ||
                                 list->GetType() == D3D12_COMMAND_LIST_TYPE_COMPUTE);
@@ -1515,7 +1584,7 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
         if (ok && want_mv && g_scaled[1]) {
             ok = scale_dispatch(list, static_cast<ID3D12Resource*>(mv.resource), mv.state, 1);
         }
-        if (ok && want_depth && g_scaled[2]) {
+        if (ok && want_depth && (g_scaled[2] || need_depth_convert)) {
             ok = scale_dispatch(list, static_cast<ID3D12Resource*>(dp.resource), dp.state, 2);
         }
         if (!ok) {
@@ -1524,7 +1593,15 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
             return;
         }
         scaled_mv = g_scaled[1];
-        scaled_depth = g_scaled[2];
+        scaled_depth = g_scaled[2] || need_depth_convert;
+        if (need_depth_convert) {
+            static bool told_wide = false;
+            if (!told_wide) {
+                told_wide = true;
+                logf("downscale: wide depth (fmt %u) -> R32 conversion pass enabled at StreamPercent=%u\n",
+                     static_cast<unsigned>(dp.format), g_percent[2]);
+            }
+        }
     }
 
     if (want_mv && (g_copied_mask & mgpu::kRequestMv) == 0) {

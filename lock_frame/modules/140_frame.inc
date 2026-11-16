@@ -101,15 +101,25 @@ static void lock_reanchor_colour_watermark(uint32_t payload)
     // A marker this far from the newest publication is not a useful watermark;
     // it is a stale/duplicate WGC frame. Leave the current ack alone.
     if (best == 0 || best_delta > 512) { return; }
-    if (best > g_ctl->colour_seq) {
+    // A fresh consumer starts after the producer has already counted records. Its
+    // marker seq and the producer's frame_id can therefore be offset by > kMaxSlots,
+    // and a stale colour_seq left by a previous consumer can be ABOVE the new
+    // producer's newest id. In that case the normal `best > colour_seq` rule can never
+    // move the ack down, so the producer skips every frame forever. Detect that
+    // condition explicitly and allow the marker's true frame to reset the ack.
+    const bool ack_far_ahead = (g_ctl->colour_seq > newest) &&
+                               (g_ctl->colour_seq - newest > mgpu::kMaxSlots);
+    if (best != 0 && (best > g_ctl->colour_seq ||
+                      (ack_far_ahead && best < g_ctl->colour_seq))) {
         static UINT told = 0;
         if (told < 12) {
             ++told;
             logf_("[lock] pair miss: re-anchor watermark %llu -> %llu"
-                  " (marker_seq12=%u newest=%llu delta=%lld)\n",
+                  " (marker_seq12=%u newest=%llu delta=%lld%s)\n",
                   (unsigned long long)g_ctl->colour_seq, (unsigned long long)best,
                   seq12, (unsigned long long)newest,
-                  static_cast<long long>(best_delta));
+                  static_cast<long long>(best_delta),
+                  ack_far_ahead ? ", stale ack" : "");
         }
         g_ctl->colour_seq = best;
     }

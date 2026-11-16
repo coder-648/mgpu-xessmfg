@@ -105,7 +105,7 @@ inline constexpr uint32_t kSharedMagic   = 0x55475047u;   // 'GPUM'
 // lock_frame v26: kMaxSlots 8 -> 16 (default, user request). 30x4 measured lag
 // up to 6 at 4K (colour + 4x present latency); 16 leaves a wide margin for WGC
 // jitter and long frames. MV/depth only: 4K capacity is ~1.06 GB, 1440p ~472 MB.
-inline constexpr uint32_t kSharedVersion = 26;
+inline constexpr uint32_t kSharedVersion = 27;
 
 // The mapping is created once, at a size that fits the largest stream we support
 // (see kStreamMaxW/H), so a layout rebuild never has to recreate it - that would
@@ -540,6 +540,13 @@ struct SharedControl
     uint64_t colour_seq;
     uint32_t producer_skipped;
     uint32_t _pad_v21;
+    // ---- v27: connection reset ----
+    // Written by the consumer immediately after it opens the mapping. The producer
+    // compares it with the last value it saw and, on a change, clears colour_seq,
+    // consumed[], frames[] and frame_published before publishing the new session.
+    // A stale ACK from a previous consumer can otherwise be thousands of frames
+    // ahead of a new producer/consumer pair and skip every publication forever.
+    uint64_t consumer_session;
 };
 
 // The textures start after the control block, on a 64 KB boundary.
