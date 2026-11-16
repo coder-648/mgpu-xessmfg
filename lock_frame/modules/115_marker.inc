@@ -272,10 +272,13 @@ static ULONGLONG     g_lock_miss_since_ms = 0;
 static constexpr UINT kPairWindow       = 64;
 static constexpr UINT kPairMinSamples   = 16;
 static constexpr UINT kPairMissPercent  = 30;
+static constexpr ULONGLONG kResetWarmupMs   = 5000;   // startup takes ~5 s to settle
+static constexpr ULONGLONG kResetCooldownMs = 15000;  // no back-to-back resets
 static uint8_t g_lock_pair_outcome[kPairWindow] = {};   // 1 = miss, 0 = success
 static UINT    g_lock_pair_outcome_pos = 0;
 static UINT    g_lock_pair_outcome_n   = 0;
 static UINT    g_lock_pair_outcome_miss = 0;
+static ULONGLONG g_lock_pair_started_ms = 0;
 
 static void lock_reset_pair_window()
 {
@@ -287,6 +290,7 @@ static void lock_reset_pair_window()
 
 static void lock_note_pair_outcome(bool miss)
 {
+    if (g_lock_pair_started_ms == 0) { g_lock_pair_started_ms = GetTickCount64(); }
     if (g_lock_pair_outcome_n < kPairWindow) {
         if (miss) { ++g_lock_pair_outcome_miss; }
         g_lock_pair_outcome[g_lock_pair_outcome_pos] = miss ? 1u : 0u;
@@ -304,6 +308,10 @@ static void lock_note_pair_outcome(bool miss)
 static bool lock_pair_rate_unhealthy()
 {
     if (g_lock_pair_outcome_n < kPairMinSamples) { return false; }
+    if (g_lock_pair_started_ms == 0 ||
+        GetTickCount64() - g_lock_pair_started_ms < kResetWarmupMs) {
+        return false;
+    }
     return g_lock_pair_outcome_miss * 100u >=
            g_lock_pair_outcome_n * kPairMissPercent;
 }
@@ -316,7 +324,7 @@ static bool lock_request_session_reset()
     if (g_ctl == nullptr) { return false; }
     const ULONGLONG now = GetTickCount64();
     if (g_lock_last_session_reset_ms != 0 &&
-        now - g_lock_last_session_reset_ms < 1000) {
+        now - g_lock_last_session_reset_ms < kResetCooldownMs) {
         return false;
     }
     // A fresh token is how the producer learns that this is a new consumer session.
