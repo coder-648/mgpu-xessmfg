@@ -265,6 +265,45 @@ static uint32_t      g_lock_last_seq12 = 0xFFFFFFFFu;
 static bool          g_lock_last_seq12_exact = false;
 static uint64_t      g_lock_last_exact_pub = 0;
 static ULONGLONG     g_lock_miss_since_ms = 0;
+// Consecutive pairing misses in the CURRENT session. A single miss is normal; a long
+// run of misses means the publication/colour queues have diverged and no amount of
+// per-frame re-anchoring will recover them. After kResetAfterMisses we ask the producer
+// for a fresh session (new consumer_session token) and drop all local pairing state.
+static UINT          g_lock_consecutive_miss = 0;
+static ULONGLONG     g_lock_last_session_reset_ms = 0;
+static uint32_t      g_lock_session_reset_serial = 0;
+static constexpr UINT kResetAfterMisses = 16;
+
+static bool lock_request_session_reset()
+{
+    if (g_ctl == nullptr) { return false; }
+    const ULONGLONG now = GetTickCount64();
+    if (g_lock_last_session_reset_ms != 0 &&
+        now - g_lock_last_session_reset_ms < 1000) {
+        return false;
+    }
+    // A fresh token is how the producer learns that this is a new consumer session.
+    // It clears colour_seq/consumed[]/frames[] and bumps generation on its next record.
+    const uint64_t token =
+        (static_cast<uint64_t>(GetCurrentProcessId()) << 32) ^
+        (static_cast<uint64_t>(now) << 1) ^
+        static_cast<uint64_t>(++g_lock_session_reset_serial);
+    g_ctl->consumer_session = token != 0 ? token : 1;
+    MemoryBarrier();
+
+    g_lock_last_seq12 = 0xFFFFFFFFu;
+    g_lock_last_seq12_exact = false;
+    g_lock_last_exact_pub = 0;
+    g_lock_miss_since_ms = 0;
+    g_lock_no_slot_streak = 0;
+    g_lock_consecutive_miss = 0;
+    g_lock_last_marker_ms = -1.0;
+    g_lock_last_session_reset_ms = now;
+
+    logf_("[lock] session reset #%u after %u consecutive misses - producer state reset\n",
+          g_lock_session_reset_serial, kResetAfterMisses);
+    return true;
+}
 
 
 static LockPairResult lock_pair_colour(ID3D11Texture2D* colour)
