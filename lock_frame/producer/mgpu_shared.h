@@ -105,7 +105,7 @@ inline constexpr uint32_t kSharedMagic   = 0x55475047u;   // 'GPUM'
 // lock_frame v26: kMaxSlots 8 -> 16 (default, user request). 30x4 measured lag
 // up to 6 at 4K (colour + 4x present latency); 16 leaves a wide margin for WGC
 // jitter and long frames. MV/depth only: 4K capacity is ~1.06 GB, 1440p ~472 MB.
-inline constexpr uint32_t kSharedVersion = 27;
+inline constexpr uint32_t kSharedVersion = 28;
 
 // The mapping is created once, at a size that fits the largest stream we support
 // (see kStreamMaxW/H), so a layout rebuild never has to recreate it - that would
@@ -550,8 +550,15 @@ struct SharedControl
 };
 
 // The textures start after the control block, on a 64 KB boundary.
-inline constexpr uint64_t kDataStart = 65536;
+// The control block grew past the old hard-coded 64 KB when the frame records were
+// expanded. If kDataStart stays below sizeof(SharedControl), the first slots overwrite
+// the tail of the control block (observed: colour_seq/consumer_session became random
+// slot data and the producer reset forever). Always derive it from the real struct.
+inline constexpr uint64_t kDataStart =
+    (sizeof(SharedControl) + 65535ull) & ~65535ull;
 inline constexpr uint64_t align64k(uint64_t v) { return (v + 65535ull) & ~65535ull; }
+static_assert(kDataStart >= sizeof(SharedControl),
+              "shared data must start after the whole control block");
 
 // Name used by both sides. "Local\\" keeps it inside the user session.
 inline constexpr const char* kMappingName = "Local\\mgpu_mailbox_v1";
