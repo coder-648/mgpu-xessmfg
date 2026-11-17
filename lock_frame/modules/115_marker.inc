@@ -349,13 +349,16 @@ static void lock_update_pair_health(bool miss)
         g_lock_rejoin_good = 0;
         return;
     }
-    if (miss) { return; }
+    if (miss) {
+        g_lock_rejoin_good = 0;
+        return;
+    }
 
-    if (g_pair_degraded) {
-        if (++g_lock_rejoin_good < 3) {
-            g_pair_health = kPairRejoin;
-            return;
-        }
+    // Healthy outcome while the window is below the warning threshold. Count it for
+    // EVERY non-normal state, not only DEGRADED: previously a SOFT_RECOVER could never
+    // leave REJOIN because this counter was only advanced in the degraded branch.
+    ++g_lock_rejoin_good;
+    if (g_pair_degraded && g_lock_rejoin_good >= 3) {
         g_pair_degraded = false;
         g_lock_degraded_since = 0;
     }
