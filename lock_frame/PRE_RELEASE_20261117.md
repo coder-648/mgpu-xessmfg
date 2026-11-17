@@ -16,6 +16,35 @@
 - 消费端按 marker 精确配对，匹配失败不会猜测 slot。
 - 支持 **40x3（40fps 输入 → 120fps 输出）** 和 **30x4（30fps → 120fps）**。
 
+## fakerFG 设计
+
+fakerFG 是游戏侧的记录层，不负责生成画面：
+
+- 通过 DXGI/Streamline 代理加载，拦截 DLSS-G 的 SetOptions、PCL marker 和 NVNGX 调用。
+- 阻断游戏原生 DLSS FrameGeneration，保证游戏每次 Present 都是真实的渲染帧。
+- 从 Streamline 标签 / DLSSG 参数块获取 MV、depth、相机和 jitter。
+- 在 Present 前把短 marker 画进画面四角，作为颜色与 MV/depth 的唯一配对键。
+- 将一帧记录交给 producer，由 producer 复制到跨卡共享 ring；fakerFG 自身不做补帧、不接管上屏。
+
+默认配置就是：
+
+```ini
+FgInput=DLSSG
+FgOutput=Capture
+```
+
+即 **DLSS-G 输入 + WGC 颜色捕获**。
+
+## 帧节奏设计
+
+- 游戏侧锁定输入：40x3 锁 40fps，30x4 锁 30fps。
+- 消费端固定倍率插帧：40x3 → 3x，30x4 → 4x，目标都是 120fps。
+- marker 把 WGC 颜色和对应 MV/depth 对齐，32 槽 ring 吸收 WGC 的异步延迟。
+- `frameRenderTime` 使用输入间隔的中位数并吸附整 vblank，减少 XeFG 的节奏误判。
+- 输入稳定时保持固定倍率；复杂场景低于目标时，可打开可选的“低帧自适应”动态补帧。
+- 40x3 的真实帧更多、延迟更低；30x4 插帧比例更高、负载和延迟更大。
+- 配对异常时进入健康状态机和光流降级，避免一次错位演变成长期卡顿。
+
 ## 核心算法与作用
 
 - **Marker 配对**：颜色四角携带 seq12/ms12，与 producer frame_id 精确匹配，防止颜色和运动数据错帧。
