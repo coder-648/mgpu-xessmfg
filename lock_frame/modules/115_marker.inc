@@ -288,6 +288,8 @@ static void lock_reset_pair_window()
     g_lock_pair_outcome_miss = 0;
 }
 
+static void lock_update_pair_health(bool miss);   // defined after the rate helper
+
 static void lock_note_pair_outcome(bool miss)
 {
     if (g_lock_pair_started_ms == 0) { g_lock_pair_started_ms = GetTickCount64(); }
@@ -296,6 +298,7 @@ static void lock_note_pair_outcome(bool miss)
         g_lock_pair_outcome[g_lock_pair_outcome_pos] = miss ? 1u : 0u;
         g_lock_pair_outcome_pos = (g_lock_pair_outcome_pos + 1) % kPairWindow;
         ++g_lock_pair_outcome_n;
+        lock_update_pair_health(miss);
         return;
     }
     const UINT old = g_lock_pair_outcome[g_lock_pair_outcome_pos];
@@ -303,6 +306,7 @@ static void lock_note_pair_outcome(bool miss)
     g_lock_pair_outcome[g_lock_pair_outcome_pos] = miss ? 1u : 0u;
     if (miss) { ++g_lock_pair_outcome_miss; }
     g_lock_pair_outcome_pos = (g_lock_pair_outcome_pos + 1) % kPairWindow;
+    lock_update_pair_health(miss);
 }
 
 static bool lock_pair_rate_unhealthy()
@@ -314,6 +318,61 @@ static bool lock_pair_rate_unhealthy()
     }
     return g_lock_pair_outcome_miss * 100u >=
            g_lock_pair_outcome_n * kPairMissPercent;
+}
+
+static ULONGLONG     g_lock_degraded_since = 0;
+static uint32_t      g_lock_rejoin_good = 0;
+
+static void lock_update_pair_health(bool miss)
+{
+    if (g_ctl == nullptr) { return; }
+    const UINT n = g_lock_pair_outcome_n;
+    if (n < kPairMinSamples ||
+        g_lock_pair_started_ms == 0 ||
+        GetTickCount64() - g_lock_pair_started_ms < kResetWarmupMs) {
+        return;
+    }
+    const UINT rate = (g_lock_pair_outcome_miss * 100u) / n;
+    const ULONGLONG now = GetTickCount64();
+
+    if (rate >= kPairMissPercent) {
+        g_pair_health = kPairDegraded;
+        g_lock_rejoin_good = 0;
+        if (!g_pair_degraded) {
+            g_pair_degraded = true;
+            g_lock_degraded_since = now;
+        }
+        return;
+    }
+    if (rate >= 10u) {
+        g_pair_health = kPairSoftRecover;
+        g_lock_rejoin_good = 0;
+        return;
+    }
+    if (miss) { return; }
+
+    if (g_pair_degraded) {
+        if (++g_lock_rejoin_good < 3) {
+            g_pair_health = kPairRejoin;
+            return;
+        }
+        g_pair_degraded = false;
+        g_lock_degraded_since = 0;
+    }
+    if (g_lock_rejoin_good >= 5) {
+        g_pair_health = kPairNormal;
+    } else if (g_pair_health != kPairNormal) {
+        g_pair_health = kPairRejoin;
+    }
+}
+
+static bool lock_should_hard_reset()
+{
+    // A rate-based reset alone made the user's bad state visible for seconds before it
+    // reacted. Enter DEGRADED first (optical-flow/last-good inputs keep the picture
+    // alive), and only hard-reset when the structural mismatch persists.
+    return g_pair_degraded && g_lock_degraded_since != 0 &&
+           GetTickCount64() - g_lock_degraded_since >= 2000;
 }
 
 static ULONGLONG     g_lock_last_session_reset_ms = 0;
@@ -344,6 +403,14 @@ static bool lock_request_session_reset()
     g_lock_miss_since_ms = 0;
     g_lock_no_slot_streak = 0;
     lock_reset_pair_window();
+    g_pair_degraded = false;
+    g_lock_degraded_since = 0;
+    g_lock_rejoin_good = 0;
+    g_pair_health = kPairHardReset;
+    g_pair_health_since = now;
+    g_mv_native_frames = 0;
+    g_mv_flow_frames = 0;
+    g_mv_none_frames = 0;
     g_lock_last_marker_ms = -1.0;
     g_lock_last_session_reset_ms = now;
 

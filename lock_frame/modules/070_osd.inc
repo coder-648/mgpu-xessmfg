@@ -82,6 +82,27 @@ static void osd_update()
         n += _snwprintf_s(line + n, 256 - n, _TRUNCATE, L"   in %.0fMB %.1fG %d%%", mb, gbps, pct);
         if (n < 0) { n = 0; }
     }
+    // Native-MV share: how often the frame that reached FG used the game's own
+    // motion vectors rather than optical flow / a fallback. This is the quickest
+    // health signal during a reset/degraded period.
+    {
+        const uint32_t native_n = g_mv_native_frames;
+        const uint32_t flow_n = g_mv_flow_frames;
+        const uint32_t none_n = g_mv_none_frames;
+        const uint32_t total_n = native_n + flow_n + none_n;
+        const int pct = (total_n > 0) ? static_cast<int>(100.0 * native_n / total_n + 0.5) : -1;
+        const wchar_t* health = (g_pair_health == kPairNormal) ? L"OK"
+                              : (g_pair_health == kPairWatch) ? L"WATCH"
+                              : (g_pair_health == kPairSoftRecover) ? L"RECOVER"
+                              : (g_pair_health == kPairDegraded) ? L"DEGRADED"
+                              : (g_pair_health == kPairHardReset) ? L"RESET"
+                              : L"REJOIN";
+        if (n > 0 && n < 220) {
+            n += _snwprintf_s(line + n, 256 - n, _TRUNCATE,
+                              L"   mvN %d%%  %s", pct, health);
+            if (n < 0) { n = 0; }
+        }
+    }
     const unsigned drops = g_lock_drops + g_pace_skips;
     if (n > 0 && n < 240 && drops > 0) {
         n += _snwprintf_s(line + n, 256 - n, _TRUNCATE, L"   drop %u", drops);

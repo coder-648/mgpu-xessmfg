@@ -135,6 +135,7 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     // 0. 身份：先从这一帧 WGC 颜色的四角 marker 解出 seq12+ms12，再到 producer 的
     //    发布里精确匹配。matched == false 时本帧只上屏真实颜色（1X），不打 tag。
     bool pair_ok = g_reuse_frame;           // 复用帧沿用上一帧已验证的 slot
+    bool fallback_pair = false;             // reset/degraded: current colour + last good slot + OF
     int  pair_slot = -1;
     int  pair_drain_slot = -1;              // 未配对时用来解除 producer 的槽位阻塞
     if (!g_reuse_frame && colour11 != nullptr && g_ctl != nullptr) {
@@ -145,7 +146,7 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
         // Every real pairing attempt contributes to the sliding health window. A
         // duplicate is not a new attempt, so it is deliberately excluded.
         lock_note_pair_outcome(!lp.verified);
-        if (lock_pair_rate_unhealthy() && lock_request_session_reset()) {
+        if (lock_should_hard_reset() && lock_request_session_reset()) {
             return;
         }
         pair_ok = lp.verified;
@@ -224,14 +225,25 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
             }
             // The watermark was already re-anchored above on the first miss; doing it
             // again after the drain only repeated the same movement.
-            g_lock_no_slot_streak++;
-            if (g_lock_no_slot_streak > 8) {
-                // Keep the picture alive if the link stays broken: one 1X frame, then try
-                // to re-anchor again. Normal gameplay never gets here.
+            if (g_pair_degraded && g_have_last &&
+                g_last_slot < ((g_ctl->slots != 0) ? g_ctl->slots : 1)) {
+                // DEGRADED: keep output alive with the last verified MV/depth slot and
+                // the optical-flow field computed from THIS colour. No guessed marker
+                // slot is used; the fallback is explicit and marked in the OSD.
+                pair_ok = true;
+                pair_slot = static_cast<int>(g_last_slot);
+                fallback_pair = true;
                 g_lock_no_slot_streak = 0;
-                pair_ok = false;
             } else {
-                return;
+                g_lock_no_slot_streak++;
+                if (g_lock_no_slot_streak > 8) {
+                    // Keep the picture alive if the link stays broken: one 1X frame, then try
+                    // to re-anchor again. Normal gameplay never gets here.
+                    g_lock_no_slot_streak = 0;
+                    pair_ok = false;
+                } else {
+                    return;
+                }
             }
         } else {
             g_lock_no_slot_streak = 0;
@@ -458,6 +470,8 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
         }
         if (g_of_active && !g_of_ready) { of_init(); }
 #endif
+        if (fallback_pair) { g_of_active = true; }
+        lock_note_mv_source(!g_of_active && !fallback_pair, g_of_active);
         // Round-robin slot walking. Protocol v5 was meant to let us pick the newest
         // GPU-complete slot (frames[].ready), but publishing that "ready" needs a
         // GetCompletedValue() poll on a SHARED_CROSS_ADAPTER fence, which stalls the
@@ -472,7 +486,7 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     // Prefetch lookup happens BEFORE the OF/colour list: a miss selects the flow as this
     // frame's vector source and suppresses the fallback copy entirely. (The copy for the
     // next slot is already running on the copy queue; the wait is a GPU-side queue op.)
-    g_of_miss = false;
+    g_of_miss = fallback_pair;
     bool pf_hit = false;
     if (g_pf_pub) {
         if (g_pub_fifo) {

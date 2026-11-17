@@ -215,6 +215,32 @@ static bool mv_from_flow()
     return false;
 }
 
+// Pairing health / optical-flow source counters. The OSD reports the share of frames
+// that actually used the game's native MV, which is the quickest way to see whether a
+// reset/degraded period is feeding generated vectors.
+enum PairHealth
+{
+    kPairNormal = 0,
+    kPairWatch,
+    kPairSoftRecover,
+    kPairDegraded,
+    kPairHardReset,
+    kPairRejoin
+};
+static PairHealth g_pair_health = kPairNormal;
+static ULONGLONG  g_pair_health_since = 0;
+static bool       g_pair_degraded = false;
+static uint32_t   g_mv_native_frames = 0;
+static uint32_t   g_mv_flow_frames = 0;
+static uint32_t   g_mv_none_frames = 0;
+
+static void lock_note_mv_source(bool native, bool flow)
+{
+    if (native) { ++g_mv_native_frames; }
+    else if (flow) { ++g_mv_flow_frames; }
+    else { ++g_mv_none_frames; }
+}
+
 // Debug features (OptiScaler exposes the same two): corner tags on generated frames, and
 // presenting *only* interpolated frames - the real frames otherwise hide the artifacts.
 static bool  g_fg_tag_interp = false;    // --fg-debug-tag-interp
