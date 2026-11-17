@@ -225,7 +225,17 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
             }
             // The watermark was already re-anchored above on the first miss; doing it
             // again after the drain only repeated the same movement.
-            if (g_pair_degraded && g_have_last &&
+            // DEGRADED, or any no-MV/OF lane with a ready optical-flow field: keep the
+            // current colour moving with the last verified slot. Wuchang deliberately
+            // publishes depth only (mask=0x2) and uses OF, so a marker miss must not
+            // immediately become a visible 1X frame.
+            const bool of_ready_fallback =
+#if MGPU_FG_OF
+                g_of_ready && mv_from_flow();
+#else
+                false;
+#endif
+            if ((g_pair_degraded || of_ready_fallback) && g_have_last &&
                 g_last_slot < ((g_ctl->slots != 0) ? g_ctl->slots : 1)) {
                 // DEGRADED: keep output alive with the last verified MV/depth slot and
                 // the optical-flow field computed from THIS colour. No guessed marker

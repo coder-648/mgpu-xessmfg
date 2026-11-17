@@ -344,8 +344,13 @@ static void lock_update_pair_health(bool miss)
         }
         return;
     }
-    if (rate >= 10u) {
+    if (rate >= 20u) {
         g_pair_health = kPairSoftRecover;
+        g_lock_rejoin_good = 0;
+        return;
+    }
+    if (rate >= 5u) {
+        g_pair_health = kPairWatch;
         g_lock_rejoin_good = 0;
         return;
     }
