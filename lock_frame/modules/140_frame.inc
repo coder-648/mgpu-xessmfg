@@ -712,9 +712,16 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     {
         static bool gated_off = false;
         // 只有"marker 配对成功 + producer 这一帧确实发布了 MV"才允许插帧。
-        // 配对失败时走 1X：用猜的 slot 插帧会得到比不插更差的鬼影。
-        const bool mv_available = pair_ok && g_ctl &&
-                                  (g_ctl->active_mask & mgpu::kRequestMv) != 0;
+        // Wuchang/Unreal uses optical flow and deliberately requests no producer MV
+        // (streams -> mv=0 depth=1). The gate must accept the OF field in that case:
+        // otherwise pair is exact but XeFG stays at 1X forever.
+        const bool producer_mv = g_ctl && (g_ctl->active_mask & mgpu::kRequestMv) != 0;
+#if MGPU_FG_OF
+        const bool flow_mv = g_of_active && g_of_ready && g_of_fresh;
+#else
+        const bool flow_mv = false;
+#endif
+        const bool mv_available = pair_ok && g_ctl && (producer_mv || flow_mv);
         if (!mv_available && !gated_off) {
             const xefg_swapchain_result_t r = g_api.SetEnabled(g_fg, 0);
             logf_("[lock] %s -> 1X (%s, %d); FG resumes when it returns\n",
