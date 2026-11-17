@@ -16,19 +16,20 @@
   1. 启动 PBZ，进入游戏画面。
   2. 游戏里开启 DLSS（Super Resolution），不要用 FSR/XeSS 做输入；分辨率与桌面一致，
      窗口化/无边框全屏。
-  3. 把游戏锁到 30 fps（测 30x4）或 40 fps（测 40x3）。本版本不在消费端丢帧。
+  3. 把游戏锁到目标输入帧率：2x 锁 60 fps、3x 锁 40 fps、4x 锁 30 fps。
+     本版本不在消费端丢帧。
   4. 运行 F:\...\PBZ\platform\steam\lock_frame\run_ui.bat：
-       选 PBZ 窗口 -> 选锁帧 30x4 或 40x3 -> 启动
+       选 PBZ 窗口 -> 固定倍率 2x / 3x / 4x -> fakerFG 输入源 DLSSG -> 启动
      或直接双击：
-       run_30x4_pbz.bat / run_40x3_pbz.bat
+       run_2x.bat / run_3x.bat / run_4x.bat
 
 日志
   游戏目录：
     PBZ_fakerFG.log       marker draw / producer start / publish
-    PBZ_mfg_producer.log  StreamPercent=150、shared ... slots=16
+    PBZ_mfg_producer.log  StreamPercent=150、shared ... slots=32
   lock_frame 输出：
     lock_frame\lock_frame_ui_HHMMSS.txt（UI 启动）
-    lock_frame\lock_frame_30x4.log / lock_frame_40x3.log（bat 启动）
+    lock_frame\lock_frame_2x.log / lock_frame_3x.log / lock_frame_4x.log（bat 启动）
 
 正常应看到
   [lock] shared: ... slots=16

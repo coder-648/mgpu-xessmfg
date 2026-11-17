@@ -1,6 +1,6 @@
 @echo off
 rem ===========================================================================
-rem  lock_frame.exe build: WGC 颜色 + marker 精确配对 + 锁帧 30x4 / 40x3。
+rem  lock_frame.exe build: WGC 颜色 + marker 精确配对 + 固定倍率 2x / 3x / 4x。
 rem     build.bat <repo-win-path>
 rem  需要 XeSS-FG / XeLL 的 import lib，以及 D3D11/WinRT。
 rem ===========================================================================
@@ -20,13 +20,16 @@ if not exist "%~dp0modules" (
   exit /b 1
 )
 
+rc /nologo /fo "%~dp0lock_frame.res" "%~dp0lock_frame.rc"
+if errorlevel 1 ( echo [build] rc failed & exit /b 1 )
+
 cl /nologo /std:c++17 /EHsc /O2 /MD /W3 /utf-8 /permissive- ^
   /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX /DMGPU_FG_OF=1 ^
   /I"%~dp0." ^
   /I"%REPO%\src" ^
   /I"%REPO%\third_party\xess\inc" ^
   /I"%REPO%\third_party\ffx\include" ^
-  "%~dp0lock_frame.cpp" ^
+  "%~dp0lock_frame.cpp" "%~dp0lock_frame.res" ^
   /Fe:lock_frame.exe /Fo:lock_frame.obj ^
   /link /MAP:lock_frame.map /LIBPATH:"%REPO%\third_party\xess\lib" ^
   /LIBPATH:"%REPO%\third_party\ffx\lib" ^

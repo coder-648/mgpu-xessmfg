@@ -289,6 +289,7 @@ static void lock_reset_pair_window()
 }
 
 static void lock_update_pair_health(bool miss);   // defined after the rate helper
+static void lock_report_pair_health();            // logs state changes only
 
 static void lock_note_pair_outcome(bool miss)
 {
@@ -299,6 +300,7 @@ static void lock_note_pair_outcome(bool miss)
         g_lock_pair_outcome_pos = (g_lock_pair_outcome_pos + 1) % kPairWindow;
         ++g_lock_pair_outcome_n;
         lock_update_pair_health(miss);
+        lock_report_pair_health();
         return;
     }
     const UINT old = g_lock_pair_outcome[g_lock_pair_outcome_pos];
@@ -307,6 +309,7 @@ static void lock_note_pair_outcome(bool miss)
     if (miss) { ++g_lock_pair_outcome_miss; }
     g_lock_pair_outcome_pos = (g_lock_pair_outcome_pos + 1) % kPairWindow;
     lock_update_pair_health(miss);
+    lock_report_pair_health();
 }
 
 static bool lock_pair_rate_unhealthy()
@@ -323,6 +326,25 @@ static bool lock_pair_rate_unhealthy()
 static ULONGLONG     g_lock_degraded_since = 0;
 static uint32_t      g_lock_rejoin_good = 0;
 
+// "Is the producer publishing at all?" - distinct from "did this colour pair?".
+// A depth-only title used to stop publishing entirely; counting that as a marker
+// mismatch drove DEGRADED -> hard reset every 15 s, which wiped the producer state and
+// made recovery impossible. Publishing stalls get their own message, not a reset.
+static uint64_t  g_lock_health_pub_seen = 0;
+static ULONGLONG g_lock_health_pub_ms   = 0;
+static bool lock_producer_publishing()
+{
+    if (g_ctl == nullptr) { return false; }
+    const uint64_t p = g_ctl->frame_published;
+    const ULONGLONG now = GetTickCount64();
+    if (p != g_lock_health_pub_seen) {
+        g_lock_health_pub_seen = p;
+        g_lock_health_pub_ms = now;
+        return true;
+    }
+    return g_lock_health_pub_ms != 0 && now - g_lock_health_pub_ms < 500;
+}
+
 static void lock_update_pair_health(bool miss)
 {
     if (g_ctl == nullptr) { return; }
@@ -335,43 +357,91 @@ static void lock_update_pair_health(bool miss)
     const UINT rate = (g_lock_pair_outcome_miss * 100u) / n;
     const ULONGLONG now = GetTickCount64();
 
+    // Hysteresis. The old code recomputed the state from the raw rate on every outcome,
+    // so 12/64 (18.75%) and 13/64 (20.3%) flipped WATCH <-> RECOVER on every sample -
+    // exactly the "state changes wildly" symptom. Enter/leave thresholds now differ:
+    //   DEGRADED  enter 30, leave below 25
+    //   RECOVER   enter 22, leave below 15
+    //   WATCH     enter  8, leave below  4
+    const PairHealth cur = g_pair_health;
+    PairHealth target;
     if (rate >= kPairMissPercent) {
-        g_pair_health = kPairDegraded;
-        g_lock_rejoin_good = 0;
+        target = kPairDegraded;
+    } else if (cur == kPairDegraded) {
+        target = (rate >= 25u) ? kPairDegraded : kPairSoftRecover;
+    } else if (cur == kPairSoftRecover) {
+        target = (rate >= 15u) ? kPairSoftRecover : kPairWatch;
+    } else if (rate >= 22u) {
+        target = kPairSoftRecover;
+    } else if (cur == kPairWatch) {
+        target = (rate >= 4u) ? kPairWatch : kPairRejoin;
+    } else if (rate >= 8u) {
+        target = kPairWatch;
+    } else {
+        target = kPairRejoin;   // promoted to OK below once enough good outcomes exist
+    }
+
+    if (target == kPairDegraded) {
         if (!g_pair_degraded) {
             g_pair_degraded = true;
             g_lock_degraded_since = now;
         }
-        return;
-    }
-    if (rate >= 20u) {
-        g_pair_health = kPairSoftRecover;
         g_lock_rejoin_good = 0;
-        return;
-    }
-    if (rate >= 5u) {
-        g_pair_health = kPairWatch;
-        g_lock_rejoin_good = 0;
-        return;
-    }
-    if (miss) {
-        g_lock_rejoin_good = 0;
+        g_pair_health = kPairDegraded;
         return;
     }
 
-    // Healthy outcome while the window is below the warning threshold. Count it for
-    // EVERY non-normal state, not only DEGRADED: previously a SOFT_RECOVER could never
-    // leave REJOIN because this counter was only advanced in the degraded branch.
-    ++g_lock_rejoin_good;
-    if (g_pair_degraded && g_lock_rejoin_good >= 3) {
-        g_pair_degraded = false;
-        g_lock_degraded_since = 0;
+    // Leaving DEGRADED needs several good outcomes, and goes through RECOVER first so the
+    // fallback path cannot toggle every other frame.
+    if (g_pair_degraded) {
+        if (miss) {
+            g_lock_rejoin_good = 0;
+            g_pair_health = kPairSoftRecover;
+            return;
+        }
+        ++g_lock_rejoin_good;
+        if (g_lock_rejoin_good >= 3) {
+            g_pair_degraded = false;
+            g_lock_degraded_since = 0;
+        }
+        g_pair_health = (g_lock_rejoin_good >= 5) ? kPairNormal : kPairSoftRecover;
+        return;
     }
+
+    if (miss) {
+        g_lock_rejoin_good = 0;
+    } else {
+        ++g_lock_rejoin_good;
+    }
+
+    if (target == kPairSoftRecover || target == kPairWatch) {
+        g_pair_health = target;
+        return;
+    }
+    // Normal band: require five good outcomes before showing OK again.
     if (g_lock_rejoin_good >= 5) {
         g_pair_health = kPairNormal;
     } else if (g_pair_health != kPairNormal) {
         g_pair_health = kPairRejoin;
     }
+}
+
+// State-change log only: the OSD can flip WATCH/RECOVER/REJOIN quickly, and without
+// this line the log cannot tell whether the picture is flapping because of the health
+// machine or because of the actual pairing outcomes.
+static void lock_report_pair_health()
+{
+    static PairHealth last = kPairNormal;
+    if (g_pair_health == last) { return; }
+    last = g_pair_health;
+    const char* name = (g_pair_health == kPairNormal) ? "OK"
+                     : (g_pair_health == kPairWatch) ? "WATCH"
+                     : (g_pair_health == kPairSoftRecover) ? "RECOVER"
+                     : (g_pair_health == kPairDegraded) ? "DEGRADED"
+                     : (g_pair_health == kPairHardReset) ? "RESET"
+                     : "REJOIN";
+    logf_("[lock] pair health -> %s (miss %u/%u)\n", name,
+          g_lock_pair_outcome_miss, g_lock_pair_outcome_n);
 }
 
 static bool lock_should_hard_reset()
@@ -502,6 +572,31 @@ static LockPairResult lock_pair_colour(ID3D11Texture2D* colour)
         // find_exact 不区分 "没有这个 seq12" 和 "有但 ms12 对不上"；都算未命中。
         ++g_lock_pair_stats.no_slot;
         r.reason = "no_slot";
+        // One-shot diagnostic (first 80 misses): does ANY slot carry this seq at all?
+        // hits>0 + unstable>0 means the snapshot raced the producer; hits==0 means the
+        // seq never reached frames[] (marker/publication identity split).
+        static unsigned told_diag = 0;
+        if (told_diag < 80) {
+            ++told_diag;
+            UINT hits = 0, unstable = 0;
+            uint64_t newest = 0, oldest = 0;
+            const UINT sc = (g_ctl->slots != 0) ? g_ctl->slots : 1;
+            for (UINT s = 0; s < sc && s < mgpu::kMaxSlots; ++s) {
+                const mgpu::FrameShared& fr = g_ctl->frames[s];
+                if (fr.frame_id == 0) { continue; }
+                if ((static_cast<uint32_t>(fr.frame_id) & 0xFFFu) == seq12) { ++hits; }
+                const uint64_t pa = fr.published;
+                const uint64_t pb = fr.published;
+                if (pa != pb) { ++unstable; }
+                if (fr.frame_id > newest) { newest = fr.frame_id; }
+                if (oldest == 0 || fr.frame_id < oldest) { oldest = fr.frame_id; }
+            }
+            logf_("[lock] pair diag: marker seq=%u ms=%u newest=%llu oldest=%llu hits=%u"
+                  " unstable=%u frame_published=%llu\n",
+                  seq12, ms12, static_cast<unsigned long long>(newest),
+                  static_cast<unsigned long long>(oldest), hits, unstable,
+                  static_cast<unsigned long long>(g_ctl->frame_published));
+        }
         return r;
     }
     if (m.ambiguous) {

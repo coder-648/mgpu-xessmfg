@@ -39,7 +39,8 @@ SDK 版本不同的话，改 `scripts/build_*.sh` 里的 `FXC_WIN`。
 
 ## 2. 第三方依赖
 
-仓库里已有的：
+`third_party/` **整体不入库**（`.gitignore` 的 `/third_party/`）。本地必须按
+`docs/ops/DEPENDENCIES.md` 的版本放到以下路径：
 
 | 路径 | 内容 |
 |---|---|
@@ -47,16 +48,20 @@ SDK 版本不同的话，改 `scripts/build_*.sh` 里的 `FXC_WIN`。
 | `third_party/ffx/` | FidelityFX SDK 头 + `ffx_opticalflow_x64.lib` / `ffx_backend_dx12_x64.lib` |
 | `third_party/minhook/` | fakerFG 的 MinHook（源码随构建编译） |
 | `third_party/streamline/` `third_party/dlss/` | Streamline / DLSS 头（只作声明参考） |
+| `third_party/optiscaler/` `third_party/Magpie-experimental/` 等 | 只作参考；不参与 lock_frame 构建 |
 
-不在仓库里的（按 `docs/ops/DEPENDENCIES.md` 的版本拉）：
+唯一随仓库跟踪的第三方源码是 `lock_frame/third_party/nlohmann/json.hpp`
+（MIT，单头文件）。
+
+拉取示例：
 
 ```bash
 git clone --depth 1 --branch v3.0.2 --filter=blob:none --sparse https://github.com/intel/xess third_party/xess
 git clone --depth 1 --branch 8af6b4a --filter=blob:none --sparse https://github.com/TsudaKageyu/minhook third_party/minhook
 ```
 
-> `third_party/xess/bin/` 被 `.gitignore` 排除：`libxess_fg.dll` / `libxell.dll`
-> 是 Intel 的，不能随仓库/公开包分发。
+> `third_party/xess/bin/` 里的 `libxess_fg.dll` / `libxell.dll` 是 Intel 的，
+> 不能随仓库/公开包分发。
 
 ---
 
@@ -123,6 +128,33 @@ SKIP_XESS_DLLS=1 ./scripts/make_release_fg.sh   # 不带 Intel DLL（公开包�
 
 旧发布脚本（`make_release.sh` / `make_addon_package.sh` / `make_local_release.sh`）
 属于 bridge/ReShade 时代，不要用于当前链路。
+
+---
+
+## 5.1 lock_frame 1.0.0 构建与发布
+
+```bash
+./lock_frame/build.sh all        # consumer / producer / fakerFG / ui
+./lock_frame/release.sh          # 用现有产物打包
+BUILD=1 ./lock_frame/release.sh  # 先全量构建再打包
+VERSION=1.0.0 ./lock_frame/release.sh
+WITH_XESS=1 ./lock_frame/release.sh   # 可选：内置 Intel 运行时（附许可）
+WITH_THIRD_PARTY=1 ./lock_frame/release.sh  # 可选：源码包放入本地 third_party
+```
+
+可覆盖：`MGPU_STAGE`、`MGPU_FXC`、`MGPU_VSDIR`。
+
+产物：
+
+| 路径 | 内容 |
+|---|---|
+| `dist/lock_frame-<ver>.zip` | 运行包（默认不含 Intel DLL） |
+| `dist/lock_frame-<ver>-src.zip` | GPL-3.0 对应源码（含 ffx/streamline/minhook/dlss） |
+| `.../manifest.json` | 版本、协议、git、逐文件 SHA-256 |
+| `.../SHA256SUMS.txt` | 校验清单 |
+
+打包后自动运行 `lock_frame/scripts/check_release.py`，检查必需文件、禁止
+`.pdb/.map/.log`、`fakerFG.ini` 默认键与全部校验值。
 
 ---
 

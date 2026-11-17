@@ -23,7 +23,7 @@ fakerFG 自己作为 DLSS-G provider 时，`provider_evaluate()` 的 `harvest()`
 
 ## 测试配置
 
-`lock_frame/pbz_dlssg_lane.ini` 是基于当前 PBZ `fakerFG.ini` 生成的测试配置，关键差异：
+`lock_frame/docs/test-configs/pbz_dlssg_lane.ini` 是基于当前 PBZ `fakerFG.ini` 生成的测试配置，关键差异：
 
 ```ini
 Passthrough=0             ; 不转发真实 runtime；由 FgInput/FgOutput 决定
@@ -49,10 +49,10 @@ MvResample=1
    copy F:\steam\steamapps\common\PBZ\platform\steam\fakerFG.ini
         F:\steam\steamapps\common\PBZ\platform\steam\fakerFG.ini.before_dlssg_lane
    ```
-2. 用仓库里的 `lock_frame/pbz_dlssg_lane.ini` 覆盖游戏目录的 `fakerFG.ini`。
+2. 用仓库里的 `lock_frame/docs/test-configs/pbz_dlssg_lane.ini` 覆盖游戏目录的 `fakerFG.ini`。
 3. 启动 PBZ，进入游戏画面；打开 DLSS Super Resolution，分辨率与桌面一致。
 4. 游戏内打开 **DLSS Frame Generation**（这次需要它进入 DLSS-G 契约）。
-5. 运行 `lock_frame\run_ui.bat`，选 30x4 或 40x3，启动。
+5. 运行 `lock_frame\run_ui.bat`，选 2x / 3x / 4x，启动。
 6. 观察：
    - `PBZ_fakerFG.log` 是否出现：
      ```

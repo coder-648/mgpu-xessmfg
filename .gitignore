@@ -10,15 +10,10 @@ out/
 *.addon64
 *.exe
 
-# 运行时 DLL / 示例程序（83 MB，部署时从 SDK 取；见 docs/DEPENDENCIES.md §4）
-third_party/xess/bin/
-
-# 上游 SDK 的完整 checkout（各自是独立的 git 仓库，钉的 commit 记在
-# docs/DEPENDENCIES.md §1；要重建就用那里给的 clone 命令）
-third_party/xess/
-third_party/reshade/
-third_party/dlss/
-third_party/minhook/
+# 第三方依赖整体不入库（按 NOTICE / docs/ops/DEPENDENCIES.md 获取）
+# 开头的 / 只匹配仓库根目录；lock_frame/third_party/ 下的 vendored
+# nlohmann/json 仍然会被跟踪。
+/third_party/
 
 # Python
 __pycache__/
@@ -35,3 +30,25 @@ desktop.ini
 
 # 部署包产物（make_addon_package.sh 生成，含第三方二进制）
 dist/
+
+# ---------------------------------------------------------------------------
+# lock_frame 正式版
+# ---------------------------------------------------------------------------
+# 构建中间文件（rc / fxc）
+*.res
+*.cso
+lock_frame/**/obj/
+
+# 运行日志与诊断包
+lock_frame/lock_frame_ui_*.txt
+lock_frame/lock_frame_ui.log
+lock_frame/diagnostics_*.zip
+diagnostics_*/
+diagnostics_*.zip
+
+# 配置/部署备份
+*.bak_*
+*.before_*
+*.pre_*
+
+

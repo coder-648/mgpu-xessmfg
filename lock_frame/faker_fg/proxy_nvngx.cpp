@@ -233,6 +233,12 @@ void publish_upscaler_record(ID3D12GraphicsCommandList* list, bool tagged)
     if (f.camera_near > 0.0f && f.camera_far > 0.0f) {
         f.flags |= MGPU_FG_FRAME_HAS_CAMERA;
     }
+    // The upscaler parameter block may simply not carry a velocity texture. Do not claim
+    // MV_ACTIVE in that case: a depth-only record is valid, and the consumer must be able
+    // to tell "no MV" from "MV we forgot to copy" (the OSD/log depends on it).
+    if (f.stream[MGPU_FG_STREAM_MV].resource == nullptr) {
+        f.flags &= ~MGPU_FG_FRAME_MV_ACTIVE;
+    }
 
     f.cmd_list     = list;                    // still OPEN: this is the copy window
     f.mode         = api_mode();

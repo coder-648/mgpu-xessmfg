@@ -660,6 +660,11 @@ Config& cfg()
     return g_cfg;
 }
 
+// One accepted record is queued for the current presentation until producer_present()
+// publishes it. This is the cross-lane "one seq per present" guard.
+static bool g_record_pending = false;
+static unsigned g_collapsed_same_present = 0;
+
 // ---------------------------------------------------------------- record
 void publish_record(const MgpuFgFrame& f)
 {
@@ -673,6 +678,7 @@ void publish_record(const MgpuFgFrame& f)
     // milliseconds; treating them as separate frames made the producer publish 3x and
     // made the present ring's seq miss the producer's frame_id. Collapse them here.
     bool duplicate = false;
+    bool same_present = false;
     lock_record();
     if (f.frame_qpc_ms != 0 && g_record.frame_qpc_ms != 0 &&
         f.stream[MGPU_FG_STREAM_MV].resource == g_record.stream[MGPU_FG_STREAM_MV].resource &&
@@ -681,8 +687,21 @@ void publish_record(const MgpuFgFrame& f)
         f.frame_qpc_ms - g_record.frame_qpc_ms <= 5) {
         duplicate = true;
     }
+    // A second lane describing the same presentation: the first record already owns this
+    // present's seq and the producer publishes it. A second seq would only make the marker
+    // point at a frame_id that never reaches frames[] (the classic no_slot).
+    // The producer_present() boundary is the authoritative "same presentation" scope.
+    if (g_record_pending) { same_present = true; }
     unlock_record();
     if (duplicate) { return; }
+    if (same_present) {
+        ++g_collapsed_same_present;
+        if ((g_collapsed_same_present % 600u) == 0u) {
+            logf("record: same-present second lane collapsed (%u so far)\n",
+                 g_collapsed_same_present);
+        }
+        return;
+    }
 
     MgpuFgFrame snap;
     // v22: attach the chain back buffer as the colour stream when the record has none
@@ -708,9 +727,13 @@ void publish_record(const MgpuFgFrame& f)
     // v2: the capture records its copies here, while the record's command list is
     // still the open one. Never inside the lock (see dispatch_sink).
     dispatch_sink(snap);
+    g_record_pending = true;
     xefg_native_frame();
     if (colour_ref != nullptr) { colour_ref->Release(); }
 }
+
+bool fg_record_pending() { return g_record_pending; }
+void fg_present_done()     { g_record_pending = false; }
 
 void fg_output_submit(const MgpuFgFrame& f)
 {

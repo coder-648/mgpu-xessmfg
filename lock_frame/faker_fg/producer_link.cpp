@@ -70,6 +70,9 @@ void producer_present(void* queue)
     if (g_producer_api != nullptr && g_producer_api->present != nullptr) {
         g_producer_api->present(queue);
     }
+    // This presentation boundary frees the "one record per present" slot even when the
+    // producer module is absent or skipped the publication.
+    fg_present_done();
 }
 
 // producer_record_scar() removed: the marker no longer transports a 16x16 tile.

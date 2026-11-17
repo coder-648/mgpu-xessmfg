@@ -63,9 +63,43 @@ struct Stage
 
     bool          game_enabled = false;
     uint32_t      game_frames  = 1;
+    uint32_t      frame_token  = 0;    // sl::FrameToken of the frame being published
 };
 
 Stage g_stage{};
+
+// One publication per Streamline frame. DLSS-G Evaluate and the PCL ePresentStart
+// fallback describe the SAME frame and carry the SAME FrameToken, but they used to call
+// publish_record() twice: two seqs were allocated while the producer copied/published
+// only the first record. The marker was drawn with the newer seq, so ~1/3 of the Wuchang
+// colour frames had no matching publication (`no_slot`) even though every present was
+// published. Collapse the two into one record by token.
+static uint32_t g_sl_published_token = 0;
+static uint32_t g_sl_eval_token = 0;
+static uint32_t g_sl_staged_token = 0;
+static unsigned g_sl_pub_calls = 0;
+static unsigned g_sl_pub_collapsed = 0;
+static unsigned g_sl_staged_skipped = 0;
+static void sl_publish_record(const MgpuFgFrame& f, uint32_t token, const char* src)
+{
+    ++g_sl_pub_calls;
+    if (token != 0 && token == g_sl_published_token) {
+        ++g_sl_pub_collapsed;
+        static unsigned logged = 0;
+        if (logged++ < 3) {
+            logf("sl: frame token %u already published - %s duplicate collapsed"
+                 " (eval=%u staged=%u)\n", token, src, g_sl_eval_token, g_sl_staged_token);
+        }
+        return;
+    }
+    g_sl_published_token = token;
+    publish_record(f);
+    if ((g_sl_pub_calls % 600u) == 0u) {
+        logf("sl: publish calls=%u collapsed=%u staged_skipped=%u (eval token=%u staged token=%u)\n",
+             g_sl_pub_calls, g_sl_pub_collapsed, g_sl_staged_skipped,
+             g_sl_eval_token, g_sl_staged_token);
+    }
+}
 
 // ---------------------------------------------------------------- real entries
 typedef sl::Result (*sl_pfn_supported)(sl::Feature, const sl::AdapterInfo&);
@@ -317,7 +351,23 @@ sl::Result hk_pcl_marker(sl::PCLMarker marker, const sl::FrameToken& frame)
         // OptiScaler's hkslPCLSetMarker: ePresentStart closes the staged frame. PBZ
         // resolves this through slGetFeatureFunction(feature=PCL).
         if (marker == sl::PCLMarker::ePresentStart) {
-            sl_publish_staged();
+            g_stage.frame_token = static_cast<uint32_t>(frame);
+            // A record is already queued for this presentation (Evaluate, another lane,
+            // or an earlier PCL call). Publishing the staged copy as well allocates a
+            // second seq; the producer only keeps the first record, while the marker
+            // uses the second -> guaranteed no_slot. Only titles that stage tags WITHOUT
+            // any earlier record (PBZ) need this fallback.
+            if (fg_record_pending()) {
+                ++g_sl_staged_skipped;
+                static unsigned told = 0;
+                if (told++ < 3) {
+                    logf("sl: present-staged skipped - a record is already pending for this"
+                         " present (eval token=%u pcl token=%u)\n",
+                         g_sl_eval_token, g_stage.frame_token);
+                }
+            } else {
+                sl_publish_staged();
+            }
         }
         static unsigned logged = 0;
         if (++logged <= 8) {
@@ -514,13 +564,34 @@ sl::Result hk_evaluate(sl::Feature feature, const sl::FrameToken& frame,
 
     sl_stage_inputs(f);
 
+    // A title that does not tag motion vectors still has depth (and a back buffer).
+    // Render size must therefore fall back to depth: with render_w/h == 0 the producer's
+    // update_content() is a no-op, the stream rectangles stay 0 and no publication ever
+    // happens - the consumer then sees 100% no_slot even though the marker is fine.
     f.render_w = f.stream[MGPU_FG_STREAM_MV].width;
     f.render_h = f.stream[MGPU_FG_STREAM_MV].height;
+    if (f.render_w < 8 || f.render_h < 8) {
+        f.render_w = f.stream[MGPU_FG_STREAM_DEPTH].width;
+        f.render_h = f.stream[MGPU_FG_STREAM_DEPTH].height;
+    }
     f.output_w = f.stream[MGPU_FG_STREAM_HUDLESS].width;
     f.output_h = f.stream[MGPU_FG_STREAM_HUDLESS].height;
     if (f.output_w < 8 && g_stage.backbuffer != nullptr) {
         f.output_w = f.stream[MGPU_FG_STREAM_BACKBUFFER].width;
         f.output_h = f.stream[MGPU_FG_STREAM_BACKBUFFER].height;
+    }
+    if (f.render_w < 8 || f.render_h < 8) {
+        // Loading/menu: nothing to publish. Still answer eOk - the title asked us for a
+        // frame and there is no error, there just are no inputs yet.
+        return sl::Result::eOk;
+    }
+    static bool told_depth_only_eval = false;
+    if (!told_depth_only_eval && f.stream[MGPU_FG_STREAM_MV].resource == nullptr) {
+        told_depth_only_eval = true;
+        logf("sl: evaluate record is depth-only (no MV tagged) render=%ux%u depth=%ux%u\n",
+             f.render_w, f.render_h,
+             f.stream[MGPU_FG_STREAM_DEPTH].width,
+             f.stream[MGPU_FG_STREAM_DEPTH].height);
     }
 
     if (f.stream[MGPU_FG_STREAM_MV].resource != nullptr ||
@@ -561,7 +632,8 @@ sl::Result hk_evaluate(sl::Feature feature, const sl::FrameToken& frame,
     const uint32_t present_id = xefg_next_frame_id();
     f.present_id = present_id;
 
-    publish_record(f);
+    g_sl_eval_token = static_cast<uint32_t>(frame);
+    sl_publish_record(f, g_sl_eval_token, "evaluate");
     // FGInput=DLSSG only: this lane is Sl_Inputs, so it must not tag anything when the
     // configured input lane is the upscaler (OptiScaler has exactly one active lane).
     if (cfg().fg_output == static_cast<int>(FgOutputSink::XeFG) &&
@@ -792,9 +864,23 @@ void sl_publish_staged()
         f.output_h = f.stream[MGPU_FG_STREAM_BACKBUFFER].height;
     }
     if (f.render_w < 8 || f.render_h < 8) { return; }
-    if (f.stream[MGPU_FG_STREAM_MV].resource == nullptr ||
+    // Motion vectors are OPTIONAL here: a depth-only title (Wuchang/Unreal with the
+    // upscaler lane, or any title that never tags sl::kFeatureDLSS_G velocity) still
+    // has to produce a publication - the marker carries the identity and the consumer
+    // generates its own vectors with optical flow. Only "no depth AND no MV" is a
+    // loading/menu frame.
+    if (f.stream[MGPU_FG_STREAM_MV].resource == nullptr &&
         f.stream[MGPU_FG_STREAM_DEPTH].resource == nullptr) {
-        return;                                 // loading/menu: no capture inputs yet
+        return;
+    }
+    static bool told_depth_only = false;
+    if (!told_depth_only && f.stream[MGPU_FG_STREAM_MV].resource == nullptr) {
+        told_depth_only = true;
+        logf("sl: depth-only publication (no MV tagged) render=%ux%u depth=%ux%u"
+             " - the consumer will use optical flow\n",
+             f.render_w, f.render_h,
+             f.stream[MGPU_FG_STREAM_DEPTH].width,
+             f.stream[MGPU_FG_STREAM_DEPTH].height);
     }
 
 
@@ -833,7 +919,8 @@ void sl_publish_staged()
     ID3D12Device* dev = nullptr;
     if (res != nullptr) { res->GetDevice(IID_PPV_ARGS(&dev)); }
     f.device = dev;
-    publish_record(f);
+    g_sl_staged_token = g_stage.frame_token;
+    sl_publish_record(f, g_sl_staged_token, "present-staged");
     if (dev != nullptr) { dev->Release(); }
 
     static unsigned logged = 0;

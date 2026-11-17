@@ -13,6 +13,8 @@ int main()
     // window size by the display DPI (175% here) and the client rect no longer
     // matches the 5120x2880 swap chain we ask XeSS-FG for.
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    logf_("[lock] lock_frame %s (shared protocol v%u)\n",
+          LOCK_FRAME_VERSION_STRING, mgpu::kSharedVersion);
 
     if (wcsstr(GetCommandLineW(), L"--no-fg")) { g_no_fg = true; }
     if (wcsstr(GetCommandLineW(), L"--no-pair-key")) { g_pair_frame_key = false; }
@@ -256,6 +258,13 @@ int main()
     }
     if (wcsstr(GetCommandLineW(), L"--fg-debug-tag-interp")) { g_fg_tag_interp = true; }
     if (wcsstr(GetCommandLineW(), L"--fg-debug-only-interp")) { g_fg_only_interp = true; }
+    // --version: print the product and wire versions, then exit. Useful for support
+    // ("which build is this?") and for the release check script.
+    if (wcsstr(GetCommandLineW(), L"--version")) {
+        printf("lock_frame %s (shared protocol v%u)\n",
+               LOCK_FRAME_VERSION_STRING, mgpu::kSharedVersion);
+        return 0;
+    }
     // --list-modes: print the refresh rates this output supports and the exact input
     // rate for every output multiplier, then exit. No game or shared memory needed.
     if (wcsstr(GetCommandLineW(), L"--list-modes")) { return list_display_modes(); }
@@ -325,23 +334,33 @@ int main()
     }
     // --lock-auto: solve (rate, multiplier) so that rate*(interp+1) divides the refresh.
     if (wcsstr(GetCommandLineW(), L"--lock-auto")) { g_lock_auto = true; }
-    // --mode 30x4 | 40x3: 这一版唯一暴露给 UI 的两个模式。它们只是
-    // (--lock, --interp) 的组合，并强制关闭动态逐帧/自动解算。
+    // --mode 2x | 3x | 4x: 固定倍率（输出 = 输入 × N）。旧的 30x4 / 40x3 作为
+    // 4x / 3x 的别名保留，老快捷方式/脚本不用改。
+    // 注意：不在这里启用 --lock 的丢帧逻辑。WGC 的到达时间有 1-2 ms 抖动，
+    // 用 GetTickCount64 做"早到就丢"会周期性丢掉真实帧（输入 30 接受成 20）。
+    // 输入锁由游戏侧（RTSS/游戏限制器）完成；这里只固定插帧数。
     if (const wchar_t* md = wcsstr(GetCommandLineW(), L"--mode ")) {
-        // 注意：不在这里启用 --lock 的丢帧逻辑。WGC 的到达时间有 1-2 ms 抖动，
-        // 用 GetTickCount64 做"早到就丢"会周期性丢掉真实帧（输入 30 接受成 20）。
-        // 输入锁由游戏侧（RTSS/游戏限制器）完成；这里只固定插帧数。
-        if (wcsstr(md, L"40x3")) {
-            g_fg_interp = 2;            // 2 generated frames -> 3x
-            logf_("[lock] mode: 锁帧 40 x 3 = 120 fps (游戏锁 40 fps)\n");
-        } else {
-            g_fg_interp = 3;            // 3 generated frames -> 4x
-            logf_("[lock] mode: 锁帧 30 x 4 = 120 fps (游戏锁 30 fps)\n");
+        const wchar_t* p = md + 7;
+        while (*p == L' ') { ++p; }
+        int mul = 0;
+        if (wcsncmp(p, L"30x4", 4) == 0 || wcsncmp(p, L"4x", 2) == 0) {
+            mul = 4;
+        } else if (wcsncmp(p, L"40x3", 4) == 0 || wcsncmp(p, L"3x", 2) == 0) {
+            mul = 3;
+        } else if (wcsncmp(p, L"2x", 2) == 0) {
+            mul = 2;
         }
-        // MUST be set: --unlock-mfg picks its patch target from this flag, and when it
-        // is false it defaults to 3 (4x) and overwrites g_fg_interp. That is exactly
-        // why 40x3 used to run 4x: mode set 2, then the patch reset it to 3.
-        g_fg_interp_set = true;
+        if (mul >= 2 && mul <= 4) {
+            g_fg_interp = mul - 1;      // 1 张插值 = 2x，2 张 = 3x，3 张 = 4x
+            // MUST be set: --unlock-mfg picks its patch target from this flag, and when it
+            // is false it defaults to 3 (4x) and overwrites g_fg_interp. That is exactly
+            // why 40x3 used to run 4x: mode set 2, then the patch reset it to 3.
+            g_fg_interp_set = true;
+            logf_("[lock] mode: fixed %dx (output = input x%d; lock input = panel Hz / %d)\n",
+                  mul, mul, mul);
+        } else {
+            logf_("[lock] mode: unrecognized '%.8ls' - keeping interp=%d\n", p, g_fg_interp);
+        }
         // Do NOT force g_interp_cadence off here: --interp-cadence is parsed earlier and
         // the UI's optional low-fps mode must survive --mode. With no such flag it is
         // already false, so the fixed path stays fixed.
@@ -712,8 +731,8 @@ int main()
     // 精确 marker 配对，所以关闭所有"按时间/轮转猜下一个槽"的路径：
     //   --prefetch-inputs / --prefetch-publications / --pub-fifo 都会在颜色到达
     //   之前预先拷贝一个"猜的"槽，锁帧版不需要也不允许这种猜测。
-    // StreamPercent 由 producer 的 fakerFG.ini 固定（默认 200），消费者不再自动调。
-    // 以上都是强制项：这一版只为两个锁帧模式服务，A/B 入口在命令行保留但不再生效。
+    // StreamPercent 由 producer 的 fakerFG.ini 固定（默认 150），消费者不再自动调。
+    // 以上都是强制项：这一版只为固定倍率 2x/3x/4x 服务，A/B 入口在命令行保留但不再生效。
     g_fg_colour_shared = false;
     g_pair_frame_key   = false;
     g_prefetch_inputs  = false;

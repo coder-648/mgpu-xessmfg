@@ -6,8 +6,9 @@
 > 为什么是 GPL-3.0 而不是 MIT：`src/xefg_dynamic_count.h` 是 OptiScaler
 > （GPL-3.0）`XeFG_DynamicCount.h` 的逐字移植，而且它被编译进了 `bridge.exe`
 > 与 `xess_mfg_consumer.exe`。
-> `third_party/optiscaler/` 下另有 6 个逐字保留的参考文件。
-> 想改成宽松许可，必须先把这两处去掉（见本文末尾）。
+> `lock_frame/faker_fg/**` 也参考了 OptiScaler 的公开实现；本地参考 checkout
+> `third_party/optiscaler/` 不入库（`third_party/` 整体忽略）。
+> 想改成宽松许可，必须先把这些派生实现去掉（见本文末尾）。
 
 ## 1. 你分发二进制时必须做的事
 
@@ -60,7 +61,21 @@ AMD / Radeon / FidelityFX、Intel / XeSS、NVIDIA / DLSS / RTX、ReShade 等名�
 
 1. 删掉 `src/xefg_dynamic_count.h` 与 `--dyn-mfg` 的全部接线
    （`docs/findings/FINAL_CONFIG.md` §9.19 已实测"固定倍率"更好，功能上没有损失）；
-2. 删掉 `third_party/optiscaler/**`，把 MV 约定改写为自己的结论 +
-   引用上游 URL（现有摘录是逐字引用，不能直接沿用）；
+2. 清理 `lock_frame/faker_fg/**` 中参考 OptiScaler 的派生实现，把 MV 约定
+   改写为自己的结论 + 引用上游 URL（本地 `third_party/optiscaler/` 只是
+   不入库的参考 checkout，不能直接沿用）；
 3. 把 `LICENSE` 换成 MIT / Apache-2.0，同步修改 `NOTICE` 与
    `src/xefg_dynamic_count.h` 顶部注释。
+## 6. 正式版发布检查（GPL-3.0）
+
+`lock_frame` 1.0.0 起按开源（GPL-3.0）发布。每次发版必须同时满足：
+
+1. 发布包包含 `LICENSE` 与 `NOTICE`；
+2. 随二进制提供完整对应源码（`lock_frame-<ver>-src.zip` 或长期仓库地址 +
+   对应 commit）；
+3. 不内置 Intel 运行时，除非同时附 `third_party/xess/LICENSE.txt`；即使内置
+   也必须保持 DLL 原样、不修改；
+4. `--unlock-mfg` 的 Intel 许可/反作弊风险写进发布说明；
+5. `manifest.json` / `SHA256SUMS.txt` 由 `lock_frame/release.sh` 生成并通过
+   `lock_frame/scripts/check_release.py`。
+

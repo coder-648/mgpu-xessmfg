@@ -10,56 +10,72 @@ Copyright (C) 2026 bilibili夕阳虹舞
 
 
 ===============================================================================
-一、本仓库内包含的第三方代码
+一、本仓库内包含的第三方代码 / 派生代码
 ===============================================================================
 
 1) OptiScaler                                        GPL-3.0
    https://github.com/optiscaler/OptiScaler
-   （取用时的 master 快照，2026-11-06；许可全文 third_party/optiscaler/LICENSE）
+   （参考时的 master 快照，2026-11-06）
 
-   - third_party/optiscaler/shaders/camera_motion/**    逐字保留的参考实现
-   - third_party/optiscaler/inputs/FG/**                逐字保留的参考实现
    - src/xefg_dynamic_count.h                           **逐字移植**自
         OptiScaler/framegen/xefg/XeFG_DynamicCount.h（用到它的开关是 --dyn-mfg）
+   - lock_frame/faker_fg/** 的 DLSS-G / XeFG 输入车道、交换链接管与
+        Dynamic MFG 接线参考了 OptiScaler 的公开实现
    - OptiScaler 的 Dynamic MFG 设计思路也影响了 --dyn-mfg 的接线方式
 
    这几处是本仓库选择 GPL-3.0 的直接原因：OptiScaler 是 copyleft，
    而 xefg_dynamic_count.h 被编译进了 bridge.exe 与 xess_mfg_consumer.exe。
+   本地参考 checkout（third_party/optiscaler/、third_party/OptiScaler-master/）
+   **不入库**，按 docs/ops/DEPENDENCIES.md 获取。
 
-2) AMD FidelityFX SDK 1.1.4                              MIT
-   https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
-   Copyright (C) 2024 Advanced Micro Devices, Inc.
-
-   - third_party/ffx/include/FidelityFX/**      （242 个头文件，含 v1.1.4 的 ffx_opticalflow.h）
-   - third_party/ffx/api/**                     （ffx_api 头文件 + 原许可证，见其中的 LICENSE.txt / SOURCE.txt）
-   - third_party/ffx/lib/ffx_opticalflow_x64.lib
-   - third_party/ffx/lib/ffx_backend_dx12_x64.lib
-     两个 .lib 由上述 SDK 源码编译而来（重建步骤见 docs/ops/BUILD.md）。
-
-3) Universal MFG Unlocker                                MIT
+2) Universal MFG Unlocker                                MIT
    https://github.com/dashdogy/MFG-Unlocker  （作者 Michael Robles）
    src/xefg_unlock.h 里那六个字节补丁的位置与改法出自它（含 "fg_keep_2x_model"
    的做法）。本仓库只沿用了这些**事实性偏移量与改法**，没有拷贝它的代码。
+
+3) JSON for Modern C++ (nlohmann/json) 3.12.0             MIT
+   https://github.com/nlohmann/json
+   Copyright (C) 2013-2025 Niels Lohmann
+   lock_frame/third_party/nlohmann/json.hpp（单头文件）
+   lock_frame/third_party/nlohmann/LICENSE.MIT
+   仅由 fakerFG 的 proxy_kernel.cpp 读取 Streamline 插件清单时使用。
+   这是唯一随仓库跟踪的第三方源码目录。
 
 
 ===============================================================================
 二、构建 / 运行期依赖 —— 不在本仓库内分发
 ===============================================================================
 
+`third_party/` **整体不入库**（`.gitignore` 的 `/third_party/`）。以下依赖
+全部从上游获取，版本/commit 与拉取命令见 `docs/ops/DEPENDENCIES.md`。
+
+AMD FidelityFX SDK 1.1.4 / 2.4.0          MIT / AMD 许可
+  https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+  光流、FFX FrameGeneration API、ffx_api 头文件与两个 .lib。本地路径
+  `third_party/ffx/`；不入库。
+
 ReShade 6.8.0                        BSD-3-Clause   https://github.com/crosire/reshade
   **旧 add-on 的宿主（历史）**。当前 fakerFG 链路不再需要 ReShade
   （`InjectReshade=0`）；只有继续使用旧 add-on 部署包时才需要它的 LICENSE.md。
 
 MinHook                              BSD-2-Clause   https://github.com/TsudaKageyu/minhook
-  fakerFG 的模块/加载器钩子使用（旧 add-on 也用过）。
+  fakerFG 的模块/加载器钩子使用。
 
 Intel XeSS SDK 3.0.2                 Intel 专有许可  https://github.com/intel/xess
-  含 libxess_fg.dll / libxell.dll / libxess.dll。当前 consumer 运行 XeFG 时使用；
-  **本仓库不提交这些 DLL**（.gitignore 已排除 third_party/xess/bin/），
+  含 libxess_fg.dll / libxell.dll / libxess.dll 与 inc/lib。当前 consumer 运行
+  XeFG 时使用；**本仓库不提交这些文件**（`third_party/` 整体忽略），
   发布二进制包前必须先读它的 LICENSE.txt。见 docs/ops/LEGAL.md。
 
-NVIDIA DLSS SDK                      NVIDIA 专有许可
-  只作 DLSS 输入约定的参考，不参与编译。
+NVIDIA DLSS SDK / Streamline         NVIDIA 许可（专有）
+  https://github.com/NVIDIA/DLSS · https://github.com/NVIDIA-RTX/Streamline
+  只作 DLSS-G / Streamline 输入契约的头文件与接口参考。
+
+Magpie                               GPL-3.0        https://github.com/Blinue/Magpie
+  FG pacing、时隙与呈现节拍的参考实现。
+
+dlssg_for_sm86                       GPL-3.0（NVIDIA 组件不转授权）
+  DLSS-G 后端与输入契约的研究参考。
+
 
 
 ===============================================================================

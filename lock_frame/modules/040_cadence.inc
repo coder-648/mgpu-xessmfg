@@ -1019,15 +1019,17 @@ static bool init_fg()
                   (g_overlay_monitor >= 0) ? " (overlay monitor)" : "");
 
             g_refresh_hz = dm.dmDisplayFrequency;
-            // A 30 fps x4 profile needs the panel to actually run at 120 Hz. 4K HDR over
-            // a link without DSC lands on 59/60 Hz, and then 4x can never show more than
-            // ~60 fps no matter what the frame generator does.
+            // A fixed multiplier needs the panel to actually run at the target output
+            // rate. 4K HDR over a link without DSC lands on 59/60 Hz, and then 4x can
+            // never show more than ~60 fps no matter what the generator does.
             if (g_refresh_hz > 0 && g_refresh_hz < 100) {
-                logf_("[lock] WARNING: panel runs at %lu Hz - 30 fps x%d needs %lu Hz; the"
-                      " output will cap near %lu fps. Check the display mode and the cable"
-                      " (4K HDR 120 Hz needs DP 1.4 + DSC or HDMI 2.1).\n",
-                      dm.dmDisplayFrequency, g_fg_interp + 1,
-                      static_cast<unsigned long>(30 * (g_fg_interp + 1)),
+                const unsigned mul = static_cast<unsigned>(g_fg_interp + 1);
+                logf_("[lock] WARNING: panel runs at %lu Hz - fixed %ux needs %lu Hz for"
+                      " %.1f fps input; the output will cap near %lu fps. Check the display"
+                      " mode and the cable (4K HDR 120 Hz needs DP 1.4 + DSC or HDMI 2.1).\n",
+                      dm.dmDisplayFrequency, mul,
+                      static_cast<unsigned long>(dm.dmDisplayFrequency * mul),
+                      static_cast<double>(dm.dmDisplayFrequency) / static_cast<double>(mul),
                       dm.dmDisplayFrequency);
             }
         }

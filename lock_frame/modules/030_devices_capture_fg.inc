@@ -342,6 +342,21 @@ static bool start_wgc()
     ComPtr<IGraphicsCaptureSession2> session2;
     if (SUCCEEDED(g_session.As(&session2))) { session2->put_IsCursorCaptureEnabled(FALSE); }
 
+    // WGC can add a capture border and secondary windows (Win11 22621+). Both cost work
+    // and neither belongs in the colour XeFG receives, so turn them off when available.
+    ComPtr<IGraphicsCaptureSession3> session3;
+    if (SUCCEEDED(g_session.As(&session3))) {
+        const HRESULT hr = session3->put_IsBorderRequired(FALSE);
+        logf_("[lock] WGC border capture = off (%s)\n",
+              SUCCEEDED(hr) ? "accepted" : "ignored by this OS");
+    }
+    ComPtr<IGraphicsCaptureSession6> session6;
+    if (SUCCEEDED(g_session.As(&session6))) {
+        const HRESULT hr = session6->put_IncludeSecondaryWindows(FALSE);
+        logf_("[lock] WGC secondary windows = off (%s)\n",
+              SUCCEEDED(hr) ? "accepted" : "ignored by this OS");
+    }
+
 
     // ---- WGC delivery throttle (Windows 11, SDK 22621+) --------------------------------
     // IGraphicsCaptureSession5::MinUpdateInterval defaults to one compositor interval

@@ -1,16 +1,16 @@
 // ============================================================================
-// lock_frame.exe - 锁帧版双卡补帧消费端（锁帧 30x4 / 锁帧 40x3）
+// lock_frame.exe - 锁帧版双卡补帧消费端（固定倍率 2x / 3x / 4x）
 //
 // 与 src/xess_mfg_consumer（v23 颜色入槽）不同，这一版把颜色放回 WGC：
 //   colour : Windows.Graphics.Capture 抓游戏窗口（scRGB/HDR 原样）
-//   mv     : 共享内存槽（producer 跨卡发布，默认 StreamPercent=200）
+//   mv     : 共享内存槽（producer 跨卡发布，默认 StreamPercent=150）
 //   depth  : 同上
 //   身份   : 颜色帧四角的 marker（6x6，32-bit code）与 frames[].frame_id + ms12
 //            精确匹配；匹配不上就本帧 1X，绝不错配。
 //
-// 为什么只提供两个模式：WGC 的到达时间被 DWM 量化到 2/3/4 vblank，动态逐帧
-// 的相位累加器无法在这种输入上工作。锁帧 30x4（120Hz）与锁帧 40x3（120Hz）
-// 让输入节拍固定，消费端按固定倍数插帧，抖动被锁帧吸收。
+// 为什么是固定倍率：WGC 的到达时间被 DWM 量化到 2/3/4 vblank，动态逐帧
+// 的相位累加器无法在这种输入上工作。锁帧让输入节拍固定，再用 2x / 3x / 4x
+// 三个固定倍数插帧（120 Hz 面板分别对应 60 / 40 / 30 fps 输入）。
 //
 // 源码取自 src/bridge（原有 WGC 实现，踩坑成果），并把当前 consumer 的
 // marker 精确配对移植回来；原版本的所有文件都没有改动。
@@ -63,6 +63,7 @@
 #include "xefg_unlock.h"
 
 #include "mgpu_shared.h"
+#include "version.h"
 
 // marker(seq12|ms12|CRC8) <-> publication 的精确配对，纯逻辑，单测在 tests/pair_core。
 #include "mgpu_pair_core.h"
@@ -90,7 +91,9 @@ using Microsoft::WRL::ComPtr;
 using ABI::Windows::Graphics::Capture::IGraphicsCaptureItem;
 using ABI::Windows::Graphics::Capture::IGraphicsCaptureSession;
 using ABI::Windows::Graphics::Capture::IGraphicsCaptureSession2;
+using ABI::Windows::Graphics::Capture::IGraphicsCaptureSession3;
 using ABI::Windows::Graphics::Capture::IGraphicsCaptureSession5;
+using ABI::Windows::Graphics::Capture::IGraphicsCaptureSession6;
 using ABI::Windows::Graphics::Capture::IDirect3D11CaptureFrame;
 using ABI::Windows::Graphics::Capture::IDirect3D11CaptureFramePool;
 using ABI::Windows::Graphics::Capture::IDirect3D11CaptureFramePoolStatics2;
@@ -100,7 +103,7 @@ using ABI::Windows::Graphics::DirectX::Direct3D11::IDirect3DSurface;
 using Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess;
 
 // ----------------------------------------------------------------- module index
-// Dependency order. Keep this list in sync with docs/design/BRIDGE_ARCH.md.
+// Dependency order. Keep this list in sync with lock_frame/docs/README.md.
 #include "modules/010_platform.inc"
 #include "modules/020_state_overlay.inc"
 #include "modules/030_devices_capture_fg.inc"

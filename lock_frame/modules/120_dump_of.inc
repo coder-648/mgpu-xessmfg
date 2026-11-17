@@ -239,6 +239,8 @@ static std::vector<unsigned char>       g_of_scratch;
 static ComPtr<ID3D12Resource>           g_of_sint;      // FFX output, ceil(size/8)
 static ComPtr<ID3D12Resource>           g_of_scd;       // scene-change output, 3x1
 static ComPtr<ID3D12Resource>           g_of_mv;        // R16G16_FLOAT UV, tagged
+static ComPtr<ID3D12Resource>           g_of_dummy_depth; // 1x1 R32F: safe t3 before the ring binds
+static ComPtr<ID3D12Resource>           g_of_dummy_prev;  // 1x1 RGBA16F: safe t2 when --fg-warp is off
 static ComPtr<ID3D12DescriptorHeap>     g_of_heap;      // [0] = SRV sint, [1] = UAV mv
 static ComPtr<ID3D12RootSignature>      g_of_root;
 static ComPtr<ID3D12PipelineState>      g_of_pso;
@@ -407,11 +409,40 @@ static bool of_init_once()
 
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = 4 + mgpu::kMaxSlots + 1;   // [0]field [1]cur [2..3]hist [4..7]depth [8]uav
+    hd.NumDescriptors = 4 + mgpu::kMaxSlots + 1;   // [0] field [1] cur [2..3] hist [4..4+kMaxSlots) depth [4+kMaxSlots] uav
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_of_heap)))) {
         logf_("[lock] --fg-of: descriptor heap FAILED\n");
         return false;
+    }
+    // t3 (the depth guide) must resolve even before the first depth ring entry exists:
+    // OF now runs on the very first colour frame in a depth-only title. A 1x1 R32F
+    // placeholder is enough - out-of-range Load() returns 0 - and every real ring bind
+    // overwrites its slot later.
+    {
+        D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC dd{};
+        dd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        dd.Width = 1; dd.Height = 1; dd.DepthOrArraySize = 1; dd.MipLevels = 1;
+        dd.Format = DXGI_FORMAT_R32_FLOAT; dd.SampleDesc.Count = 1;
+        if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &dd,
+                D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_of_dummy_depth)))) {
+            logf_("[lock] --fg-of: depth placeholder FAILED\n");
+            return false;
+        }
+        // t2 (the previous colour used by the refinement step) is normally provided by
+        // --fg-warp's history textures, which are never created in the XeFG path. Bind a
+        // 1x1 black placeholder instead of leaving the descriptor unbound; the seed field
+        // is still correct, only the optional per-pixel refinement becomes a no-op.
+        D3D12_RESOURCE_DESC pd{};
+        pd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        pd.Width = 1; pd.Height = 1; pd.DepthOrArraySize = 1; pd.MipLevels = 1;
+        pd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; pd.SampleDesc.Count = 1;
+        if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &pd,
+                D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_of_dummy_prev)))) {
+            logf_("[lock] --fg-of: history placeholder FAILED\n");
+            return false;
+        }
     }
     const UINT dstride = g_device->GetDescriptorHandleIncrementSize(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -430,9 +461,33 @@ static bool of_init_once()
     gd.Texture2D.MipLevels = 1;
     cpu.ptr += dstride;
     g_device->CreateShaderResourceView(g_shared12.Get(), &gd, cpu);
-    // [2],[3] = the two history colours, [4..7] = the depth ring: all bound lazily, once
-    cpu.ptr += static_cast<SIZE_T>(2 + mgpu::kMaxSlots) * dstride;
-    // descriptor 6: the MV we tag
+    // [2],[3] = the two history colours. They are placeholders here and get overwritten
+    // by of_bind_hist() when --fg-warp created real history textures; in the XeFG-only
+    // path they stay as a safe 1x1 black source for the optional refinement step.
+    D3D12_SHADER_RESOURCE_VIEW_DESC hv{};
+    hv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    hv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    hv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    hv.Texture2D.MipLevels = 1;
+    cpu.ptr += dstride;                    // [1] -> [2]
+    g_device->CreateShaderResourceView(g_of_dummy_prev.Get(), &hv, cpu);
+    cpu.ptr += dstride;                    // [2] -> [3]
+    g_device->CreateShaderResourceView(g_of_dummy_prev.Get(), &hv, cpu);
+    // [4 .. 4+kMaxSlots) = the depth ring: real entries are bound lazily; seed the whole
+    // range with the placeholder first.
+    cpu.ptr += dstride;                    // [3] -> [4]
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC dsv{};
+        dsv.Format = DXGI_FORMAT_R32_FLOAT;
+        dsv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        dsv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        dsv.Texture2D.MipLevels = 1;
+        for (UINT i = 0; i < mgpu::kMaxSlots; ++i) {
+            g_device->CreateShaderResourceView(g_of_dummy_depth.Get(), &dsv, cpu);
+            cpu.ptr += dstride;
+        }
+    }
+    // descriptor 4+kMaxSlots: the MV we tag
     D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
     ud.Format = DXGI_FORMAT_R16G16_FLOAT;
     ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;

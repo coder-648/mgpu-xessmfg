@@ -80,6 +80,21 @@ static void ack_previous_slot()
     g_ack_slot = mgpu::kMaxSlots;
 }
 
+// A colour frame is monotonic: once we matched frame N, no slot older than N can ever be
+// useful. Releasing them keeps the producer's credit window from collapsing to the three
+// slots the consumer happened to read (Wuchang's no_slot holes came from that 3-slot ring).
+static void ack_older_than(uint64_t frame_id)
+{
+    if (!g_ctl || frame_id == 0) { return; }
+    const UINT sc = (g_ctl->slots != 0) ? g_ctl->slots : 1;
+    for (UINT k = 0; k < sc && k < mgpu::kMaxSlots; ++k) {
+        const mgpu::FrameShared& fr = g_ctl->frames[k];
+        if (fr.frame_id != 0 && fr.frame_id < frame_id && fr.published != 0) {
+            g_ctl->consumed[k] = fr.published;
+        }
+    }
+}
+
 // Drops our local (consumer-side) copies of the input streams. Only their *size* can
 // change now: the placed views are fixed for the life of the process (protocol v9).
 static void prefetch_invalidate();          // --prefetch-inputs, defined below
@@ -250,7 +265,11 @@ static bool input_copy_queue_usable()
     // switch exists to measure the depth-1 cost, not to run with a second queue in flight.
     if (g_no_throttle) { return false; }
 #if MGPU_FG_OF
-    if (g_fg_of) { return false; }
+    // The flow pass reads the depth ring on the framebuffer's own list. A parallel copy
+    // queue could be overwriting that same ring texture while the flow dispatch is still
+    // reading it (observed as flicker/undefined depth on depth-only titles, where the
+    // consumer - not --fg-of - selected the flow automatically).
+    if (g_fg_of || mv_from_flow()) { return false; }
 #endif
     if (g_copy_list[0]) { return true; }
     D3D12_COMMAND_QUEUE_DESC q{};

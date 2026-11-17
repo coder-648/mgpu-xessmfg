@@ -132,6 +132,54 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     probe_colour_black();
     lock_overlay_stall_gate();
 
+#if MGPU_FG_OF
+    // The flow field is a per-frame output: never let a failed dispatch inherit the
+    // previous frame's "fresh" flag.
+    g_of_fresh = false;
+    // Resolve the vector source BEFORE pairing. A depth-only title must be able to
+    // initialize optical flow even if the very first marker pair fails; the old code
+    // only did this inside the pair-success branch, so a no-slot start could never
+    // reach OF and stayed at 1X forever.
+    if (!g_reuse_frame && colour11 != nullptr && g_ctl != nullptr) {
+        if (g_mv_auto) {
+            const bool known = g_ctl->frame_published != 0;
+            if (known) {
+                g_auto_use_mv = !g_fg_of && producer_has_mv_stream();
+            }
+            static int8_t told_mv_src = -1;
+            const int8_t now_src = g_auto_use_mv ? 1 : 0;
+            if (known && now_src != told_mv_src) {
+                told_mv_src = now_src;
+                logf_("[lock] mv: auto -> %s (active_mask=0x%X mv slot %ux%u%s,"
+                      " input_flags=0x%X)\n",
+                      g_auto_use_mv ? "the producer's motion vectors"
+                                    : (g_fg_of
+                                           ? "optical flow (forced: Unreal/no-MV policy)"
+                                           : "optical flow / zeroed (no MV received)"),
+                      g_ctl->active_mask,
+                      g_ctl->streams[mgpu::kStreamMv].width,
+                      g_ctl->streams[mgpu::kStreamMv].height,
+                      producer_has_mv_stream() ? "" : " (no MV data)",
+                      g_ctl->producer.input_flags);
+            }
+        }
+        g_of_active = mv_from_flow();
+        // A real depth stream is required: g_of_mv is created at the depth stream size
+        // (XeFG rejects a MV/depth size mismatch). If the layout is not live yet, retry
+        // on the next colour frame instead of freezing g_of_out_w/h at the capture size.
+        if (g_of_active && !g_of_ready && g_ctl->frame_published != 0 &&
+            g_ctl->streams[mgpu::kStreamDepth].width >= 256) {
+            if (!of_init()) {
+                static bool told_of_fail = false;
+                if (!told_of_fail) {
+                    told_of_fail = true;
+                    logf_("[lock] of: initialization FAILED - no vector source this session\n");
+                }
+            }
+        }
+    }
+#endif
+
     // 0. 身份：先从这一帧 WGC 颜色的四角 marker 解出 seq12+ms12，再到 producer 的
     //    发布里精确匹配。matched == false 时本帧只上屏真实颜色（1X），不打 tag。
     bool pair_ok = g_reuse_frame;           // 复用帧沿用上一帧已验证的 slot
@@ -144,10 +192,25 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
         // 也不参与命中率统计（记在 pair: 的 dup 里）。
         if (lp.duplicate) { return; }
         // Every real pairing attempt contributes to the sliding health window. A
-        // duplicate is not a new attempt, so it is deliberately excluded.
-        lock_note_pair_outcome(!lp.verified);
-        if (lock_should_hard_reset() && lock_request_session_reset()) {
-            return;
+        // duplicate is not a new attempt, so it is deliberately excluded. When the
+        // producer has published nothing at all (depth-only lane not feeding us yet),
+        // that is a transport problem, not a marker mismatch: do not poison the health
+        // window and do not trigger a session reset loop.
+        const bool publishing = lock_producer_publishing();
+        if (publishing) {
+            lock_note_pair_outcome(!lp.verified);
+            if (lock_should_hard_reset() && lock_request_session_reset()) {
+                return;
+            }
+        } else {
+            static ULONGLONG told_stall_ms = 0;
+            const ULONGLONG now_ms = GetTickCount64();
+            if (told_stall_ms == 0 || now_ms - told_stall_ms > 2000) {
+                told_stall_ms = now_ms;
+                logf_("[lock] no producer publication yet (frame_published=%llu) -"
+                      " waiting for the depth-only record; pairing is not attempted\n",
+                      static_cast<unsigned long long>(g_ctl ? g_ctl->frame_published : 0));
+            }
         }
         pair_ok = lp.verified;
         pair_slot = lp.slot;
@@ -302,6 +365,15 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
         // ~14.7 MB/frame across PCIe) would be pure waste.
         if (g_fg_of) { want_producer_mv = false; }
 #endif
+        // Auto mode: once the producer has published depth-only for a while, stop asking
+        // for MV so it cannot start copying a stale/dummy texture and flip the source back.
+        // Re-probe every ~120 frames so a title that begins feeding vectors is found.
+        if (g_mv_auto && g_ctl && g_ctl->frame_published != 0 &&
+            !producer_has_mv_stream()) {
+            static uint32_t probe = 0;
+            const bool allow_probe = ((++probe % 120u) == 0u);
+            if (!allow_probe) { want_producer_mv = false; }
+        }
         g_ctl->consumer_request = want_producer_mv ? mgpu::kRequestMv : 0u;
         // v14: the full switch board. --no-mv/--no-depth/--fg-of/--no-colour fold into it, so
         // there is exactly one place that decides what crosses the bus.
@@ -445,22 +517,7 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
         // Auto MV: what did the producer actually publish? Refreshed once per captured
         // frame - this is the "handle what we received" decision, not a UI option.
         if (g_mv_auto && g_ctl) {
-            const uint32_t pf = g_ctl->producer.input_flags;
-            const bool known = pf != 0;          // nothing published yet -> keep the assumption
-            const bool active = (pf & mgpu::kInputFlagMvActive) != 0;
-            const bool placed = g_ctl->streams[1].slot_size != 0 &&
-                                g_ctl->streams[1].width >= 256;
-            if (known) { g_auto_use_mv = active && placed; }
-            static int8_t told = -1;
-            const int8_t now = g_auto_use_mv ? 1 : 0;
-            if (known && now != told) {
-                told = now;
-                logf_("[lock] mv: auto -> %s (producer flags=0x%X, mv slot %ux%u%s)\n",
-                      g_auto_use_mv ? "the producer's motion vectors"
-                                    : "optical flow / zeroed (no MV received)",
-                      pf, g_ctl->streams[1].width, g_ctl->streams[1].height,
-                      placed ? "" : " (not placed)");
-            }
+            g_auto_use_mv = !g_fg_of && producer_has_mv_stream();
         }
         g_of_active = mv_from_flow();
         g_of_fresh = false;
@@ -491,6 +548,9 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
         // behaviour that always ran at full rate.
         g_last_slot = slot;
         g_have_last = true;
+        // Release every publication older than the one we just matched; their colour has
+        // already been consumed and they only pin the producer's credit window.
+        ack_older_than(g_ctl->frames[slot].frame_id);
     }
 
     // Prefetch lookup happens BEFORE the OF/colour list: a miss selects the flow as this
@@ -725,18 +785,42 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
         // Wuchang/Unreal uses optical flow and deliberately requests no producer MV
         // (streams -> mv=0 depth=1). The gate must accept the OF field in that case:
         // otherwise pair is exact but XeFG stays at 1X forever.
-        const bool producer_mv = g_ctl && (g_ctl->active_mask & mgpu::kRequestMv) != 0;
+        const bool producer_mv = producer_has_mv_stream();
 #if MGPU_FG_OF
-        const bool flow_mv = g_of_active && g_of_ready && g_of_fresh;
+        // XeFG rejects a frame whose MV and depth sizes differ. g_of_mv is created at
+        // the depth stream size at init; a later resolution/preset change can invalidate
+        // that. Refuse to tag (1X) and say why instead of feeding a mismatched pair.
+        const bool of_size_ok =
+            g_ctl != nullptr &&
+            g_of_out_w == g_ctl->streams[mgpu::kStreamDepth].width &&
+            g_of_out_h == g_ctl->streams[mgpu::kStreamDepth].height;
+        if (g_of_active && g_of_ready && g_of_fresh && !of_size_ok) {
+            static bool told_size = false;
+            if (!told_size) {
+                told_size = true;
+                logf_("[lock] of: tagged size %ux%u != depth stream %ux%u - OF disabled"
+                      " (resolution changed after init)\n",
+                      g_of_out_w, g_of_out_h,
+                      g_ctl ? g_ctl->streams[mgpu::kStreamDepth].width : 0u,
+                      g_ctl ? g_ctl->streams[mgpu::kStreamDepth].height : 0u);
+            }
+        }
+        const bool flow_mv = g_of_active && g_of_ready && g_of_fresh && of_size_ok;
 #else
         const bool flow_mv = false;
 #endif
         const bool mv_available = pair_ok && g_ctl && (producer_mv || flow_mv);
         if (!mv_available && !gated_off) {
             const xefg_swapchain_result_t r = g_api.SetEnabled(g_fg, 0);
-            logf_("[lock] %s -> 1X (%s, %d); FG resumes when it returns\n",
+            logf_("[lock] %s -> 1X (%s, %d) [pair=%d producer_mv=%d of=%d/%d]\n",
                   pair_ok ? "MV missing this frame" : "colour/motion pairing unverified",
-                  xefg_str(r), (int)r);
+                  xefg_str(r), (int)r, pair_ok ? 1 : 0, producer_mv ? 1 : 0,
+#if MGPU_FG_OF
+                  g_of_ready ? 1 : 0, g_of_fresh ? 1 : 0
+#else
+                  0, 0
+#endif
+                  );
             if (r == XEFG_SWAPCHAIN_RESULT_SUCCESS) { gated_off = true; }
         } else if (mv_available && gated_off) {
             const xefg_swapchain_result_t r = g_api.SetEnabled(g_fg, 1);
@@ -759,7 +843,9 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     // MV and depth can be different sizes (UE5: MVs at render size, depth at full res), so
     // each is tagged with its own stream size - the old code used streams[1] for both.
 #if MGPU_FG_OF
-    if (g_of_active && g_of_ready && g_of_fresh) {
+    if (g_of_active && g_of_ready && g_of_fresh &&
+        g_ctl && g_of_out_w == g_ctl->streams[mgpu::kStreamDepth].width &&
+        g_of_out_h == g_ctl->streams[mgpu::kStreamDepth].height) {
         // Our own field: 1/8 resolution, screen-UV units, computed from this frame's
         // colour on this GPU (the producer's MV stream measured as garbage). Requiring
         // g_of_fresh keeps a stale field from being tagged when the flow did not run.
@@ -1050,8 +1136,12 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     // MV.Scale reports its render size there (CP2077: 2560x1440), and XeFG's definition of
     // "pixels" has to agree with the depth/MV grid it gets.
     if (g_of_active && g_of_fresh) {
-        cd.motionVectorScaleX = static_cast<float>(g_ctl->streams[1].width ? g_ctl->streams[1].width : 1u);
-        cd.motionVectorScaleY = static_cast<float>(g_ctl->streams[1].height ? g_ctl->streams[1].height : 1u);
+        // XeFG multiplies each velocity texel by this value. g_of_mv is the resource we
+        // actually tag, so the scale is ITS size - not the producer's MV stream size.
+        // They differ on depth-only titles (there is no MV stream at all) and whenever
+        // MV and depth have different source resolutions.
+        cd.motionVectorScaleX = static_cast<float>(g_of_out_w ? g_of_out_w : 1u);
+        cd.motionVectorScaleY = static_cast<float>(g_of_out_h ? g_of_out_h : 1u);
     }
     if (g_mv_sign < 0.0f) {
         cd.motionVectorScaleX = -cd.motionVectorScaleX;

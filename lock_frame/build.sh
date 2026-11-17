@@ -13,7 +13,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
 STAGE_ROOT="${MGPU_STAGE:-/mnt/c/temp/mgpu}"
 REPO_WIN="$(wslpath -w "$REPO")"
-FXC_WIN="/mnt/c/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/fxc.exe"
+FXC_WIN="${MGPU_FXC:-/mnt/c/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/fxc.exe}"
 
 WHAT="${1:-consumer}"
 
@@ -22,9 +22,11 @@ build_consumer() {
     rm -rf "$stage"
     mkdir -p "$stage" "$REPO/build"
     cp "$HERE/lock_frame.cpp" "$stage/"
+    cp "$HERE/lock_frame.rc" "$stage/"
     cp "$HERE/build.bat" "$stage/"
     cp "$HERE/osd_panel.h" "$stage/"
-    cp "$HERE/include/mgpu_shared.h" "$stage/"     # v24: kMaxSlots=6
+    cp "$HERE/version.h" "$stage/"
+    cp "$HERE/include/mgpu_shared.h" "$stage/"     # v28: kMaxSlots=32
     cp -r "$HERE/modules" "$stage/"
     for dll in libxess_fg.dll libxell.dll; do
         cp "$REPO/third_party/xess/bin/$dll" "$stage/" 2>/dev/null || true
@@ -80,7 +82,8 @@ build_producer() {
 setlocal
 cd /d "%~dp0"
 set "REPO=%~1"
-set "VSDIR=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
+if not defined MGPU_VSDIR set "MGPU_VSDIR=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
+set "VSDIR=%MGPU_VSDIR%"
 call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
 if not exist obj mkdir obj
 cl /nologo /std:c++17 /EHsc /O2 /MD /W3 /utf-8 /permissive- ^
@@ -122,7 +125,8 @@ build_faker() {
 setlocal
 cd /d "%~dp0"
 set "REPO=%~1"
-set "VSDIR=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
+if not defined MGPU_VSDIR set "MGPU_VSDIR=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
+set "VSDIR=%MGPU_VSDIR%"
 call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
 if not exist obj mkdir obj
 cl /nologo /std:c++17 /EHsc /O2 /MD /W3 /utf-8 /permissive- ^
@@ -132,7 +136,7 @@ cl /nologo /std:c++17 /EHsc /O2 /MD /W3 /utf-8 /permissive- ^
   /I"%REPO%\\third_party\\ffx\\include" ^
   /I"%REPO%\third_party\dlss\include" /I"%REPO%\third_party\minhook\include" ^
   /I"%REPO%\third_party\minhook\src" ^
-  /I"%REPO%\third_party\OptiScaler-master\external" ^
+  /I"%REPO%\lock_frame\third_party" ^
   unity.cpp "%REPO%\third_party\minhook\src\buffer.c" "%REPO%\third_party\minhook\src\hook.c" ^
   "%REPO%\third_party\minhook\src\trampoline.c" "%REPO%\third_party\minhook\src\hde\hde64.c" ^
   /Fe:fakerFG.dll /Fo:obj\ /link /DLL /DEF:fakerFG.def /MAP:fakerFG.map d3d12.lib dxgi.lib user32.lib psapi.lib
@@ -151,16 +155,21 @@ build_ui() {
     local stage="$STAGE_ROOT/lock_frame_ui"
     rm -rf "$stage"; mkdir -p "$stage" "$REPO/build"
     cp "$HERE/ui/mgpu_ui.cpp" "$stage/lock_frame_ui.cpp"
-    cp "$HERE/include/mgpu_shared.h" "$stage/"     # v24: same version check
+    cp "$HERE/ui/lock_frame_ui.rc" "$stage/"
+    cp "$HERE/include/mgpu_shared.h" "$stage/"     # v28: shared protocol check
+    cp "$HERE/version.h" "$stage/"
     cat > "$stage/build.bat" <<'BAT'
 @echo off
 setlocal
 cd /d "%~dp0"
 set "REPO=%~1"
-set "VSDIR=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
+if not defined MGPU_VSDIR set "MGPU_VSDIR=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
+set "VSDIR=%MGPU_VSDIR%"
 call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
+rc /nologo /fo "%~dp0lock_frame_ui.res" "%~dp0lock_frame_ui.rc"
+if errorlevel 1 ( echo [build] rc failed & exit /b 1 )
 cl /nologo /std:c++17 /EHsc /O2 /MD /W3 /utf-8 /permissive- ^
-  /DUNICODE /D_UNICODE /I"%~dp0." /I"%REPO%\src" "%~dp0lock_frame_ui.cpp" ^
+  /DUNICODE /D_UNICODE /I"%~dp0." /I"%REPO%\src" "%~dp0lock_frame_ui.cpp" "%~dp0lock_frame_ui.res" ^
   /Fe:lock_frame_ui.exe /Fo:lock_frame_ui.obj ^
   /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib shell32.lib advapi32.lib dwmapi.lib
 if errorlevel 1 exit /b 1

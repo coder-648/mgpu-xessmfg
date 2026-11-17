@@ -78,6 +78,17 @@
 | [`design/FAKER_FG_PORT.md`](design/FAKER_FG_PORT.md) | **fakerFG × OptiScaler 逐机制对照与移植清单**：入口/呈现/输入契约三段 + 已踩过的坑 + “不要再做的事” |
 | [`design/FG_BACKEND.md`](design/FG_BACKEND.md) | "为什么不能当观察者"的论证（§9–§10 已作废，见 FAKER_FG） |
 | [`design/VENDOR_COMPAT_PLAN.md`](design/VENDOR_COMPAT_PLAN.md) | 厂商兼容计划（输入源抽象 + 副卡泛化，M6.x） |
+
+---
+
+## 4. lock_frame 正式版
+
+`lock_frame/` 是独立的固定倍率（2x/3x/4x）实现，文档不与主干混放：
+
+| 文档 | 内容 |
+|---|---|
+| [`../lock_frame/README.md`](../lock_frame/README.md) | 构建、部署、运行、日志判读 |
+| [`../lock_frame/docs/README.md`](../lock_frame/docs/README.md) | lock_frame 文档索引（规划/发布说明/测试步骤） |
 | [`findings/QUALITY_VARIABLES.md`](findings/QUALITY_VARIABLES.md) | **画质/预算变量作用表** + 怎么自己复测 |
 | [`findings/PERF_BASELINE.md`](findings/PERF_BASELINE.md) | **性能基线（别重测）+ 优化候选清单** + 怎么看 `breakdown` |
 | [`findings/PERF_ROUND_HANDOVER.md`](findings/PERF_ROUND_HANDOVER.md) | **性能分析轮交接（2026-11-14）**：链路、日志速查、基线数字、杠杆排序、开关、五个坑 |

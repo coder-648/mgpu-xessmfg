@@ -14,13 +14,14 @@
   2. 游戏设置里开启 DLSS（必须是 DLSS，不是 TAA/TSR）——日志出现
      "sr: upscaler lane ..." / "xefg: upscaler Evaluates ..." 才说明输入链路通了。
   3. 窗口/无边框全屏，分辨率与桌面一致（日志里是 1920x1080 -> 3840x2160）。
-  4. 把游戏锁到 30 fps（用 30x4）或 40 fps（用 40x3）：RTSS 或游戏内限制器。
-     本版本不在消费端丢帧，输入节拍由游戏侧锁帧提供。
-  5. 运行 lock_frame\lock_frame_ui.exe：
+  4. 把游戏锁到目标输入帧率：2x 锁 60 fps、3x 锁 40 fps、4x 锁 30 fps
+     （120 Hz 面板）：RTSS 或游戏内限制器。本版本不在消费端丢帧。
+  5. 运行 lock_frame_ui.exe：
        - 选 Cyberpunk 窗口
-       - 模式选「锁帧 30 x 4」或「锁帧 40 x 3」
+       - 固定倍率选 2x / 3x / 4x
+       - fakerFG 输入源选 DLSSG（推荐）
        - 点启动
-     或者直接运行 lock_frame\run_30x4.bat / run_40x3.bat（已带 --game Cyberpunk2077.exe）。
+     或者直接运行 run_2x.bat / run_3x.bat / run_4x.bat。
 
 看哪些日志
   游戏目录 Cyberpunk2077_fakerFG.log：
@@ -30,7 +31,7 @@
     - 如果还是 "producer: ... not present"   说明 DLL 没放对位置
   lock_frame 输出：
     - UI 启动：lock_frame\lock_frame_ui_HHMMSS.txt
-    - run bat：lock_frame\lock_frame_30x4.log / lock_frame_40x3.log
+    - run bat：lock_frame\lock_frame_2x.log / lock_frame_3x.log / lock_frame_4x.log
     正常应有：
       [lock] marker: seq12=... ms12=... code=0x...
       [lock] marker pair: WGC ... -> slot ... (frame_id=...)
@@ -38,14 +39,15 @@
       dup 是 loading/menu/pause 的重复帧（按 seq12 去重），不参与命中率；
       正常游戏中的 active 窗口应只剩 exact 和少量 no_slot。
     - exact 应接近 total；no_slot/unreadable 多说明 marker 被 HUD 挡住或画面被缩放
-    - lag.max + 2 必须小于 4（4 个槽）
+    - lag.max + 2 必须小于 32（32 个槽）
 
 注意
   - 不要同时运行旧的 xess_mfg_consumer.exe；同一时间只跑 lock_frame.exe。
   - 方案里有两个 A/B 文件，默认都不要放：
       marker_disable.on       （会让 fakerFG 不画 marker，配对必然失败）
       marker_repair_off.on    （会让四角 marker 留在画面上）
-  - 面板需要 120 Hz（30x4 / 40x3 都是 120 fps 输出）。
+  - 面板需要 120 Hz 才能让 2x/3x/4x 都输出 120 fps；其他刷新率按
+    “输入 = 刷新率 / 倍率”推导。
 
 回滚
   把备份目录里的 dxgi.dll.pre_lock_frame / nvngx_dlssg.dll.pre_lock_frame /

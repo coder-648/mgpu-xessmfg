@@ -121,6 +121,7 @@ uint32_t    g_next_slot = 0;
 uint64_t g_qpc_freq = 0;
 uint64_t g_last_publish_qpc = 0;
 uint64_t g_last_publish_frame_qpc = 0;   // f.frame_qpc_ms of the last counted publish
+uint64_t g_last_published_seq = 0;       // last frame_id actually written to frames[]
 double   g_publish_ms_ema = 0.0;
 // v22 diagnostics: record/present/publish counters + copy-queue retirement latency.
 uint64_t g_record_in = 0;
@@ -129,6 +130,9 @@ uint64_t g_publish_calls = 0;
 double   g_copy_wait_ema = 0.0;
 double   g_copy_wait_max = 0.0;
 uint64_t g_publish_skips = 0;
+uint64_t g_publish_seq_dedup = 0;
+uint64_t g_record_replaced = 0;
+uint64_t g_record_dropped = 0;
 uint64_t g_pub_seq = 0;      // v23: unique, monotonic publication counter
 ULONGLONG g_t0 = 0;   // first record timestamp, ms (diagnostics)
 
@@ -982,6 +986,14 @@ bool slot_free(uint32_t slot)
     if (c == nullptr) { return true; }
     const uint64_t published = g_fwd_value[slot];
     if (published == 0) { return true; }
+    // The colour watermark is the strongest credit: anything older than the last frame
+    // the consumer actually paired can never be needed again. Without this, a consumer
+    // that keeps matching the same slot ACKs only that slot, slots 1..N stay un-ACKed,
+    // and the producer degrades to reusing slot 0 forever (Wuchang's 1-slot ring).
+    if (c->colour_seq != 0) {
+        const uint64_t fid = c->frames[slot].frame_id;
+        if (fid != 0 && fid < c->colour_seq) { return true; }
+    }
     return c->consumed[slot] >= published;
 }
 
@@ -992,7 +1004,37 @@ bool claim_slot()
         const uint32_t s = (g_next_slot + i) % mgpu::kMaxSlots;
         if (!slot_free(s)) { continue; }
         g_cur_slot = s;
+        // Round-robin: without advancing g_next_slot the producer reused slot 0 on every
+        // frame (as soon as the consumer ACKed it), overwriting the publication the WGC
+        // colour was still in flight to match. That is exactly "marker seq = newest-1,
+        // hits=0" on Wuchang: only one slot ever held the newest frame.
+        g_next_slot = (s + 1u) % mgpu::kMaxSlots;
         return true;
+    }
+
+    // No ACKed slot. Dropping this publication leaves a permanent hole in frames[] (the
+    // marker seq can never be paired) and collapses the ring. Reclaim the OLDEST
+    // publication instead: its colour is several frames behind and can no longer be
+    // matched; a continuous 32-slot stream is worth more than preserving one stale slot.
+    if (mgpu::SharedControl* c = ctl()) {
+        int oldest = -1;
+        uint64_t oldest_pub = UINT64_MAX;
+        for (uint32_t i = 0; i < mgpu::kMaxSlots; ++i) {
+            const uint64_t p = g_fwd_value[i];
+            if (p == 0) { oldest = static_cast<int>(i); oldest_pub = 0; break; }
+            if (p < oldest_pub) { oldest_pub = p; oldest = static_cast<int>(i); }
+        }
+        if (oldest >= 0) {
+            g_cur_slot = static_cast<uint32_t>(oldest);
+            g_next_slot = (g_cur_slot + 1u) % mgpu::kMaxSlots;
+            ++c->producer_skipped;   // keep the diagnostic counter meaningful
+            static uint32_t reclaimed = 0;
+            if (++reclaimed <= 3 || (reclaimed % 300u) == 0u) {
+                logf("producer: no ACKed slot - reclaimed oldest slot %d (pub=%llu, %u so far)\n",
+                     oldest, static_cast<unsigned long long>(oldest_pub), reclaimed);
+            }
+            return true;
+        }
     }
 
     // v23.1: no ACKed slot. The old behaviour overwrote the oldest slot, which could be
@@ -1241,6 +1283,7 @@ void reset_consumer_session(mgpu::SharedControl* c, uint64_t session)
     c->generation += 1;
     g_next_slot = 0;
     g_last_publish_frame_qpc = 0;
+    g_last_published_seq = 0;
     g_last_publish_qpc = 0;
     MemoryBarrier();
     logf("producer: NEW consumer session 0x%llX - ACK/frame state reset (generation %u)\n",
@@ -1279,13 +1322,16 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
         const uint64_t di = g_record_in - s_last_hb;
         s_last_hb = g_record_in;
         logf("producer: t=%llums in=%llu (+%llu) present=%llu publish=%llu skip=%llu"
-             " copywait=%.1fms max=%.1fms mask=0x%X wantc=%d\n",
+             " seqdedup=%llu replaced=%llu dropped=%llu copywait=%.1fms max=%.1fms mask=0x%X wantc=%d\n",
              static_cast<unsigned long long>(GetTickCount64() - g_t0),
              static_cast<unsigned long long>(g_record_in),
              static_cast<unsigned long long>(di),
              static_cast<unsigned long long>(g_present_calls),
              static_cast<unsigned long long>(g_publish_calls),
              static_cast<unsigned long long>(g_publish_skips),
+             static_cast<unsigned long long>(g_publish_seq_dedup),
+             static_cast<unsigned long long>(g_record_replaced),
+             static_cast<unsigned long long>(g_record_dropped),
              g_copy_wait_ema, g_copy_wait_max, g_copied_mask,
              g_want_colour_session ? 1 : 0);
     }
@@ -1356,10 +1402,12 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
             if (!told_dev) { told_dev = true; logf("producer: record has no device - no transport\n"); }
             return;
         }
+        // Stream 1 is the MV slot. When the title provides no MV we still lay it out with
+        // the MV format/size (fixed layout), so a later frame that does carry vectors can
+        // be copied without a protocol change. The depth format is separate (always R32).
         uint32_t fmt = mv.resource != nullptr
                            ? mv.format
-                           : static_cast<uint32_t>(
-                                 static_cast<ID3D12Resource*>(dp.resource)->GetDesc().Format);
+                           : static_cast<uint32_t>(DXGI_FORMAT_R16G16_FLOAT);
         {
             static bool s_colour_ini = false;
             if (!s_colour_ini) {
@@ -1384,9 +1432,17 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
             if (cf == 0) { cf = static_cast<uint32_t>(cd.Format); }
         }
         if (cw < 256 || ch < 256) { cw = f->output_w; ch = f->output_h; }
+        // A depth-only record (no motion vectors) still has to size the transport.
+        // f.render_w/h used to come only from the MV stream; fakerFG now falls back to
+        // depth there, and this second fallback keeps an older fakerFG working too.
+        uint32_t eff_rw = f->render_w, eff_rh = f->render_h;
+        if (eff_rw < 8 || eff_rh < 8) {
+            eff_rw = dp.width; eff_rh = dp.height;
+            if (eff_rw < 8 || eff_rh < 8) { eff_rw = f->output_w; eff_rh = f->output_h; }
+        }
         ID3D12Device* dev = static_cast<ID3D12Device*>(f->device);
         if (InterlockedCompareExchange(&g_init_started, 1, 0) == 0) {
-            start_shared_init(dev, f->render_w, f->render_h, fmt, cw, ch, cf);
+            start_shared_init(dev, eff_rw, eff_rh, fmt, cw, ch, cf);
         }
         if (InterlockedCompareExchange(&g_init_failed, 0, 0) != 0) {
             static bool told_fail = false;
@@ -1400,7 +1456,15 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
         return;
     }
 
-    update_content(f->render_w, f->render_h);
+    // Same fallback as the init path: a depth-only record has no MV stream to take the
+    // render size from. Without this, update_content(0,0) returns immediately and the
+    // stream rectangles never leave 0 - the producer publishes nothing.
+    {
+        uint32_t rec_rw = f->render_w, rec_rh = f->render_h;
+        if (rec_rw < 8 || rec_rh < 8) { rec_rw = dp.width; rec_rh = dp.height; }
+        if (rec_rw < 8 || rec_rh < 8) { rec_rw = f->output_w; rec_rh = f->output_h; }
+        if (rec_rw >= 8 && rec_rh >= 8) { update_content(rec_rw, rec_rh); }
+    }
 
     // Who wants what? The bridge writes request_mask every frame it processes; with no
     // bridge running it stays 0, and copying 63 MB/frame into cross-adapter memory for
@@ -1504,11 +1568,41 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
     }
 
     if (!g_slot_locked) {
-        if (!claim_slot()) { return; }
+        if (!claim_slot()) {
+            static unsigned told_noslot = 0;
+            if (f->seq != 0 && told_noslot++ < 300) {
+                logf("record: no slot for seq=%llu (copies pending mask=0x%X)\n",
+                     static_cast<unsigned long long>(f->seq), g_copied_mask);
+            }
+            return;
+        }
         g_slot_locked = true;
         copy_begin_frame();     // one async list per frame (no-op when disabled)
     }
-    if (g_copied_mask == 0) { g_frame = *f; }   // the first record owns this frame
+    if (g_copied_mask == 0) {
+        g_frame = *f;   // the first record owns this frame
+    } else if (f->seq != 0 && f->seq != g_frame.seq &&
+               f->stream[mgpu::kStreamMv].resource == g_frame.stream[mgpu::kStreamMv].resource &&
+               f->stream[mgpu::kStreamDepth].resource == g_frame.stream[mgpu::kStreamDepth].resource) {
+        // A newer record for the SAME inputs arrived before the pending one was published.
+        // Keep the copies already recorded (same resources) but adopt the new identity, so
+        // the seq the marker is carrying is the one that reaches frames[].
+        ++g_record_replaced;
+        if (g_record_replaced <= 20) {
+            logf("record: seq %llu replaces pending seq %llu (same MV/depth, copies kept)\n",
+                 static_cast<unsigned long long>(f->seq),
+                 static_cast<unsigned long long>(g_frame.seq));
+        }
+        g_frame = *f;
+    } else if (f->seq != 0 && f->seq != g_frame.seq) {
+        ++g_record_dropped;
+        if (g_record_dropped <= 20) {
+            logf("record: seq %llu arrived while seq %llu pending with DIFFERENT inputs -"
+                 " dropped\n",
+                 static_cast<unsigned long long>(f->seq),
+                 static_cast<unsigned long long>(g_frame.seq));
+        }
+    }
 
     auto* list = static_cast<ID3D12GraphicsCommandList*>(f->cmd_list);
     // A COPY-only list (some UE5 tag lanes) cannot accept the downscale Dispatch. Fall
@@ -1522,7 +1616,10 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
         if (!told) {
             told = true;
             g_force_full_size = true;
-            update_content(f->render_w, f->render_h);
+            uint32_t crw = f->render_w, crh = f->render_h;
+            if (crw < 8 || crh < 8) { crw = dp.width; crh = dp.height; }
+            if (crw < 8 || crh < 8) { crw = f->output_w; crh = f->output_h; }
+            if (crw >= 8 && crh >= 8) { update_content(crw, crh); }
             logf("downscale: list type %d cannot take a Dispatch - falling back to"
                  " StreamPercent=100 for this title\n", static_cast<int>(list->GetType()));
         }
@@ -1567,7 +1664,15 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
     bool scaled_mv = false, scaled_depth = false;
     const bool need_depth_convert = want_depth && dp.resource != nullptr &&
                                     wide_depth_format(static_cast<DXGI_FORMAT>(dp.format));
-    if (g_scaled[1] || g_scaled[2] || need_depth_convert) {
+    // Only pass a stream through the downscale when its source actually exists. A
+    // depth-only record (no MV tagged) must NOT fail just because StreamPercent>100
+    // also covers the missing MV stream: that made scale_dispatch(null) return false,
+    // skipped the whole frame and therefore published nothing at all - the consumer's
+    // 100% no_slot in the no-MV case.
+    const bool need_scaled_mv = want_mv && mv.resource != nullptr && g_scaled[1];
+    const bool need_scaled_depth = want_depth && dp.resource != nullptr &&
+                                   (g_scaled[2] || need_depth_convert);
+    if (need_scaled_mv || need_scaled_depth) {
         const bool can_dispatch =
             list != nullptr && (list->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT ||
                                 list->GetType() == D3D12_COMMAND_LIST_TYPE_COMPUTE);
@@ -1581,10 +1686,10 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
             return;
         }
         bool ok = true;
-        if (ok && want_mv && g_scaled[1]) {
+        if (ok && need_scaled_mv) {
             ok = scale_dispatch(list, static_cast<ID3D12Resource*>(mv.resource), mv.state, 1);
         }
-        if (ok && want_depth && (g_scaled[2] || need_depth_convert)) {
+        if (ok && need_scaled_depth) {
             ok = scale_dispatch(list, static_cast<ID3D12Resource*>(dp.resource), dp.state, 2);
         }
         if (!ok) {
@@ -1592,8 +1697,8 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
             if (!told) { told = true; logf("downscale: pass failed - frames skipped\n"); }
             return;
         }
-        scaled_mv = g_scaled[1];
-        scaled_depth = g_scaled[2] || need_depth_convert;
+        scaled_mv = need_scaled_mv;
+        scaled_depth = need_scaled_depth;
         if (need_depth_convert) {
             static bool told_wide = false;
             if (!told_wide) {
@@ -1646,17 +1751,43 @@ uint32_t mv_unit_bits(const MgpuFgFrame& f)
 // ---------------------------------------------------------------- publish
 // Called from fakerFG's Present detour, i.e. after the title submitted the list
 // the copies were recorded on. Metadata first, fence last (protocol v5).
+struct PublishSpinGuard
+{
+    volatile LONG* busy = nullptr;
+    explicit PublishSpinGuard(volatile LONG* b) : busy(b) {}
+    ~PublishSpinGuard() { if (busy != nullptr) { InterlockedExchange(busy, 0); } }
+};
+
 void publish_frame(void* queue_ptr)
 {
+    // Wuchang presents ~2x per rendered frame; if two presents ever land on different
+    // threads, g_frame/g_copied_mask/g_cur_slot would be corrupted. Serialize with a
+    // plain Win32 interlocked flag: std::mutex pulled MSVCP140 into the first Present and
+    // crashed (0xC0000005 -> UE PresentInternal E_ABORT).
+    static volatile LONG s_publish_busy = 0;
+    static unsigned s_concurrent = 0;
+    if (InterlockedCompareExchange(&s_publish_busy, 1, 0) != 0) {
+        ++s_concurrent;
+        if (s_concurrent <= 5) {
+            logf("producer: concurrent publish_frame detected - serialized (%u so far)\n",
+                 s_concurrent);
+        }
+        while (InterlockedCompareExchange(&s_publish_busy, 1, 0) != 0) {
+            SwitchToThread();
+        }
+    }
+    PublishSpinGuard publish_guard(&s_publish_busy);
     ++g_publish_calls;
     // One publication per source frame. fakerFG's Present path can call us more than
-    // once for the same Evaluate record (XeFG chain + title present); publishing the
-    // same frame_qpc again copies the same MV/depth twice and gives the consumer
-    // duplicate candidates. The record's frame_qpc_ms is identical for those calls.
-    const uint64_t pub_fq = g_frame.frame_qpc_ms;
-    if (pub_fq != 0 && pub_fq == g_last_publish_frame_qpc) {
+    // once for the same record (XeFG chain + title present). Dedup by SEQ, not by
+    // frame_qpc_ms: the marker/record identity is seq, and two distinct seqs can share
+    // the same millisecond qpc (or one lane can stamp a new qpc). Deduping by qpc left
+    // those seqs unpublished while the marker had already advanced -> no_slot.
+    if (g_frame.seq != 0 && g_frame.seq == g_last_published_seq) {
+        ++g_publish_seq_dedup;
         return;
     }
+    const uint64_t pub_fq = g_frame.frame_qpc_ms;
 
     // Frame interval, counted only when the source frame changes: fakerFG's Present detour
     // can publish the same record twice (XeFG chain + title present), so a per-call
@@ -1688,6 +1819,12 @@ void publish_frame(void* queue_ptr)
 
     if (!g_ready || !g_frame_valid || g_copied_mask == 0) {
         ++g_publish_skips;
+        static unsigned told_skip = 0;
+        if (g_frame.seq != 0 && told_skip++ < 300) {
+            logf("publish skip seq=%llu ready=%d valid=%d mask=0x%X\n",
+                 static_cast<unsigned long long>(g_frame.seq),
+                 g_ready ? 1 : 0, g_frame_valid ? 1 : 0, g_copied_mask);
+        }
         g_copied_mask = 0;
         g_frame_valid = false;
         g_slot_locked = false;
@@ -1771,6 +1908,14 @@ void publish_frame(void* queue_ptr)
         c->stream_bytes[mgpu::kStreamDepth] = (active & mgpu::kRequestDepth)
                                  ? g_stream_w[2] * g_stream_h[2] * 4u : 0u;
         c->frame_published = f.seq;
+        g_last_published_seq = f.seq;
+        static int trace_pub = -1;
+        if (trace_pub < 0) { trace_pub = ini_int(L"PublishTrace", 0) != 0 ? 1 : 0; }
+        if (trace_pub != 0) {
+            logf("publish trace seq=%llu slot=%u frame_published=%llu\n",
+                 static_cast<unsigned long long>(f.seq), slot,
+                 static_cast<unsigned long long>(f.seq));
+        }
 
         c->producer.input_api   = mgpu::kInputApiFaker;
         c->producer.input_flags = (f.flags & ~mgpu::kInputFlagMvActive) |

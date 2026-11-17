@@ -3,13 +3,13 @@
 > ⚠️ **部分过时**：当前链路的构建依赖（XeSS / FFX / MinHook / Streamline / DLSS 头）
 > 见 [`BUILD.md`](BUILD.md) §2；本文里 ReShade / add-on 相关的版本与构建步骤属于历史。
 
-记录**已拉入仓库**的依赖、版本、取用方式与更新命令。
+记录第三方依赖的版本、取用方式与更新命令。
 
-> **版本控制（2026-11-07）**：本目录现在是 git 仓库根（`git init` 之后首次提交）。
-> `third_party/` 下四个上游 SDK 的完整 checkout（xess / reshade / dlss / minhook）
-> 是**各自独立的 git 仓库**，被 `.gitignore` 排除在外的同时，把**钉住的 commit** 记在下面 §1，
-> 用 §3 的命令可以一键重建。真正进版本库的只有 `third_party/ffx/`（头文件 + 两个 .lib）
-> 和 `third_party/optiscaler/`（GPL-3.0 的参考文件），共 ~5 MB。
+> **版本控制（2026-11-18）**：`third_party/` **整体不入库**（`.gitignore` 的
+> `/third_party/`）。本地按本文 §1 的版本/commit 拉取；只有
+> `lock_frame/third_party/nlohmann/`（MIT，单头文件）随仓库跟踪。
+> 发布包的源码 zip 若由本地构建生成，可能包含 `third_party/ffx` 等构建依赖；
+> git 仓库本身不再提交它们。
 >
 > 许可：本仓库整体 **GPL-3.0-or-later**（根目录 `LICENSE` / `NOTICE`），逐项见 §4。
 
@@ -21,9 +21,9 @@
 | `third_party/xess/` | https://github.com/intel/xess | **v3.0.2**（`8fe81bd`，XeSS 3 SDK） | 162 MB | `inc/` `lib/` `bin/` `doc/` | 否（外部仓库；`bin/` 是运行时 DLL） |
 | `third_party/dlss/` | https://github.com/NVIDIA/DLSS | **v310.9.16**（`9981c63`） | 1.1 MB | 只作参考（DLSS 输入约定） | 否（外部仓库） |
 | `third_party/minhook/` | https://github.com/TsudaKageyu/minhook | `8af6b4a` | 436 KB | `include/` `src/`（add-on 的 Present 钩子） | 否（外部仓库） |
-| `third_party/ffx/` | https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK | **SDK 1.1.4** | 4.9 MB | `include/FidelityFX/`（242 个头文件）+ `lib/ffx_opticalflow_x64.lib`、`lib/ffx_backend_dx12_x64.lib` | **是** |
-| `third_party/ffx/api/` | 同上（tag `v1.1.4`，路径 `ffx-api/include/ffx_api/`） | **SDK 1.1.4** | 60 KB | `ffx_api.h` `ffx_api_types.h` `ffx_upscale.h` `ffx_framegeneration.h` `dx12/ffx_api_dx12.h` + `LICENSE.txt` + `SOURCE.txt` | **是**（add-on 的 `in_ffx.cpp` 用；2026-11-07 加） |
-| `third_party/optiscaler/` | https://github.com/optiscaler/OptiScaler | `master`，2026-11-06 | 124 KB | `shaders/camera_motion/CM_*`、`inputs/FG/XeFG_Inputs_Dx12.*`、`LICENSE` | **是** |
+| `third_party/ffx/` | https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK | **SDK 1.1.4** | 4.9 MB | `include/FidelityFX/`（242 个头文件）+ `lib/ffx_opticalflow_x64.lib`、`lib/ffx_backend_dx12_x64.lib` | 否（本地构建依赖） |
+| `third_party/ffx/api/` | 同上（tag `v1.1.4`，路径 `ffx-api/include/ffx_api/`） | **SDK 1.1.4** | 60 KB | `ffx_api.h` `ffx_api_types.h` `ffx_upscale.h` `ffx_framegeneration.h` `dx12/ffx_api_dx12.h` + `LICENSE.txt` + `SOURCE.txt` | 否（本地构建依赖） |
+| `third_party/optiscaler/` | https://github.com/optiscaler/OptiScaler | `master`，2026-11-06 | 124 KB | `shaders/camera_motion/CM_*`、`inputs/FG/XeFG_Inputs_Dx12.*`、`LICENSE` | 否（参考文件） |
 
 ### 2026-11-07 的瘦身（1.4 GB → 181 MB）
 

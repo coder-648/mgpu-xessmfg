@@ -199,12 +199,18 @@ static bool g_auto_use_mv = true;     // per frame, from ProducerInfo/StreamShar
 static bool mv_from_producer()
 {
     if (g_no_inputs) { return false; }
-    if (g_mv_auto)   { return g_auto_use_mv; }
 #if MGPU_FG_OF
+    // Auto-detected Unreal / --fg-of always means "our own vectors", even while the
+    // producer still happens to have an MV stream. Checked first so g_mv_auto cannot
+    // claim the producer's vectors after the title was classified as no-MV.
     if (g_fg_of) { return false; }
 #endif
+    if (g_mv_auto)   { return g_auto_use_mv; }
     return !g_no_mv;
 }
+
+// The authoritative "the producer is actually delivering motion vectors" is defined
+// after g_ctl below (it needs the shared control block).
 
 static bool mv_from_flow()
 {
@@ -265,7 +271,7 @@ static float g_down_support = 0.0f;   // kernel support in output-pixel units
 static float g_scale = 0.0f;   // --scale f: present at f x the captured size (0 = use g_out_den)
 static int  g_out_den = 1;      // --den N: output at 1/N of the captured size
 static UINT g_swap_buffers = 2; // --buffers N: XeSS-FG presents twice per input frame
-static UINT g_wgc_pool = 2;     // --pool N: WGC frame pool depth (2..8)
+static UINT g_wgc_pool = 4;     // --pool N: WGC frame pool depth (2..8)
 static UINT g_max_latency = 1;  // --latency N: DXGI maximum frame latency
 static UINT g_refresh_hz = 0;   // panel refresh, filled in once the output is known
 static bool g_tearing = false;  // --tearing: never block on vblank (may tear)
@@ -586,6 +592,19 @@ static void overlay_rect(RECT* out)
 }
 
 static mgpu::SharedControl*   g_ctl = nullptr;
+
+// The authoritative "the producer is actually delivering motion vectors" test.
+// - active_mask is written by the producer only for streams it really copied;
+// - the MV slot is ALWAYS placed (fixed layout), so slot_size/width alone is not
+//   evidence that any vector data exists. That was the trap: a depth-only title has
+//   streams[1].slot_size != 0, so the old `placed` check kept g_auto_use_mv = true.
+static bool producer_has_mv_stream()
+{
+    if (g_ctl == nullptr) { return false; }
+    return (g_ctl->active_mask & mgpu::kRequestMv) != 0 &&
+           g_ctl->streams[mgpu::kStreamMv].slot_size != 0;
+}
+
 static ComPtr<ID3D12Resource> g_mv[mgpu::kMaxSlots];
 static ComPtr<ID3D12Resource> g_depth[mgpu::kMaxSlots];
 // --fg-colour shared: take the colour from the add-on's stream[0] (a cross-adapter copy of

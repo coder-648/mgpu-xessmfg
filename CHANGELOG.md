@@ -3,6 +3,22 @@
 只记**用户能感知**的变化与对应实测依据。每条结论的原始数据在
 `docs/findings/PERF_BASELINE.md` / `FINAL_CONFIG.md`。
 
+### feat: lock_frame 1.0.0 正式版基线（固定倍率 + 输入源 + 开源发布）(2026-11-17)
+
+- **固定倍率 2x / 3x / 4x**：UI 从 30x4/40x3 两个写死模式改为三档；consumer
+  `--mode 2x|3x|4x`，旧 `30x4/40x3` 保留别名。建议输入锁帧按目标显示器刷新率
+  计算（120Hz：60/40/30），不能整除时 UI 提示。
+- **fakerFG 输入源可选**：UI 写入/备份游戏目录 `fakerFG.ini` 的 `FgInput`
+  （DLSSG / NVNGX / Upscaler / FSR），并强制 `FgOutput=Capture`、`Passthrough=0`。
+- **UI 环境自检**：版本/协议、GPU 数量、`libxess_fg`/`libxell`、游戏配置四项
+  直接显示；新增“游戏窗口”下拉，按目标显示器取刷新率。
+- **版本与发布工程**：`version.h`（1.0.0）、`--version`、日志轮转（保留 8 份）；
+  新增 `lock_frame/release.sh`、`deploy_game.bat`、manifest/SHA256 与 GPL 源码包，
+  已生成并校验通过 `dist/lock_frame-1.0.0*.zip`。
+- **开源**：项目继续以 GPL-3.0 发布；发布包随附 `LICENSE`、`NOTICE` 与对应源码。
+- **保留** `--unlock-mfg`：2x 不发送；3x/4x 继续发送，保证非 Intel 卡开箱即用。
+  该开关会修改 Intel DLL，风险已写入发布说明。
+
 ### feat: 颜色入槽（协议 v22）—— 彻底删除 WGC (2026-11-15)
 
 - **一条发布 = 一帧**：producer 在同一个槽、同一个 fence 下发布 **颜色（stream 0）+

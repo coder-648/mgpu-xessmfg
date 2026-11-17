@@ -1,7 +1,7 @@
 // ============================================================================
-//  lock_frame_ui.cpp - 锁帧版（30x4 / 40x3）前端
+//  lock_frame_ui.cpp - 固定倍率 2x / 3x / 4x + fakerFG 输入源前端
 //
-//  只做三件事：选游戏窗口、选两个锁帧模式之一、启动/停止 lock_frame.exe。
+//  只做四件事：选游戏窗口、选固定倍率、选 fakerFG 输入源、启动/停止 lock_frame.exe。
 //  其他旋钮（GPU/输出/叠加层/HDR）保留，是因为它们与锁帧无关、且已实测。
 //
 //  Layout and look follow Lossless Scaling 3.2.2: a dark frameless window with its
@@ -31,12 +31,14 @@
 #include <cstring>
 
 #include "mgpu_shared.h"
+#include "version.h"
 
 #include <atomic>
 #include <string>
 #include <vector>
 #include <cstdio>
 #include <cstdint>
+#include <algorithm>
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -106,9 +108,11 @@ struct Profile;
 
 struct State
 {
-    // 帧生成：锁帧版只有两个模式
-    int  fg_mode = 0;          // 0 = 锁帧 30x4, 1 = 锁帧 40x3
-    int  interp = 4;           // 由模式推导：30x4 -> 4, 40x3 -> 3（只用于显示）
+    // 帧生成：固定倍率 2x / 3x / 4x
+    int  fg_mode = 2;          // 0 = 2x, 1 = 3x, 2 = 4x（默认 4x，沿用旧版行为）
+    int  interp = 4;           // 由 fg_mode 推导的倍率（只用于显示）
+    // fakerFG 侧输入源：0 DLSSG（推荐）, 1 NVNGX, 2 Upscaler, 3 FSR
+    int  fg_input = 0;
     // 模式 1 = 动态逐帧 (--interp-cadence): 每帧按"这一帧实际过了几个 vblank"要帧数,
     // 输出恒定 1 帧/vblank。实测 4K --den 2、空刷新: 60fps 0.8% / 40fps 0.4% / 30fps 0.6%
     // (固定倍率同条件是 2.5%/1.5%/2.6%)。此模式下倍数按 6x 上限解锁 (--interp 5),
@@ -116,7 +120,7 @@ struct State
     // 详见 docs/findings/PERF_BASELINE.md 3.17-3.21。
     // (旧的 --dyn-mfg 实验档已从界面移除: 同场景空刷新 7.6%, 见 3.19。)
     // cadence = 低帧自适应：输入因复杂场景低于锁帧上限时，按实际经过的 vblank
-    // 动态增加插帧数，尽量保持模式的目标输出（40x3/30x4 都是 120）。默认关闭。
+    // 动态增加插帧数，尽量保持模式的目标输出（2x/3x/4x 都输出到面板刷新率）。默认关闭。
     bool cadence = false;
     // 输出帧率上限 (Hz)，直接手输：0 = 面板刷新（填满每个 vblank，不发 --fg-out-hz）；
     // 5..1000 = 上限（--fg-out-hz N）。只在"动态倍率"开启时有意义：它决定每帧要几张，
@@ -139,7 +143,6 @@ struct State
     // Input interval the pacing model assumes: 0 = measured, 1 = 25 ms, 2 = 33 ms.
     // Feeds --input-ms; measured benefit at 3x+MV: slow 17->0, skip 19->13 (docs 5.18).
     int  ivl_sel = 0;
-    bool no_depth = false;      // --no-depth: skip the depth stream (cross-card 28 -> 14 MB/frame)
     bool no_marker = false;     // --no-marker: no in-frame pairing key (falls back to time/FIFO)
     // --upsample (A/B): rebuild MV+depth from the StreamPercent size to the game's render
     // size on the consumer GPU. XeFG requires both to be the same size, so this is one
@@ -177,9 +180,10 @@ struct State
     // (fps / multiplier / input fps / gpu wait / game frame time / lock / drops).
     bool osd = true;
     // 启动
-    int  target_mode = 0;      // 0 = the foreground window (LSFG habit), 1 = the selected one
+    // 启动目标：0 = 前台窗口（旧习惯），1 = 下拉里选中的窗口（正式版默认）
+    int  target_mode = 1;
     int  lock_fps = 3;         // hint only: 0 off, 30, 24, 40, 60 (40 = 3 vblanks @120Hz)
-    int  hotkey = 0;   // index into g_hotkeys (0 = Ctrl+PageUp)
+    int  hotkey = 0;           // index into g_hotkeys (0 = Ctrl+PageUp)
     std::wstring win_title;    // remembered target, matched by title on load
     HWND win_hwnd = nullptr;
 };
@@ -267,8 +271,10 @@ enum Id
 {
     ID_NONE = 0,
     ID_FG_TYPE, ID_FG_MODE, ID_INTERP, ID_OUT, ID_PERF, ID_UPSAMPLE_INFO,
+    ID_FG_INPUT, ID_FG_INI,
+    ID_VERSION, ID_CHECK_GPU, ID_CHECK_RUNTIME, ID_CHECK_GAME,
     ID_CAP_API, ID_POOL, ID_LAT, ID_STREAM_INFO,
-    ID_JITZ, ID_FOV, ID_NODEPTH, ID_NOMARKER, ID_UPSAMPLE, ID_STRAUTO, ID_STRASYM, ID_PREFETCH, ID_UI, ID_RT, ID_UNLOCK, ID_SLACK, ID_IVL,
+    ID_JITZ, ID_FOV, ID_NOMARKER, ID_UPSAMPLE, ID_STRAUTO, ID_STRASYM, ID_PREFETCH, ID_UI, ID_RT, ID_UNLOCK, ID_SLACK, ID_IVL,
     ID_CADENCE, ID_OUTFPS, ID_HEAD_FIXED, ID_HEAD_DYN,
     ID_TEAR, ID_SDR, ID_LAYERED, ID_RELAY, ID_OSD,
     ID_GPU, ID_GPUSEL, ID_DISPLAY,
@@ -287,12 +293,22 @@ struct CardDef { const wchar_t* title; const RowDef* rows; int n; int col; };
 // RK_HEAD 只是分区标题（不可点），模式外的行会被灰掉并且点不动。
 static const RowDef kRowsFg[] = {
     { ID_FG_TYPE, L"类型",            RK_INFO },
-    { ID_FG_MODE, L"锁帧模式",        RK_DD   },
+    { ID_FG_MODE, L"固定倍率",        RK_DD   },
     { ID_OUT,     L"输出",            RK_DD   },
     { ID_CADENCE, L"低帧自适应（动态补帧）", RK_TOG },
     { ID_UPSAMPLE_INFO, L"MV/深度重建", RK_INFO },
     // 锁帧版把 MV/depth 的 StreamPercent 固定为 150（producer 默认），
     // 颜色走 WGC；消费端默认把 150% 的 MV/depth 联合重建到输入画面尺寸。
+};
+static const RowDef kRowsGame[] = {
+    { ID_FG_INPUT, L"fakerFG 输入源", RK_DD   },
+    { ID_FG_INI,   L"游戏配置",       RK_INFO },
+};
+static const RowDef kRowsCheck[] = {
+    { ID_VERSION,       L"版本",          RK_INFO },
+    { ID_CHECK_GPU,     L"GPU",           RK_INFO },
+    { ID_CHECK_RUNTIME, L"XeSS 运行时",   RK_INFO },
+    { ID_CHECK_GAME,    L"游戏配置检查",  RK_INFO },
 };
 static const RowDef kRowsCap[] = {
     { ID_CAP_API, L"捕获 API",        RK_INFO },
@@ -300,7 +316,6 @@ static const RowDef kRowsCap[] = {
     { ID_SDR,     L"色彩空间",        RK_DD   },
     { ID_POOL,    L"帧池深度",        RK_SPIN },
     { ID_LAT,     L"最大帧延迟数",    RK_SPIN },
-    { ID_NODEPTH,  L"不传深度 (省一半带宽，会关掉重建)", RK_TOG },
     // 输入预拷与"关闭标记配对"是 bridge 时代的 A/B 开关；锁帧版强制关闭，
     // 留在这里只会让人误以为可以点，所以从界面移除（命令行仍可解析）。
 };
@@ -309,6 +324,7 @@ static const RowDef kRowsDev[] = {
     { ID_DISPLAY, L"输出显示器（只读）", RK_INFO },
 };
 static const RowDef kRowsLaunch[] = {
+    { ID_TARGET,  L"游戏窗口",             RK_DD   },
     { ID_HOTKEY,  L"开关热键（点击可改）", RK_INFO },
     { ID_LOCK,    L"建议锁帧",             RK_INFO },
     { ID_CMD,     L"启动命令",             RK_CMDLINE },
@@ -326,6 +342,8 @@ template <int N> constexpr int rows_of(const RowDef (&)[N]) { return N; }
 
 static const CardDef kCards[] = {
     { L"帧生成",       kRowsFg,     rows_of(kRowsFg), 0 },
+    { L"环境自检",     kRowsCheck,  rows_of(kRowsCheck), 0 },
+    { L"游戏侧配置",   kRowsGame,   rows_of(kRowsGame), 1 },
     { L"捕获",         kRowsCap,    rows_of(kRowsCap), 1 },
     { L"启动",         kRowsLaunch, rows_of(kRowsLaunch), 0 },
     { L"GPU / 显示器", kRowsDev,    rows_of(kRowsDev), 1 },
@@ -337,8 +355,9 @@ static const CardDef kCards[] = {
 static const int kCardCount = (int)(sizeof(kCards) / sizeof(kCards[0]));
 
 // ------------------------------------------------------------------ options
-static const wchar_t* kOptFgMode[] = { L"锁帧 30 x 4（输入 30 → 输出 120）",
-                                       L"锁帧 40 x 3（输入 40 → 输出 120）" };
+// 固定倍率：2x / 3x / 4x。显示文本按当前面板刷新率动态计算输入帧率。
+static const wchar_t* kOptFgInput[] = { L"DLSSG（推荐）", L"NVNGX", L"Upscaler", L"FSR" };
+static const wchar_t* kFgInputIni[]  = { L"DLSSG", L"NVNGX", L"Upscaler", L"FSR" };
 static const wchar_t* kOptOut[]    = { L"1:1 原生", L"5K -> 4K (0.75x)", L"半分辨率" };
 static const wchar_t* kOptFov[]    = { L"55.0", L"58.7", L"60.0", L"65.0" };
 static const wchar_t* kOptIvl[]    = { L"自动（倍数+1 vblank 余量）", L"16.7 ms (60 fps)", L"20 ms (50 fps)",
@@ -359,7 +378,8 @@ static std::wstring hotkey_name();          // defined with the input handling
 static int opt_count(Id id)
 {
     switch (id) {
-    case ID_FG_MODE: return 2;
+    case ID_FG_MODE: return 3;
+    case ID_FG_INPUT: return 4;
     case ID_OUT:     return 3;
     case ID_SDR:     return 2;
     case ID_FOV:     return 4;
@@ -378,7 +398,17 @@ static int opt_count(Id id)
 static const wchar_t* opt_text(Id id, int i)
 {
     switch (id) {
-    case ID_FG_MODE: return kOptFgMode[i % 3];
+    case ID_FG_MODE: {
+        static std::wstring s;
+        const int mul = (i < 0 || i > 2) ? 4 : (i + 2);      // 2x / 3x / 4x
+        const unsigned hz = (g_refresh > 1) ? g_refresh : 120;
+        wchar_t b[96]{};
+        _snwprintf_s(b, _TRUNCATE, L"%dx（输入 %.1f fps -> 输出 %u fps）",
+                     mul, static_cast<double>(hz) / static_cast<double>(mul), hz);
+        s = b;
+        return s.c_str();
+    }
+    case ID_FG_INPUT: return kOptFgInput[(i < 0 || i > 3) ? 0 : i];
     case ID_OUT:     return kOptOut[i % 3];
     case ID_SDR:     return kOptColor[i % 2];
     case ID_FOV:     return kOptFov[i % 4];
@@ -408,13 +438,14 @@ static const wchar_t* opt_text(Id id, int i)
     }
 }
 
-// 锁帧版没有互斥控件：模式只有两个，其余行始终可用。
+// 固定倍率没有互斥控件：2x/3x/4x 三选一，其余行始终可用。
 static bool row_enabled(Id) { return true; }
 
 static int opt_get(Id id)
 {
     switch (id) {
     case ID_FG_MODE: return S().fg_mode;
+    case ID_FG_INPUT: return S().fg_input;
     case ID_OUT:     return S().out_mode;
     case ID_SDR:     return S().sdr ? 1 : 0;
     case ID_FOV:     return S().fov_sel;
@@ -433,11 +464,14 @@ static int opt_get(Id id)
 
 
 // Caption shown on the right of a row.
+static bool target_game_ini(std::wstring* out);
+static std::wstring exe_dir();
+static bool exe_file_exists(const wchar_t* name);
 static std::wstring row_value(Id id)
 {
     wchar_t buf[128]{};
     switch (id) {
-    case ID_FG_TYPE: return L"XeFG 1.3.1 (libxess_fg)";
+    case ID_FG_TYPE: return L"XeFG (libxess_fg)";
     case ID_CAP_API: return L"WGC";
     case ID_STREAM_INFO:   return L"150% 跨卡，消费端重建";
     case ID_UPSAMPLE_INFO: return L"→ 输入画面尺寸（默认开）";
@@ -453,6 +487,46 @@ static std::wstring row_value(Id id)
         return L"(未知)";
     }
     case ID_INTERP: _snwprintf_s(buf, _TRUNCATE, L"%dx", S().interp); return buf;
+    case ID_FG_MODE: return opt_text(ID_FG_MODE, S().fg_mode);
+    case ID_FG_INPUT: return opt_text(ID_FG_INPUT, S().fg_input);
+    case ID_FG_INI: {
+        std::wstring ini;
+        return target_game_ini(&ini) ? ini : std::wstring(L"(先选择游戏窗口)");
+    }
+    case ID_VERSION:
+        _snwprintf_s(buf, _TRUNCATE, L"%s（协议 v%u）",
+                     LOCK_FRAME_VERSION_WSTRING, mgpu::kSharedVersion);
+        return buf;
+    case ID_CHECK_GPU:
+        if (g_adapters.size() >= 2) {
+            _snwprintf_s(buf, _TRUNCATE, L"%d 块（OK）", (int)g_adapters.size());
+        } else {
+            _snwprintf_s(buf, _TRUNCATE, L"%d 块（需要双卡）", (int)g_adapters.size());
+        }
+        return buf;
+    case ID_CHECK_RUNTIME: {
+        const bool fg = exe_file_exists(L"libxess_fg.dll");
+        const bool xell = exe_file_exists(L"libxell.dll");
+        if (fg && xell) { return L"libxess_fg + libxell OK"; }
+        if (!fg && !xell) { return L"缺少 libxess_fg.dll / libxell.dll"; }
+        return fg ? L"缺少 libxell.dll" : L"缺少 libxess_fg.dll";
+    }
+    case ID_CHECK_GAME: {
+        std::wstring ini;
+        if (!target_game_ini(&ini) ||
+            GetFileAttributesW(ini.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            return L"未选择游戏或缺少 fakerFG.ini";
+        }
+        wchar_t out[32]{};
+        GetPrivateProfileStringW(L"fakerFG", L"FgOutput", L"", out, 32, ini.c_str());
+        if (_wcsicmp(out, L"Capture") != 0) { return L"FgOutput 不是 Capture"; }
+        const int pass = (int)GetPrivateProfileIntW(L"fakerFG", L"Passthrough", 0, ini.c_str());
+        if (pass != 0) { return L"Passthrough=1（应为 0）"; }
+        wchar_t in[32]{};
+        GetPrivateProfileStringW(L"fakerFG", L"FgInput", L"", in, 32, ini.c_str());
+        if (in[0] == 0) { return L"FgInput 为空"; }
+        return L"fakerFG.ini OK";
+    }
     case ID_OUTFPS:
         // 手输的数字框：0 表示"面板刷新"（不限制），其余是 Hz 上限。
         if (S().out_fps == 0) { return L"面板刷新"; }
@@ -462,11 +536,14 @@ static std::wstring row_value(Id id)
     case ID_LAT:    _snwprintf_s(buf, _TRUNCATE, L"%d", S().latency); return buf;
     case ID_HOTKEY: return g_capture_hotkey ? std::wstring(L"按下新组合键...") : hotkey_name();
     case ID_LOCK: {
-        // 锁帧版：两个模式都输出 120 fps（120 Hz 面板）。
-        const int in = (S().fg_mode == 1) ? 40 : 30;
-        const int mul = (S().fg_mode == 1) ? 3 : 4;
-        _snwprintf_s(buf, _TRUNCATE, L"游戏锁 %d fps -> %dx -> %d fps 输出",
-                     in, mul, in * mul);
+        const unsigned hz = (g_refresh > 1) ? g_refresh : 120;
+        const int mul = S().fg_mode + 2;
+        const double in = static_cast<double>(hz) / static_cast<double>(mul);
+        if (hz % static_cast<unsigned>(mul) != 0) {
+            _snwprintf_s(buf, _TRUNCATE, L"锁 %.1f fps（%dx，不能整除）", in, mul);
+        } else {
+            _snwprintf_s(buf, _TRUNCATE, L"锁 %.1f fps（%dx -> %u fps）", in, mul, hz);
+        }
         return buf;
     }
     case ID_TARGET:
@@ -543,6 +620,48 @@ static std::wstring exe_dir()
     return (slash == std::wstring::npos) ? std::wstring(L".") : s.substr(0, slash);
 }
 
+// File next to lock_frame_ui.exe (the consumer also loads libxess/libxell from there).
+static bool exe_file_exists(const wchar_t* name)
+{
+    if (name == nullptr) { return false; }
+    const std::wstring p = exe_dir() + L"\\" + name;
+    return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+// Keep the folder bounded: the consumer prints a line per report window and the UI
+// writes every run to lock_frame_ui_HHMMSS.txt. Keep the newest 8 run logs and drop
+// the rest; also drop lock_frame_ui.log when it grows past 4 MiB.
+static void prune_old_logs()
+{
+    struct Ent { ULONGLONG t; std::wstring path; };
+    std::vector<Ent> logs;
+    WIN32_FIND_DATAW fd{};
+    const std::wstring pattern = exe_dir() + L"\\lock_frame_ui_*.txt";
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) { continue; }
+            ULARGE_INTEGER u{};
+            u.LowPart = fd.ftLastWriteTime.dwLowDateTime;
+            u.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+            logs.push_back(Ent{ u.QuadPart, exe_dir() + L"\\" + fd.cFileName });
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    std::sort(logs.begin(), logs.end(),
+              [](const Ent& a, const Ent& b) { return a.t > b.t; });
+    for (size_t i = 8; i < logs.size(); ++i) { DeleteFileW(logs[i].path.c_str()); }
+
+    const std::wstring ui_log = exe_dir() + L"\\lock_frame_ui.log";
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (GetFileAttributesExW(ui_log.c_str(), GetFileExInfoStandard, &fad)) {
+        ULARGE_INTEGER u{};
+        u.LowPart = fad.nFileSizeLow;
+        u.HighPart = fad.nFileSizeHigh;
+        if (u.QuadPart > (4ull << 20)) { DeleteFileW(ui_log.c_str()); }
+    }
+}
+
 static std::wstring ini_path() { return exe_dir() + L"\\lock_frame_ui.ini"; }
 
 static void ini_w(const std::wstring& sec, const wchar_t* key, int v)
@@ -577,6 +696,119 @@ static void set_msg(const wchar_t* m)
 }
 
 
+// ------------------------------------------------- fakerFG.ini（游戏侧配置）
+// 输入源是 fakerFG 的配置，不是 consumer 参数。UI 只改游戏目录里现有的
+// fakerFG.ini，并在写之前备份；配置文件不存在时不去猜路径/造一份半配置。
+static HWND config_target_window()
+{
+    if (S().target_mode == 1 && S().win_hwnd && IsWindow(S().win_hwnd)) {
+        return S().win_hwnd;
+    }
+    if (g_win_sel >= 0 && g_win_sel < (int)g_wins.size()) {
+        return g_wins[g_win_sel].hwnd;
+    }
+    HWND fg = GetForegroundWindow();
+    return (fg != nullptr && fg != g_hwnd) ? fg : nullptr;
+}
+
+// The refresh rate of the monitor the selected window is on, not the primary
+// monitor. Multi-monitor (game on a 144 Hz screen, desktop on 60 Hz) otherwise
+// shows the wrong "lock input" number.
+static UINT refresh_for_window(HWND h)
+{
+    if (h == nullptr) { return g_refresh; }
+    HMONITOR mon = MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(mon, &mi)) {
+        DEVMODEW dm{};
+        dm.dmSize = sizeof(dm);
+        if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) &&
+            dm.dmDisplayFrequency > 1) {
+            return dm.dmDisplayFrequency;
+        }
+    }
+    return g_refresh;
+}
+
+static bool target_game_ini(std::wstring* out)
+{
+    if (out == nullptr) { return false; }
+    HWND h = config_target_window();
+    if (h == nullptr) { return false; }
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (pid == 0) { return false; }
+    HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (p == nullptr) { return false; }
+    wchar_t exe[MAX_PATH]{};
+    DWORD n = MAX_PATH;
+    const BOOL ok = QueryFullProcessImageNameW(p, 0, exe, &n);
+    CloseHandle(p);
+    if (!ok || n == 0) { return false; }
+    std::wstring path(exe, n);
+    const size_t slash = path.find_last_of(L'\\');
+    if (slash == std::wstring::npos) { return false; }
+    *out = path.substr(0, slash) + L"\\fakerFG.ini";
+    return true;
+}
+
+static const wchar_t* fg_input_ini_value(int i)
+{
+    return kFgInputIni[(i < 0 || i > 3) ? 0 : i];
+}
+
+static void apply_fg_input()
+{
+    std::wstring ini;
+    if (!target_game_ini(&ini)) {
+        set_msg(L"先选择游戏窗口，才能写入 fakerFG.ini");
+        return;
+    }
+    if (GetFileAttributesW(ini.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        set_msg(L"游戏目录没有 fakerFG.ini：请先按 README 放好配置文件");
+        uilog("fg-input: %ls missing", ini.c_str());
+        return;
+    }
+
+    wchar_t bak[512]{};
+    _snwprintf_s(bak, _TRUNCATE, L"%s.bak_%lu", ini.c_str(),
+                 (unsigned long)GetTickCount());
+    if (!CopyFileW(ini.c_str(), bak, FALSE)) {
+        uilog("fg-input: backup failed err=%lu", (unsigned long)GetLastError());
+    }
+
+    const wchar_t* v = fg_input_ini_value(S().fg_input);
+    if (!WritePrivateProfileStringW(L"fakerFG", L"FgInput", v, ini.c_str())) {
+        set_msg(L"写入 fakerFG.ini 失败（只读或权限不足）");
+        uilog("fg-input: write failed err=%lu", (unsigned long)GetLastError());
+        return;
+    }
+    // 这一版 UI 服务的是双卡 consumer 链路：输出必须是 Capture（producer/consumer），
+    // 不能是游戏内本地 XeFG。Passthrough 也必须关闭，否则 fakerFG 不接管契约。
+    WritePrivateProfileStringW(L"fakerFG", L"FgOutput", L"Capture", ini.c_str());
+    WritePrivateProfileStringW(L"fakerFG", L"Passthrough", L"0", ini.c_str());
+    wchar_t msg[256]{};
+    _snwprintf_s(msg, _TRUNCATE, L"已写入 FgInput=%s，重启游戏生效", v);
+    set_msg(msg);
+    uilog("fg-input: %ls -> %ls", ini.c_str(), v);
+}
+
+// Reflect the file on disk when the user picks another game window; the dropdown
+// then shows what the game will actually load, not just the last UI selection.
+static void sync_fg_input_from_target()
+{
+    std::wstring ini;
+    if (!target_game_ini(&ini)) { return; }
+    if (GetFileAttributesW(ini.c_str()) == INVALID_FILE_ATTRIBUTES) { return; }
+    wchar_t v[32]{};
+    GetPrivateProfileStringW(L"fakerFG", L"FgInput", L"", v, 32, ini.c_str());
+    for (int i = 0; i < 4; ++i) {
+        if (_wcsicmp(v, fg_input_ini_value(i)) == 0) { S().fg_input = i; return; }
+    }
+}
+
+
 // ------------------------------------------------------------------ profiles
 static std::wstring prof_sec(int i)
 {
@@ -591,6 +823,8 @@ static void save_profile(int i)
     const State& s = g_profiles[i].st;
     ini_ws(sec, L"name", g_profiles[i].name);
     ini_w(sec, L"fg_mode", s.fg_mode);
+    ini_w(sec, L"mult", s.fg_mode + 2);
+    ini_w(sec, L"fg_input", s.fg_input);
     ini_w(sec, L"interp", s.interp);
     ini_w(sec, L"out_mode", s.out_mode);
     ini_w(sec, L"pool", s.pool);
@@ -603,7 +837,6 @@ static void save_profile(int i)
     ini_w(sec, L"gpu_sel", s.gpu_sel);
     ini_w(sec, L"hotkey3", s.hotkey);
     ini_w(sec, L"jitter_zero", s.jitter_zero ? 1 : 0);
-    ini_w(sec, L"no_depth", s.no_depth ? 1 : 0);
     ini_w(sec, L"no_marker", s.no_marker ? 1 : 0);
     ini_w(sec, L"upsample", s.upsample ? 1 : 0);
     ini_w(sec, L"stream_auto", s.stream_auto ? 1 : 0);
@@ -629,8 +862,18 @@ static void load_profile(int i)
     Profile& p = g_profiles[i];
     State& s = p.st;
     p.name        = ini_rs(sec, L"name", L"默认");
-    s.fg_mode     = ini_r(sec, L"fg_mode", s.fg_mode);
-    s.interp      = ini_r(sec, L"interp", s.interp);
+    // 新版本存 mult=2/3/4；旧档案只有 fg_mode（0 = 30x4, 1 = 40x3）。
+    {
+        int mult = ini_r(sec, L"mult", -1);
+        if (mult < 2 || mult > 4) {
+            const int old = ini_r(sec, L"fg_mode", 2);
+            mult = (old == 1) ? 3 : 4;
+        }
+        s.fg_mode = mult - 2;
+        s.interp  = mult;
+    }
+    s.fg_input    = ini_r(sec, L"fg_input", s.fg_input);
+    if (s.fg_input < 0 || s.fg_input > 3) { s.fg_input = 0; }
     s.out_mode    = ini_r(sec, L"out_mode", s.out_mode);
     s.pool        = ini_r(sec, L"pool", s.pool);
     s.latency     = ini_r(sec, L"latency", s.latency);
@@ -644,7 +887,6 @@ static void load_profile(int i)
     s.hotkey      = ini_r(sec, L"hotkey3", s.hotkey);
     if (s.hotkey < 0 || s.hotkey >= kHotkeyCount) { s.hotkey = 0; }
     s.jitter_zero = ini_r(sec, L"jitter_zero", s.jitter_zero ? 1 : 0) != 0;
-    s.no_depth    = ini_r(sec, L"no_depth", s.no_depth ? 1 : 0) != 0;
     s.no_marker   = ini_r(sec, L"no_marker", s.no_marker ? 1 : 0) != 0;
     s.upsample    = ini_r(sec, L"upsample", s.upsample ? 1 : 0) != 0;
     s.stream_auto = ini_r(sec, L"stream_auto", s.stream_auto ? 1 : 0) != 0;
@@ -660,11 +902,11 @@ static void load_profile(int i)
     s.osd = ini_r(sec, L"osd", s.osd ? 1 : 0) != 0;
     s.perf_no_throttle = ini_r(sec, L"perf", s.perf_no_throttle ? 1 : 0) != 0;
     s.cadence     = ini_r(sec, L"cadence", s.cadence ? 1 : 0) != 0;
-    // 锁帧版只有两个固定模式；cadence 是低帧自适应补偿开关。
-    if (s.fg_mode < 0 || s.fg_mode > 1) { s.fg_mode = 0; }
+    // 固定倍率 2x/3x/4x；cadence 是低帧自适应补偿开关。
+    if (s.fg_mode < 0 || s.fg_mode > 2) { s.fg_mode = 2; }
     s.out_fps     = 0;
     s.win_title   = ini_rs(sec, L"win_title", L"");
-    s.interp      = (s.fg_mode == 1) ? 3 : 4;
+    s.interp      = s.fg_mode + 2;
     if (s.pool < 2) { s.pool = 2; }
     if (s.pool > 6) { s.pool = 6; }
     if (s.latency < 1) { s.latency = 1; }
@@ -750,7 +992,10 @@ static void rescan_windows()
             if (g_wins[i].title == want) { g_win_sel = (int)i; break; }
         }
     }
-    if (g_win_sel >= 0) { S().win_title = g_wins[g_win_sel].title; }
+    if (g_win_sel >= 0) {
+        S().win_title = g_wins[g_win_sel].title;
+        S().win_hwnd = g_wins[g_win_sel].hwnd;
+    }
 }
 
 
@@ -771,16 +1016,19 @@ static std::wstring build_cmdline(HWND target, bool display)
     static const wchar_t* kOut[] = { L" --den 1", L" --scale 0.75", L" --den 2" };
     cmd += kOut[(S().out_mode >= 0 && S().out_mode <= 2) ? S().out_mode : 0];
 
-    // 只有两个模式：--mode 直接决定输入锁与插帧数（30x4 / 40x3）。
+    // 固定倍率：2x / 3x / 4x。--mode 直接决定插帧数；输入锁仍由游戏侧完成。
+    const int mul = S().fg_mode + 2;
     wchar_t b[256]{};
-    _snwprintf_s(b, _TRUNCATE, L" --pool %d --latency %d %s",
-                 S().pool, S().latency,
-                 (S().fg_mode == 1) ? L"--mode 40x3" : L"--mode 30x4");
+    _snwprintf_s(b, _TRUNCATE, L" --pool %d --latency %d --mode %dx",
+                 S().pool, S().latency, mul);
     cmd += b;
-    // 低帧自适应：输入低于锁帧上限时，按实际 vblank 动态增加插帧数，目标仍是
-    // 40x3/30x4 的 120 fps。只作为可选补偿，不改变正常固定倍率路径。
+    // 低帧自适应：输入低于目标时，按实际 vblank 动态增加插帧数，目标仍是面板刷新率。
+    // 只作为可选补偿，不改变正常固定倍率路径。
     if (S().cadence) {
-        cmd += L" --interp-cadence --fg-out-hz 120";
+        wchar_t c[64]{};
+        _snwprintf_s(c, _TRUNCATE, L" --interp-cadence --fg-out-hz %u",
+                     (g_refresh > 1) ? g_refresh : 120u);
+        cmd += c;
     }
     // Which GPU runs the frame generation (A card rendering + N card output, or the
     // other way round). 0 = let bridge decide from the window monitor / producer LUID.
@@ -814,8 +1062,10 @@ static std::wstring build_cmdline(HWND target, bool display)
     // Current pipeline: publications are consumed in order and the in-frame marker is the
     // pairing key (see docs/findings/PERF_ROUND_HANDOVER.md). --report 40 keeps the log
     // readable while still showing every phase of a slow frame.
-    cmd += L" --unlock-mfg --fg-ui none --fg-rt-mode auto --upsample --report 40";
-    if (S().no_depth)  { cmd += L" --no-depth"; }
+    cmd += L" --fg-ui none --fg-rt-mode auto --upsample --report 40";
+    // 2x 不需要解锁：原版库就支持 1 张插值帧。3x/4x 继续沿用现有的字节补丁，
+    // 保证非 Intel 卡上开箱即用；补丁失败时 consumer 会回退并打日志。
+    if (mul > 2) { cmd += L" --unlock-mfg"; }
     // FOV and 输入间隔 are no longer exposed in the UI (2026-11-08): FOV only feeds the
     // synthetic projection, which the XeFG frame-generation path ignores (5.16), and
     // --input-ms no longer matters for pacing now that frameRenderTime is vblank-snapped.
@@ -1191,7 +1441,6 @@ static void layout_items(std::vector<Item>& out, int* content_h)
             it.rc = RECT{ x + 16, ry, x + colw - 16, ry + hh };
             ry += hh;
             it.on = (it.id == ID_JITZ) ? S().jitter_zero
-                  : (it.id == ID_NODEPTH) ? S().no_depth
                   : (it.id == ID_NOMARKER) ? S().no_marker
                   : (it.id == ID_UPSAMPLE) ? S().upsample
                   : (it.id == ID_STRAUTO) ? S().stream_auto
@@ -1343,10 +1592,11 @@ static void draw_info(HDC dc, const RECT& r, const std::wstring& value)
 static std::wstring dd_caption(Id id)
 {
     if (id == ID_LOCK) {
-        wchar_t b[64]{};
-        const int in = (S().fg_mode == 1) ? 40 : 30;
-        _snwprintf_s(b, _TRUNCATE, L"锁 %d fps（%d 倍 -> %d fps）",
-                     in, (S().fg_mode == 1) ? 3 : 4, in * ((S().fg_mode == 1) ? 3 : 4));
+        wchar_t b[96]{};
+        const unsigned hz = (g_refresh > 1) ? g_refresh : 120;
+        const int mul = S().fg_mode + 2;
+        _snwprintf_s(b, _TRUNCATE, L"锁 %.1f fps（%dx -> %u fps）",
+                     static_cast<double>(hz) / static_cast<double>(mul), mul, hz);
         return b;
     }
     // Cadence + motion vectors, measured 2026-11-09:
@@ -1665,11 +1915,6 @@ static void toggle_field(Id id)
 {
     switch (id) {
     case ID_JITZ:    S().jitter_zero = !S().jitter_zero; break;
-    case ID_NODEPTH:
-        S().no_depth = !S().no_depth;
-        set_msg(S().no_depth ? L"不传深度：跨卡 28.1 -> 14.1 MB/帧（XeFG 少了遮挡判断）"
-                             : L"传深度（默认）");
-        break;
     case ID_NOMARKER:
         S().no_marker = !S().no_marker;
         set_msg(S().no_marker
@@ -1747,8 +1992,12 @@ static void set_opt(Id id, int idx)
 {
     switch (id) {
     case ID_FG_MODE:
-        S().fg_mode = idx % 2;
-        S().interp = (S().fg_mode == 1) ? 3 : 4;
+        S().fg_mode = idx % 3;
+        S().interp = S().fg_mode + 2;
+        break;
+    case ID_FG_INPUT:
+        S().fg_input = (idx < 0 || idx > 3) ? 0 : idx;
+        apply_fg_input();
         break;
     case ID_OUT:     S().out_mode = idx % 3; break;
     case ID_SDR:
@@ -1773,6 +2022,9 @@ static void set_opt(Id id, int idx)
             g_win_sel = idx;
             S().win_title = g_wins[idx].title;
             S().win_hwnd = g_wins[idx].hwnd;
+            S().target_mode = 1;      // a picked window wins over "foreground at hotkey"
+            g_refresh = refresh_for_window(g_wins[idx].hwnd);
+            sync_fg_input_from_target();
         }
         break;
     default: break;
@@ -1978,8 +2230,12 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             }
         }
         CloseHandle(CreateThread(nullptr, 0, hotkey_poll_thread, nullptr, 0, nullptr));
-        uilog("ui started, hotkey index=%d", S().hotkey);
+        uilog("ui started, version %s, hotkey index=%d",
+              LOCK_FRAME_VERSION_STRING, S().hotkey);
+        prune_old_logs();
         rescan_windows();
+        sync_fg_input_from_target();
+        if (HWND t = config_target_window()) { g_refresh = refresh_for_window(t); }
         apply_hotkey();
         SetTimer(h, 1, 500, nullptr);
         return 0;
@@ -2145,7 +2401,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
     wc.lpszClassName = L"lock_frame_ui";
     RegisterClassExW(&wc);
 
-    HWND hwnd = CreateWindowExW(0, L"lock_frame_ui", L"MGPU 锁帧 30x4 / 40x3", WS_POPUP | WS_MINIMIZEBOX,
+    HWND hwnd = CreateWindowExW(0, L"lock_frame_ui", L"MGPU 固定倍率 2x / 3x / 4x", WS_POPUP | WS_MINIMIZEBOX,
                                 (GetSystemMetrics(SM_CXSCREEN) - kWinW) / 2,
                                 (GetSystemMetrics(SM_CYSCREEN) - kWinH) / 2,
                                 kWinW, kWinH, nullptr, nullptr, inst, nullptr);

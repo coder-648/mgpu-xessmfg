@@ -14,7 +14,8 @@
 - 颜色走 WGC，不占渲染卡颜色拷贝带宽。
 - MV/depth 走独立共享内存和 copy queue。
 - 消费端按 marker 精确配对，匹配失败不会猜测 slot。
-- 支持 **40x3（40fps 输入 → 120fps 输出）** 和 **30x4（30fps → 120fps）**。
+- 支持 **2x（60fps 输入 → 120fps 输出）**、**3x（40fps → 120fps）** 和
+  **4x（30fps → 120fps）**；其他刷新率按“输入 = 刷新率 / 倍率”推导。
 
 ## fakerFG 设计
 
@@ -35,14 +36,26 @@ FgOutput=Capture
 
 即 **DLSS-G 输入 + WGC 颜色捕获**。
 
+输入源可在 UI 的“游戏侧配置”里切换，写入同一份 `fakerFG.ini`：
+
+| `FgInput` | 来源 |
+|---|---|
+| `DLSSG` | Streamline `slSetTag / slEvaluateFeature(DLSS_G)`（推荐，已实测） |
+| `NVNGX` | `NVSDK_NGX_DLSSG` 参数块 |
+| `Upscaler` | DLSS-SR 参数块 |
+| `FSR` | FFX 3.1 `FrameGenerationPrepare` |
+
+UI 写 `FgInput` 时会同时写 `FgOutput=Capture` 与 `Passthrough=0`，并在写之前
+备份原文件；切换后需要重启游戏。
+
 ## 帧节奏设计
 
-- 游戏侧锁定输入：40x3 锁 40fps，30x4 锁 30fps。
-- 消费端固定倍率插帧：40x3 → 3x，30x4 → 4x，目标都是 120fps。
+- 游戏侧锁定输入：2x 锁面板/2，3x 锁面板/3，4x 锁面板/4（120Hz 面板即 60/40/30fps）。
+- 消费端固定倍率插帧：2x / 3x / 4x，目标都是面板刷新率。
 - marker 把 WGC 颜色和对应 MV/depth 对齐，32 槽 ring 吸收 WGC 的异步延迟。
 - `frameRenderTime` 使用输入间隔的中位数并吸附整 vblank，减少 XeFG 的节奏误判。
 - 输入稳定时保持固定倍率；复杂场景低于目标时，可打开可选的“低帧自适应”动态补帧。
-- 40x3 的真实帧更多、延迟更低；30x4 插帧比例更高、负载和延迟更大。
+- 2x 延迟最低、真实帧最多；3x 居中；4x 插帧比例最高、负载和延迟最大。
 - 配对异常时进入健康状态机和光流降级，避免一次错位演变成长期卡顿。
 
 ## 核心算法与作用
@@ -82,8 +95,9 @@ mvN 99%   OK
    ```
 2. 保留游戏已有的 `libxess_fg.dll`、`libxell.dll` 和 `lock_frame_ui.ini`。
 3. 游戏设为无边框/窗口化全屏，开启 DLSS Frame Generation。
-4. 游戏锁帧：30x4 锁 30fps，40x3 锁 40fps。
-5. 启动游戏后运行 `lock_frame_ui.exe`，选择窗口和模式，点击启动。
+4. 游戏锁帧：2x 锁 60fps，3x 锁 40fps，4x 锁 30fps（120Hz 面板）。
+5. 启动游戏后运行 `lock_frame_ui.exe`，选择窗口、固定倍率和 fakerFG 输入源，
+   点击启动。
 
 默认配置：
 
@@ -105,4 +119,4 @@ CopyInline=0
 - 光流降级的画质低于游戏原生 MV，depth 也不是无损恢复。
 - reset/degraded 期间可能出现短暂重复帧或 1X。
 - 游戏自身低于锁帧上限时，补帧无法创造真实运动信息。
-- 当前为尝鲜版，建议先用于 2077/PBZ 测试和日志观察。
+- 当前为正式版基线（开源 GPL-3.0），建议先用于 2077/PBZ 测试和日志观察。

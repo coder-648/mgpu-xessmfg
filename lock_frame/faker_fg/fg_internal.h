@@ -227,6 +227,13 @@ void* real_ngx(const char* export_name);
 
 // ---------------------------------------------------------------- record / API
 void publish_record(const MgpuFgFrame& f);
+
+// True from an accepted publish_record() until the next producer_present(). A second
+// lane (typically the PCL ePresentStart staged fallback) must not allocate another seq
+// for the same presentation: the producer keeps the first record, while the marker would
+// use the second -> one guaranteed no_slot per extra call.
+bool fg_record_pending();
+void fg_present_done();
 // Route one completed record to the selected FG output sink. Capture-only output
 // returns immediately: the producer is already fed by publish_record().
 void fg_output_submit(const MgpuFgFrame& f);
