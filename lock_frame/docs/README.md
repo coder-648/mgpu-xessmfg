@@ -4,6 +4,7 @@
 |---|---|
 | [`../README.md`](../README.md) | 项目说明、构建、部署、日志判读 |
 | [`RELEASE_NOTES_1.0.0.md`](RELEASE_NOTES_1.0.0.md) | 1.0.0 发布说明 |
+| [`RELEASE_1.0.0.md`](RELEASE_1.0.0.md) | GitHub Release 发布正文（下载/校验/安装/已知限制） |
 | [`RELEASE_PLAN_2026-11-17.md`](RELEASE_PLAN_2026-11-17.md) | 正式版规划、决策记录、实施状态 |
 | [`PRE_RELEASE_20261117.md`](PRE_RELEASE_20261117.md) | 尝鲜版说明（历史） |
 | [`FG_PIPELINE.md`](FG_PIPELINE.md) | fakerFG 输入/输出管线 |
