@@ -1,6 +1,0 @@
-namespace Magpie {
-    [default_interface]
-    runtimeclass TextMenuFlyout : Windows.UI.Xaml.Controls.MenuFlyout {
-        TextMenuFlyout();
-    }
-}

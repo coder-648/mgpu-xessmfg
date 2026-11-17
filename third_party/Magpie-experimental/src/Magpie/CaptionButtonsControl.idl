@@ -1,6 +1,0 @@
-namespace Magpie {
-	[default_interface]
-	runtimeclass CaptionButtonsControl : Windows.UI.Xaml.Controls.UserControl {
-		CaptionButtonsControl();
-	}
-}
