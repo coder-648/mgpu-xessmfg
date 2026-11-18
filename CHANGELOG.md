@@ -3,6 +3,52 @@
 只记**用户能感知**的变化与对应实测依据。每条结论的原始数据在
 `docs/findings/PERF_BASELINE.md` / `FINAL_CONFIG.md`。
 
+### feat: lock_frame v30 —— `frameRenderTime` 改为连续限斜率 feed（Wuchang 实测通过）(2026-11-19)
+
+- **`--fg-rt-mode auto` 不再是 quant/raw 二选一**，而是一个连续量
+  （`rt_auto_feed_ms`）：`target = max(m·vblank, 中位数)`，2% 死区，
+  **每批最多 +0.5 ms、恢复时立即回落**。
+  - 40 fps → 25.0 ms（1 张/vblank，速度准确）；
+  - 进入 33 fps 场景 → ~0.35 s 内 25→31 ms 平滑爬升，**没有模式跳变**；
+  - 回到 40 fps → 立即回 25.0。
+  实测（Wuchang，120 Hz、3x、输入 32.8–40.1 fps、39 个统计窗口）：
+  `rt ≥ 25.0` 与 `rt ≤ 输入+1 ms` **全部成立（0 次超额）**，`dropped=0`，
+  运行中 0 次配对失败；慢场景输出 97–107 fps。主观：**"整体稍慢但是顺"**（已确认）。
+- **抽帧门加 2% 死区**：`q > 0.98`（输入高出目标不到 2%）时不丢、额度重置为 1。
+  工作点正好在 40 fps 上下时，一次丢弃换来一个 2× 内容间隙，不值得。
+- **修掉 `presentation is not vblank-paced` 误报**：现在只有"显示帧率也明显低于批次应产出"
+  才报（`total` 变小是 XeFG 异步 pacing 的正常现象）。
+- **UI 移除"低帧自适应"开关**（旧算法）：它会传 `--interp-cadence`，按设计让时隙抽帧门
+  让位并每批换倍率（3x/4x 闪烁/重影）。现在界面只暴露固定倍率 2x/3x/4x，v30 的连续 feed
+  就是默认路径。`--interp-cadence` 仍保留为命令行 A/B，UI 不再发送。
+  同时删掉 `lock_frame_ui.ini` 的 `cadence` 键（旧文件里的该键会被忽略）。
+- 已知未做：`--lock` 仍用 `GetTickCount64` + 整数 ms（60 档 58.8 fps）；XeLL 的 `sleep`
+  仍在 `SIMULATION_START` 之后；`--lock` 的非整除 Bresenham。
+  `--slack` / `--slack-auto` 实测更差（hold 造成两批背靠背），不要用于这条链路。
+
+### feat: lock_frame v29 —— 默认路径改用游戏时钟 + 时隙抽帧门 (2026-11-18)
+
+- **测速换源（默认生效）**：`frameRenderTime` 与 cadence 判决改用 producer 发布的
+  **游戏自己的 present 时钟** `FrameShared.frame_qpc_ms`（1 ms 分辨率），不再用 WGC 的
+  `SystemRelativeTime`。后者被量化到整 vblank：39 fps 和 42 fps 都读成 25 ms，
+  于是 39 fps 时 XeFG 按 25 ms 摊 3 张、剩下的 3.6 ms 什么都不显示——
+  这就是"每批尾部的小停顿"。现在 39/35 fps 会按真实间隔摊开（1,1,2）。
+- **默认 `--fg-rt-mode` 从 `quant` 改为 `auto`**：供得上（输入 ≥ 刷新/(interp+1)）时仍贴
+  `m·vblank`（落面板网格）；供不上时喂真实间隔（摊开而不是定格）。
+- **时隙抽帧门（默认开启）**：`--mode 2x/3x/4x` 下按
+  `target = 刷新/(interp+1)` 用漏桶保留输入，超供（41–43 fps）不再交给 DWM 抽帧。
+  丢帧发生在**颜色拷贝之前**，并把该槽立即 ACK；漏桶让丢帧均匀
+  （42 fps + 3x：每 21 帧丢 1 张，实测保留 40.0 fps）。`--no-slot-gate` 回到旧行为。
+- **观测**：OSD 的 `in fps` / `game ms` 改用游戏时钟；报告每个窗口新增
+  `game clock: in … target … kept/dropped …` 与 `in(vb)`（0.5 vblank 分桶）两行；
+  `drop` 计数包含门丢弃。
+- **不改变**：颜色仍走 WGC、marker 精确配对、`--upsample`（MV/depth 150%）、
+  prefetch 强制关闭、固定倍率（不做动态倍率）。
+- **已知未做**：`--lock` 仍用 `GetTickCount64` + 整数 ms（60 档 58.8 fps）；
+  XeLL 的 `sleep` 仍在 `SIMULATION_START` 之后；`--lock` 的非整除 Bresenham。
+- 依据与验收步骤：`docs/design/LOCK_FRAME_IMPROVEMENTS.md` §11/§12
+  （离线仿真实测：保留率精确等于 target，丢帧最大连续 1–2 张）。
+
 ### feat: lock_frame 1.0.0 正式版基线（固定倍率 + 输入源 + 开源发布）(2026-11-17)
 
 - **固定倍率 2x / 3x / 4x**：UI 从 30x4/40x3 两个写死模式改为三档；consumer

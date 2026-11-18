@@ -62,7 +62,12 @@ cp -f "$HERE/run_40x3.bat"                    "$OUT/"
 cp -f "$HERE/deploy_game.bat"                 "$OUT/"
 cp -f "$HERE/collect_diagnostics.bat"         "$OUT/"
 cp -f "$HERE/README.md"                       "$OUT/README.md"
-cp -f "$HERE/docs/RELEASE_NOTES_1.0.0.md"     "$OUT/RELEASE_NOTES.md"
+# 发布说明按版本取；没有对应文件时退回 1.0.0（保持旧版本可复现打包）。
+if [ -f "$HERE/docs/RELEASE_NOTES_$VER.md" ]; then
+    cp -f "$HERE/docs/RELEASE_NOTES_$VER.md"  "$OUT/RELEASE_NOTES.md"
+else
+    cp -f "$HERE/docs/RELEASE_NOTES_1.0.0.md" "$OUT/RELEASE_NOTES.md"
+fi
 cp -f "$REPO/CHANGELOG.md"                    "$OUT/CHANGELOG.md"
 cp -f "$REPO/LICENSE"                         "$OUT/"
 cp -f "$REPO/NOTICE"                          "$OUT/"

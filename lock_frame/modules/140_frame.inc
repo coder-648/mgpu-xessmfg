@@ -125,6 +125,132 @@ static void lock_reanchor_colour_watermark(uint32_t payload)
     }
 }
 
+// ============================================================================
+//  v29: game-clock cadence + slot decimation (the default path)
+//
+//  Why: WGC's arrival timestamp (SystemRelativeTime) is quantised to whole vblanks, so a
+//  42 fps input and a 39 fps input both read as "3 vblanks" (25 ms). The producer publishes
+//  the game's own present clock in frames[].frame_qpc_ms (1 ms resolution); one sample per
+//  colour frame is enough to measure what the game actually did.
+//
+//  Two consumers:
+//    * frameRenderTime (040_cadence.inc) - the gap between ACCEPTED frames, so a dropped
+//      frame is reported as the 2T gap it really is and XeFG spreads its batch over it.
+//    * the leaky-bucket gate below - drops the surplus before any copy, so the forwarded
+//      rate is panel/(interp+1) and the panel is not left to DWM's mercy.
+// ============================================================================
+static double game_raw_ms() { return (g_game_last_ms > 0.5) ? g_game_last_ms : 0.0; }
+static double game_ema_ms() { return (g_game_acc_ema > 0.5) ? g_game_acc_ema : 0.0; }
+
+static double game_median_ms()
+{
+    if (g_game_ring_n == 0) { return 0.0; }
+    double v[16];
+    for (UINT i = 0; i < g_game_ring_n; ++i) { v[i] = g_game_ring[i]; }
+    for (UINT i = 1; i < g_game_ring_n; ++i) {
+        const double k = v[i];
+        int j = static_cast<int>(i) - 1;
+        while (j >= 0 && v[j] > k) { v[j + 1] = v[j]; --j; }
+        v[j + 1] = k;
+    }
+    return v[g_game_ring_n / 2];
+}
+
+// 1 = the rate is moving (raw tracks it better), 0 = steady (quant removes the +-1 vblank
+// jitter), -1 = not enough samples yet (caller falls back to the WGC-based decision).
+static int game_rate_moving()
+{
+    if (g_game_in_fast <= 0.0 || g_game_in_slow <= 0.0) { return -1; }
+    const double vb = refresh_ms();
+    if (!(vb > 0.5)) { return -1; }
+    return (dabs_(g_game_in_fast - g_game_in_slow) > 0.25 * vb) ? 1 : 0;
+}
+
+// One sample per incoming colour frame (accepted or dropped): the input rate.
+static void note_game_input(uint64_t t)
+{
+    if (t == 0) { return; }
+    double dt = 0.0;
+    if (g_game_prev_qpc != 0 && t > g_game_prev_qpc) {
+        dt = static_cast<double>(t - g_game_prev_qpc);
+        // 1 ms is the field's resolution; anything bigger than 200 ms is a stall, not
+        // a cadence sample (loading / alt-tab / a pair miss).
+        if (dt < 1.0 || dt > 200.0) { dt = 0.0; }
+    }
+    g_game_prev_qpc = t;
+    if (dt <= 0.0) { return; }
+    if (g_game_in_ema <= 0.0) { g_game_in_ema = dt; }
+    else { g_game_in_ema = g_game_in_ema * 0.95 + dt * 0.05; }        // ~20 frames
+    if (g_game_in_fast <= 0.0 || g_game_in_slow <= 0.0) {
+        g_game_in_fast = dt;
+        g_game_in_slow = dt;
+    } else {
+        g_game_in_fast = g_game_in_fast * 0.70 + dt * 0.30;
+        g_game_in_slow = g_game_in_slow * 0.95 + dt * 0.05;
+    }
+}
+
+// Accepted frame: the accepted-to-accepted gap. This is the interval frameRenderTime must
+// describe - when the gate dropped the frame in between it is 2T, and XeFG has to spread
+// its m outputs over that, not over T.
+static void note_game_accepted(uint64_t t)
+{
+    if (t == 0) { return; }
+    double dt = 0.0;
+    if (g_game_prev_acc_qpc != 0 && t > g_game_prev_acc_qpc) {
+        dt = static_cast<double>(t - g_game_prev_acc_qpc);
+        if (dt < 1.0 || dt > 400.0) { dt = 0.0; }
+    }
+    g_game_prev_acc_qpc = t;
+    if (dt <= 0.0) { return; }
+    g_game_last_ms = dt;
+    g_game_acc_ema = (g_game_acc_ema > 0.5) ? (g_game_acc_ema * 0.9 + dt * 0.1) : dt;
+    g_game_ring[g_game_ring_i] = dt;
+    g_game_ring_i = (g_game_ring_i + 1) % 16;
+    if (g_game_ring_n < 16) { ++g_game_ring_n; }
+    const double vb = refresh_ms();
+    if (vb > 0.5) {
+        int k = static_cast<int>(dt / vb * 2.0 + 0.5);   // 0.5-vblank buckets
+        if (k < 1) { k = 1; }
+        if (k > 16) { k = 16; }
+        ++g_in_step_hist[k];
+    }
+}
+
+// True when this colour frame must not be used: keeping it would push the forwarded rate
+// above panel/(interp+1). A leaky bucket spreads the drops (1 in 21 at 42 fps, never a
+// burst), which is what keeps the content steps even.
+// Another limiter owns the input when --lock or --pace is set: the gate then stays out.
+static bool slot_gate_drop()
+{
+    if (!g_slot_gate || g_ctl == nullptr) { return false; }
+    // Another owner: an explicit limiter, or a controller that already picks the count
+    // per frame (a gate on top would fight it - it drops inputs the controller asked for).
+    if (g_lock_fps > 1.0 || g_pace_ms > 0.0) { return false; }
+    if (g_interp_cadence || g_interp_auto || g_dyn_mfg) { return false; }
+    // No generated frames to absorb the drop: dropping would lower the shown rate.
+    if (g_no_fg || g_fg_warp || g_fg_interp_actual < 1) { return false; }
+    const int m = static_cast<int>(g_fg_interp_actual) + 1;
+    if (m < 2 || g_game_in_ema < 1.0) { return false; }
+    const double vb = refresh_ms();
+    if (!(vb > 0.5)) { return false; }
+    const double f_in = 1000.0 / g_game_in_ema;                    // measured input rate
+    const double target = 1000.0 / (vb * static_cast<double>(m));  // panel / m
+    double q = target / f_in;
+    if (q > 1.0) { q = 1.0; }        // under-supplied: keep everything
+    if (q < 0.2) { q = 0.2; }        // never drop more than 4 of 5
+    // A 2% overshoot is not worth a dropped frame. The measured working point of this title
+    // is 39-40 fps against a 40 fps target, where the interval jitter already produces 2.5/
+    // 3.5 vblank batches; one drop there costs a full 2x content gap for nothing. Only start
+    // decimating when the surplus is real.
+    if (q > 0.98) { g_slot_credit = 1.0; return false; }
+    g_slot_credit += q;
+    if (g_slot_credit < 1.0) { return true; }
+    g_slot_credit -= 1.0;
+    if (g_slot_credit > 2.0) { g_slot_credit = 2.0; }
+    return false;
+}
+
 static void run_frame_ex(ID3D11Texture2D* colour11)
 {
     if (!service_shared_layout()) { return; }
@@ -327,6 +453,36 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
                 g_ctl->colour_seq = g_ctl->frames[pair_slot].frame_id;
             }
         }
+    }
+
+    // ---- v29 default-path pacing: decimate the surplus on the GAME clock --------------
+    // Decided here, before the colour copy / MV copies / tag / present: a dropped frame
+    // costs nothing but the WGC capture we already paid for. The signal is
+    // frames[].frame_qpc_ms (the game's own present clock, 1 ms) because WGC's
+    // SystemRelativeTime is quantised to whole vblanks - a 42 fps input and a 39 fps
+    // input are indistinguishable there.
+    //
+    // `fallback_pair` (DEGRADED, last verified slot) carries a stale timestamp and is
+    // excluded; a pair miss resets the clocks so the next interval cannot span the hole.
+    if (!g_reuse_frame && !fallback_pair && pair_ok &&
+        pair_slot >= 0 && pair_slot < static_cast<int>(mgpu::kMaxSlots) && g_ctl != nullptr) {
+        const uint64_t game_t = g_ctl->frames[pair_slot].frame_qpc_ms;
+        note_game_input(game_t);
+        if (slot_gate_drop()) {
+            ++g_slot_drops;
+            // Nothing was read from this slot. The ACK is deliberately NOT written here:
+            // ack_previous_slot() (next accepted frame) and ack_older_than() (the accepted
+            // frame's own path) both run *after* gpu_throttle(), which is what guarantees
+            // the previous frame's GPU work has retired before a slot is handed back.
+            // The dropped publication is older than the next accepted one, so the normal
+            // watermark releases it there.
+            return;
+        }
+        ++g_slot_keeps;
+        note_game_accepted(game_t);
+    } else if (!g_reuse_frame) {
+        g_game_prev_qpc = 0;
+        g_game_prev_acc_qpc = 0;
     }
 
     // 1. colour: capture frame -> shared sink (D3D11, on the AMD card)
@@ -1324,9 +1480,17 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     // One window is not enough evidence: a catch-up burst (two frames processed
     // back to back after a stall) drops the EMA for a single window and used to
     // trigger this on a perfectly healthy run. Require three in a row.
+    //
+    // v30: a fast `total` alone no longer means anything - with frameRenderTime pinned to
+    // m vblanks XeFG paces asynchronously, so Present returns early and total is 4-8 ms by
+    // design (Wuchang logged total=5.7ms, input=25.6ms on a perfectly paced run). Only warn
+    // when the *displayed* rate is also short of what the batches should produce.
+    const double expected_out = (g_arrival_ms_ema > 0.5)
+        ? static_cast<double>(g_fg_interp_actual + 1) * 1000.0 / g_arrival_ms_ema : 0.0;
     if (!g_nopace_warned && g_frames > 200 && ps.framesPresented >= 2 &&
         g_arrival_ms_ema > 8.0 && g_ms_total > 0.0 &&
-        g_ms_total < 0.35 * g_arrival_ms_ema) {
+        g_ms_total < 0.35 * g_arrival_ms_ema &&
+        expected_out > 1.0 && static_cast<double>(g_show_fps) < expected_out - 10.0) {
         if (++g_nopace_windows >= 3) {
             g_nopace_warned = true;
             logf_("[lock] WARNING: presentation is not vblank-paced - total=%.1fms but the input"
@@ -1412,6 +1576,34 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
         g_presented_sum = 0.0;
         g_presented_n = 0;
 
+        // v29: the default-path pacing numbers. `in(vb)` is the interval between ACCEPTED
+        // frames in vblanks (0.5-vblank buckets): at a locked 40 fps with 3x it is 3.0,
+        // and a 4.0 bucket means the gate dropped the frame in between. `slot` is what the
+        // gate did this window (it stays idle when --lock / --pace owns the input).
+        if (g_slot_keeps || g_slot_drops || g_game_in_ema > 0.5) {
+            const double vb = refresh_ms();
+            const double target = (vb > 0.5)
+                ? 1000.0 / (vb * static_cast<double>(g_fg_interp_actual + 1)) : 0.0;
+            const double in_fps = (g_game_in_ema > 0.5) ? 1000.0 / g_game_in_ema : 0.0;
+            const unsigned gate_n = g_slot_keeps + g_slot_drops;
+            logf_("[lock]   game clock: in %.1f fps (%.2f ms) target %.1f fps%s"
+                  " -> kept=%u dropped=%u (%.1f%%) gate=%s rate=%s\n",
+                  in_fps, g_game_in_ema, target,
+                  (target > 0.0 && in_fps > target * 1.02) ? " OVER" : "",
+                  g_slot_keeps, g_slot_drops,
+                  (gate_n > 0) ? 100.0 * g_slot_drops / gate_n : 0.0,
+                  g_slot_gate ? "on" : "off",
+                  (game_rate_moving() < 0) ? "?" : (game_rate_moving() ? "moving" : "steady"));
+            logf_("[lock]   in(vb):");
+            for (int i = 1; i <= 16; ++i) {
+                if (g_in_step_hist[i]) { logf_(" %.1f=%u", i * 0.5, g_in_step_hist[i]); }
+            }
+            logf_("  (accepted-to-accepted, 0.5-vblank buckets)\n");
+            for (int i = 0; i <= 16; ++i) { g_in_step_hist[i] = 0; }
+            g_slot_keeps = 0;
+            g_slot_drops = 0;
+        }
+
         // Cadence control (both flags off by default, so neither the call nor the log
         // line appears in a normal run):
         //   --interp-auto  re-pick the interpolation count so the output lands on whole
@@ -1424,7 +1616,12 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
             g_interp_cadence) {
             // Same estimator the accumulator used (mean of the ring), so this line and `want`
             // can never disagree again - they did, and it read as "input=3 vblanks but 5x".
-            const double t_in = arr_mean_ms();
+            //
+            // v29: prefer the GAME clock. arr_mean_ms() rejects any sample above 1.6x its
+            // EMA (its spike filter), so a 26.7 ms input with 2-7% double intervals reads as
+            // 25.0 ms - and then `out` below claims 120 fps while the real output is ~112.
+            const double gm = game_median_ms();
+            const double t_in = (gm > 0.5) ? gm : arr_mean_ms();
 
             const double vb = refresh_ms();
             // In cadence mode the multiplier changes per frame, so report the average
@@ -1456,7 +1653,12 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
                   // g_fg_interp_actual, i.e. the *ceiling* (--interp N), which read as "we are
                   // asking for 2" while the average below was 5x - the most misleading pair of
                   // numbers in the log (2026-11-10).
-                  (g_cad_last_k > 0) ? (g_cad_last_k - 1) : 0u, mul,
+                  // v29: outside --interp-cadence the count is fixed, so print the applied one
+                  // (the line used to show interp=0 for a 3x run, which reads as "1X").
+                  (g_interp_cadence && g_cad_last_k > 0)
+                      ? static_cast<unsigned>(g_cad_last_k - 1)
+                      : g_fg_interp_actual,
+                  mul,
                   (out_ms > 0.0) ? 1000.0 / out_ms : 0.0, out_vb,
                   (frac > 0.06) ? " NOT-EXACT" : "", g_refresh_hz,
                   g_lock_fps, g_lock_drops,

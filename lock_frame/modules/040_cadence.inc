@@ -21,13 +21,18 @@
 //   --fg-rt-mode ema|raw|median|quant   what we hand XeFG as frameRenderTime
 //   --interp-auto [floor|round]         keep the output on a whole-vblank cadence
 enum { kFgRtEma = 0, kFgRtRaw = 1, kFgRtMedian = 2, kFgRtQuant = 3, kFgRtAuto = 4 };
-static int g_fg_rt_mode = kFgRtQuant;   // quant: median snapped to whole vblanks (see fg_render_time_ms)
-// --fg-rt-mode auto: pick quant or raw from whether the *input rate* is moving.
-// Two EMAs of the interval, one fast, one slow; when they disagree by more than a quarter
-// of a vblank the rate is changing (unlocked / GPU-bound) and raw tracks it better, because
-// the median lags a step by a couple of windows. A locked rate keeps them together even
-// though individual frames jitter by +-1 vblank, which is exactly the distinction we want
-// (a locked 40 fps also arrives as 2/3/4 vblanks and belongs to quant).
+// v30: auto is the default and it is a CONTINUOUS feed, not a mode (see rt_auto_feed_ms):
+//   - never below m*vblank, so the panel is never asked for more than one output per vblank
+//     (asking for less is what makes the panel drop, which is worse than any hold);
+//   - a 2% deadband keeps the 39-40 fps working point on the plan;
+//   - when a scene is slower, the feed ramps up by at most 0.5 ms per batch, so a scene
+//     change is a 0.15 s ramp instead of a visible step.
+// Measured on Wuchang: individual intervals of 17-39 ms around a 25 ms median must never be
+// fed raw (17 ms asks for 0.68 vblank per output); the median + ramp handles that.
+static int g_fg_rt_mode = kFgRtAuto;   // see fg_render_time_ms / rt_* below
+// The legacy WGC fast/slow pair, kept as auto's fallback until the game clock has a sample
+// (and as the fast/slow flag in the report). Two EMAs; when they disagree by more than a
+// quarter of a vblank the rate is moving (unlocked / GPU-bound).
 static double g_rt_ema_fast = 0.0;
 static double g_rt_ema_slow = 0.0;
 static int    g_rt_auto_state = 0;      // 0 = rate is steady (quant), 1 = rate is moving (raw)
@@ -129,12 +134,47 @@ static UINT   g_spike_count = 0;          // spikes this report window
 // so it is worth counting explicitly instead of guessing.
 static UINT   g_burst_count = 0;
 
+// v30 auto: ONE continuous, slew-limited feed instead of a quant/raw mode.
+//
+// The physical constraint: XeFG lays m outputs over whatever we report, so asking for less
+// than m*vblank makes the panel drop, and asking for more than the real gap leaves a hold.
+// A mode switch (quant <-> raw) is itself a step, which is what a scene change made visible.
+//
+//   target = max(m*vblank, median)   // never below the plan: 1 output per vblank
+//   a 2% deadband keeps a 39-40 fps working point on the plan
+//   feed grows at most 0.5 ms per batch, shrinks immediately (a smaller feed never over-asks)
+//
+// So a scene that drops from 40 to 36 fps ramps 25.0 -> 27.8 ms over ~6 batches (0.15 s)
+// instead of flipping mode: spacing stays <= 1 output per vblank the whole time, and the
+// residual is a constant, bounded motion-speed error instead of per-batch jitter.
+static double game_median_ms();   // defined in 140_frame.inc, declared before its first use
+static double rt_quant_value();   // defined below, before fg_render_time_ms()
+
+static double rt_auto_feed_ms()
+{
+    const double vb = refresh_ms();
+    const int m = static_cast<int>(g_fg_interp_actual) + 1;
+    if (!(vb > 0.5) || m < 2) { return rt_quant_value(); }
+    const double plan = vb * static_cast<double>(m);
+    const double med = game_median_ms();
+
+    double target = plan;
+    if (med > 0.5 && med < 200.0) { target = (med > plan) ? med : plan; }
+    if (target < plan * 1.02) { target = plan; }        // deadband at the working point
+
+    static double s_feed = 0.0;
+    if (s_feed <= 0.0) { s_feed = plan; }
+    if (target <= s_feed) { s_feed = target; }          // recover instantly
+    else { s_feed = (target < s_feed + 0.5) ? target : s_feed + 0.5; }
+    return s_feed;
+}
+
 static const char* fg_rt_mode_name()
 {
     switch (g_fg_rt_mode) {
     case kFgRtRaw:    return "raw";
     case kFgRtMedian: return "median";
-    case kFgRtAuto:   return (g_rt_auto_state == 1) ? "auto:raw" : "auto:quant";
+    case kFgRtAuto:   return "auto";
     case kFgRtQuant:  return "quant";
     default:          return "ema";
     }
@@ -477,8 +517,21 @@ static double input_interval_ms()
 
 // Raw: the interval the producer actually delivered. Most responsive, and the noisiest -
 // it feeds one sample of jitter straight into the pacer's plan.
+//
+// v29: "delivered" now means the *game's* clock (frames[].frame_qpc_ms, 1 ms resolution),
+// not the WGC arrival (SystemRelativeTime, quantised to whole vblanks). The WGC value is
+// only a fallback for the first frames and for the - no-producer case.
+// The game-clock helpers live in 140_frame.inc (this module is earlier in the TU), so they
+// are forward-declared here. They return 0 until a sample exists.
+static double game_raw_ms();
+static double game_ema_ms();
+static double game_median_ms();
+static int    game_rate_moving();   // 1 = rate moving, 0 = steady, -1 = no data yet
+
 static double rt_raw_value()
 {
+    const double g = game_raw_ms();
+    if (g > 0.5) { return g; }
     return (g_arr_last_raw > 0.0) ? g_arr_last_raw : g_arrival_ms_ema;
 }
 
@@ -488,7 +541,12 @@ static double rt_raw_value()
 static double rt_quant_value()
 {
     const double vb = refresh_ms();
-    int k = static_cast<int>(arr_median_ms() / vb + 0.5);
+    // v29: snap the *game's* median; the WGC median is vblank-quantised already, which
+    // is exactly the information loss that made 39 fps look like a locked 40.
+    const double gm = game_median_ms();
+    const double base_ms = (gm > 0.5) ? gm : arr_median_ms();
+    const double last_ms = (game_raw_ms() > 0.5) ? game_raw_ms() : g_arr_last_raw;
+    int k = static_cast<int>(base_ms / vb + 0.5);
     if (k < 1) { k = 1; }
     const double plan = static_cast<double>(k) * vb;
 
@@ -513,9 +571,9 @@ static double rt_quant_value()
     // fix any more - the accumulator itself already absorbs rate changes (bounded phase, one
     // count step per frame). A genuinely isolated hitch in cadence mode is left to
     // `--fg-rt-spike 1 --fg-cad-rt 0`.
-    if (g_fg_rt_spike && !g_interp_cadence && g_arr_last_raw > plan * kSpikeRatio &&
-        g_arr_last_raw < 100.0) {
-        int kr = static_cast<int>(g_arr_last_raw / vb + 0.5);
+    if (g_fg_rt_spike && !g_interp_cadence && last_ms > plan * kSpikeRatio &&
+        last_ms < 100.0) {
+        int kr = static_cast<int>(last_ms / vb + 0.5);
         if (kr < k) { kr = k; }
         const int kcap = k * 3;              // never chase a real hitch (>3x the plan)
         if (kr > kcap) { kr = kcap; }
@@ -525,7 +583,7 @@ static double rt_quant_value()
                 --g_spike_logs_left;
                 logf_("[lock] rt spike: last input %.1fms (%.1f vblanks) > plan %.1fms"
                       " - frameRenderTime %.1fms for this frame (%.1f vblanks)%s\n",
-                      g_arr_last_raw, g_arr_last_raw / vb, plan, rt, rt / vb,
+                      last_ms, last_ms / vb, plan, rt, rt / vb,
                       (g_spike_logs_left == 0) ? " (further spikes not logged)" : "");
             }
             ++g_spike_count;
@@ -615,16 +673,29 @@ static double fg_render_time_ms()
         // measured *worse* than auto in all three paired rounds (0.2/0.4/0.5% empty vblanks
         // vs 0.1/0.1/0.3%, max hole 4-6 vblanks vs 2), because a smooth estimate lags the
         // step when the throttled input rate actually moves. See PERF_BASELINE 3.23.
-        return (g_arrival_ms_ema > 0.5) ? g_arrival_ms_ema : rt_quant_value();
+        //
+        // v29: prefer the game-clock EMA (accepted-to-accepted). The old source was
+        // g_frame_ms_ema, which is measured with GetTickCount64 and quantised to 1 ms on a
+        // 15.6 ms clock - it cannot see a 3.6 ms step at all.
+        {
+            const double ge = game_ema_ms();
+            if (ge > 0.5) { return ge; }
+            return (g_arrival_ms_ema > 0.5) ? g_arrival_ms_ema : rt_quant_value();
+        }
     case kFgRtMedian:
-        return arr_median_ms();
+        {
+            const double gm = game_median_ms();
+            return (gm > 0.5) ? gm : arr_median_ms();
+        }
     case kFgRtAuto:
-        // Measured both ends (PERF_BASELINE 3.19): with --interp-cadence, "raw" wins when the
-        // input rate is actually moving (0.7% empty vs 1.0%), while "quant" wins - or ties -
-        // when the rate is held by a limiter, because then the per-frame jitter is pure noise.
-        // Decide from the *rate*, not from the per-frame spread: a locked 40 fps also arrives
-        // as 2/3/4 vblanks, and that case belongs to quant.
-        return (g_rt_auto_state == 1) ? rt_raw_value() : rt_quant_value();
+        // v30: no quant/raw decision any more - that switch was itself a step, and a scene
+        // change (40 -> 36 fps) flipped it while the eye was watching.
+        //
+        // rt_auto_feed_ms() returns max(m*vblank, median), ramped: spacing is never worse
+        // than one output per vblank (no drops), and a slower scene widens the batch over
+        // ~0.15 s. The residual is a constant motion-speed error proportional to the deficit,
+        // which reads as "the game is a bit slower", not as judder.
+        return rt_auto_feed_ms();
     case kFgRtQuant:
     default:
         return rt_quant_value();

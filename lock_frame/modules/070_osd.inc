@@ -61,11 +61,15 @@ static void osd_update()
     // One line, numbers only: "120 fps  x5  in 24.0  gpu 7.9 ms  game 41.2 ms  lock 24"
     wchar_t line[256]{};
     int n = 0;
-    const double in_fps = (g_arrival_ms_ema > 0.5) ? 1000.0 / g_arrival_ms_ema : 0.0;
+    // v29: prefer the game's own present clock (frames[].frame_qpc_ms). The WGC arrival is
+    // quantised to whole vblanks, so it shows 40.0 fps for a 39 fps input and for a 42 fps
+    // one alike - the two cases this version is about.
+    const double in_ms = (g_game_in_ema > 0.5) ? g_game_in_ema : g_arrival_ms_ema;
+    const double in_fps = (in_ms > 0.5) ? 1000.0 / in_ms : 0.0;
     n = _snwprintf_s(line, 256, _TRUNCATE,
                      L"%d fps   x%u   in %.1f fps   gpu %.1f ms   game %.1f ms",
                      g_show_fps, static_cast<unsigned>(g_fg_interp_actual + 1),
-                     in_fps, g_ms_throttle, g_arrival_ms_ema);
+                     in_fps, g_ms_throttle, in_ms);
     if (n < 0) { n = 0; }
     if (n > 0 && n < 250 && g_lock_fps > 1.0) {
         n += _snwprintf_s(line + n, 256 - n, _TRUNCATE, L"   lock %.0f", g_lock_fps);
@@ -103,7 +107,7 @@ static void osd_update()
             if (n < 0) { n = 0; }
         }
     }
-    const unsigned drops = g_lock_drops + g_pace_skips;
+    const unsigned drops = g_lock_drops + g_pace_skips + g_slot_drops;
     if (n > 0 && n < 240 && drops > 0) {
         n += _snwprintf_s(line + n, 256 - n, _TRUNCATE, L"   drop %u", drops);
     }

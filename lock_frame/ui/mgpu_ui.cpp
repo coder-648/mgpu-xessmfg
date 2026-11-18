@@ -113,15 +113,9 @@ struct State
     int  interp = 4;           // 由 fg_mode 推导的倍率（只用于显示）
     // fakerFG 侧输入源：0 DLSSG（推荐）, 1 NVNGX, 2 Upscaler, 3 FSR
     int  fg_input = 0;
-    // 模式 1 = 动态逐帧 (--interp-cadence): 每帧按"这一帧实际过了几个 vblank"要帧数,
-    // 输出恒定 1 帧/vblank。实测 4K --den 2、空刷新: 60fps 0.8% / 40fps 0.4% / 30fps 0.6%
-    // (固定倍率同条件是 2.5%/1.5%/2.6%)。此模式下倍数按 6x 上限解锁 (--interp 5),
-    // 因为 40fps 的输入会抖到 4 vblank、30fps 会到 5-6 vblank, 上限不够就填不满。
-    // 详见 docs/findings/PERF_BASELINE.md 3.17-3.21。
-    // (旧的 --dyn-mfg 实验档已从界面移除: 同场景空刷新 7.6%, 见 3.19。)
-    // cadence = 低帧自适应：输入因复杂场景低于锁帧上限时，按实际经过的 vblank
-    // 动态增加插帧数，尽量保持模式的目标输出（2x/3x/4x 都输出到面板刷新率）。默认关闭。
-    bool cadence = false;
+    // v30: the old per-frame multiplier (--interp-cadence, "low-fps adaptation") was
+    // removed from the UI. It disabled the slot gate by design and changed the count every
+    // batch, which flickers at 3x/4x; the continuous feed keeps slow scenes smooth instead.
     // 输出帧率上限 (Hz)，直接手输：0 = 面板刷新（填满每个 vblank，不发 --fg-out-hz）；
     // 5..1000 = 上限（--fg-out-hz N）。只在"动态倍率"开启时有意义：它决定每帧要几张，
     // 所以"120Hz 面板但只要 60fps"就是填 60（输入 30 时正好 2x）。最低仍是 2x，
@@ -275,7 +269,7 @@ enum Id
     ID_VERSION, ID_CHECK_GPU, ID_CHECK_RUNTIME, ID_CHECK_GAME,
     ID_CAP_API, ID_POOL, ID_LAT, ID_STREAM_INFO,
     ID_JITZ, ID_FOV, ID_NOMARKER, ID_UPSAMPLE, ID_STRAUTO, ID_STRASYM, ID_PREFETCH, ID_UI, ID_RT, ID_UNLOCK, ID_SLACK, ID_IVL,
-    ID_CADENCE, ID_OUTFPS, ID_HEAD_FIXED, ID_HEAD_DYN,
+    ID_OUTFPS, ID_HEAD_FIXED, ID_HEAD_DYN,
     ID_TEAR, ID_SDR, ID_LAYERED, ID_RELAY, ID_OSD,
     ID_GPU, ID_GPUSEL, ID_DISPLAY,
     ID_TMODE, ID_TARGET, ID_HOTKEY, ID_LOCK, ID_CMD,
@@ -287,18 +281,16 @@ enum RowKind { RK_INFO = 0, RK_DD, RK_SPIN, RK_TOG, RK_SLIDER, RK_CMDLINE, RK_ED
 struct RowDef { Id id; const wchar_t* label; RowKind kind; };
 struct CardDef { const wchar_t* title; const RowDef* rows; int n; int col; };
 
-// 两种模式互斥，各自一块：
-//   固定     -> 倍数写死（2x/3x/4x…），节拍恒定
-//   动态逐帧 -> 每帧按实际经过的 vblank 决定插几张，只受"输出帧率"上限约束
-// RK_HEAD 只是分区标题（不可点），模式外的行会被灰掉并且点不动。
+// v30: only the FIXED multiplier path is exposed (2x/3x/4x). The old per-frame multiplier
+// ("low-fps adaptation") was removed: it fought the slot gate and flickered at 3x/4x.
+// RK_HEAD is a section title (not clickable); rows outside the mode are greyed out.
 static const RowDef kRowsFg[] = {
     { ID_FG_TYPE, L"类型",            RK_INFO },
     { ID_FG_MODE, L"固定倍率",        RK_DD   },
     { ID_OUT,     L"输出",            RK_DD   },
-    { ID_CADENCE, L"低帧自适应（动态补帧）", RK_TOG },
     { ID_UPSAMPLE_INFO, L"MV/深度重建", RK_INFO },
-    // 锁帧版把 MV/depth 的 StreamPercent 固定为 150（producer 默认），
-    // 颜色走 WGC；消费端默认把 150% 的 MV/depth 联合重建到输入画面尺寸。
+    // 颜色走 WGC；MV/depth 的 StreamPercent 由 fakerFG.ini 决定（默认 150，Wuchang 实测用 100），
+    // 消费端把收到的 MV/depth 联合重建到输入画面尺寸。
 };
 static const RowDef kRowsGame[] = {
     { ID_FG_INPUT, L"fakerFG 输入源", RK_DD   },
@@ -473,7 +465,7 @@ static std::wstring row_value(Id id)
     switch (id) {
     case ID_FG_TYPE: return L"XeFG (libxess_fg)";
     case ID_CAP_API: return L"WGC";
-    case ID_STREAM_INFO:   return L"150% 跨卡，消费端重建";
+    case ID_STREAM_INFO:   return L"按 fakerFG.ini 的 StreamPercent";
     case ID_UPSAMPLE_INFO: return L"→ 输入画面尺寸（默认开）";
     case ID_GPU:     return L"AMD Radeon RX 6750 GRE";
     case ID_DISPLAY: {
@@ -851,8 +843,7 @@ static void save_profile(int i)
     ini_w(sec, L"relay_input", s.relay_input ? 1 : 0);
     ini_w(sec, L"osd", s.osd ? 1 : 0);
     ini_w(sec, L"perf", s.perf_no_throttle ? 1 : 0);
-    ini_w(sec, L"cadence", s.cadence ? 1 : 0);
-    // 锁帧版只保存模式本身；cadence/outfps 是旧版本的字段，不再写。
+    // 只保存模式本身；outfps 是旧版本的字段，不再写。
     ini_ws(sec, L"win_title", s.win_title);
 }
 
@@ -901,8 +892,7 @@ static void load_profile(int i)
     s.relay_input = ini_r(sec, L"relay_input", s.relay_input ? 1 : 0) != 0;
     s.osd = ini_r(sec, L"osd", s.osd ? 1 : 0) != 0;
     s.perf_no_throttle = ini_r(sec, L"perf", s.perf_no_throttle ? 1 : 0) != 0;
-    s.cadence     = ini_r(sec, L"cadence", s.cadence ? 1 : 0) != 0;
-    // 固定倍率 2x/3x/4x；cadence 是低帧自适应补偿开关。
+    // 固定倍率 2x/3x/4x。
     if (s.fg_mode < 0 || s.fg_mode > 2) { s.fg_mode = 2; }
     s.out_fps     = 0;
     s.win_title   = ini_rs(sec, L"win_title", L"");
@@ -1022,14 +1012,8 @@ static std::wstring build_cmdline(HWND target, bool display)
     _snwprintf_s(b, _TRUNCATE, L" --pool %d --latency %d --mode %dx",
                  S().pool, S().latency, mul);
     cmd += b;
-    // 低帧自适应：输入低于目标时，按实际 vblank 动态增加插帧数，目标仍是面板刷新率。
-    // 只作为可选补偿，不改变正常固定倍率路径。
-    if (S().cadence) {
-        wchar_t c[64]{};
-        _snwprintf_s(c, _TRUNCATE, L" --interp-cadence --fg-out-hz %u",
-                     (g_refresh > 1) ? g_refresh : 120u);
-        cmd += c;
-    }
+    // v30: no --interp-cadence here. The continuous frameRenderTime feed (--fg-rt-mode auto)
+    // keeps slow scenes smooth while the slot gate stays the single pacing owner.
     // Which GPU runs the frame generation (A card rendering + N card output, or the
     // other way round). 0 = let bridge decide from the window monitor / producer LUID.
     if (S().gpu_sel > 0 && S().gpu_sel <= (int)g_adapters.size()) {
@@ -1042,10 +1026,11 @@ static std::wstring build_cmdline(HWND target, bool display)
     // Fixed part: reversed-Z projection, no UI texture, 3x..6x unlock, and the
     // vblank-snapped frame-time feed. jitter is NOT in the fixed part - see below.
     //
-    // --fg-rt-mode auto (2026-11-08): 锁帧时喂"中位数吸附整 vblank"（quant），帧率真的在移动时
-    // 喂真实间隔（raw）—— 判据是"短中位数(16 样本) vs 长中位数(64 样本) 差 ≥0.6 vblank，
-    // 连续 3 个统计窗口一致才切"。实测（PERF_BASELINE 3.20）：锁 60fps 全程 flips=0、
-    // 空刷新 0.8%（与纯 quant 相同）；未锁帧帧率漂移时才切 raw（0.8% vs quant 1.1%）。
+    // --fg-rt-mode auto (v30): a continuous, slew-limited feed, not a mode switch.
+    //   target = max(m*vblank, game-clock median), 2% deadband, +0.5 ms per batch,
+    //   instant recovery. 40 fps -> 25.0 ms (1 output/vblank); a 33 fps scene ramps to
+    //   ~31 ms over 0.35 s instead of flipping quant<->raw. See
+    //   docs/design/LOCK_FRAME_IMPROVEMENTS.md 12.5d/12.5e.
     if (S().overlay_layered) { cmd += L" --overlay-layered"; }
     if (S().relay_input) { cmd += L" --relay-input"; }
     if (!S().osd) { cmd += L" --no-osd"; }
@@ -1454,7 +1439,6 @@ static void layout_items(std::vector<Item>& out, int* content_h)
                   : (it.id == ID_RELAY) ? S().relay_input
                   : (it.id == ID_OSD) ? S().osd
                   : (it.id == ID_PERF) ? S().perf_no_throttle
-                  : (it.id == ID_CADENCE) ? S().cadence
                   : false;
             out.push_back(it);
         }
@@ -1965,7 +1949,6 @@ static void toggle_field(Id id)
         break;
     case ID_OSD:     S().osd = !S().osd; break;
     case ID_PERF:    S().perf_no_throttle = !S().perf_no_throttle; break;
-    case ID_CADENCE: S().cadence = !S().cadence; break;
     default: break;
     }
 }

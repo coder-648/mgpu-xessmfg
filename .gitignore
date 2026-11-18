@@ -52,3 +52,6 @@ diagnostics_*.zip
 *.pre_*
 
 
+
+# 发布产物（zip/folder/manifest）不入库
+/dist/

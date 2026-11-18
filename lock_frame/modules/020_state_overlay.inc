@@ -335,6 +335,33 @@ static bool         g_slack_auto = false;
 static UINT         g_slack_auto_drops = 0;   // frames still dropped while --slack-auto is on
 static UINT         g_slack_auto_real  = 0;   // ... of which had new producer content (real loss)
 static UINT         g_slack_auto_holds = 0;   // frames held back (would have been dropped)
+// ---- v29 default-path pacing: game-clock cadence + slot decimation ----------------
+// Why: the WGC arrival timestamps are quantised to vblanks, so a 42 fps input and a
+// 39 fps input both read as "3 vblanks" (25 ms). The producer publishes the game's own
+// present clock (frames[].frame_qpc_ms, 1 ms resolution) - one sample per colour frame
+// lets us measure what the game actually did, and decimate the surplus before any copy.
+//
+// g_slot_gate: on by default in --mode; --no-slot-gate restores the old behaviour.
+// Only active when nothing else limits the input (--lock / --pace own it if set).
+static bool     g_slot_gate = true;
+static double   g_slot_credit = 1.0;      // leaky bucket; seeded full so frame 1 passes
+static UINT     g_slot_drops = 0;         // rejected by the gate this window
+static UINT     g_slot_keeps = 0;         // accepted this window
+// Game clock, one sample per incoming colour frame (accepted or dropped).
+static uint64_t g_game_prev_qpc = 0;      // frames[].frame_qpc_ms of the last frame seen
+static double   g_game_in_ema = 0.0;      // input interval (all frames), slow EMA
+static double   g_game_in_fast = 0.0;     // fast EMA: steady/moving flag (report + legacy auto)
+static double   g_game_in_slow = 0.0;
+// Accepted-to-accepted: the raw/ema/median feeds use this, so a dropped frame is reported
+// as the real (2T) gap. auto uses the plan (m vblanks) while the input keeps up.
+static uint64_t g_game_prev_acc_qpc = 0;
+static double   g_game_last_ms = 0.0;     // last accepted interval (raw)
+static double   g_game_acc_ema = 0.0;
+static double   g_game_ring[16] = {};     // accepted intervals, 16 samples
+static UINT     g_game_ring_n = 0;
+static UINT     g_game_ring_i = 0;
+static UINT     g_in_step_hist[17] = {};  // 0.5-vb buckets, index 1..16
+
 static bool         g_last_overran = false;   // last run_frame() exceeded the input interval
 // Producer publication counter we last consumed (v10's `frame_published`). --slack-auto uses
 // it to tell "this queued capture carries new content" from "DWM re-composited the same

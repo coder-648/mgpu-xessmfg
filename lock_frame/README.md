@@ -182,6 +182,48 @@ A/B 文件（放在 exe 旁边）：
 - `marker_repair_off.on`：不补四角 marker（会看到画面四角的小方块）。
 - 游戏目录的 `marker_disable.on`：fakerFG 不画 marker（配对必然失败，仅排障）。
 
+## v30（2026-11-19）frameRenderTime 连续限斜率
+
+`--fg-rt-mode auto` 从"quant/raw 二选一"改成**一个连续量**：
+
+```
+target = max(m·vblank, 中位数)   // 永不低于计划 → 永不请求 <1 vb 的间距 → 不丢帧
+2% 死区                          // 39–40 fps 的工作点不动
+每批最多 +0.5 ms，恢复立即回落     // 场景切换是 0.35 s 的爬坡，不是台阶
+```
+
+- 40 fps → 25.0 ms（1 张/vblank）；33 fps → 约 0.35 s 爬到 31 ms；回 40 → 立即 25.0。
+- 抽帧门 2% 死区（`q>0.98` 不丢）。
+- `not vblank-paced` 警告不再误报（`total` 变小是正常现象）。
+- **UI 移除"低帧自适应"开关**（旧算法）：它让时隙抽帧门让位、每批换倍率（3x/4x 闪烁）。
+  界面现在只暴露固定倍率 2x/3x/4x，v30 连续 feed 是默认路径；`--interp-cadence` 只留命令行 A/B。
+- Wuchang 实测：输入 32.8–40.1 fps、`dropped=0`、`rt` 0 次超额；
+  慢场景输出 97–107 fps，主观"整体稍慢但是顺"。
+- **不要用 `--slack` / `--slack-auto`**：实测更差（hold 让两批背靠背交给 XeFG）。
+
+## v29（2026-11-18）默认路径：游戏时钟 + 时隙抽帧门
+
+只改"节奏判定"，不动颜色/配对/上采样；产品版本 1.0.1。
+
+- **测速换源**：`frameRenderTime` 和 cadence 判决改用 producer 发布的
+  `FrameShared.frame_qpc_ms`（游戏自己的 present 时钟，1 ms）。WGC 的
+  `SystemRelativeTime` 被量化到整 vblank——39 fps 和 42 fps 都读成 25 ms，
+  所以 39 fps 时 XeFG 按 25 ms 摊 3 张、剩下的 3.6 ms 空白，表现为
+  "每批尾部的小停顿"。现在供不上时喂真实间隔（1,1,2）。
+- **`--fg-rt-mode` 默认 `auto`**：输入 ≥ `刷新/(interp+1)` → `quant`（贴 `m·vblank`，
+  落面板网格）；低于它 → `raw`（摊开真实间隔，避免批尾定格）。
+  `fg_rt_mode_name()` 会显示实际选择（`auto:quant` / `auto:raw`）。
+- **时隙抽帧门（默认开启）**：`--mode` 下按 `刷新/(interp+1)` 用漏桶保留输入。
+  42 fps + 3x 时每 21 帧丢 1 张（保留 40.0 fps），丢在**颜色拷贝之前**、不占
+  `present_id`；`--no-slot-gate` 回到旧行为。`--lock` / `--pace` / cadence /
+  `--no-fg` / `--fg warp` 下自动让位，避免双重限帧。
+- **观测**：OSD 的 `in fps` / `game ms` 改用游戏时钟；报告每窗口新增
+  `game clock: in … target … kept/dropped …` 与 `in(vb)`（0.5 vblank 分桶）；
+  `drop` 计数包含门丢弃。
+- **验证**：`docs/design/LOCK_FRAME_IMPROVEMENTS.md` §12（V1–V5 步骤 + 离线仿真表）。
+- **已知未做**：`--lock` 仍是 `GetTickCount64` + 整数 ms（60 档 58.8 fps）；
+  XeLL `sleep` 仍在 `SIMULATION_START` 之后；`--lock` 的非整除 Bresenham。
+
 ## v28（2026-11-17，正式版基线）固定倍率 + 输入源
 
 - 共享协议 `kSharedVersion = 28`，`kMaxSlots = 32`；控制块与纹理数据区分离。

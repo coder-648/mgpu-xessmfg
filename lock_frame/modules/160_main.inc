@@ -334,6 +334,12 @@ int main()
     }
     // --lock-auto: solve (rate, multiplier) so that rate*(interp+1) divides the refresh.
     if (wcsstr(GetCommandLineW(), L"--lock-auto")) { g_lock_auto = true; }
+    // v29: slot gate. On by default in --mode: the forwarded input rate is held at
+    // refresh/(interp+1) by dropping the surplus *before* any copy, decided on the game's
+    // own clock (frames[].frame_qpc_ms). --no-slot-gate restores the old forward-everything
+    // behaviour (the panel then has to decimate, which it does not do evenly).
+    if (wcsstr(GetCommandLineW(), L"--no-slot-gate")) { g_slot_gate = false; }
+    if (wcsstr(GetCommandLineW(), L"--slot-gate")) { g_slot_gate = true; }
     // --mode 2x | 3x | 4x: 固定倍率（输出 = 输入 × N）。旧的 30x4 / 40x3 作为
     // 4x / 3x 的别名保留，老快捷方式/脚本不用改。
     // 注意：不在这里启用 --lock 的丢帧逻辑。WGC 的到达时间有 1-2 ms 抖动，
@@ -375,8 +381,13 @@ int main()
     if (g_fg_rt_mode != kFgRtEma) {
         const char* what = (g_fg_rt_mode == kFgRtQuant) ? "median, snapped to whole vblanks"
                           : (g_fg_rt_mode == kFgRtRaw)  ? "the raw last input interval"
+                          : (g_fg_rt_mode == kFgRtAuto) ? "max(m vblanks, median), ramped 0.5 ms"
+                                                          " per batch (never below m vblanks)"
                                                         : "median of the last 16 input intervals";
-        logf_("[lock] --fg-rt-mode %s: frameRenderTime = %s\n", fg_rt_mode_name(), what);
+        logf_("[lock] --fg-rt-mode %s%s: frameRenderTime = %s (source: the game's own"
+              " present clock, frames[].frame_qpc_ms)\n",
+              (g_fg_rt_mode == kFgRtAuto) ? "auto" : fg_rt_mode_name(),
+              (g_fg_rt_mode == kFgRtAuto) ? " (default)" : "", what);
     }
     if (g_interp_auto) {
         logf_("[lock] --interp-auto (%s): the interpolation count follows the measured"
@@ -749,9 +760,10 @@ int main()
     logf_("[lock] --upsample: ON by default - MV/depth 150%% transfer, reconstructed to the"
           " input picture size before tagging\n");
     logf_("[lock] locked cadence: interp=%d (%dx per input), report every %d frames;"
-          " the game's own limiter must hold the input rate%s\n",
+          " slot gate: %s%s\n",
           g_fg_interp, g_fg_interp + 1, 40,
-          (g_lock_fps > 1.0) ? " (--lock also drops early captures)" : "");
+          g_slot_gate ? "on (drops the surplus on the game clock)" : "off",
+          (g_lock_fps > 1.0) ? "; --lock also drops early captures" : "");
 
     logf_("[lock] mode: fg=%s den=%d scale=%.2f buffers=%u pool=%u latency=%u tearing=%d"
           " xell=%s(mode %d) inputs=%s sharp=%.2f colour=%d interp=%d unlock=%d down=%d\n",
