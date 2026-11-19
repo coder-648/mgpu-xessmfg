@@ -11,7 +11,7 @@ XeSS-FG 插帧，再叠加回游戏窗口。支持固定 **2x / 3x / 4x**。
 
 1. 把压缩包解压到任意可写目录，例如 `D:\lock_frame`。
    **不要只解压到游戏目录里。**
-2. 双击 `lock_frame_ui.exe`（或 `run_ui.bat`）。
+2. 双击 `lock_frame_ui.exe`。
 3. 第一次启动会出现欢迎页，点「知道了，开始」。
 
 需要：Windows 10 1903+ / Windows 11、D3D12、游戏支持 DLSS 帧生成、无边框/窗口化全屏。
@@ -42,7 +42,6 @@ XeSS-FG 插帧，再叠加回游戏窗口。支持固定 **2x / 3x / 4x**。
 | `lock_frame_ui.ini` | 索引 + 全局 UI 偏好（语言/缩放/最近游戏） |
 | `profiles\<游戏名>.ini` | **每个游戏一份完整配置**（倍率/输入源/MV/GPU/OSD…） |
 | `lock_frame_ui.log` / `lock_frame_ui_HHMMSS.txt` | 日志（保留最近 8 份运行日志） |
-| `deploy_game.bat` | 命令行安装（等价于 UI 的"安装"） |
 | `collect_diagnostics.bat` | 生成诊断包（本地，不上传） |
 
 游戏目录里还会有：`fakerFG.ini`（游戏侧配置）与 `fakerFG.ini.bak_<时间>`（最近 8 份备份）。
@@ -54,12 +53,19 @@ XeSS-FG 插帧，再叠加回游戏窗口。支持固定 **2x / 3x / 4x**。
 - **3x/4x 实际只有 2x**：确认 `libxell.dll` 在工具目录；部分游戏只支持 2x。
 - **画面撕裂/菜单点不动**：高级设置里检查 `分层窗口 / 输入转发 / OSD`，或先试 2x。
 - **改了配置没生效**：游戏侧 `fakerFG.ini` 每次进游戏只读一次，改完要重启游戏。
-- **想恢复原样**：点「还原 / 移除组件」，或运行 `deploy_game.bat` 同目录的还原逻辑。
+- **想恢复原样**：点「还原 / 移除组件」（会恢复游戏原来的 `dxgi.dll` 并删除组件）。
 - **反馈问题**：运行 `collect_diagnostics.bat`，把 zip 和日志一起提供。
 
 更多排障见 `docs/TROUBLESHOOTING.md`；玩法与原理见 `docs/SUPPORTED-GAMES.md` 与本仓库文档。
 
-## 五、许可
+## 五、卸载
+
+- 只卸载某个游戏：选中它 →「还原 / 移除组件」；
+- 完全卸载：删掉整个工具目录即可（不写注册表、不写 AppData）；
+- 游戏目录里如需手工清理：删除 `dxgi.dll`、`fakerFG.dll`、`nvngx_dlssg.dll`、
+  `xess_mfg_producer.dll`，并把 `dxgi.dll.bak` / `nvngx_dlssg_real.dll` 改回原名。
+
+## 六、许可
 
 - 本体：GPL-3.0（见 `LICENSE` / `NOTICE`），对应源码见同版本 `-src.zip`。
 - 随包 Intel XeSS 运行时按 Intel 许可原样再分发（见 `INTEL-XESS-LICENSE.txt`），未修改。

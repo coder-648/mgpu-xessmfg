@@ -53,13 +53,6 @@ cp -f "$REPO/build/lock_frame_ui.exe"         "$OUT/"
 cp -f "$REPO/build/fakerFG.dll"               "$OUT/"
 cp -f "$REPO/build/xess_mfg_producer.dll"      "$OUT/"
 cp -f "$HERE/fakerFG.ini"                     "$OUT/"
-cp -f "$HERE/run_ui.bat"                      "$OUT/"
-cp -f "$HERE/run_2x.bat"                      "$OUT/"
-cp -f "$HERE/run_3x.bat"                      "$OUT/"
-cp -f "$HERE/run_4x.bat"                      "$OUT/"
-cp -f "$HERE/run_30x4.bat"                    "$OUT/"
-cp -f "$HERE/run_40x3.bat"                    "$OUT/"
-cp -f "$HERE/deploy_game.bat"                 "$OUT/"
 cp -f "$HERE/collect_diagnostics.bat"         "$OUT/"
 cp -f "$HERE/README.md"                       "$OUT/README.md"
 # 发布说明按版本取；没有对应文件时退回 1.0.0（保持旧版本可复现打包）。
@@ -68,7 +61,6 @@ if [ -f "$HERE/docs/RELEASE_NOTES_$VER.md" ]; then
 else
     cp -f "$HERE/docs/RELEASE_NOTES_1.0.0.md" "$OUT/RELEASE_NOTES.md"
 fi
-cp -f "$REPO/CHANGELOG.md"                    "$OUT/CHANGELOG.md"
 cp -f "$REPO/LICENSE"                         "$OUT/"
 cp -f "$REPO/NOTICE"                          "$OUT/"
 
@@ -92,29 +84,6 @@ else
 EOF
 fi
 
-cat > "$OUT/docs/DEPLOY.md" <<'EOF'
-# 部署到游戏
-
-1. 把整个发布包解压到一个可写目录（不要只解压到游戏目录）。
-2. 以管理员/普通权限运行：
-
-   ```bat
-   deploy_game.bat "F:\steam\steamapps\common\PBZ\platform\steam"
-   ```
-
-   它会：
-   - 把游戏自己的 `nvngx_dlssg.dll` 保留为 `nvngx_dlssg_real.dll`；
-   - 备份原有 `dxgi.dll` 为 `dxgi.dll.bak`；
-   - 写入 `fakerFG.dll` / `dxgi.dll` / `nvngx_dlssg.dll` / `xess_mfg_producer.dll`；
-   - 只在缺失时放入 `fakerFG.ini`。
-3. 把 `libxess_fg.dll` / `libxell.dll` 放到**发布包目录**（与 `lock_frame_ui.exe`
-   同目录），不要放进游戏目录。
-4. 启动游戏，进到画面并开启 DLSS Frame Generation；再运行 `lock_frame_ui.exe`。
-5. 在 UI 里选择游戏窗口、固定倍率、fakerFG 输入源，点击启动。
-
-卸载见 `UNINSTALL.md`。
-EOF
-
 # --- docs --------------------------------------------------------------------
 cat > "$OUT/docs/SUPPORTED-GAMES.md" <<'EOF'
 # 已验证游戏
@@ -134,8 +103,8 @@ EOF
 cat > "$OUT/docs/TROUBLESHOOTING.md" <<'EOF'
 # 排障
 
-1. **UI 显示“缺少 libxess_fg.dll”**
-   把 Intel XeSS 的 `libxess_fg.dll`、`libxell.dll` 放到 UI 同目录。
+1. **提示缺少 libxess_fg.dll / libxell.dll**
+   本包默认自带这两个 DLL；如果手动删掉了，从原压缩包重新解压一份放回 UI 同目录。
 2. **启动后没有画面 / 一直 1X**
    确认游戏目录的 `fakerFG.ini` 是 `FgInput=DLSSG`、`FgOutput=Capture`、
    `Passthrough=0`；确认游戏已开启 DLSS Frame Generation（或对应输入 API）。
@@ -149,40 +118,6 @@ cat > "$OUT/docs/TROUBLESHOOTING.md" <<'EOF'
 6. **需要反馈问题**
    运行 `collect_diagnostics.bat`，把生成的 zip 发给支持者；它只收集日志、
    版本、系统/显卡/显示模式信息，不联网、不上传。
-EOF
-
-cat > "$OUT/docs/UNINSTALL.md" <<'EOF'
-# 卸载
-
-1. 从游戏目录删除 `fakerFG.dll`、`dxgi.dll`、`xess_mfg_producer.dll`
-   （如果这些文件是本项目放入的）。
-2. 恢复部署前的备份（如有 `*.bak` / `nvngx_dlssg_real.dll`）。
-3. 删除 `lock_frame.exe`、`lock_frame_ui.exe`、`fakerFG.ini` 以及本项目生成的
-   `*_fakerFG.log` / `*_mfg_producer.log` / `lock_frame_ui*.txt`。
-EOF
-
-cat > "$OUT/README.txt" <<EOF
-lock_frame $VER（共享协议 v$PROTO）
-
-1. 解压到一个可写目录（不要只解压到游戏目录）。
-2. 运行：
-     deploy_game.bat "游戏 exe 目录"
-3. 把 libxess_fg.dll / libxell.dll 放到本目录（与 lock_frame_ui.exe 同目录）。
-4. 启动游戏，进画面，开启 DLSS Frame Generation。
-5. 运行 lock_frame_ui.exe：
-     - 选择游戏窗口
-     - 固定倍率：2x / 3x / 4x（120Hz 面板分别锁 60/40/30 fps）
-     - fakerFG 输入源：DLSSG（推荐）
-     - 点启动
-6. 排障：docs/TROUBLESHOOTING.md；反馈前运行 collect_diagnostics.bat。
-
-文件：
-  lock_frame.exe / lock_frame_ui.exe   消费端与前端
-  fakerFG.dll                         游戏侧代理（deploy_game 复制为 dxgi.dll 等）
-  xess_mfg_producer.dll               跨卡传输
-  fakerFG.ini                         游戏侧配置模板（deploy_game 只在缺失时放入）
-
-许可证：GPL-3.0，见 LICENSE / NOTICE。对应源码见同版本 -src.zip。
 EOF
 
 # --- manifest + checksums ----------------------------------------------------

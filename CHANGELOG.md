@@ -3,7 +3,20 @@
 只记**用户能感知**的变化与对应实测依据。每条结论的原始数据在
 `docs/findings/PERF_BASELINE.md` / `FINAL_CONFIG.md`。
 
-### refactor(config): 每个游戏一个配置文件 profiles\<游戏名>.ini（旧档案自动迁移）(2026-11-19)
+### chore(release): 精简发布包（1.2.0 独立软件形态）(2026-11-19)
+
+- 移除与 GUI 重复/无关的文件：`deploy_game.bat`、`run_2x/3x/4x/30x4/40x3.bat`、
+  `run_ui.bat`、`README.txt`、`CHANGELOG.md`、`docs/DEPLOY.md`、`docs/UNINSTALL.md`。
+- 包内现在只剩运行所需 + 必要说明：两个 exe、`fakerFG.dll`、`xess_mfg_producer.dll`、
+  `fakerFG.ini`、Intel 运行时（`libxess_fg.dll` / `libxell.dll`）、
+  `collect_diagnostics.bat`、`README.md`、`RELEASE_NOTES.md`、`LICENSE`、`NOTICE`、
+  Intel 许可、`docs/TROUBLESHOOTING.md`、`docs/SUPPORTED-GAMES.md`、
+  `manifest.json`、`SHA256SUMS.txt`，外加空 `profiles/` 目录。
+- `check_release.py` 的必需文件同步调整（不再要求 bat 安装脚本 / README.txt）。
+- 卸载说明并入包内 README；还原仍由 UI 的「还原 / 移除组件」完成。
+
+实测：打包校验 17 文件通过；从下载目录启动 `sha256: checked=16 bad=0`。
+
 
 - **存储拆分**：
   - `<exe>\lock_frame_ui.ini` 只保留索引：`[games] count=N` + 每项 `[gameN] path=profiles\xxx.ini, name=...`；
