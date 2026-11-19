@@ -1,96 +1,108 @@
 # mgpu / lock_frame
 
-**把游戏的渲染和帧生成拆到两块 GPU 上。** 游戏照常在自己的卡上渲染 + 超分；
-`lock_frame` 在另一块卡上用 XeSS-FG 插帧，再叠加到游戏窗口上屏。
+**把游戏的渲染和帧生成拆到两块 GPU 上。** 游戏照常在自己的显卡上渲染 + 超分，
+`lock_frame` 在另一块显卡上用 XeSS-FG 插帧，再叠加回游戏窗口上屏——
+目标是在不换显卡的情况下把帧数翻倍到 4 倍。
 
-当前正式版：**lock_frame 1.0.0**，共享协议 **v28**，开源 **GPL-3.0**。
-详细文档：[`lock_frame/docs/README.md`](lock_frame/docs/README.md)。
+当前正式版：**lock_frame 1.2.0**（共享协议 v28，GPL-3.0）。
+发布包**自带 Intel 运行时**（`libxess_fg.dll` / `libxell.dll`），解压即用。
 
-> 当前主线是 `lock_frame/`。`src/` 下的实现是同一套技术的早期版本/实验代码，
-> 保留用于对照与历史追溯；发布和使用以 `lock_frame/` 为准。
+![主界面](docs/bilibili/images/01-main.png)
 
-## 核心要点
+> 小白向图文教程：[`docs/bilibili/使用说明.md`](docs/bilibili/使用说明.md)（可直接发 B 站专栏）。
+> 详细技术文档：[`lock_frame/docs/README.md`](lock_frame/docs/README.md)。
 
-- 颜色走 WGC，不再从渲染卡复制 4K 颜色；跨卡只传 MV + depth。
-- MV/depth 默认 `StreamPercent=150`（每维 2/3，字节 4/9），消费卡联合重建。
-- 颜色四角 marker（seq12 + ms12 + CRC8）与 producer frame_id 精确配对；
-  配不上就本帧 1X，不猜槽。
-- 固定倍率 2x / 3x / 4x；120Hz 面板分别锁 60 / 40 / 30 fps，输出恒定 120。
-- 32 槽 publication ring 吸收 WGC 异步延迟；健康状态机 + 光流降级 +
-  session/ACK 恢复。
+## 这个工具适合谁
+
+- 有两块显卡（核显 + 独显，或两张独显），想把游戏帧数再往上推；
+- 游戏本身支持 **DLSS Frame Generation**，并且能开 **无边框 / 窗口化全屏**；
+- 单机 / 离线游戏。
+
+**不适合**：带反作弊的在线游戏、必须独占全屏的游戏、只有一块显卡还想零损耗的用户
+（单卡能跑，但会和游戏抢性能）。
+
+## 5 分钟上手
+
+1. **解压**发布包到任意可写目录（不要只解压进游戏目录），双击 `lock_frame_ui.exe`。
+2. 首次启动看欢迎页 → 点「知道了，开始」。
+3. 点「当前游戏」卡片右上角的 **选择游戏** → 「添加 exe…」选中游戏主程序
+   （例如 `Cyberpunk2077.exe`），列表里点它一下即可。
+4. 回到主界面点 **安装 / 应用配置**：会把组件装进游戏目录，并把你当前的配置
+   写进游戏里的 `fakerFG.ini`。
+5. 启动游戏、进画面、开启 **DLSS 帧生成**（无边框 / 窗口化全屏），回到工具点 **刷新**：
+   窗口和 producer 就绪后，「启动补帧」按钮亮起，点它即可。
+
+| 选择游戏 | 高级设置 |
+|---|---|
+| ![选择游戏](docs/bilibili/images/02-choose.png) | ![高级设置](docs/bilibili/images/03-advanced.png) |
+
+```text
+首次启动
+  └─ 选择游戏（添加 exe） → 安装 / 应用配置
+        └─ 进游戏（无边框 + DLSS FG） → 刷新 → 启动补帧
+              └─ 想调参数：操作行的「高级设置」（改的是当前游戏的配置）
+```
+
+## 每个游戏的配置存在哪
+
+- 主配置（索引 + 全局 UI 偏好）：`lock_frame_ui.ini`
+- 单游戏配置：`profiles\<游戏名>.ini`（倍率、输入源、MV 比例、GPU、OSD…全部在这里）
+- 游戏侧配置：`<游戏目录>\fakerFG.ini`（安装/重新应用时写入，改前自动备份，保留 8 份）
+- 日志：`lock_frame_ui.log` 与 `lock_frame_ui_HHMMSS.txt`
+
+全部在 exe 旁边，便携式，不写注册表 / AppData。
 
 ## 核心功能
 
 | 功能 | 说明 |
 |---|---|
-| 固定倍率 | 2x / 3x / 4x（`--mode 2x / 3x / 4x`；旧 `30x4/40x3` 为别名） |
-| fakerFG 输入源 | DLSSG（默认，已实测）/ NVNGX / Upscaler / FSR |
-| 颜色 | WGC，scRGB/HDR 原样；SDR/HDR10 输出可切 |
-| 配对 | 四角 marker 精确匹配；失败 1X；重复帧按 seq12 去重 |
-| 降级 | 无 MV/配对失败走 FidelityFX 光流；depth-only 游戏可用 |
-| 恢复 | 64 帧健康窗口；持续错位才 reset；consumer 重连新 session |
-| UI | 选窗口、倍率、输入源；目标显示器刷新率；环境自检；日志轮转 |
-| 诊断 | `pair:` / OSD `mvN` / `--dump` / `collect_diagnostics.bat` |
+| 固定倍率 | 2x / 3x / 4x（120Hz 面板建议锁 60 / 40 / 30 fps） |
+| fakerFG 输入源 | DLSSG（默认）/ NVNGX / Upscaler / FSR |
+| 就绪检查 | 安装、Intel 运行时、游戏窗口、producer、fakerFG.ini 五项状态 |
+| 安装 / 还原 | 一键部署（自动备份 `dxgi.dll`）与一键还原；游戏运行中会拦截 |
+| 配置管理 | 一游戏一配置（`profiles\*.ini`），点名字可重命名，ini 漂移会提示重新应用 |
+| 诊断 | 一键诊断包、内嵌 400 行日志、`pair:`/OSD 指标 |
+| 界面 | 中/英双语、DPI 缩放、键盘操作、UIA 读屏 |
 
-## 核心数据
 
-| 项目 | 实测/默认 |
-|---|---|
-| 4x（旧 30x4）长跑 | 精确配对约 99.2%，输出约 99.77%，`show=118~120` |
-| 3x（旧 40x3）稳态 | `exact=40 no_slot=0`，`presents=120/120` |
-| 延迟（120Hz 填满） | 2x@60 ≈ 40–48ms；3x@40 ≈ 55–65ms；4x@30 ≈ 73–82ms |
-| 跨卡流量（4K，150%） | MV+depth ≈ 28MB/帧（不再传 4K 颜色） |
-| 共享 ring | 32 槽；v28 控制块与数据区分离 |
-| 2x 依赖 | 原版 `libxess_fg` 即可 |
-| 3x/4x 依赖 | `--unlock-mfg`；实测 `libxess_fg 1.3.1.78` / `libxell 1.3.2.10` |
+## 已知限制（1.2.0）
 
-## 使用条件
+- 全局扫描（Steam/Epic/GOG/注册表批量导入）暂从界面下线，改为手动添加 exe。
+- 中文重命名依赖输入法提交字符，暂没有 IME 候选浮层。
+- 没有“删除游戏配置”按钮：删掉 `profiles\*.ini` 后重启 UI 即可。
+- 仅单机/离线使用；请勿用于带反作弊的在线游戏。
 
-- Windows 10 1903+ / Windows 11，D3D12。
-- 推荐双 GPU：游戏渲染卡 + 帧生成卡；单卡可跑但不建议。
-- 游戏无边框/窗口化全屏；开启 DLSS Frame Generation（或对应输入 API）。
-- 自备 `libxess_fg.dll` / `libxell.dll`（正式包默认不分发）。
-- 仅单机/离线；不要在带反作弊的在线游戏中使用。
+## 从源码构建
 
-## 快速开始
+```bash
+./lock_frame/build.sh ui        # 只构建 UI → build/lock_frame_ui.exe
+./lock_frame/build.sh all       # consumer / producer / fakerFG / UI
+./lock_frame/release.sh         # 打 dist/lock_frame-<ver>.zip（默认含 Intel 运行时）
+WITH_XESS=0 ./lock_frame/release.sh   # 精简包（不含 Intel DLL）
+```
 
-1. 解压发布包，运行 `deploy_game.bat "游戏 exe 目录"`。
-2. 把 `libxess_fg.dll` / `libxell.dll` 放到 `lock_frame_ui.exe` 同目录。
-3. 启动游戏，开启 DLSS Frame Generation，锁到建议输入帧率。
-4. 运行 `lock_frame_ui.exe`：选窗口、2x/3x/4x、输入源 DLSSG，启动。
+依赖：Windows SDK（含 `fxc`）、MSVC、Git Bash/WSL、Python 3。
+详细构建与依赖说明见 `lock_frame/docs/ops/BUILD.md` 与 `docs/ops/DEPENDENCIES.md`。
 
-## 项目结构
+## 目录
 
-| 路径 | 内容 |
-|---|---|
-| `lock_frame/` | 当前正式版：consumer、producer、fakerFG、UI、构建/发布 |
-| `lock_frame/docs/` | 规划、发布说明、测试步骤、配置 |
-| `docs/` | 架构、协议、性能基线、踩坑记录（含早期链路） |
-| `src/` | 早期实现/实验代码（legacy/对照） |
-| `third_party/` | 本地依赖，整体不入库；按 `docs/ops/DEPENDENCIES.md` 获取 |
-| `lock_frame/third_party/nlohmann/` | 唯一随仓库跟踪的第三方源码（MIT） |
+```
+lock_frame/            当前主线：consumer、producer、fakerFG、UI、发布脚本
+lock_frame/ui/         可视化客户端（mgpu_ui.cpp）
+lock_frame/docs/       技术文档、发布说明、UI 设计
+docs/bilibili/         B 站专栏图文（使用说明 + 截图）
+src/                   早期实验实现（保留对照，发布以 lock_frame/ 为准）
+third_party/           第三方依赖与许可（不入库，按 NOTICE 获取）
+```
 
-## 已知边界
+## 许可证与第三方
 
-- 非整除刷新率（如 165Hz）不承诺完美节奏；UI 会提示。
-- 3x/4x 的字节补丁只对实测版本成立；失败会回退并打日志。
-- NVNGX / Upscaler / FSR 输入源为实验性；DLSSG 为正式支持。
-- 低帧自适应默认关闭；开启后可能有轻微 flicker/ghosting。
-- 正式包未签名；用 `SHA256SUMS.txt` 校验。
+- 项目本体：**GPL-3.0**（见 `LICENSE` / `NOTICE`）。
+- 随包的 Intel XeSS 运行时按 Intel 许可原样再分发（见包内
+  `INTEL-XESS-LICENSE.txt`），未做任何修改。
+- 其他第三方组件与许可见 `NOTICE` 与 `docs/ops/LEGAL.md`。
 
-## 第三方与许可
+## 反馈
 
-本项目 GPL-3.0（`LICENSE`）。第三方逐项见 `NOTICE` 与
-`docs/ops/LEGAL.md`；`third_party/` 整体不入库。主要项目：
-
-- OptiScaler（GPL-3.0）
-- AMD FidelityFX SDK（MIT / AMD 许可）
-- Universal MFG Unlocker（MIT）
-- nlohmann/json（MIT）
-- MinHook（BSD-2-Clause）
-- ReShade（BSD-3-Clause）
-- Intel XeSS SDK（Intel 许可；默认不分发）
-- NVIDIA DLSS SDK / Streamline（NVIDIA 许可）
-- Magpie（GPL-3.0）
-- dlssg_for_sm86（GPL-3.0；NVIDIA 组件不转授权）
-- Microsoft Windows SDK / DirectX 12
+- 先跑一次「一键诊断」，把生成的 zip 和 `lock_frame_ui.log` 一起提供；
+- 说明游戏名、显卡型号、是否开启 DLSS FG、使用的倍率。
