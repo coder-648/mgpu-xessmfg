@@ -24,9 +24,16 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <shellapi.h>
+#include <commdlg.h>
 #include <dwmapi.h>
 #include <tlhelp32.h>
 #include <dxgi.h>
+#include <bcrypt.h>
+#include <objbase.h>
+#include <oleauto.h>
+#include <UIAutomationCore.h>
+#include <UIAutomationCoreApi.h>
+#include <UIAutomationClient.h>
 #include <cstdarg>
 #include <cstring>
 
@@ -34,6 +41,8 @@
 #include "version.h"
 
 #include <atomic>
+#include <ctime>
+#include <deque>
 #include <string>
 #include <vector>
 #include <cstdio>
@@ -43,8 +52,203 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "uiautomationcore.lib")
+
+// ------------------------------------------------------------------- language
+// 集中式翻译：静态文案在绘制时查表（txt / 提示框），带参数的动态文案在构造处
+// 用 T(zh,en) 选择。查不到就回退中文，保证不会出现空白。
+static int g_lang = 0;      // 0 = 中文，1 = English
+
+struct TrPair { const wchar_t* zh; const wchar_t* en; };
+static const TrPair kTr[] = {
+    // 标题 / 侧栏
+    { L"MGPU  双显卡帧生成", L"MGPU  Dual-GPU FG" },
+    { L"游戏配置", L"Game profiles" },
+    { L"当前游戏", L"Current game" },
+    { L"（还没有选择）", L"(none selected)" },
+    { L"用[游戏库]扫描或手动选 exe", L"Scan the library or pick an exe" },
+    { L"帮助 / 快捷键 (F1)", L"Help / shortcuts (F1)" },
+    { L"高级设置", L"Advanced settings" },
+    { L"收起高级设置", L"Hide advanced settings" },
+    // 三步卡
+    { L"把锁帧组件装进游戏", L"Install lock_frame into the game" },
+    { L"进入游戏画面", L"Get into the game" },
+    { L"选择倍率并启动", L"Pick a multiplier and start" },
+    { L"选择游戏 exe 并安装", L"Pick game exe and install" },
+    { L"还原游戏目录", L"Restore folder" },
+    { L"游戏库 / 扫描", L"Game library / scan" },
+    { L"（点这里选择游戏窗口）", L"(click to choose the game window)" },
+    { L"刷新", L"Refresh" },
+    { L"建议游戏内锁 %.0f fps（%dx → 输出 %u fps）", L"Lock %.0f fps in game (%dx -> %u fps output)" },
+    { L"建议锁 %.1f fps（%u Hz 不能被 %dx 整除，节奏不会完美）", L"Lock %.1f fps (%u Hz not divisible by %dx; pacing will not be perfect)" },
+    { L"启动", L"Start" },
+    { L"停止", L"Stop" },
+    { L"输入 %.1f fps", L"input %.1f fps" },
+    // 状态卡
+    { L"运行状态", L"Status" },
+    { L"游戏侧安装", L"Game install" },
+    { L"Intel 运行时", L"Intel runtime" },
+    { L"查看日志", L"View log" },
+    { L"一键诊断", L"Diagnostics" },
+    { L"需要细调（GPU / 色彩 / 热键 / 帧池）？点[高级设置]；快捷键与常见问题按 F1。",
+      L"Need tuning (GPU / colour / hotkey / frame pool)? Click [Advanced]; press F1 for shortcuts and FAQ." },
+    // 帮助面板
+    { L"帮助与快捷键", L"Help and shortcuts" },
+    { L"关闭", L"Close" },
+    { L"三步开始", L"Three steps" },
+    { L"1. 装进游戏：点[选择游戏 exe 并安装]，或用[游戏库 / 扫描]自动找 Steam 游戏。",
+      L"1. Install: click [Pick game exe and install], or use [Game library / scan] to find Steam games." },
+    { L"2. 进游戏：无边框 / 窗口化全屏，开启 DLSS 帧生成；游戏起来后窗口会自动选中。",
+      L"2. In game: borderless fullscreen + DLSS Frame Generation; the window is auto-selected." },
+    { L"3. 倍率 + 启动：选 2x / 3x / 4x，按建议锁帧，点[启动]。",
+      L"3. Multiplier + start: pick 2x / 3x / 4x, apply the suggested in-game lock, click [Start]." },
+    { L"快捷键", L"Shortcuts" },
+    { L"Tab / Shift+Tab 切换焦点　Enter / Space 触发　Esc 关闭面板",
+      L"Tab / Shift+Tab move focus    Enter / Space activate    Esc close panel" },
+    { L"PageUp / PageDown / Home / End：列表翻页　F1：打开本帮助",
+      L"PageUp / PageDown / Home / End: page lists    F1: open this help" },
+    { L"常见问题", L"FAQ" },
+    { L"看不到游戏窗口：先进实际画面再点[刷新]；确认游戏不是独占全屏。",
+      L"No game window: reach the in-game scene, click [Refresh]; avoid exclusive fullscreen." },
+    { L"状态是“部分插帧”：HUD 可能挡住画面四角，或窗口被缩放。",
+      L"Status shows partial frame generation: a HUD may cover the screen corners, or the window is scaled." },
+    { L"只有 1 块 GPU：能跑，但插帧会和游戏抢性能；建议双卡。",
+      L"Only one GPU: it runs, but frame generation competes with the game; two GPUs are recommended." },
+    // 游戏库 / 日志
+    { L"游戏库（%d）", L"Game library (%d)" },
+    { L"扫描本机", L"Scan this PC" },
+    { L"手动 exe", L"Manual exe" },
+    { L"使用此游戏", L"Use this game" },
+    { L"安装 / 更新", L"Install / update" },
+    { L"还原", L"Restore" },
+    { L"删除", L"Remove" },
+    { L"还没有游戏。点右上角[扫描本机]（Steam / Epic / GOG / 注册表），或[手动 exe]。",
+      L"No games yet. Click [Scan this PC] (Steam / Epic / GOG / registry), or [Manual exe]." },
+    { L"运行日志（最近 400 行）", L"Runtime log (last 400 lines)" },
+    { L"复制全部", L"Copy all" },
+    { L"打开目录", L"Open folder" },
+    { L"（还没有日志：点「启动」跑一次消费端，这里会显示它的输出）",
+      L"(no log yet: click [Start] once and the consumer output will show here)" },
+    // 抽屉：卡片与行
+    { L"帧生成", L"Frame generation" },
+    { L"环境自检", L"Self-check" },
+    { L"游戏侧配置", L"Game-side config" },
+    { L"捕获", L"Capture" },
+    { L"启动", L"Launch" },
+    { L"GPU / 显示器", L"GPU / display" },
+    { L"叠加层", L"Overlay" },
+    { L"类型", L"Type" },
+    { L"固定倍率", L"Fixed multiplier" },
+    { L"输出", L"Output" },
+    { L"MV/深度重建", L"MV/depth rebuild" },
+    { L"fakerFG 输入源", L"fakerFG input" },
+    { L"MV/深度传输比例", L"MV/depth transfer" },
+    { L"游戏侧日志 (Log)", L"Game-side log (Log)" },
+    { L"100%（1:1，最清晰）", L"100% (1:1, sharpest)" },
+    { L"150%（默认，每维 2/3）", L"150% (default, 2/3 each)" },
+    { L"200%（每维 1/2）", L"200% (1/2 each)" },
+    { L"400%（每维 1/4，最省）", L"400% (1/4 each, lightest)" },
+    { L"游戏配置", L"Game config" },
+    { L"版本", L"Version" },
+    { L"GPU", L"GPU" },
+    { L"XeSS 运行时", L"XeSS runtime" },
+    { L"游戏配置检查", L"Game config check" },
+    { L"安装包完整性", L"Package integrity" },
+    { L"捕获 API", L"Capture API" },
+    { L"MV/深度传输", L"MV/depth transfer" },
+    { L"色彩空间", L"Colour space" },
+    { L"帧池深度", L"Frame pool" },
+    { L"最大帧延迟数", L"Max frame latency" },
+    { L"帧生成用的 GPU", L"Frame-generation GPU" },
+    { L"输出显示器（只读）", L"Output display (read-only)" },
+    { L"界面缩放", L"UI scale" },
+    { L"界面语言 / Language", L"Language" },
+    { L"游戏窗口", L"Game window" },
+    { L"开关热键（点击可改）", L"Toggle hotkey (click to change)" },
+    { L"建议锁帧", L"Suggested lock" },
+    { L"启动命令", L"Command line" },
+    { L"分层窗口 (A/B)", L"Layered window (A/B)" },
+    { L"输入转发 (A/B)", L"Input relay (A/B)" },
+    { L"单行 OSD", L"Single-line OSD" },
+    // 抽屉：选项
+    { L"1:1 原生", L"1:1 native" },
+    { L"5K -> 4K (0.75x)", L"5K -> 4K (0.75x)" },
+    { L"半分辨率", L"Half resolution" },
+    { L"HDR10（默认）", L"HDR10 (default)" },
+    { L"SDR（BT.709）", L"SDR (BT.709)" },
+    { L"DLSSG（推荐）", L"DLSSG (recommended)" },
+    { L"自动（跟随系统）", L"Auto (system DPI)" },
+    { L"自动（窗口所在显示器 / 避开游戏卡）", L"Auto (window monitor / avoid game GPU)" },
+    { L"30 fps", L"30 fps" },
+    { L"24 fps", L"24 fps" },
+    { L"40 fps", L"40 fps" },
+    { L"60 fps", L"60 fps" },
+    { L"前景窗口 (鼠标点进游戏再按热键)", L"Foreground window (click into the game, then hotkey)" },
+    { L"上一次启动的窗口", L"Last launched window" },
+    // 自检 / 信息行（静态）
+    { L"按 fakerFG.ini 的 StreamPercent", L"from fakerFG.ini StreamPercent" },
+    { L"→ 输入画面尺寸（默认开）", L"-> input frame size (on by default)" },
+    { L"(未知)", L"(unknown)" },
+    { L"(先选择游戏窗口)", L"(select the game window first)" },
+    { L"未选择游戏或缺少 fakerFG.ini", L"No game selected or fakerFG.ini missing" },
+    { L"缺少 fakerFG.ini", L"fakerFG.ini missing" },
+    { L"FgOutput 不是 Capture", L"FgOutput is not Capture" },
+    { L"Passthrough=1（应为 0）", L"Passthrough=1 (should be 0)" },
+    { L"FgInput 为空", L"FgInput is empty" },
+    { L"面板刷新", L"Panel refresh" },
+    { L"按下新组合键...", L"Press a new hotkey..." },
+    { L"(无窗口)", L"(no window)" },
+    { L"(无)", L"(none)" },
+    { L"不锁帧", L"No lock" },
+    { L"缺少 libxess_fg.dll / libxell.dll", L"Missing libxess_fg.dll / libxell.dll" },
+    { L"缺少 libxell.dll", L"Missing libxell.dll" },
+    { L"缺少 libxess_fg.dll", L"Missing libxess_fg.dll" },
+    { L"未提供 SHA256SUMS.txt（开发构建）", L"SHA256SUMS.txt not provided (dev build)" },
+    { L"无匹配文件（开发构建）", L"No matching files (dev build)" },
+    { L"未校验", L"Not checked" },
+    { L"游戏库 · ", L"Library · " },
+    { L"v%s · 协议 v%u", L"v%s · protocol v%u" },
+    { L"完成", L"Done" },
+    { L"滚轮翻页 · Tab/上下切换 · Enter 激活 · Esc 收起",
+      L"Wheel to scroll · Tab/Up/Down to move · Enter to activate · Esc to close" },
+    { L"fakerFG.ini 路径", L"fakerFG.ini path" },
+    { L"自选 exe…", L"Pick exe…" },
+    { L"主程序…", L"Main exe…" },
+    { L"选择主程序", L"Choose the main executable" },
+    { L"按匹配分数排序；点击一行即设为主程序并保存", L"Sorted by match score; click a row to set it" },
+    { L"已设置主程序：", L"Main exe set: " },
+    { L"Esc 关闭 · 想换别的 exe 用[自选 exe…]", L"Esc to close · use [Pick exe...] for anything else" },
+    { L"主程序待解析", L"exe not resolved" },
+    { L"主程序：", L"exe: " },
+    { L"自选 exe 安装", L"Install selected exe" },
+    { L"安装到游戏", L"Install to game" },
+    { L"安装完成", L"Installed" },
+    { L"安装失败", L"Install failed" },
+    { L"已选择：", L"Selected: " },
+};
+static const wchar_t* tr_lookup(const wchar_t* zh)
+{
+    if (g_lang == 0 || zh == nullptr) { return nullptr; }
+    for (const TrPair& p : kTr) {
+        if (wcscmp(p.zh, zh) == 0) { return p.en; }
+    }
+    return nullptr;
+}
+
+static const wchar_t* T(const wchar_t* zh, const wchar_t* en)
+{
+    return (g_lang == 0) ? zh : en;
+}
+
+
+
+
 
 // ------------------------------------------------------------- GPU adapters
 // The UI used to show a hard-coded "AMD Radeon RX 6750 GRE" and always let bridge
@@ -87,6 +291,30 @@ static void enum_adapters()
 }
 
 // ------------------------------------------------------------------- theme
+// 整个界面按"逻辑像素"布局（1200x620 这套坐标保持不变），绘制时用
+// MM_ANISOTROPIC 把逻辑坐标映射到实际客户区。这样 125% / 150% / 200% 缩放下
+// 字号、卡片、点击区域一起变大，而不是缩成一小块看不清的窗口。
+static double g_scale = 1.0;
+static BOOL   g_dpi_aware = FALSE;
+static int    g_scale_pct = 0;     // 0 = 跟随系统；>=80 = 手动百分比（高级设置）
+
+static double dpi_scale_for(HWND h)
+{
+    UINT dpi = 96;
+    if (h != nullptr) { dpi = GetDpiForWindow(h); }
+    else              { dpi = GetDpiForSystem(); }
+    if (dpi < 96) { dpi = 96; }
+    return static_cast<double>(dpi) / 96.0;
+}
+
+static double effective_scale(HWND h)
+{
+    if (g_scale_pct >= 80 && g_scale_pct <= 300) {
+        return static_cast<double>(g_scale_pct) / 100.0;
+    }
+    return dpi_scale_for(h);
+}
+
 static const COLORREF C_BG        = RGB(24, 24, 24);   // window background
 static const COLORREF C_SIDEBAR   = RGB(20, 20, 20);   // left panel
 static const COLORREF C_CARD      = RGB(37, 37, 37);   // card body
@@ -102,6 +330,9 @@ static const COLORREF C_ACCENT    = RGB(90, 160, 240);
 static const COLORREF C_ON        = RGB(196, 196, 196);   // light track when on, like the reference
 static const COLORREF C_BTN       = RGB(52, 52, 52);
 static const COLORREF C_BTN_HOVER = RGB(68, 68, 68);
+static const COLORREF C_OK        = RGB(96, 190, 120);   // 就绪 / 正在插帧
+static const COLORREF C_WARN      = RGB(226, 180, 80);   // 可继续，但要注意
+static const COLORREF C_BAD       = RGB(220, 96, 96);    // 阻断 / 几乎没插帧
 
 // ------------------------------------------------------------------- state
 struct Profile;
@@ -113,6 +344,9 @@ struct State
     int  interp = 4;           // 由 fg_mode 推导的倍率（只用于显示）
     // fakerFG 侧输入源：0 DLSSG（推荐）, 1 NVNGX, 2 Upscaler, 3 FSR
     int  fg_input = 0;
+    // fakerFG.ini：MV/深度传输比例（100=1:1，150=每维 2/3，200=1/2，400=1/4）
+    int  stream_pct = 150;
+    bool fg_log = true;        // fakerFG.ini 的 Log
     // v30: the old per-frame multiplier (--interp-cadence, "low-fps adaptation") was
     // removed from the UI. It disabled the slot gate by design and changed the count every
     // batch, which flickers at 3x/4x; the continuous feed keeps slow scenes smooth instead.
@@ -215,11 +449,42 @@ static const int kHotkeyCount = (int)(sizeof(g_hotkeys) / sizeof(g_hotkeys[0]));
 // ------------------------------------------------------------------- globals
 static std::vector<Profile>  g_profiles;
 static int                   g_prof = 0;
+
+// 游戏库：按游戏目录（exe 所在目录）记住名称 / 倍率 / 输入源 / 锁帧。
+// 这样换游戏、标题变化、窗口重开都不用重新配一遍。
+struct GameEntry
+{
+    std::wstring root;      // 安装根目录（扫描得到，仅用于展示/继续查找）
+    std::wstring dir;       // 实际部署目录（游戏 exe 所在），可能为空
+    std::wstring exe;       // 解析出的主程序完整路径（可能为空 = 待解析）
+    std::wstring name;      // 显示名
+    std::wstring source;    // Steam / Epic / GOG / 注册表 / 手动
+    std::wstring profile;   // profiles\xxx.ini（相对 exe 目录；空=旧档案，待迁移）
+    int          mult = 2;
+    int          fg_input = 0;
+    int          lock = 0;          // 旧字段：= st.lock_fps，仅兼容旧档案
+    unsigned long long last_use = 0;
+    State        st;                // 这个游戏自己的完整配置（权威来源）
+};
+static std::vector<GameEntry> g_games;
+static size_t g_resolve_cursor = 0;   // 后台初始化：轮询到哪个条目
+static bool   g_pick_view = false;     // 主程序候选面板
+
+// 当前游戏名字的行内重命名（点击名字进入，Enter 保存 / Esc 取消）。
+static bool         g_name_edit = false;
+static bool         g_name_fresh = false;   // 刚进入编辑：首字符覆盖原名字
+static std::wstring g_name_buf;
+static RECT         g_name_hit{};
+static void name_edit_commit(bool save);
+static void name_edit_start();
 static std::vector<WinEntry> g_wins;
 static int                   g_win_sel = -1;
+static bool                  g_user_picked = false;   // 用户手动选过窗口就不再自动切换
+static HWND                  g_last_auto_hwnd = nullptr;
 
 static HWND    g_hwnd = nullptr;
 static HFONT   g_f_title = nullptr, g_f_card = nullptr, g_f_ui = nullptr, g_f_small = nullptr;
+static HFONT   g_f_mono = nullptr;
 static bool    g_running = false;
 static HANDLE  g_child = nullptr;
 static DWORD   g_child_pid = 0;
@@ -251,12 +516,65 @@ static int     g_scroll = 0;              // main area scroll offset (px)
 static int     g_content_h = 0;           // measured at paint time
 static int     g_hover_y = -1;            // hovered row (client coords)
 static int     g_hover_x = -1;
+static int     g_tip_id = 0;              // 当前悬停的控件（0 = 无）
+static DWORD   g_tip_since = 0;           // 悬停开始时间（>450ms 才显示说明）
 static int     g_popup_id = 0;            // dropdown id whose list is open (0 = none)
 static RECT    g_popup_rect{};            // where the closed control sits
 static int     g_popup_hover = -1;
 static bool    g_dragging = false;
 
-static State& S() { return g_profiles[g_prof].st; }
+// ------------------------------------------------------------- 内嵌日志查看器
+// 保留最近 400 行 consumer 输出 + UI 消息，供"看日志"面板显示。写文件仍然是
+// lock_frame_ui_HHMMSS.txt（完整日志），这里只是让用户不用离开界面。
+static std::deque<std::wstring>  g_log_lines;
+static std::vector<std::wstring> g_log_snap;
+static bool                      g_log_view = false;
+static int                       g_log_scroll = 0;
+static bool                      g_line_cs_ready = false;
+static bool                      g_show_cmd = false;   // 高级模式：启动命令默认折叠
+static bool                      g_welcome = false;    // 首次运行的三件事提示
+static bool                      g_help_view = false;  // 帮助 / 快捷键面板
+static std::wstring              g_sha_text = L"未校验";  // 安装包完整性（启动时一次）
+
+// ------------------------------------------------------- 简易模式 / 就绪状态
+// Default to the 3-step view. The old card view stays available as "高级设置"
+// and keeps its own state; switching only flips this flag.
+static bool                g_advanced = false;
+static std::wstring        g_game_dir;              // 游戏 exe 所在目录（部署目标）
+static std::atomic<int>    g_pair_exact{ 0 };       // 最近一个 report 窗口的 exact
+static std::atomic<int>    g_pair_total{ 0 };       // 最近一个 report 窗口的 total
+
+struct Ready
+{
+    bool deployed = false;      // 游戏目录里已有 fakerFG.dll + dxgi.dll
+    bool runtime  = false;      // libxess_fg.dll（3x/4x 还需要 libxell.dll）
+    bool window   = false;      // 下拉选中的窗口仍然存在
+    bool producer = false;      // 该进程已加载 xess_mfg_producer.dll
+    bool ini      = false;      // fakerFG.ini 是消费者链路配置
+};
+static Ready g_ready{};
+static bool  g_ini_drift = false;   // fakerFG.ini 与保存的配置不一致（被外部改过）
+
+
+// 有选中游戏时，配置属于这个游戏；没有选游戏时才落到"通用配置"（p0）。
+static void drawer_focus_step(int dir);                      // 抽屉键盘焦点
+static void close_advanced_silent();                         // 打开其它子页时收起抽屉
+static GameEntry* find_game_mut(const std::wstring& dir);   // 定义见 find_game
+static std::wstring norm_path(const std::wstring& p);        // 定义见 find_game 之前
+static void save_all();                                      // 定义见 remember_game 之后
+static bool game_entry_installed(const GameEntry& e);        // 定义见游戏库部分
+static void draw_dot(HDC dc, int cx, int cy, COLORREF c);    // 定义见绘制部分
+static void rescan_windows();                                // 定义见窗口枚举部分
+static State& S()
+{
+    if (!g_game_dir.empty()) {
+        GameEntry* e = find_game_mut(g_game_dir);
+        if (e != nullptr) { return e->st; }
+    }
+    if (g_profiles.empty()) { g_profiles.push_back(Profile{}); }
+    if (g_prof < 0 || g_prof >= (int)g_profiles.size()) { g_prof = 0; }
+    return g_profiles[(size_t)g_prof].st;
+}
 
 
 
@@ -265,15 +583,23 @@ enum Id
 {
     ID_NONE = 0,
     ID_FG_TYPE, ID_FG_MODE, ID_INTERP, ID_OUT, ID_PERF, ID_UPSAMPLE_INFO,
-    ID_FG_INPUT, ID_FG_INI,
+    ID_FG_INPUT, ID_FG_INI, ID_STREAM_PCT, ID_FG_LOG,
     ID_VERSION, ID_CHECK_GPU, ID_CHECK_RUNTIME, ID_CHECK_GAME,
     ID_CAP_API, ID_POOL, ID_LAT, ID_STREAM_INFO,
     ID_JITZ, ID_FOV, ID_NOMARKER, ID_UPSAMPLE, ID_STRAUTO, ID_STRASYM, ID_PREFETCH, ID_UI, ID_RT, ID_UNLOCK, ID_SLACK, ID_IVL,
     ID_OUTFPS, ID_HEAD_FIXED, ID_HEAD_DYN,
     ID_TEAR, ID_SDR, ID_LAYERED, ID_RELAY, ID_OSD,
-    ID_GPU, ID_GPUSEL, ID_DISPLAY,
+    ID_GPU, ID_GPUSEL, ID_DISPLAY, ID_UISCALE, ID_CHECK_SHA, ID_LANG,
     ID_TMODE, ID_TARGET, ID_HOTKEY, ID_LOCK, ID_CMD,
     ID_MIN, ID_CLOSE, ID_START, ID_ADD, ID_DEL,
+    // 简易模式（P0）：一键安装 / 还原、窗口、倍率、启动、诊断
+    ID_S_INSTALL, ID_S_UNDEPLOY, ID_S_WINDOW, ID_S_REFRESH, ID_S_START,
+    ID_S_2X, ID_S_3X, ID_S_4X, ID_S_DIAG, ID_S_LOGVIEW, ID_S_GAMELIB, ID_S_PICKEXE,
+    ID_S_HELP, ID_S_ADV,
+    // 内嵌日志查看器
+    ID_LOG_REFRESH, ID_LOG_CLOSE,
+    // 游戏库（下拉）
+    ID_GAMELIB,
 };
 
 enum RowKind { RK_INFO = 0, RK_DD, RK_SPIN, RK_TOG, RK_SLIDER, RK_CMDLINE, RK_EDIT, RK_HEAD };
@@ -293,14 +619,17 @@ static const RowDef kRowsFg[] = {
     // 消费端把收到的 MV/depth 联合重建到输入画面尺寸。
 };
 static const RowDef kRowsGame[] = {
-    { ID_FG_INPUT, L"fakerFG 输入源", RK_DD   },
-    { ID_FG_INI,   L"游戏配置",       RK_INFO },
+    { ID_FG_INPUT,   L"fakerFG 输入源",     RK_DD   },
+    { ID_STREAM_PCT, L"MV/深度传输比例",    RK_DD   },
+    { ID_FG_LOG,     L"游戏侧日志 (Log)",   RK_TOG  },
+    { ID_FG_INI,     L"fakerFG.ini 路径",   RK_INFO },
 };
 static const RowDef kRowsCheck[] = {
     { ID_VERSION,       L"版本",          RK_INFO },
     { ID_CHECK_GPU,     L"GPU",           RK_INFO },
     { ID_CHECK_RUNTIME, L"XeSS 运行时",   RK_INFO },
     { ID_CHECK_GAME,    L"游戏配置检查",  RK_INFO },
+    { ID_CHECK_SHA,     L"安装包完整性",  RK_INFO },
 };
 static const RowDef kRowsCap[] = {
     { ID_CAP_API, L"捕获 API",        RK_INFO },
@@ -314,6 +643,8 @@ static const RowDef kRowsCap[] = {
 static const RowDef kRowsDev[] = {
     { ID_GPUSEL,  L"帧生成用的 GPU",      RK_DD   },
     { ID_DISPLAY, L"输出显示器（只读）", RK_INFO },
+    { ID_UISCALE, L"界面缩放",           RK_DD   },
+    { ID_LANG,    L"界面语言 / Language", RK_DD   },
 };
 static const RowDef kRowsLaunch[] = {
     { ID_TARGET,  L"游戏窗口",             RK_DD   },
@@ -349,6 +680,11 @@ static const int kCardCount = (int)(sizeof(kCards) / sizeof(kCards[0]));
 // ------------------------------------------------------------------ options
 // 固定倍率：2x / 3x / 4x。显示文本按当前面板刷新率动态计算输入帧率。
 static const wchar_t* kOptFgInput[] = { L"DLSSG（推荐）", L"NVNGX", L"Upscaler", L"FSR" };
+// StreamPercent：100 = 1:1，150 = 每维 2/3，200 = 每维 1/2，400 = 每维 1/4
+static const wchar_t* kOptStream[] = {
+    L"100%（1:1，最清晰）", L"150%（默认，每维 2/3）", L"200%（每维 1/2）", L"400%（每维 1/4，最省）"
+};
+static const int kStreamPct[] = { 100, 150, 200, 400 };
 static const wchar_t* kFgInputIni[]  = { L"DLSSG", L"NVNGX", L"Upscaler", L"FSR" };
 static const wchar_t* kOptOut[]    = { L"1:1 原生", L"5K -> 4K (0.75x)", L"半分辨率" };
 static const wchar_t* kOptFov[]    = { L"55.0", L"58.7", L"60.0", L"65.0" };
@@ -356,13 +692,16 @@ static const wchar_t* kOptIvl[]    = { L"自动（倍数+1 vblank 余量）", L"
                                       L"25 ms (40 fps)", L"33 ms (30 fps)", L"41.7 ms (24 fps)" };
 static const wchar_t* kOptUi[]     = { L"关闭", L"自动" };
 static const wchar_t* kOptRt[]     = { L"ema", L"median (16 帧)" };
-static const wchar_t* kOptLock[]   = { L"关闭", L"30 fps", L"24 fps", L"40 fps", L"60 fps" };
+static const wchar_t* kOptLock[]   = { L"不锁帧", L"30 fps", L"24 fps", L"40 fps", L"60 fps" };
 static const wchar_t* kOptTMode[]  = { L"前景窗口 (鼠标点进游戏再按热键)", L"上一次启动的窗口" };
 // 色彩空间：我们捕获到的是 scRGB(FP16) 的 HDR 画面，默认按 HDR10（BT.2020 primaries + PQ）
 // 编码输出；--sdr 走 BT.709 + gamma 2.2 且告诉交换链这是 SDR。
 // 在 HDR 显示器上选 SDR 会看起来发灰/发闷（这是 SDR 在 HDR 屏上的正常表现，不是 bug），
 // 反之在 SDR 显示器上保持 HDR10 会发灰发亮。所以做成一个显式开关。
 static const wchar_t* kOptColor[]  = { L"HDR10（默认）", L"SDR（BT.709）" };
+static const wchar_t* kOptUiScale[] = { L"自动（跟随系统）", L"100%", L"110%", L"125%",
+                                       L"150%", L"175%", L"200%" };
+static const int      kUiScalePct[] = { 0, 100, 110, 125, 150, 175, 200 };
 static const double   kLockFps[]   = { 0.0, 30.0, 24.0, 40.0, 60.0 };
 
 static std::wstring hotkey_name();          // defined with the input handling
@@ -372,6 +711,7 @@ static int opt_count(Id id)
     switch (id) {
     case ID_FG_MODE: return 3;
     case ID_FG_INPUT: return 4;
+    case ID_STREAM_PCT: return 4;
     case ID_OUT:     return 3;
     case ID_SDR:     return 2;
     case ID_FOV:     return 4;
@@ -383,6 +723,8 @@ static int opt_count(Id id)
     case ID_TARGET:  return (int)g_wins.size();
     case ID_TMODE:   return 2;
     case ID_GPUSEL: return 1 + (int)g_adapters.size();
+    case ID_UISCALE: return 7;
+    case ID_LANG:    return 2;
     default:         return 0;
     }
 }
@@ -395,12 +737,18 @@ static const wchar_t* opt_text(Id id, int i)
         const int mul = (i < 0 || i > 2) ? 4 : (i + 2);      // 2x / 3x / 4x
         const unsigned hz = (g_refresh > 1) ? g_refresh : 120;
         wchar_t b[96]{};
-        _snwprintf_s(b, _TRUNCATE, L"%dx（输入 %.1f fps -> 输出 %u fps）",
-                     mul, static_cast<double>(hz) / static_cast<double>(mul), hz);
+        if (hz % static_cast<unsigned>(mul) == 0) {
+            _snwprintf_s(b, _TRUNCATE, T(L"%dx（%u→%u fps）", L"%dx (%u->%u fps)"), mul,
+                         hz / static_cast<unsigned>(mul), hz);
+        } else {
+            _snwprintf_s(b, _TRUNCATE, T(L"%dx（%.1f→%u fps）", L"%dx (%.1f->%u fps)"), mul,
+                         static_cast<double>(hz) / mul, hz);
+        }
         s = b;
         return s.c_str();
     }
     case ID_FG_INPUT: return kOptFgInput[(i < 0 || i > 3) ? 0 : i];
+    case ID_STREAM_PCT: return kOptStream[(i < 0 || i > 3) ? 1 : i];
     case ID_OUT:     return kOptOut[i % 3];
     case ID_SDR:     return kOptColor[i % 2];
     case ID_FOV:     return kOptFov[i % 4];
@@ -409,6 +757,8 @@ static const wchar_t* opt_text(Id id, int i)
     case ID_RT:      return kOptRt[i % 2];
     case ID_HOTKEY:  return g_hk_custom ? L"自定义" : g_hotkeys[i % kHotkeyCount].name;
     case ID_LOCK:    return kOptLock[i % 5];
+    case ID_UISCALE: return kOptUiScale[i % 7];
+    case ID_LANG:    return (i % 2) ? L"English" : L"中文";
     case ID_TMODE:   return kOptTMode[i % 2];
     case ID_GPUSEL: {
         if (i <= 0) { return L"自动（窗口所在显示器 / 避开游戏卡）"; }
@@ -438,6 +788,12 @@ static int opt_get(Id id)
     switch (id) {
     case ID_FG_MODE: return S().fg_mode;
     case ID_FG_INPUT: return S().fg_input;
+    case ID_STREAM_PCT: {
+        for (int i = 0; i < 4; ++i) {
+            if (kStreamPct[i] == S().stream_pct) { return i; }
+        }
+        return 1;
+    }
     case ID_OUT:     return S().out_mode;
     case ID_SDR:     return S().sdr ? 1 : 0;
     case ID_FOV:     return S().fov_sel;
@@ -450,6 +806,13 @@ static int opt_get(Id id)
     case ID_TMODE:   return S().target_mode;
     case ID_GPUSEL: return (S().gpu_sel > 0 && S().gpu_sel <= (int)g_adapters.size())
                             ? S().gpu_sel : 0;
+    case ID_UISCALE: {
+        for (int i = 0; i < 7; ++i) {
+            if (kUiScalePct[i] == g_scale_pct) { return i; }
+        }
+        return 0;
+    }
+    case ID_LANG: return (g_lang != 0) ? 1 : 0;
     default: return 0;
     }
 }
@@ -482,18 +845,22 @@ static std::wstring row_value(Id id)
     case ID_FG_MODE: return opt_text(ID_FG_MODE, S().fg_mode);
     case ID_FG_INPUT: return opt_text(ID_FG_INPUT, S().fg_input);
     case ID_FG_INI: {
+        // 优先用游戏库选中的目录（它才是部署目标），没有再看前台窗口。
+        if (!g_game_dir.empty()) { return g_game_dir + L"\\fakerFG.ini"; }
         std::wstring ini;
         return target_game_ini(&ini) ? ini : std::wstring(L"(先选择游戏窗口)");
     }
     case ID_VERSION:
-        _snwprintf_s(buf, _TRUNCATE, L"%s（协议 v%u）",
+        _snwprintf_s(buf, _TRUNCATE, T(L"%s（协议 v%u）", L"%s (protocol v%u)"),
                      LOCK_FRAME_VERSION_WSTRING, mgpu::kSharedVersion);
         return buf;
     case ID_CHECK_GPU:
         if (g_adapters.size() >= 2) {
-            _snwprintf_s(buf, _TRUNCATE, L"%d 块（OK）", (int)g_adapters.size());
+            _snwprintf_s(buf, _TRUNCATE, T(L"%d 块（OK）", L"%d GPUs (OK)"),
+                         (int)g_adapters.size());
         } else {
-            _snwprintf_s(buf, _TRUNCATE, L"%d 块（需要双卡）", (int)g_adapters.size());
+            _snwprintf_s(buf, _TRUNCATE, T(L"%d 块（需要双卡）", L"%d GPU (two recommended)"),
+                         (int)g_adapters.size());
         }
         return buf;
     case ID_CHECK_RUNTIME: {
@@ -505,9 +872,13 @@ static std::wstring row_value(Id id)
     }
     case ID_CHECK_GAME: {
         std::wstring ini;
-        if (!target_game_ini(&ini) ||
-            GetFileAttributesW(ini.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        if (!g_game_dir.empty()) {
+            ini = g_game_dir + L"\\fakerFG.ini";
+        } else if (!target_game_ini(&ini)) {
             return L"未选择游戏或缺少 fakerFG.ini";
+        }
+        if (GetFileAttributesW(ini.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            return L"缺少 fakerFG.ini";
         }
         wchar_t out[32]{};
         GetPrivateProfileStringW(L"fakerFG", L"FgOutput", L"", out, 32, ini.c_str());
@@ -519,6 +890,7 @@ static std::wstring row_value(Id id)
         if (in[0] == 0) { return L"FgInput 为空"; }
         return L"fakerFG.ini OK";
     }
+    case ID_CHECK_SHA: return g_sha_text;
     case ID_OUTFPS:
         // 手输的数字框：0 表示"面板刷新"（不限制），其余是 Hz 上限。
         if (S().out_fps == 0) { return L"面板刷新"; }
@@ -532,9 +904,11 @@ static std::wstring row_value(Id id)
         const int mul = S().fg_mode + 2;
         const double in = static_cast<double>(hz) / static_cast<double>(mul);
         if (hz % static_cast<unsigned>(mul) != 0) {
-            _snwprintf_s(buf, _TRUNCATE, L"锁 %.1f fps（%dx，不能整除）", in, mul);
+            _snwprintf_s(buf, _TRUNCATE, T(L"锁 %.1f fps（%dx，不能整除）",
+                                           L"lock %.1f fps (%dx, not divisible)"), in, mul);
         } else {
-            _snwprintf_s(buf, _TRUNCATE, L"锁 %.1f fps（%dx -> %u fps）", in, mul, hz);
+            _snwprintf_s(buf, _TRUNCATE, T(L"锁 %.1f fps（%dx -> %u fps）",
+                                           L"lock %.1f fps (%dx -> %u fps)"), in, mul, hz);
         }
         return buf;
     }
@@ -620,6 +994,26 @@ static bool exe_file_exists(const wchar_t* name)
     return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES;
 }
 
+// 目标进程里是否加载了某个模块。用来区分"装了一半没进游戏"和"游戏已经在跑但
+// producer 还没挂上" —— 后者几乎总是因为游戏里没开 DLSS 帧生成。
+static bool proc_has_module(DWORD pid, const wchar_t* name)
+{
+    if (pid == 0 || name == nullptr) { return false; }
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (snap == INVALID_HANDLE_VALUE) { return false; }
+    MODULEENTRY32W me{};
+    me.dwSize = sizeof(me);
+    bool found = false;
+    if (Module32FirstW(snap, &me)) {
+        do {
+            if (_wcsicmp(me.szModule, name) == 0) { found = true; break; }
+        } while (Module32NextW(snap, &me));
+    }
+    CloseHandle(snap);
+    return found;
+}
+
+
 // Keep the folder bounded: the consumer prints a line per report window and the UI
 // writes every run to lock_frame_ui_HHMMSS.txt. Keep the newest 8 run logs and drop
 // the rest; also drop lock_frame_ui.log when it grows past 4 MiB.
@@ -656,34 +1050,79 @@ static void prune_old_logs()
 
 static std::wstring ini_path() { return exe_dir() + L"\\lock_frame_ui.ini"; }
 
-static void ini_w(const std::wstring& sec, const wchar_t* key, int v)
+// 新文件先写 UTF-16LE BOM：这样 WritePrivateProfileStringW 会保持 Unicode，
+// 中文游戏名在非中文系统上也不会变成乱码。
+static void ensure_utf16_bom(const std::wstring& path)
+{
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) { return; }
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { return; }
+    const unsigned char bom[2] = { 0xFF, 0xFE };
+    DWORD w = 0;
+    WriteFile(h, bom, 2, &w, nullptr);
+    CloseHandle(h);
+}
+
+// save_state/load_state 期间临时指向某个游戏配置文件；结束后恢复。
+static const wchar_t* g_ini_file_override = nullptr;
+
+// file 为空 = 主配置文件；否则读写指定的游戏配置文件（profiles\*.ini）。
+static void ini_w(const std::wstring& sec, const wchar_t* key, int v,
+                  const wchar_t* file = nullptr)
 {
     wchar_t buf[32]{};
     _snwprintf_s(buf, _TRUNCATE, L"%d", v);
-    WritePrivateProfileStringW(sec.c_str(), key, buf, ini_path().c_str());
+    WritePrivateProfileStringW(sec.c_str(), key, buf,
+        file ? file : (g_ini_file_override ? g_ini_file_override : ini_path().c_str()));
 }
 
-static void ini_ws(const std::wstring& sec, const wchar_t* key, const std::wstring& v)
+static void ini_ws(const std::wstring& sec, const wchar_t* key, const std::wstring& v,
+                   const wchar_t* file = nullptr)
 {
-    WritePrivateProfileStringW(sec.c_str(), key, v.c_str(), ini_path().c_str());
+    WritePrivateProfileStringW(sec.c_str(), key, v.c_str(),
+        file ? file : (g_ini_file_override ? g_ini_file_override : ini_path().c_str()));
 }
 
-static int ini_r(const std::wstring& sec, const wchar_t* key, int def)
+static int ini_r(const std::wstring& sec, const wchar_t* key, int def,
+                 const wchar_t* file = nullptr)
 {
-    return (int)GetPrivateProfileIntW(sec.c_str(), key, def, ini_path().c_str());
+    return (int)GetPrivateProfileIntW(sec.c_str(), key, def,
+        file ? file : (g_ini_file_override ? g_ini_file_override : ini_path().c_str()));
 }
 
-static std::wstring ini_rs(const std::wstring& sec, const wchar_t* key, const wchar_t* def)
+static std::wstring ini_rs(const std::wstring& sec, const wchar_t* key, const wchar_t* def,
+                           const wchar_t* file = nullptr)
 {
     wchar_t buf[512]{};
-    GetPrivateProfileStringW(sec.c_str(), key, def, buf, 512, ini_path().c_str());
+    GetPrivateProfileStringW(sec.c_str(), key, def, buf, 512,
+        file ? file : (g_ini_file_override ? g_ini_file_override : ini_path().c_str()));
     return buf;
+}
+
+// 日志缓冲：写文件仍由 reader_thread 负责；这里保留最近 400 行给查看器。
+static void log_line_wide(const std::wstring& w)
+{
+    if (!g_line_cs_ready) { return; }
+    EnterCriticalSection(&g_line_cs);
+    g_log_lines.push_back(w);
+    while (g_log_lines.size() > 400) { g_log_lines.pop_front(); }
+    LeaveCriticalSection(&g_line_cs);
+}
+
+static void log_line_utf8(const std::string& s)
+{
+    wchar_t w[1024]{};
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w, 1023);
+    log_line_wide(w);
 }
 
 static void set_msg(const wchar_t* m)
 {
     g_msg = m;
     g_msg_until = GetTickCount() + 4000;
+    log_line_wide(std::wstring(L"[ui] ") + m);
     if (g_hwnd) { InvalidateRect(g_hwnd, nullptr, FALSE); }
 }
 
@@ -745,21 +1184,226 @@ static bool target_game_ini(std::wstring* out)
     return true;
 }
 
+// --------------------------------------- 游戏侧安装：一键部署 / 一键还原（P0）
+// 原来只有 deploy_game.bat。小白不会开命令行、也不会手打游戏目录，所以把同一套
+// 文件操作搬进 UI：选 exe -> 自动备份 -> 复制 -> 报告每一步。幂等，重复点安全。
+static bool file_in_dir(const std::wstring& dir, const wchar_t* name)
+{
+    if (dir.empty() || name == nullptr) { return false; }
+    return GetFileAttributesW((dir + L"\\" + name).c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+static std::wstring game_dir_for_window(HWND hwnd)
+{
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == 0) { return L""; }
+    HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (p == nullptr) { return L""; }
+    wchar_t exe[MAX_PATH]{};
+    DWORD n = MAX_PATH;
+    const BOOL ok = QueryFullProcessImageNameW(p, 0, exe, &n);
+    CloseHandle(p);
+    if (!ok || n == 0) { return L""; }
+    std::wstring path(exe, n);
+    const size_t slash = path.find_last_of(L'\\');
+    return (slash == std::wstring::npos) ? std::wstring(L"") : path.substr(0, slash);
+}
+
+static bool faker_ini_ok(const std::wstring& dir)
+{
+    const std::wstring ini = dir + L"\\fakerFG.ini";
+    if (GetFileAttributesW(ini.c_str()) == INVALID_FILE_ATTRIBUTES) { return false; }
+    wchar_t out[32]{};
+    GetPrivateProfileStringW(L"fakerFG", L"FgOutput", L"", out, 32, ini.c_str());
+    if (_wcsicmp(out, L"Capture") != 0) { return false; }
+    if ((int)GetPrivateProfileIntW(L"fakerFG", L"Passthrough", 0, ini.c_str()) != 0) {
+        return false;
+    }
+    wchar_t in[32]{};
+    GetPrivateProfileStringW(L"fakerFG", L"FgInput", L"", in, 32, ini.c_str());
+    return in[0] != 0;
+}
+
+static bool pick_game_file(std::wstring* exe_out)
+{
+    wchar_t file[MAX_PATH]{};
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_hwnd;
+    ofn.lpstrFilter = L"游戏程序 (*.exe)\0*.exe\0所有文件\0*.*\0";
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrTitle = L"选择游戏的 exe";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameW(&ofn)) { return false; }
+    *exe_out = file;
+    return exe_out->find(L'\\') != std::wstring::npos;
+}
+
+static bool pick_game_exe(std::wstring* dir_out)
+{
+    std::wstring path;
+    if (!pick_game_file(&path)) { return false; }
+    const size_t slash = path.find_last_of(L'\\');
+    if (slash == std::wstring::npos) { return false; }
+    *dir_out = path.substr(0, slash);
+    return true;
+}
+
 static const wchar_t* fg_input_ini_value(int i)
 {
     return kFgInputIni[(i < 0 || i > 3) ? 0 : i];
 }
 
+static void read_game_ini_state(const std::wstring& ini)
+{
+    if (GetFileAttributesW(ini.c_str()) == INVALID_FILE_ATTRIBUTES) { return; }
+    wchar_t v[32]{};
+    GetPrivateProfileStringW(L"fakerFG", L"FgInput", L"", v, 32, ini.c_str());
+    for (int i = 0; i < 4; ++i) {
+        if (_wcsicmp(v, fg_input_ini_value(i)) == 0) { S().fg_input = i; break; }
+    }
+
+    int pct = (int)GetPrivateProfileIntW(L"fakerFG", L"StreamPercent", 150, ini.c_str());
+    wchar_t mv[16]{};
+    GetPrivateProfileStringW(L"fakerFG", L"StreamPercentMv", L"", mv, 16, ini.c_str());
+    if (mv[0] != 0) { pct = _wtoi(mv); }
+    if (pct < 100) { pct = 100; }
+    if (pct > 400) { pct = 400; }
+    int best = 150;
+    int best_d = 0x7fffffff;
+    for (int i = 0; i < 4; ++i) {
+        const int d = (kStreamPct[i] > pct) ? (kStreamPct[i] - pct) : (pct - kStreamPct[i]);
+        if (d < best_d) { best_d = d; best = kStreamPct[i]; }
+    }
+    S().stream_pct = best;
+    S().fg_log = (GetPrivateProfileIntW(L"fakerFG", L"Log", 1, ini.c_str()) != 0);
+}
+
+// 目录里是否有进程正在运行（覆盖最小化到托盘、窗口被隐藏的游戏）。
+// 只看可执行文件路径：dir 本身或它的子目录都算，避免把同名前缀目录误判。
+static bool dir_has_process(const std::wstring& dir)
+{
+    if (dir.empty()) { return false; }
+    const std::wstring k = norm_path(dir);
+    if (k.empty()) { return false; }
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) { return false; }
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    bool found = false;
+    const DWORD self = GetCurrentProcessId();
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (pe.th32ProcessID == self) { continue; }
+            HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+            if (p == nullptr) { continue; }
+            wchar_t buf[1024]{};
+            DWORD n = (DWORD)(sizeof(buf) / sizeof(buf[0]));
+            if (QueryFullProcessImageNameW(p, 0, buf, &n)) {
+                const std::wstring exe = norm_path(buf);
+                if (exe.size() > k.size() + 1 && exe.compare(0, k.size(), k) == 0 &&
+                    exe[k.size()] == L'\\') {
+                    found = true;
+                }
+            }
+            CloseHandle(p);
+            if (found) { break; }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return found;
+}
+
+// 这个目录的游戏是否正在运行：先看窗口，再看进程路径（托盘/隐藏窗口）。
+static bool game_dir_running(const std::wstring& dir)
+{
+    if (dir.empty()) { return false; }
+    rescan_windows();
+    GameEntry* e = find_game_mut(dir);
+    const std::wstring k = norm_path(dir);
+    for (const WinEntry& w : g_wins) {
+        const std::wstring d = game_dir_for_window(w.hwnd);
+        if (!d.empty() && norm_path(d) == k) { return true; }
+    }
+    // 用安装根目录判断，子目录里的 exe 也能覆盖到（Steam 的 Binaries/Win64 之类）。
+    if (e != nullptr && !e->root.empty()) { return dir_has_process(e->root); }
+    return dir_has_process(dir);
+}
+
+static std::wstring game_ini_path()
+{
+    if (!g_game_dir.empty()) { return g_game_dir + L"\\fakerFG.ini"; }
+    std::wstring ini;
+    return target_game_ini(&ini) ? ini : std::wstring();
+}
+
+// 只读取关键三项，用来判断"文件被人改过、和保存的配置不一致"。
+struct IniCfg { bool valid = false; int fg_input = 0; int pct = 150; bool log = true; };
+static IniCfg read_ini_cfg(const std::wstring& ini)
+{
+    IniCfg c;
+    if (ini.empty() || GetFileAttributesW(ini.c_str()) == INVALID_FILE_ATTRIBUTES) { return c; }
+    c.valid = true;
+    wchar_t v[32]{};
+    GetPrivateProfileStringW(L"fakerFG", L"FgInput", L"", v, 32, ini.c_str());
+    for (int i = 0; i < 4; ++i) {
+        if (_wcsicmp(v, fg_input_ini_value(i)) == 0) { c.fg_input = i; break; }
+    }
+    int pct = (int)GetPrivateProfileIntW(L"fakerFG", L"StreamPercent", 150, ini.c_str());
+    wchar_t mv[16]{};
+    GetPrivateProfileStringW(L"fakerFG", L"StreamPercentMv", L"", mv, 16, ini.c_str());
+    if (mv[0] != 0) { pct = _wtoi(mv); }
+    if (pct < 100) { pct = 100; }
+    if (pct > 400) { pct = 400; }
+    int best = 150, best_d = 0x7fffffff;
+    for (int i = 0; i < 4; ++i) {
+        const int d = (kStreamPct[i] > pct) ? (kStreamPct[i] - pct) : (pct - kStreamPct[i]);
+        if (d < best_d) { best_d = d; best = kStreamPct[i]; }
+    }
+    c.pct = best;
+    c.log = (GetPrivateProfileIntW(L"fakerFG", L"Log", 1, ini.c_str()) != 0);
+    return c;
+}
+
+// 每个游戏目录单独备份 fakerFG.ini，只保留最新 8 份。
+static void prune_ini_backups(const std::wstring& ini)
+{
+    const size_t slash = ini.find_last_of(L'\\');
+    const std::wstring prefix = (slash == std::wstring::npos) ? std::wstring()
+                                                             : ini.substr(0, slash + 1);
+    struct Ent { std::wstring path; unsigned long long tick; };
+    std::vector<Ent> v;
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((ini + L".bak_*").c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) { continue; }
+            unsigned long long t = 0;
+            const wchar_t* p = wcsstr(fd.cFileName, L".bak_");
+            if (p != nullptr) { t = _wcstoui64(p + 5, nullptr, 10); }
+            v.push_back(Ent{ prefix + fd.cFileName, t });
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    std::sort(v.begin(), v.end(),
+              [](const Ent& a, const Ent& b) { return a.tick > b.tick; });
+    for (size_t i = 8; i < v.size(); ++i) { DeleteFileW(v[i].path.c_str()); }
+}
+
 static void apply_fg_input()
 {
-    std::wstring ini;
-    if (!target_game_ini(&ini)) {
-        set_msg(L"先选择游戏窗口，才能写入 fakerFG.ini");
+    const std::wstring ini = game_ini_path();
+    if (ini.empty()) {
+        set_msg(T(L"先选择游戏窗口或游戏库条目，才能写入 fakerFG.ini",
+                  L"Select a game window or library entry first"));
         return;
     }
     if (GetFileAttributesW(ini.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        set_msg(L"游戏目录没有 fakerFG.ini：请先按 README 放好配置文件");
-        uilog("fg-input: %ls missing", ini.c_str());
+        set_msg(T(L"游戏目录没有 fakerFG.ini：请先部署游戏侧文件",
+                  L"No fakerFG.ini in the game folder: deploy the game-side files first"));
+        uilog("fakerfg: %ls missing", ini.c_str());
         return;
     }
 
@@ -767,23 +1411,41 @@ static void apply_fg_input()
     _snwprintf_s(bak, _TRUNCATE, L"%s.bak_%lu", ini.c_str(),
                  (unsigned long)GetTickCount());
     if (!CopyFileW(ini.c_str(), bak, FALSE)) {
-        uilog("fg-input: backup failed err=%lu", (unsigned long)GetLastError());
+        uilog("fakerfg: backup failed err=%lu", (unsigned long)GetLastError());
+    } else {
+        prune_ini_backups(ini);
     }
 
-    const wchar_t* v = fg_input_ini_value(S().fg_input);
-    if (!WritePrivateProfileStringW(L"fakerFG", L"FgInput", v, ini.c_str())) {
-        set_msg(L"写入 fakerFG.ini 失败（只读或权限不足）");
-        uilog("fg-input: write failed err=%lu", (unsigned long)GetLastError());
+    wchar_t pct[16]{};
+    _snwprintf_s(pct, _TRUNCATE, L"%d", S().stream_pct);
+    bool ok = true;
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"FgInput",
+                                          fg_input_ini_value(S().fg_input), ini.c_str()) != 0;
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"FgOutput", L"Capture", ini.c_str()) != 0;
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"Passthrough", L"0", ini.c_str()) != 0;
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"RealSwapchainObject", L"1", ini.c_str()) != 0;
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"StreamPercent", pct, ini.c_str()) != 0;
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"StreamPercentMv", pct, ini.c_str()) != 0;
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"StreamPercentDepth", pct, ini.c_str()) != 0;
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"Log", S().fg_log ? L"1" : L"0",
+                                          ini.c_str()) != 0;
+    if (!ok) {
+        set_msg(T(L"写入 fakerFG.ini 失败（只读或权限不足）",
+                  L"Failed to write fakerFG.ini (read-only or permission denied)"));
+        uilog("fakerfg: write failed ini=%ls", ini.c_str());
         return;
     }
-    // 这一版 UI 服务的是双卡 consumer 链路：输出必须是 Capture（producer/consumer），
-    // 不能是游戏内本地 XeFG。Passthrough 也必须关闭，否则 fakerFG 不接管契约。
-    WritePrivateProfileStringW(L"fakerFG", L"FgOutput", L"Capture", ini.c_str());
-    WritePrivateProfileStringW(L"fakerFG", L"Passthrough", L"0", ini.c_str());
-    wchar_t msg[256]{};
-    _snwprintf_s(msg, _TRUNCATE, L"已写入 FgInput=%s，重启游戏生效", v);
-    set_msg(msg);
-    uilog("fg-input: %ls -> %ls", ini.c_str(), v);
+
+    set_msg(T(L"已写入 fakerFG.ini（输入源 / MV 比例 / Log），重启游戏生效",
+              L"fakerFG.ini written (input / MV ratio / Log); restart the game to apply"));
+    uilog("fakerfg: wrote %ls input=%ls pct=%d log=%d", ini.c_str(),
+          fg_input_ini_value(S().fg_input), S().stream_pct, S().fg_log ? 1 : 0);
+}
+
+// 从指定目录的 fakerFG.ini 读回 FgInput（不依赖游戏是否在跑）。
+static void sync_fg_input_from_dir(const std::wstring& dir)
+{
+    read_game_ini_state(dir + L"\\fakerFG.ini");
 }
 
 // Reflect the file on disk when the user picks another game window; the dropdown
@@ -791,15 +1453,216 @@ static void apply_fg_input()
 static void sync_fg_input_from_target()
 {
     std::wstring ini;
-    if (!target_game_ini(&ini)) { return; }
-    if (GetFileAttributesW(ini.c_str()) == INVALID_FILE_ATTRIBUTES) { return; }
-    wchar_t v[32]{};
-    GetPrivateProfileStringW(L"fakerFG", L"FgInput", L"", v, 32, ini.c_str());
-    for (int i = 0; i < 4; ++i) {
-        if (_wcsicmp(v, fg_input_ini_value(i)) == 0) { S().fg_input = i; return; }
-    }
+    if (target_game_ini(&ini)) { read_game_ini_state(ini); }
 }
 
+
+// 安装到 <dir>：与 deploy_game.bat 等价，但把每一步结果返回给 UI。
+static bool deploy_game_dir(const std::wstring& dir, std::wstring* out)
+{
+    std::wstring log;
+    auto line = [&](const wchar_t* s) { log += L"  "; log += s; log += L"\r\n"; };
+    auto fail = [&](const wchar_t* s) -> bool {
+        log += L"  [失败] "; log += s; log += L"\r\n";
+        if (out) { *out = log; }
+        return false;
+    };
+
+    if (dir.empty() || GetFileAttributesW(dir.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        return fail(L"游戏目录不存在");
+    }
+    if (!exe_file_exists(L"fakerFG.dll")) {
+        return fail(L"发布包目录里没有 fakerFG.dll（请使用完整的发布压缩包）");
+    }
+
+    const std::wstring src = exe_dir();
+    const std::wstring dll = src + L"\\fakerFG.dll";
+    const std::wstring dxgi = dir + L"\\dxgi.dll";
+    const std::wstring dxgi_bak = dir + L"\\dxgi.dll.bak";
+    const std::wstring dlssg = dir + L"\\nvngx_dlssg.dll";
+    const std::wstring dlssg_real = dir + L"\\nvngx_dlssg_real.dll";
+
+    // 第一次部署才备份游戏自己的 dxgi.dll。已经装过（fakerFG.dll 存在）时不能再把
+    // 我们的 dxgi.dll 备份成 .bak，否则还原就还原成我们自己的文件了。
+    if (!file_in_dir(dir, L"fakerFG.dll") && file_in_dir(dir, L"dxgi.dll") &&
+        !file_in_dir(dir, L"dxgi.dll.bak")) {
+        if (!MoveFileW(dxgi.c_str(), dxgi_bak.c_str())) {
+            return fail(L"备份原 dxgi.dll 失败（游戏是否正在运行？目录是否只读？）");
+        }
+        line(L"已备份游戏原 dxgi.dll -> dxgi.dll.bak");
+    }
+    if (file_in_dir(dir, L"nvngx_dlssg.dll") && !file_in_dir(dir, L"nvngx_dlssg_real.dll")) {
+        if (MoveFileW(dlssg.c_str(), dlssg_real.c_str())) {
+            line(L"已保留游戏原 DLSS-G -> nvngx_dlssg_real.dll");
+        }
+    }
+
+    const wchar_t* aliases[] = { L"dxgi.dll", L"nvngx_dlssg.dll", L"fakerFG.dll" };
+    for (const wchar_t* name : aliases) {
+        if (!CopyFileW(dll.c_str(), (dir + L"\\" + name).c_str(), FALSE)) {
+            return fail(L"复制 fakerFG.dll 失败（游戏是否正在运行？目录是否只读？）");
+        }
+    }
+    line(L"已写入 fakerFG.dll（dxgi.dll / nvngx_dlssg.dll 两个别名）");
+
+    if (exe_file_exists(L"xess_mfg_producer.dll")) {
+        if (CopyFileW((src + L"\\xess_mfg_producer.dll").c_str(),
+                      (dir + L"\\xess_mfg_producer.dll").c_str(), FALSE)) {
+            line(L"已写入 xess_mfg_producer.dll");
+        } else {
+            line(L"[注意] xess_mfg_producer.dll 复制失败");
+        }
+    } else {
+        line(L"[注意] 发布包里没有 xess_mfg_producer.dll");
+    }
+
+    if (!file_in_dir(dir, L"fakerFG.ini")) {
+        if (exe_file_exists(L"fakerFG.ini") &&
+            CopyFileW((src + L"\\fakerFG.ini").c_str(),
+                      (dir + L"\\fakerFG.ini").c_str(), FALSE)) {
+            line(L"已放入 fakerFG.ini 模板");
+        } else {
+            line(L"[注意] 没有 fakerFG.ini 模板，请手动放入");
+        }
+    } else {
+        line(L"保留现有 fakerFG.ini（未覆盖）");
+    }
+
+    if (file_in_dir(dir, L"version.dll")) {
+        line(L"[重要] 目录里有 version.dll（dlssg_sm86），它会抢 nvngx_dlssg.dll，建议移除");
+    }
+    line(L"完成。请重启游戏，进入实际画面后点[刷新窗口列表]。");
+    if (out) { *out = log; }
+    return true;
+}
+
+static bool undeploy_game_dir(const std::wstring& dir, std::wstring* out)
+{
+    std::wstring log;
+    auto line = [&](const wchar_t* s) { log += L"  "; log += s; log += L"\r\n"; };
+
+    if (dir.empty()) {
+        if (out) { *out = L"还没有选择游戏目录"; }
+        return false;
+    }
+    if (!file_in_dir(dir, L"fakerFG.dll")) {
+        if (out) { *out = L"这个目录里没有 fakerFG.dll，看起来没装过（无需还原）"; }
+        return false;
+    }
+
+    const wchar_t* ours[] = { L"nvngx_dlssg.dll", L"fakerFG.dll", L"xess_mfg_producer.dll" };
+    for (const wchar_t* name : ours) {
+        DeleteFileW((dir + L"\\" + name).c_str());
+    }
+
+    // dxgi.dll 单独特判：有 .bak 才能安全删（随后会还原）；没有 .bak 时只有确认它
+    // 就是我们放进去的别名（与发布包 fakerFG.dll 同尺寸）才删，避免把游戏的原始
+    // dxgi.dll 当成我们的文件删掉。
+    const bool have_bak = file_in_dir(dir, L"dxgi.dll.bak");
+    bool dxgi_is_ours = false;
+    {
+        WIN32_FILE_ATTRIBUTE_DATA a{}, b{};
+        const std::wstring dxgi = dir + L"\\dxgi.dll";
+        const std::wstring dll = exe_dir() + L"\\fakerFG.dll";
+        if (GetFileAttributesExW(dxgi.c_str(), GetFileExInfoStandard, &a) &&
+            GetFileAttributesExW(dll.c_str(), GetFileExInfoStandard, &b)) {
+            dxgi_is_ours = (a.nFileSizeHigh == b.nFileSizeHigh) &&
+                           (a.nFileSizeLow == b.nFileSizeLow);
+        }
+    }
+    if (have_bak || dxgi_is_ours) {
+        DeleteFileW((dir + L"\\dxgi.dll").c_str());
+        line(L"已移除 fakerFG.dll / dxgi.dll / nvngx_dlssg.dll / xess_mfg_producer.dll");
+    } else {
+        line(L"已移除 fakerFG.dll / nvngx_dlssg.dll / xess_mfg_producer.dll");
+        line(L"[保留] dxgi.dll 不是本组件写入的（没有 dxgi.dll.bak），未删除");
+    }
+
+    if (file_in_dir(dir, L"dxgi.dll.bak")) {
+        if (MoveFileW((dir + L"\\dxgi.dll.bak").c_str(), (dir + L"\\dxgi.dll").c_str())) {
+            line(L"已还原游戏原 dxgi.dll");
+        } else {
+            line(L"[注意] dxgi.dll.bak 还原失败，请手动把 .bak 改回 dxgi.dll");
+        }
+    }
+    if (file_in_dir(dir, L"nvngx_dlssg_real.dll")) {
+        if (MoveFileW((dir + L"\\nvngx_dlssg_real.dll").c_str(),
+                      (dir + L"\\nvngx_dlssg.dll").c_str())) {
+            line(L"已还原游戏原 nvngx_dlssg.dll");
+        }
+    }
+    line(L"fakerFG.ini 已保留（里面可能改过 FgInput）。");
+    if (out) { *out = log; }
+    return true;
+}
+
+static void run_diagnostics()
+{
+    const std::wstring bat = exe_dir() + L"\\collect_diagnostics.bat";
+    if (GetFileAttributesW(bat.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        set_msg(L"collect_diagnostics.bat 不在 exe 旁边，无法一键诊断");
+        return;
+    }
+    ShellExecuteW(nullptr, L"open", bat.c_str(), nullptr, exe_dir().c_str(), SW_SHOWNORMAL);
+    set_msg(L"正在生成诊断包（完成后在 exe 旁边，可整包发给人看）");
+}
+
+static void open_log_folder()
+{
+    ShellExecuteW(nullptr, L"open", exe_dir().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    set_msg(L"已打开日志所在目录");
+}
+
+// 每 2 s 重算一次；简易模式和启动前检查共用同一份结论，避免两处说法不一致。
+static void refresh_readiness()
+{
+    Ready r{};
+    // 先按"选中的游戏"找它的窗口；找不到再退回手动选中的窗口。
+    int wi = -1;
+    if (!g_game_dir.empty()) {
+        const std::wstring k = norm_path(g_game_dir);
+        for (int i = 0; i < (int)g_wins.size(); ++i) {
+            const std::wstring d = game_dir_for_window(g_wins[(size_t)i].hwnd);
+            if (!d.empty() && norm_path(d) == k) { wi = i; break; }
+        }
+    }
+    // 新模型里"窗口就绪"必须属于当前游戏；没选游戏时不再拿任意窗口充数。
+    if (wi < 0) { r.window = false; }
+
+    if (wi >= 0) {
+        const WinEntry& we = g_wins[(size_t)wi];
+        r.window = true;
+        r.producer = proc_has_module(we.pid, L"xess_mfg_producer.dll");
+        if (!g_user_picked && g_win_sel != wi) {
+            g_win_sel = wi;
+            S().win_hwnd = we.hwnd;
+            S().win_title = we.title;
+            S().target_mode = 1;
+        }
+        // 没有任何游戏被选中时，才从窗口反推目录；已选游戏不能被子窗口改掉。
+        if (g_game_dir.empty()) {
+            const std::wstring dir = game_dir_for_window(we.hwnd);
+            if (!dir.empty() && (r.producer || file_in_dir(dir, L"fakerFG.dll"))) {
+                g_game_dir = dir;
+            }
+        }
+    }
+
+    r.deployed = !g_game_dir.empty() && file_in_dir(g_game_dir, L"fakerFG.dll") &&
+                 file_in_dir(g_game_dir, L"dxgi.dll");
+    r.runtime = exe_file_exists(L"libxess_fg.dll") &&
+                (S().fg_mode < 1 || exe_file_exists(L"libxell.dll"));
+    r.ini = !g_game_dir.empty() && faker_ini_ok(g_game_dir);
+    g_ini_drift = false;
+    if (r.deployed && !g_game_dir.empty()) {
+        const IniCfg c = read_ini_cfg(g_game_dir + L"\\fakerFG.ini");
+        if (c.valid) {
+            g_ini_drift = (c.fg_input != S().fg_input) || (c.pct != S().stream_pct) ||
+                          (c.log != S().fg_log);
+        }
+    }
+    g_ready = r;
+}
 
 // ------------------------------------------------------------------ profiles
 static std::wstring prof_sec(int i)
@@ -809,11 +1672,12 @@ static std::wstring prof_sec(int i)
     return b;
 }
 
-static void save_profile(int i)
+// 一份完整配置的读写：profile 与游戏条目共用同一套键（cfg=1 表示是完整配置）。
+static void save_state(const std::wstring& sec, const State& s, const wchar_t* file = nullptr)
 {
-    const std::wstring sec = prof_sec(i);
-    const State& s = g_profiles[i].st;
-    ini_ws(sec, L"name", g_profiles[i].name);
+    const wchar_t* prev = g_ini_file_override;
+    g_ini_file_override = file;
+    ini_w(sec, L"cfg", 1);
     ini_w(sec, L"fg_mode", s.fg_mode);
     ini_w(sec, L"mult", s.fg_mode + 2);
     ini_w(sec, L"fg_input", s.fg_input);
@@ -845,14 +1709,21 @@ static void save_profile(int i)
     ini_w(sec, L"perf", s.perf_no_throttle ? 1 : 0);
     // 只保存模式本身；outfps 是旧版本的字段，不再写。
     ini_ws(sec, L"win_title", s.win_title);
+    g_ini_file_override = prev;
 }
 
-static void load_profile(int i)
+static void save_profile(int i)
 {
     const std::wstring sec = prof_sec(i);
-    Profile& p = g_profiles[i];
-    State& s = p.st;
-    p.name        = ini_rs(sec, L"name", L"默认");
+    ini_ws(sec, L"name", g_profiles[(size_t)i].name);
+    save_state(sec, g_profiles[(size_t)i].st);
+}
+
+static void load_state(const std::wstring& sec, State& s, const wchar_t* file = nullptr)
+{
+    const wchar_t* prev = g_ini_file_override;
+    g_ini_file_override = file;
+    s = State{};
     // 新版本存 mult=2/3/4；旧档案只有 fg_mode（0 = 30x4, 1 = 40x3）。
     {
         int mult = ini_r(sec, L"mult", -1);
@@ -901,20 +1772,1144 @@ static void load_profile(int i)
     if (s.pool > 6) { s.pool = 6; }
     if (s.latency < 1) { s.latency = 1; }
     if (s.latency > 3) { s.latency = 3; }
+    g_ini_file_override = prev;
+}
+
+static void load_profile(int i)
+{
+    const std::wstring sec = prof_sec(i);
+    load_state(sec, g_profiles[(size_t)i].st);
+    g_profiles[(size_t)i].name = ini_rs(sec, L"name", L"默认");
+}
+
+static std::wstring last_component(const std::wstring& path)
+{
+    std::wstring p = path;
+    while (!p.empty() && (p.back() == L'\\' || p.back() == L'/')) { p.pop_back(); }
+    const size_t s = p.find_last_of(L"\\/");
+    return (s == std::wstring::npos) ? p : p.substr(s + 1);
+}
+
+// 对话框里只显示末尾两级路径，长路径不会把 MessageBox 撑爆/裁字。
+static std::wstring short_path(const std::wstring& p, int parts = 2)
+{
+    std::vector<std::wstring> v;
+    std::wstring cur;
+    for (wchar_t c : p) {
+        if (c == L'\\' || c == L'/') { if (!cur.empty()) { v.push_back(cur); cur.clear(); } }
+        else { cur.push_back(c); }
+    }
+    if (!cur.empty()) { v.push_back(cur); }
+    std::wstring out;
+    for (int i = (int)v.size() - parts; i < (int)v.size(); ++i) {
+        if (i < 0) { continue; }
+        if (!out.empty()) { out += L"\\"; }
+        out += v[(size_t)i];
+    }
+    return out.empty() ? p : out;
+}
+
+// MessageBox 不会自动折行：按固定列数硬折（优先在分隔符后），避免右侧被裁掉。
+static std::wstring wrap_path(const std::wstring& s, size_t width = 26)
+{
+    std::wstring out;
+    size_t col = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        out.push_back(s[i]);
+        ++col;
+        if (col >= width) {
+            out += L"\r\n";
+            col = 0;
+        }
+    }
+    return out;
+}
+static bool same_name(const std::wstring& a, const std::wstring& b)
+{
+    return !a.empty() && !b.empty() && _wcsicmp(a.c_str(), b.c_str()) == 0;
+}
+
+// exe 文件名去掉扩展名：新加游戏默认用它作为配置名。
+static std::wstring file_stem(const std::wstring& path)
+{
+    std::wstring f = last_component(path);
+    const size_t dot = f.find_last_of(L'.');
+    if (dot != std::wstring::npos && dot > 0) { f = f.substr(0, dot); }
+    return f;
+}
+
+static std::wstring norm_path(const std::wstring& p)
+{
+    std::wstring s = p;
+    while (!s.empty() && (s.back() == L'\\' || s.back() == L'/')) { s.pop_back(); }
+    for (wchar_t& c : s) { c = (wchar_t)towlower(c); }
+    return s;
+}
+
+// parent 与 child 是否是同一个目录，或 parent 是 child 的祖先（按 \ 边界）。
+static bool path_within(const std::wstring& parent, const std::wstring& child)
+{
+    const std::wstring p = norm_path(parent);
+    const std::wstring c = norm_path(child);
+    if (p.empty() || c.empty()) { return false; }
+    if (p == c) { return true; }
+    return c.size() > p.size() && c.compare(0, p.size(), p) == 0 && c[p.size()] == L'\\';
+}
+
+static GameEntry* find_game_mut(const std::wstring& dir)
+{
+    if (dir.empty()) { return nullptr; }
+    for (GameEntry& g : g_games) {
+        if ((!g.dir.empty() && (path_within(g.dir, dir) || path_within(dir, g.dir))) ||
+            (!g.root.empty() && (path_within(g.root, dir) || path_within(dir, g.root)))) {
+            return &g;
+        }
+    }
+    return nullptr;
+}
+
+static const GameEntry* find_game(const std::wstring& dir)
+{
+    return find_game_mut(dir);
+}
+
+// 新加的游戏从"通用配置"复制一份，避免继承上一个游戏的窗口等会话信息。
+static State baseline_state()
+{
+    if (g_profiles.empty()) { g_profiles.push_back(Profile{}); }
+    const int i = (g_prof >= 0 && g_prof < (int)g_profiles.size()) ? g_prof : 0;
+    State s = g_profiles[(size_t)i].st;
+    s.win_hwnd = nullptr;
+    s.win_title.clear();
+    return s;
+}
+
+// ------------------------------------------------------- 每游戏一个配置文件
+// 目录：<exe>\profiles\，主 ini 只存 [games] count + 每项 path。
+static std::wstring profile_dir_abs() { return exe_dir() + L"\\profiles"; }
+static std::wstring profile_abs(const std::wstring& rel) { return exe_dir() + L"\\" + rel; }
+
+static void ensure_profile_dir()
+{
+    CreateDirectoryW(profile_dir_abs().c_str(), nullptr);
+}
+
+// 文件名里不能出现的字符换成下划线；保留中文/字母/数字。
+static std::wstring sanitize_file_name(const std::wstring& in)
+{
+    std::wstring out;
+    for (wchar_t c : in) {
+        if (c < 32 || c == L'\\' || c == L'/' || c == L':' || c == L'*' || c == L'?' ||
+            c == L'"' || c == L'<' || c == L'>' || c == L'|') {
+            out.push_back(L'_');
+        } else if (c == L' ') {
+            out.push_back(L'_');
+        } else {
+            out.push_back(c);
+        }
+        if (out.size() >= 48) { break; }
+    }
+    while (!out.empty() && (out.back() == L'.' || out.back() == L'_')) { out.pop_back(); }
+    return out;
+}
+
+static bool profile_used_by_other(const std::wstring& rel, const GameEntry* self)
+{
+    for (const GameEntry& g : g_games) {
+        if (&g == self) { continue; }
+        if (!g.profile.empty() && _wcsicmp(g.profile.c_str(), rel.c_str()) == 0) { return true; }
+    }
+    return false;
+}
+
+static std::wstring new_profile_rel(const std::wstring& base_name, const GameEntry* self)
+{
+    std::wstring base = sanitize_file_name(base_name);
+    if (base.empty()) { base = L"game"; }
+    for (int k = 1; k < 1000; ++k) {
+        wchar_t name[96]{};
+        if (k == 1) { _snwprintf_s(name, _TRUNCATE, L"profiles\\%s.ini", base.c_str()); }
+        else { _snwprintf_s(name, _TRUNCATE, L"profiles\\%s_%d.ini", base.c_str(), k); }
+        const std::wstring rel = name;
+        if (GetFileAttributesW(profile_abs(rel).c_str()) == INVALID_FILE_ATTRIBUTES &&
+            !profile_used_by_other(rel, self)) {
+            return rel;
+        }
+    }
+    return L"profiles\\game.ini";
+}
+
+static void save_game_file(const GameEntry& e)
+{
+    if (e.profile.empty()) { return; }
+    const std::wstring f = profile_abs(e.profile);
+    ensure_utf16_bom(f);
+    ini_ws(L"game", L"root", e.root, f.c_str());
+    ini_ws(L"game", L"dir", e.dir, f.c_str());
+    ini_ws(L"game", L"exe", e.exe, f.c_str());
+    ini_ws(L"game", L"name", e.name, f.c_str());
+    ini_ws(L"game", L"source", e.source, f.c_str());
+    ini_w(L"game", L"last_use", (int)(e.last_use & 0x7FFFFFFF), f.c_str());
+    save_state(L"game", e.st, f.c_str());
+}
+
+static void load_game_file(GameEntry& e, const std::wstring& path)
+{
+    e.root = ini_rs(L"game", L"root", L"", path.c_str());
+    e.dir = ini_rs(L"game", L"dir", L"", path.c_str());
+    e.exe = ini_rs(L"game", L"exe", L"", path.c_str());
+    e.name = ini_rs(L"game", L"name", L"", path.c_str());
+    e.source = ini_rs(L"game", L"source", L"", path.c_str());
+    load_state(L"game", e.st, path.c_str());
+    e.last_use = (unsigned long long)ini_r(L"game", L"last_use", 0, path.c_str());
+    e.mult = e.st.fg_mode + 2;
+    e.fg_input = e.st.fg_input;
+    e.lock = e.st.lock_fps;
+}
+
+// 迁移后清掉主 ini 里遗留的内联字段（新格式只保留 path/name）。
+static void clear_legacy_game_keys(const wchar_t* sec)
+{
+    static const wchar_t* keys[] = {
+        L"root", L"dir", L"exe", L"source", L"mult", L"fg_input", L"lock", L"last_use",
+        L"cfg", L"fg_mode", L"interp", L"out_mode", L"pool", L"latency", L"fov", L"ivl",
+        L"rt", L"tmode", L"gpu_sel", L"hotkey3", L"jitter_zero", L"no_marker",
+        L"upsample", L"stream_auto", L"stream_asym", L"input_prefetch", L"ui_none",
+        L"unlock", L"slack1", L"tearing", L"sdr", L"overlay_layered", L"relay_input",
+        L"osd", L"perf", L"win_title",
+    };
+    for (const wchar_t* k : keys) {
+        WritePrivateProfileStringW(sec, k, nullptr, ini_path().c_str());
+    }
+}
+
+static void save_games()
+{
+    ensure_profile_dir();
+    ini_w(L"games", L"count", (int)g_games.size());
+    for (int i = 0; i < (int)g_games.size(); ++i) {
+        wchar_t sec[24]{};
+        _snwprintf_s(sec, _TRUNCATE, L"game%d", i);
+        GameEntry& e = g_games[(size_t)i];
+        if (e.profile.empty()) {
+            const std::wstring base = !e.name.empty() ? e.name
+                                     : (!e.exe.empty() ? file_stem(e.exe)
+                                                       : last_component(e.dir.empty() ? e.root : e.dir));
+            e.profile = new_profile_rel(base, &e);
+        }
+        e.mult = e.st.fg_mode + 2;          // 旧字段跟配置保持一致
+        e.fg_input = e.st.fg_input;
+        e.lock = e.st.lock_fps;
+        // 主 ini 只留索引；名字也镜像一份，方便手工查看/坏文件时兜底。
+        ini_ws(sec, L"path", e.profile);
+        ini_ws(sec, L"name", e.name);
+        if (!ini_rs(sec, L"dir", L"").empty() || ini_r(sec, L"cfg", 0) != 0) {
+            clear_legacy_game_keys(sec);    // 旧格式内联字段：迁移完成后清掉
+        }
+        save_game_file(e);
+    }
+}
+
+static void load_games()
+{
+    g_games.clear();
+    int n = ini_r(L"games", L"count", 0);
+    if (n < 0) { n = 0; }
+    if (n > 400) { n = 400; }
+    bool migrated = false;
+    for (int i = 0; i < n; ++i) {
+        wchar_t sec[24]{};
+        _snwprintf_s(sec, _TRUNCATE, L"game%d", i);
+        GameEntry e;
+        e.profile = ini_rs(sec, L"path", L"");
+        if (!e.profile.empty()) {
+            load_game_file(e, profile_abs(e.profile));
+            if (e.dir.empty() && e.root.empty() && e.exe.empty()) { continue; }  // 文件缺失/损坏
+        } else {
+            // 旧档案：字段直接写在 [gameN] 里，先读进内存，最后迁移成单独文件。
+            e.dir = ini_rs(sec, L"dir", L"");
+            e.root = ini_rs(sec, L"root", L"");
+            e.exe = ini_rs(sec, L"exe", L"");
+            if (e.dir.empty() && e.root.empty()) { continue; }
+            e.name = ini_rs(sec, L"name", L"");
+            e.source = ini_rs(sec, L"source", L"");
+            load_state(sec, e.st);
+            e.mult = e.st.fg_mode + 2;
+            e.fg_input = e.st.fg_input;
+            e.lock = e.st.lock_fps;
+            e.last_use = (unsigned long long)ini_r(sec, L"last_use", 0);
+            migrated = true;
+        }
+        if (e.name.empty()) {
+            e.name = !e.exe.empty() ? file_stem(e.exe)
+                                    : last_component(e.dir.empty() ? e.root : e.dir);
+        }
+        g_games.push_back(e);
+    }
+    if (migrated) { save_games(); }   // 生成 profiles\*.ini 并重写索引
+}
+
+// =========================================================== 本机游戏扫描
+// 用户不一定知道 exe 在哪。这里从 Steam / Epic / GOG / 卸载注册表把
+// "游戏名 + 安装位置" 收进游戏库；索引优先级：已解析的 exe 目录 > 安装根目录。
+static bool game_like_name(const std::wstring& n);
+
+static std::string read_file_bytes(const std::wstring& path)
+{
+    std::string out;
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { return out; }
+    char buf[8192];
+    DWORD got = 0;
+    while (ReadFile(h, buf, sizeof(buf), &got, nullptr) && got > 0) {
+        out.append(buf, got);
+    }
+    CloseHandle(h);
+    return out;
+}
+
+static std::wstring utf8_to_wide(const std::string& s)
+{
+    if (s.empty()) { return L""; }
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    if (n <= 0) { return L""; }
+    std::wstring w((size_t)n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
+    return w;
+}
+
+// 取一行里所有 "..." 的内容（VDF / JSON 都是这种形状，够用就行）。
+static void quoted_values(const std::string& line, std::vector<std::string>* out)
+{
+    for (size_t i = 0; i < line.size(); ++i) {
+        if (line[i] != '"') { continue; }
+        const size_t j = line.find('"', i + 1);
+        if (j == std::string::npos) { break; }
+        out->push_back(line.substr(i + 1, j - i - 1));
+        i = j;
+    }
+}
+
+static void split_lines(const std::string& data, std::vector<std::string>* out)
+{
+    size_t start = 0;
+    while (start <= data.size()) {
+        const size_t nl = data.find('\n', start);
+        const size_t end = (nl == std::string::npos) ? data.size() : nl;
+        out->push_back(data.substr(start, end - start));
+        if (nl == std::string::npos) { break; }
+        start = nl + 1;
+    }
+}
+
+static bool g_sha_checked = false;
+static bool g_sha_ok = false;
+
+static bool sha256_file_hex(const std::wstring& path, std::wstring* out)
+{
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) {
+        return false;
+    }
+    DWORD obj_len = 0, cb = 0, hash_len = 0;
+    BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&obj_len),
+                      sizeof(obj_len), &cb, 0);
+    BCryptGetProperty(alg, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hash_len),
+                      sizeof(hash_len), &cb, 0);
+    std::vector<UCHAR> obj(obj_len > 0 ? obj_len : 1);
+    std::vector<UCHAR> hash(hash_len > 0 ? hash_len : 32);
+
+    bool ok = false;
+    BCRYPT_HASH_HANDLE h = nullptr;
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (f != INVALID_HANDLE_VALUE &&
+        BCryptCreateHash(alg, &h, obj.data(), obj_len, nullptr, 0, 0) == 0) {
+        ok = true;
+        UCHAR buf[64 * 1024];
+        for (;;) {
+            DWORD got = 0;
+            if (!ReadFile(f, buf, sizeof(buf), &got, nullptr)) {
+                if (GetLastError() != ERROR_HANDLE_EOF) { ok = false; }
+                break;
+            }
+            if (got == 0) { break; }
+            if (BCryptHashData(h, buf, got, 0) != 0) { ok = false; break; }
+        }
+        if (ok && BCryptFinishHash(h, hash.data(), hash_len, 0) == 0) {
+            static const wchar_t* H = L"0123456789abcdef";
+            out->clear();
+            for (DWORD i = 0; i < hash_len; ++i) {
+                out->push_back(H[hash[i] >> 4]);
+                out->push_back(H[hash[i] & 15]);
+            }
+        } else {
+            ok = false;
+        }
+    }
+    if (h != nullptr) { BCryptDestroyHash(h); }
+    if (f != INVALID_HANDLE_VALUE) { CloseHandle(f); }
+    BCryptCloseAlgorithmProvider(alg, 0);
+    return ok;
+}
+
+// 启动时校验一次安装包完整性（不周期采样，不占运行性能）。
+static void verify_package()
+{
+    if (g_sha_checked) { return; }
+    g_sha_checked = true;
+
+    const std::string data = read_file_bytes(exe_dir() + L"\\SHA256SUMS.txt");
+    if (data.empty()) {
+        g_sha_text = T(L"未提供 SHA256SUMS.txt（开发构建）",
+                       L"SHA256SUMS.txt not provided (dev build)");
+        uilog("sha256: no SHA256SUMS.txt");
+        return;
+    }
+
+    std::vector<std::string> lines;
+    split_lines(data, &lines);
+    int checked = 0, bad = 0;
+    for (const std::string& l : lines) {
+        if (l.size() < 66) { continue; }
+        const std::string want = l.substr(0, 64);
+        size_t p = 64;
+        while (p < l.size() && (l[p] == ' ' || l[p] == '\t')) { ++p; }
+        if (p >= l.size()) { continue; }
+        std::string rel = l.substr(p);
+        if (rel.rfind("./", 0) == 0) { rel = rel.substr(2); }
+
+        std::wstring w = utf8_to_wide(rel);
+        for (wchar_t& c : w) { if (c == L'/') { c = L'\\'; } }
+        const std::wstring full = exe_dir() + L"\\" + w;
+        if (GetFileAttributesW(full.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            continue;                      // 本机没有这个文件（如 Intel 运行时）
+        }
+        std::wstring got;
+        if (!sha256_file_hex(full, &got)) { ++bad; continue; }
+        ++checked;
+        std::wstring want_w = utf8_to_wide(want);
+        for (wchar_t& c : want_w) { c = (wchar_t)towlower(c); }
+        if (got != want_w) { ++bad; }
+    }
+
+    wchar_t b[128]{};
+    if (checked == 0 && bad == 0) {
+        g_sha_text = T(L"无匹配文件（开发构建）", L"No matching files (dev build)");
+    } else if (bad == 0) {
+        g_sha_ok = true;
+        _snwprintf_s(b, _TRUNCATE, T(L"OK（%d 个文件）", L"OK (%d files)"), checked);
+        g_sha_text = b;
+    } else {
+        _snwprintf_s(b, _TRUNCATE, T(L"%d/%d 个文件校验失败", L"%d/%d files failed"),
+                     bad, checked + bad);
+        g_sha_text = b;
+    }
+    uilog("sha256: checked=%d bad=%d", checked, bad);
+}
+
+
+static std::wstring reg_str(HKEY root, const wchar_t* sub, const wchar_t* value)
+{
+    HKEY k = nullptr;
+    std::wstring out;
+    if (RegOpenKeyExW(root, sub, 0, KEY_READ, &k) == ERROR_SUCCESS) {
+        wchar_t buf[1024]{};
+        DWORD sz = sizeof(buf);
+        DWORD type = 0;
+        if (RegQueryValueExW(k, value, nullptr, &type, reinterpret_cast<LPBYTE>(buf), &sz) ==
+                ERROR_SUCCESS &&
+            (type == REG_SZ || type == REG_EXPAND_SZ)) {
+            out = buf;
+        }
+        RegCloseKey(k);
+    }
+    return out;
+}
+
+static bool dir_exists(const std::wstring& p)
+{
+    if (p.empty()) { return false; }
+    const DWORD a = GetFileAttributesW(p.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+static void scan_steam(std::vector<GameEntry>* out)
+{
+    std::wstring steam = reg_str(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"SteamPath");
+    if (steam.empty()) {
+        steam = reg_str(HKEY_LOCAL_MACHINE, L"SOFTWARE\\WOW6432Node\\Valve\\Steam",
+                        L"InstallPath");
+    }
+    if (steam.empty()) { return; }
+    for (wchar_t& c : steam) { if (c == L'/') { c = L'\\'; } }
+
+    std::vector<std::wstring> libs{ steam };
+    std::vector<std::string> lines;
+    split_lines(read_file_bytes(steam + L"\\steamapps\\libraryfolders.vdf"), &lines);
+    for (const std::string& line : lines) {
+        std::vector<std::string> q;
+        quoted_values(line, &q);
+        if (q.size() < 2) { continue; }
+        const bool is_path = _stricmp(q[0].c_str(), "path") == 0;
+        const bool is_index = !q[0].empty() &&
+            q[0].find_first_not_of("0123456789") == std::string::npos;
+        if (!is_path && !is_index) { continue; }
+        std::wstring p = utf8_to_wide(q[1]);
+        for (wchar_t& c : p) { if (c == L'/') { c = L'\\'; } }
+        if (dir_exists(p)) { libs.push_back(p); }
+    }
+
+    for (const std::wstring& lib : libs) {
+        const std::wstring common = lib + L"\\steamapps\\common";
+        WIN32_FIND_DATAW fd{};
+        HANDLE h = FindFirstFileW((lib + L"\\steamapps\\appmanifest_*.acf").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) { continue; }
+        do {
+            const std::string acf = read_file_bytes(lib + L"\\steamapps\\" + fd.cFileName);
+            std::wstring name, idir;
+            std::vector<std::string> alines;
+            split_lines(acf, &alines);
+            for (const std::string& l : alines) {
+                std::vector<std::string> q;
+                quoted_values(l, &q);
+                if (q.size() < 2) { continue; }
+                if (_stricmp(q[0].c_str(), "name") == 0 && name.empty()) {
+                    name = utf8_to_wide(q[1]);
+                } else if (_stricmp(q[0].c_str(), "installdir") == 0 && idir.empty()) {
+                    idir = utf8_to_wide(q[1]);
+                }
+            }
+            if (!idir.empty()) {
+                GameEntry e;
+                e.root = common + L"\\" + idir;
+                if (dir_exists(e.root) && game_like_name(idir) &&
+                    game_like_name(e.name.empty() ? idir : e.name)) {
+                    e.name = name.empty() ? idir : name;
+                    e.source = L"Steam";
+                    out->push_back(e);
+                }
+            }
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+}
+
+static void scan_epic(std::vector<GameEntry>* out)
+{
+    wchar_t programdata[512]{};
+    if (GetEnvironmentVariableW(L"ProgramData", programdata, 512) == 0) { return; }
+    const std::wstring dat =
+        std::wstring(programdata) + L"\\Epic\\UnrealEngineLauncher\\LauncherInstalled.dat";
+    const std::string data = read_file_bytes(dat);
+    if (data.empty()) { return; }
+
+    const std::string key = "\"InstallLocation\"";
+    size_t pos = 0;
+    while ((pos = data.find(key, pos)) != std::string::npos) {
+        const size_t colon = data.find(':', pos + key.size());
+        const size_t q1 = (colon == std::string::npos) ? std::string::npos
+                                                       : data.find('"', colon);
+        const size_t q2 = (q1 == std::string::npos) ? std::string::npos
+                                                    : data.find('"', q1 + 1);
+        if (q2 == std::string::npos) { break; }
+        std::wstring p = utf8_to_wide(data.substr(q1 + 1, q2 - q1 - 1));
+        for (wchar_t& c : p) { if (c == L'/') { c = L'\\'; } }
+        if (dir_exists(p)) {
+            GameEntry e;
+            e.root = p;
+            e.name = last_component(p);
+            e.source = L"Epic";
+            out->push_back(e);
+        }
+        pos = q2 + 1;
+    }
+}
+
+static void scan_gog(std::vector<GameEntry>* out)
+{
+    const wchar_t* paths[] = {
+        L"SOFTWARE\\WOW6432Node\\GOG.com\\Games",
+        L"SOFTWARE\\GOG.com\\Games",
+    };
+    for (const wchar_t* sub : paths) {
+        HKEY k = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, sub, 0, KEY_READ, &k) != ERROR_SUCCESS) {
+            continue;
+        }
+        wchar_t name[128]{};
+        for (DWORD i = 0;; ++i) {
+            DWORD len = 128;
+            if (RegEnumKeyExW(k, i, name, &len, nullptr, nullptr, nullptr, nullptr) !=
+                ERROR_SUCCESS) {
+                break;
+            }
+            const std::wstring p = reg_str(HKEY_LOCAL_MACHINE,
+                                           (std::wstring(sub) + L"\\" + name).c_str(),
+                                           L"path");
+            if (!dir_exists(p)) { continue; }
+            GameEntry e;
+            e.root = p;
+            const std::wstring gn = reg_str(HKEY_LOCAL_MACHINE,
+                                            (std::wstring(sub) + L"\\" + name).c_str(),
+                                            L"gameName");
+            e.name = gn.empty() ? last_component(p) : gn;
+            e.source = L"GOG";
+            out->push_back(e);
+        }
+        RegCloseKey(k);
+    }
+}
+
+static bool game_like_name(const std::wstring& n)
+{
+    static const wchar_t* bad[] = {
+        L"update for", L"hotfix", L"redistributable", L"runtime", L"sdk",
+        L"directx", L"visual c++", L".net ", L"driver", L"language pack",
+        L"运行库", L"支持组件",
+        L"steamworks", L"proton", L"steam linux runtime", L"steamvr",
+        L"easy anti-cheat", L"battleye", L"dedicated server",
+    };
+    std::wstring s = n;
+    for (wchar_t& c : s) { c = (wchar_t)towlower(c); }
+    for (const wchar_t* b : bad) {
+        if (s.find(b) != std::wstring::npos) { return false; }
+    }
+    return true;
+}
+
+static bool bad_install_dir(const std::wstring& p)
+{
+    std::wstring s = p;
+    for (wchar_t& c : s) { c = (wchar_t)towlower(c); }
+    if (s.find(L"\\windowsapps") != std::wstring::npos) { return true; }
+    wchar_t windir[260]{};
+    if (GetWindowsDirectoryW(windir, 260) > 0) {
+        std::wstring w = windir;
+        for (wchar_t& c : w) { c = (wchar_t)towlower(c); }
+        if (!w.empty() && s.rfind(w, 0) == 0) { return true; }
+    }
+    return false;
+}
+
+static void scan_uninstall(std::vector<GameEntry>* out)
+{
+    struct Key { HKEY root; const wchar_t* sub; };
+    const Key keys[] = {
+        { HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall" },
+        { HKEY_LOCAL_MACHINE,
+          L"SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall" },
+        { HKEY_CURRENT_USER, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall" },
+    };
+    for (const Key& key : keys) {
+        HKEY k = nullptr;
+        if (RegOpenKeyExW(key.root, key.sub, 0, KEY_READ, &k) != ERROR_SUCCESS) { continue; }
+        wchar_t sub[256]{};
+        for (DWORD i = 0;; ++i) {
+            DWORD len = 256;
+            if (RegEnumKeyExW(k, i, sub, &len, nullptr, nullptr, nullptr, nullptr) !=
+                ERROR_SUCCESS) {
+                break;
+            }
+            HKEY sk = nullptr;
+            if (RegOpenKeyExW(k, sub, 0, KEY_READ, &sk) != ERROR_SUCCESS) { continue; }
+            wchar_t dn[512]{}, loc[1024]{};
+            DWORD sz = sizeof(dn), type = 0;
+            RegQueryValueExW(sk, L"DisplayName", nullptr, &type,
+                             reinterpret_cast<LPBYTE>(dn), &sz);
+            sz = sizeof(loc);
+            type = 0;
+            RegQueryValueExW(sk, L"InstallLocation", nullptr, &type,
+                             reinterpret_cast<LPBYTE>(loc), &sz);
+            RegCloseKey(sk);
+
+            const std::wstring name = dn;
+            std::wstring dir = loc;
+            while (!dir.empty() && dir.back() == L' ') { dir.pop_back(); }
+            if (name.empty() || dir.empty()) { continue; }
+            if (!game_like_name(name) || bad_install_dir(dir) || !dir_exists(dir)) { continue; }
+            GameEntry e;
+            e.root = dir;
+            e.name = name;
+            e.source = L"注册表";
+            out->push_back(e);
+        }
+        RegCloseKey(k);
+    }
+}
+
+// 在一个安装根目录里找"最像主程序"的 exe，返回它所在目录（部署目标）。
+static bool bad_exe_name(const std::wstring& n)
+{
+    static const wchar_t* bad[] = {
+        L"unins", L"setup", L"redist", L"vcredist", L"dxsetup", L"crash",
+        L"report", L"launcher", L"helper", L"ue4prereq", L"unitycrashhandler",
+    };
+    std::wstring s = n;
+    for (wchar_t& c : s) { c = (wchar_t)towlower(c); }
+    for (const wchar_t* b : bad) {
+        if (s.find(b) != std::wstring::npos) { return true; }
+    }
+    return false;
+}
+
+// ------------------------------------------------------- 主程序解析（PE 探测）
+// 包体内可能有多个 exe：启动器、崩溃报告、反作弊、真正的游戏进程。这里按
+//   * 是否导入 d3d11/d3d12/dxgi（图形程序的最强信号）
+//   * 名字是否像当前游戏目录 / UE 的 -Win64-Shipping
+//   * 体积、目录深度、明确黑名单
+// 打分选主程序；分数太低时保留为空，交给"自选 exe 安装"。
+static bool pe_file_imports_dx(const std::wstring& path)
+{
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) { return false; }
+    auto read_at = [&](DWORD off, void* buf, DWORD n) -> bool {
+        LARGE_INTEGER li{};
+        li.QuadPart = off;
+        if (!SetFilePointerEx(f, li, nullptr, FILE_BEGIN)) { return false; }
+        DWORD got = 0;
+        return ReadFile(f, buf, n, &got, nullptr) && got == n;
+    };
+
+    bool dx = false;
+    IMAGE_DOS_HEADER dos{};
+    if (read_at(0, &dos, sizeof(dos)) && dos.e_magic == IMAGE_DOS_SIGNATURE) {
+        IMAGE_FILE_HEADER fh{};
+        const DWORD nt = (DWORD)dos.e_lfanew;
+        if (read_at(nt + 4, &fh, sizeof(fh)) && fh.SizeOfOptionalHeader >= 96) {
+            const bool pe64 = (fh.Machine == IMAGE_FILE_MACHINE_AMD64 ||
+                               fh.Machine == IMAGE_FILE_MACHINE_ARM64);
+            BYTE opt[240]{};
+            const DWORD opt_size = fh.SizeOfOptionalHeader > sizeof(opt)
+                                       ? (DWORD)sizeof(opt) : fh.SizeOfOptionalHeader;
+            if (read_at(nt + 4 + sizeof(fh), opt, opt_size)) {
+                const DWORD dd = pe64 ? 112u : 96u;
+                DWORD import_rva = 0;
+                if (dd + 8 <= opt_size) {
+                    DWORD v = 0;
+                    memcpy(&v, opt + dd, 4);
+                    import_rva = v;
+                }
+                if (import_rva != 0 && fh.NumberOfSections > 0 && fh.NumberOfSections <= 96) {
+                    std::vector<IMAGE_SECTION_HEADER> secs(fh.NumberOfSections);
+                    const DWORD sec_off = nt + 4 + sizeof(fh) + fh.SizeOfOptionalHeader;
+                    if (read_at(sec_off, secs.data(),
+                                (DWORD)(secs.size() * sizeof(IMAGE_SECTION_HEADER)))) {
+                        auto rva2off = [&](DWORD rva) -> DWORD {
+                            for (const auto& sc : secs) {
+                                const DWORD vs = sc.Misc.VirtualSize ? sc.Misc.VirtualSize
+                                                                    : sc.SizeOfRawData;
+                                if (rva >= sc.VirtualAddress && rva < sc.VirtualAddress + vs) {
+                                    return sc.PointerToRawData + (rva - sc.VirtualAddress);
+                                }
+                            }
+                            return 0;
+                        };
+                        const DWORD desc = rva2off(import_rva);
+                        if (desc != 0) {
+                            for (int i = 0; i < 48; ++i) {
+                                IMAGE_IMPORT_DESCRIPTOR id{};
+                                if (!read_at(desc + (DWORD)i * sizeof(id), &id, sizeof(id))) {
+                                    break;
+                                }
+                                if (id.Name == 0) { break; }
+                                const DWORD name_off = rva2off(id.Name);
+                                if (name_off == 0) { continue; }
+                                char name[64]{};
+                                if (!read_at(name_off, name, sizeof(name) - 1)) { continue; }
+                                for (char& c : name) { c = (char)tolower((unsigned char)c); }
+                                if (strstr(name, "d3d12.dll") || strstr(name, "d3d11.dll") ||
+                                    strstr(name, "dxgi.dll")) {
+                                    dx = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    CloseHandle(f);
+    return dx;
+}
+
+struct ExePick
+{
+    std::wstring path;
+    std::wstring dir;
+    int          score = -100000;
+};
+
+static std::wstring norm_alnum(const std::wstring& in)
+{
+    std::wstring out;
+    for (wchar_t c : in) {
+        if (iswalnum(c)) { out.push_back((wchar_t)towlower(c)); }
+    }
+    return out;
+}
+
+static int name_similarity(const std::wstring& stem, const std::wstring& folder)
+{
+    const std::wstring a = norm_alnum(stem), b = norm_alnum(folder);
+    if (a.empty() || b.empty()) { return 0; }
+    if (a == b) { return 30; }
+    if (a.find(b) != std::wstring::npos || b.find(a) != std::wstring::npos) { return 20; }
+    int n = 0;
+    while (n < (int)a.size() && n < (int)b.size() && a[(size_t)n] == b[(size_t)n]) { ++n; }
+    return (n >= 4) ? 10 : 0;
+}
+
+static std::wstring exe_stem(const std::wstring& name)
+{
+    const size_t dot = name.find_last_of(L'.');
+    return (dot == std::wstring::npos) ? name : name.substr(0, dot);
+}
+
+static void resolve_game_exes(const std::wstring& root, std::vector<ExePick>* out,
+                              int max_items)
+{
+    if (out == nullptr) { return; }
+    out->clear();
+    std::vector<ExePick> found;
+    struct Node { std::wstring dir; int depth; };
+    std::vector<Node> q{ Node{ root, 0 } };
+    const std::wstring folder = last_component(root);
+
+    for (size_t qi = 0; qi < q.size() && qi < 260; ++qi) {
+        const Node c = q[qi];
+        WIN32_FIND_DATAW fd{};
+        HANDLE h = FindFirstFileW((c.dir + L"\\*").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) { continue; }
+        do {
+            if (fd.cFileName[0] == L'.') { continue; }
+            const std::wstring full = c.dir + L"\\" + fd.cFileName;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                std::wstring dn = fd.cFileName;
+                for (wchar_t& ch : dn) { ch = (wchar_t)towlower(ch); }
+                if (c.depth >= 3 || (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+                    continue;
+                }
+                if (dn == L"redist" || dn == L"_commonredist" || dn == L"directx" ||
+                    dn == L"dotnet" || dn == L"support" || dn == L"engine" ||
+                    dn == L"__installer" || dn == L"easyanticheat" || dn == L"battleye") {
+                    continue;
+                }
+                q.push_back(Node{ full, c.depth + 1 });
+                continue;
+            }
+            const size_t n = wcslen(fd.cFileName);
+            if (n < 5 || _wcsicmp(fd.cFileName + n - 4, L".exe") != 0) { continue; }
+
+            std::wstring lower = fd.cFileName;
+            for (wchar_t& ch : lower) { ch = (wchar_t)towlower(ch); }
+            const unsigned long long size =
+                ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+            if (size < (1ull << 20)) { continue; }        // < 1 MB 基本不是主程序
+            if (bad_exe_name(lower)) { continue; }
+
+            int score = 0;
+            if (pe_file_imports_dx(full)) { score += 60; }
+            if (lower.find(L"shipping") != std::wstring::npos) { score += 25; }
+            if (lower.find(L"game") != std::wstring::npos) { score += 15; }
+            score += name_similarity(exe_stem(lower), folder);
+            if (size >= (20ull << 20))     { score += 25; }
+            else if (size >= (8ull << 20)) { score += 15; }
+            else                           { score += 5; }
+            if (c.depth == 0)      { score += 10; }
+            else if (c.depth == 1) { score += 6; }
+            else                   { score += 3; }
+
+            ExePick p;
+            p.path = full;
+            p.dir = c.dir;
+            p.score = score;
+            found.push_back(p);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+
+    std::sort(found.begin(), found.end(),
+              [](const ExePick& a, const ExePick& b) { return a.score > b.score; });
+    const int total = (int)found.size();
+    const int n = (max_items > 0 && total > max_items) ? max_items : total;
+    out->assign(found.begin(), found.begin() + n);
+}
+
+static void resolve_game_exe(const std::wstring& root, ExePick* best, ExePick* second)
+{
+    std::vector<ExePick> v;
+    resolve_game_exes(root, &v, 2);
+    *best = (v.size() > 0) ? v[0] : ExePick{};
+    *second = (v.size() > 1) ? v[1] : ExePick{};
+}
+
+// 兼容旧调用：只取目录（分数太低视为解析失败）。
+static std::wstring find_game_exe_dir(const std::wstring& root)
+{
+    ExePick best, second;
+    resolve_game_exe(root, &best, &second);
+    return (best.score >= 40) ? best.dir : std::wstring();
+}
+
+// 已经部署过的游戏：目录里存在 fakerFG.dll，直接认它（不需要再猜 exe）。
+static std::wstring find_deployed_dir(const std::wstring& root)
+{
+    struct Node { std::wstring dir; int depth; };
+    std::vector<Node> q{ Node{ root, 0 } };
+    for (size_t qi = 0; qi < q.size() && qi < 120; ++qi) {
+        const Node c = q[qi];
+        if (GetFileAttributesW((c.dir + L"\\fakerFG.dll").c_str()) != INVALID_FILE_ATTRIBUTES) {
+            return c.dir;
+        }
+        if (c.depth >= 3) { continue; }
+        WIN32_FIND_DATAW fd{};
+        HANDLE h = FindFirstFileW((c.dir + L"\\*").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) { continue; }
+        do {
+            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) { continue; }
+            if (fd.cFileName[0] == L'.') { continue; }
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) { continue; }
+            if (_wcsicmp(fd.cFileName, L"redist") == 0 ||
+                _wcsicmp(fd.cFileName, L"_CommonRedist") == 0 ||
+                _wcsicmp(fd.cFileName, L"DirectX") == 0) { continue; }
+            q.push_back(Node{ c.dir + L"\\" + fd.cFileName, c.depth + 1 });
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    return std::wstring();
+}
+
+// 选中 / 安装某个游戏时调用：优先已安装目录，否则解析主程序并写回。
+static bool ensure_entry_resolved(GameEntry& e)
+{
+    const std::wstring old_dir = e.dir, old_root = e.root;
+    const bool auto_name = e.name.empty() ||
+        same_name(e.name, last_component(old_dir.empty() ? old_root : old_dir));
+    auto fix_name = [&]() {
+        if (auto_name && !e.exe.empty()) { e.name = file_stem(e.exe); }
+    };
+    if (!e.exe.empty() &&
+        GetFileAttributesW(e.exe.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        const size_t s = e.exe.find_last_of(L'\\');
+        if (s != std::wstring::npos) { e.dir = e.exe.substr(0, s); }
+        fix_name();
+        return true;
+    }
+    if (e.root.empty()) { return false; }
+
+    if (e.dir.empty()) {
+        const std::wstring dep = find_deployed_dir(e.root);
+        if (!dep.empty()) { e.dir = dep; }
+    }
+    const std::wstring base = e.dir.empty() ? e.root : e.dir;
+    ExePick best, second;
+    resolve_game_exe(base, &best, &second);
+    if (!best.path.empty() && best.score >= 40) {
+        e.exe = best.path;
+        e.dir = best.dir;
+        fix_name();
+        return true;
+    }
+    return !e.dir.empty();
+}
+
+static void dedupe_games(std::vector<GameEntry>* v)
+{
+    std::vector<GameEntry> out;
+    for (const GameEntry& e : *v) {
+        bool dup = false;
+        for (const GameEntry& o : out) {
+            if ((!e.root.empty() && !o.root.empty() && norm_path(e.root) == norm_path(o.root)) ||
+                (!e.dir.empty() && !o.dir.empty() && norm_path(e.dir) == norm_path(o.dir)) ||
+                (!e.dir.empty() && !o.root.empty() && norm_path(e.dir) == norm_path(o.root))) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) { out.push_back(e); }
+    }
+    v->swap(out);
+}
+
+// 扫描并合并进游戏库（不覆盖已有条目）。返回新增数量。
+static int scan_games_merge()
+{
+    std::vector<GameEntry> found;
+    scan_steam(&found);
+    scan_epic(&found);
+    scan_gog(&found);
+    scan_uninstall(&found);
+    dedupe_games(&found);
+
+    int added = 0;
+    for (const GameEntry& f : found) {
+        if (find_game(f.root) != nullptr) { continue; }
+        if (!f.dir.empty() && find_game(f.dir) != nullptr) { continue; }
+        if (g_games.size() >= 200) { break; }
+        GameEntry n = f;
+        n.st = baseline_state();       // 每个游戏一份自己的配置
+        g_games.push_back(n);
+        ++added;
+    }
+    save_games();
+    return added;
+}
+
+// 记住当前这套设置属于哪个游戏。安装完成 / 成功启动 / 改输入源时调用。
+static void remember_game(const std::wstring& dir)
+{
+    if (dir.empty()) { return; }
+    GameEntry* e = find_game_mut(dir);
+    if (e == nullptr) {
+        if (g_games.size() >= 200) { g_games.erase(g_games.begin()); }
+        GameEntry n;
+        n.dir = dir;
+        n.root = dir;
+        n.name = last_component(dir);
+        n.source = L"手动";
+        n.st = baseline_state();
+        if (g_game_dir.empty() || norm_path(g_game_dir) != norm_path(dir)) { n.st = S(); }
+        g_games.push_back(n);
+        e = &g_games.back();
+    }
+    if (e->dir.empty()) { e->dir = dir; }
+    if (e->root.empty()) { e->root = dir; }
+    if (e->name.empty()) { e->name = last_component(dir); }
+    if (e->source.empty()) { e->source = L"手动"; }
+    e->mult = e->st.fg_mode + 2;
+    e->fg_input = e->st.fg_input;
+    e->lock = e->st.lock_fps;
+    e->last_use = (unsigned long long)std::time(nullptr);
+    save_games();
+}
+
+// 切换到这个游戏时恢复它自己的倍率 / 输入源 / 锁帧提示。
+static void apply_game(const std::wstring& dir)
+{
+    GameEntry* e = find_game_mut(dir);
+    if (e == nullptr) { return; }
+    if (g_game_dir.empty() || norm_path(g_game_dir) != norm_path(dir)) { g_game_dir = dir; }
+    // 配置已经是这个条目自己的（S() 按 g_game_dir 路由），这里只做字段同步。
+    e->st.interp = e->st.fg_mode + 2;
+    e->mult = e->st.fg_mode + 2;
+    e->fg_input = e->st.fg_input;
+    e->lock = e->st.lock_fps;
+}
+
+// 选中一个游戏：后续所有设置都写进它自己的配置；FgInput 以它的 fakerFG.ini 为准。
+static bool select_game(int idx)
+{
+    name_edit_commit(false);
+    if (idx < 0 || idx >= (int)g_games.size()) { return false; }
+    GameEntry& e = g_games[(size_t)idx];
+    ensure_entry_resolved(e);
+    std::wstring d = e.dir;
+    if (d.empty()) { d = e.root; }
+    if (d.empty()) {
+        set_msg(T(L"这个条目还没有路径：用[主程序…]指定游戏 exe",
+                  L"No path for this entry: pick the exe with [Main exe...]"));
+        return false;
+    }
+    e.dir = d;
+    g_game_dir = d;
+    apply_game(d);
+    sync_fg_input_from_dir(d);
+    e.last_use = (unsigned long long)std::time(nullptr);
+    g_user_picked = false;
+    g_last_auto_hwnd = nullptr;
+    ini_ws(L"ui", L"game_dir", g_game_dir);
+    save_all();
+    refresh_readiness();
+    return true;
+}
+
+// 安装完成 = 应用这个游戏保存的配置（写入它的 fakerFG.ini）。
+static void apply_config_after_deploy(const std::wstring& dir)
+{
+    if (dir.empty()) { return; }
+    g_game_dir = dir;
+    apply_fg_input();
+    refresh_readiness();
+    save_all();
+}
+
+static void name_edit_start()
+{
+    GameEntry* e = find_game_mut(g_game_dir);
+    if (e == nullptr) { return; }
+    g_name_edit = true;
+    g_name_fresh = true;
+    g_name_buf = e->name;
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void name_edit_commit(bool save)
+{
+    if (!g_name_edit) { return; }
+    if (save) {
+        std::wstring t = g_name_buf;
+        while (!t.empty() && iswspace(t.front())) { t.erase(t.begin()); }
+        while (!t.empty() && iswspace(t.back())) { t.pop_back(); }
+        if (!t.empty() && t.size() <= 64) {
+            GameEntry* e = find_game_mut(g_game_dir);
+            if (e != nullptr) {
+                const std::wstring old_name = e->name;
+                e->name = t;
+                // 配置文件如果是按旧名字自动命名的，跟着改名（失败就保持原路径）。
+                if (!e->profile.empty()) {
+                    const std::wstring want =
+                        L"profiles\\" + sanitize_file_name(old_name) + L".ini";
+                    if (_wcsicmp(e->profile.c_str(), want.c_str()) == 0) {
+                        const std::wstring rel = new_profile_rel(t, e);
+                        if (_wcsicmp(rel.c_str(), e->profile.c_str()) != 0 &&
+                            MoveFileW(profile_abs(e->profile).c_str(),
+                                      profile_abs(rel).c_str())) {
+                            e->profile = rel;
+                        }
+                    }
+                }
+                save_games();
+                set_msg(T(L"已重命名游戏配置", L"Game renamed"));
+            }
+        }
+    }
+    g_name_edit = false;
+    g_name_fresh = false;
+    g_name_buf.clear();
+    InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
 static void save_all()
 {
     ini_w(std::wstring(L"ui"), L"count", (int)g_profiles.size());
     ini_w(std::wstring(L"ui"), L"active", g_prof);
+    ini_w(std::wstring(L"ui"), L"advanced", g_advanced ? 1 : 0);
+    ini_w(std::wstring(L"ui"), L"scale_pct", g_scale_pct);
+    ini_w(std::wstring(L"ui"), L"lang", g_lang);
+    ini_w(std::wstring(L"ui"), L"show_cmd", g_show_cmd ? 1 : 0);
+    ini_ws(std::wstring(L"ui"), L"game_dir", g_game_dir);
     ini_w(std::wstring(L"ui"), L"hk_custom", g_hk_custom ? 1 : 0);
     ini_w(std::wstring(L"ui"), L"hk_mods", (int)g_hk_mods);
     ini_w(std::wstring(L"ui"), L"hk_vk", (int)g_hk_vk);
     for (int i = 0; i < (int)g_profiles.size(); ++i) { save_profile(i); }
+    save_games();
 }
 
 static void load_all()
 {
+    ensure_utf16_bom(ini_path());
+    g_advanced = ini_r(L"ui", L"advanced", 0) != 0;
+    g_scale_pct = ini_r(L"ui", L"scale_pct", 0);
+    if (g_scale_pct != 0 && (g_scale_pct < 80 || g_scale_pct > 300)) { g_scale_pct = 0; }
+    g_lang = ini_r(L"ui", L"lang", 0);
+    if (g_lang < 0 || g_lang > 1) { g_lang = 0; }
+    g_show_cmd = ini_r(L"ui", L"show_cmd", 0) != 0;
+    g_welcome = ini_r(L"ui", L"welcomed", 0) == 0;
+    load_games();
+    g_game_dir = ini_rs(L"ui", L"game_dir", L"");
     g_hk_custom = ini_r(L"ui", L"hk_custom", 0) != 0;
     g_hk_mods = (UINT)ini_r(L"ui", L"hk_mods", MOD_CONTROL | MOD_ALT);
     g_hk_vk = (UINT)ini_r(L"ui", L"hk_vk", VK_F11);
@@ -926,6 +2921,12 @@ static void load_all()
     for (int i = 0; i < n; ++i) { load_profile(i); }
     g_prof = ini_r(L"ui", L"active", 0);
     if (g_prof < 0 || g_prof >= (int)g_profiles.size()) { g_prof = 0; }
+
+    // 游戏库要等 profile 和 game_dir 都读完之后再覆盖倍率/输入源/锁帧。
+    if (!g_game_dir.empty()) { apply_game(g_game_dir); }
+
+    // 启动时落一次盘：生成/刷新 profiles\*.ini，并清掉旧格式的内联字段。
+    save_games();
 }
 
 // ------------------------------------------------------ window enumeration
@@ -977,9 +2978,20 @@ static void rescan_windows()
     // Re-bind the remembered window of the active profile by title.
     g_win_sel = g_wins.empty() ? -1 : 0;
     const std::wstring want = S().win_title;
+    bool matched = false;
     if (!want.empty()) {
         for (size_t i = 0; i < g_wins.size(); ++i) {
-            if (g_wins[i].title == want) { g_win_sel = (int)i; break; }
+            if (g_wins[i].title == want) { g_win_sel = (int)i; matched = true; break; }
+        }
+    }
+    // 没有记忆命中时，优先选"已经加载 producer"的那个窗口：它就是我们要的游戏，
+    // 而不是列表里正好最大的浏览器。
+    if (!matched) {
+        for (size_t i = 0; i < g_wins.size(); ++i) {
+            if (proc_has_module(g_wins[i].pid, L"xess_mfg_producer.dll")) {
+                g_win_sel = (int)i;
+                break;
+            }
         }
     }
     if (g_win_sel >= 0) {
@@ -1078,6 +3090,15 @@ static void parse_line(const std::string& s)
         return p ? atof(p + strlen(key)) : 0.0;
     };
     if (strstr(s.c_str(), "show=")) { g_show = (int)num("show="); }
+    // 简易模式的状态卡要把"exact/total"翻成一句人话，所以单独留一份。
+    if (strstr(s.c_str(), "pair:")) {
+        const int exact = (int)num("exact=");
+        const int total = (int)num("(total=");
+        if (total > 0) {
+            g_pair_exact = exact;
+            g_pair_total = total;
+        }
+    }
     if (strstr(s.c_str(), "breakdown:")) {
         g_gpu = num("gpu=");
         g_present = num("present=");
@@ -1119,7 +3140,7 @@ static DWORD WINAPI reader_thread(LPVOID)
             WriteFile(log, buf, got, &wrote, nullptr);
         }
         for (DWORD i = 0; i < got; ++i) {
-            if (buf[i] == '\n') { parse_line(acc); acc.clear(); }
+            if (buf[i] == '\n') { parse_line(acc); log_line_utf8(acc); acc.clear(); }
             else if (buf[i] != '\r') { acc.push_back(buf[i]); }
         }
         if (g_hwnd) { PostMessageW(g_hwnd, WM_APP + 1, 0, 0); }
@@ -1206,6 +3227,7 @@ static void stop_bridge()
     g_child_pid = 0;
     g_running = false;
     g_show = 0; g_xn = 0; g_skip = 0; g_gpu = 0; g_game = 0; g_present = 0;
+    g_pair_exact = 0; g_pair_total = 0;
 }
 
 // A target only makes sense if it is the process that created the shared mailbox,
@@ -1237,7 +3259,7 @@ static bool target_is_producer(HWND wnd, DWORD* out_pid, DWORD* out_producer,
     return ok;
 }
 
-static void start_bridge()
+static void start_bridge(bool user_initiated)
 {
     // Which window do we capture? In "foreground" mode it is whatever has focus when
     // the hotkey fires - Lossless Scaling's own muscle memory - which also means the
@@ -1298,6 +3320,45 @@ static void start_bridge()
         uilog("start: lock_frame.exe missing next to %ls", exe_dir().c_str());
         return;
     }
+
+    // 启动前检查（只在用户主动点启动时弹，热键不打断游戏）。全部是"可以继续"的
+    // 警告：宁可让用户带着已知问题跑一次，也不要把它挡在门外。
+    if (user_initiated) {
+        refresh_readiness();
+        std::wstring warn;
+        if (g_adapters.size() < 2) {
+            warn += L"· 只检测到 1 块 GPU：可以跑，但不建议（插帧会和游戏抢同一张卡）\r\n";
+        }
+        if (!exe_file_exists(L"libxess_fg.dll")) {
+            warn += L"· 缺少 libxess_fg.dll（Intel XeSS-FG 运行时，正式包默认不内置）\r\n";
+        }
+        if (S().fg_mode >= 1 && !exe_file_exists(L"libxell.dll")) {
+            warn += L"· 缺少 libxell.dll（3x / 4x 需要）\r\n";
+        }
+        if (!g_game_dir.empty() && !faker_ini_ok(g_game_dir)) {
+            warn += L"· 游戏目录的 fakerFG.ini 不是消费者链路配置"
+                    L"（FgOutput 应为 Capture、Passthrough=0）\r\n";
+        }
+        const unsigned hz = (g_refresh > 1) ? g_refresh : 120;
+        const int mul = S().fg_mode + 2;
+        if (hz % static_cast<unsigned>(mul) != 0) {
+            wchar_t b[160]{};
+            _snwprintf_s(b, _TRUNCATE,
+                         L"· 面板 %u Hz 不能被 %dx 整除：输出节奏不会完美\r\n", hz, mul);
+            warn += b;
+        }
+        if (!g_ready.producer) {
+            warn += L"· 还没检测到 producer：确认游戏已开 DLSS 帧生成并进入实际画面\r\n";
+        }
+        if (!warn.empty()) {
+            warn = L"启动前检查发现：\r\n\r\n" + warn + L"\r\n仍然启动吗？";
+            if (MessageBoxW(g_hwnd, warn.c_str(), L"启动前检查",
+                            MB_YESNO | MB_ICONWARNING) != IDYES) {
+                uilog("start: cancelled by preflight");
+                return;
+            }
+        }
+    }
     SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
     HANDLE rd = nullptr, wr = nullptr;
     if (!CreatePipe(&rd, &wr, &sa, 0)) {
@@ -1341,6 +3402,14 @@ static void start_bridge()
         GetWindowTextW(target, t, 256);
         S().win_title = t;
     }
+    // 成功启动即记住这个游戏的目录和当前倍率/输入源/锁帧，下次直接恢复。
+    {
+        const std::wstring tdir = game_dir_for_window(target);
+        if (!tdir.empty()) {
+            g_game_dir = tdir;
+            remember_game(tdir);
+        }
+    }
     save_all();
     uilog("start: pid=%lu cmd=%ls", (unsigned long)g_child_pid, cmd.c_str());
     // Point out the one combination that pays for MV without seeing the benefit: at 3x the
@@ -1352,22 +3421,26 @@ static void start_bridge()
     }
 }
 
-static void toggle_bridge()
+static void toggle_bridge(bool user_initiated)
 {
     uilog("hotkey/button: running=%d child_pid=%lu", (int)g_running, (unsigned long)g_child_pid);
     if (g_running) { stop_bridge(); set_msg(L"消费端已停止"); }
-    else           { start_bridge(); }
+    else           { start_bridge(user_initiated); }
     if (g_hwnd) { InvalidateRect(g_hwnd, nullptr, FALSE); }
 }
 
 
 // ------------------------------------------------------------------- layout
-static const int kWinW = 1200, kWinH = 620;
-static const int kTitleH = 38;
-static const int kSideW = 250;
-static const int kMargin = 22;
+static const int kWinW = 1240, kWinH = 720;
+static const int kTitleH = 42;
+static const int kSideW = 232;
+static const int kMargin = 20;
 static const int kGap = 16;
-static const int kCardHead = 44;
+// 统一的圆角与控件高度：卡片 10、控件 7；紧凑按钮 30、常规 36、主按钮 44+
+static const int RAD_CARD = 12;
+static const int RAD_CTL  = 7;
+static const int BTN_H    = 36;
+static const int kCardHead = 40;
 static const int kRowH = 33;
 static const int kCardTail = 12;
 static const int kBottomH = 34;
@@ -1381,7 +3454,27 @@ struct Item
     bool    on = false;
 };
 
-static int row_h(RowKind k) { return (k == RK_CMDLINE) ? 106 : kRowH; }
+// 鼠标坐标是设备像素，绘制用的是逻辑坐标：所有命中测试前先换算一次。
+static POINT to_logical(int mx, int my)
+{
+    POINT p{ mx, my };
+    RECT cr{};
+    if (g_hwnd != nullptr && GetClientRect(g_hwnd, &cr) &&
+        cr.right > 0 && cr.bottom > 0) {
+        p.x = static_cast<LONG>((long long)p.x * kWinW / cr.right);
+        p.y = static_cast<LONG>((long long)p.y * kWinH / cr.bottom);
+    }
+    return p;
+}
+
+// 启动命令默认折叠：折叠时和普通行一样高，点一下展开成 106px 的换行命令行。
+static int row_h(RowKind k, Id id = ID_NONE)
+{
+    if (k == RK_CMDLINE) {
+        return (id == ID_CMD && !g_show_cmd) ? kRowH : 106;
+    }
+    return kRowH;
+}
 
 static int ctl_w(RowKind k)
 {
@@ -1394,58 +3487,6 @@ static int ctl_w(RowKind k)
     }
 }
 
-static void layout_items(std::vector<Item>& out, int* content_h)
-{
-    out.clear();
-    const int main_x = kSideW;
-    const int content_w = kWinW - kSideW - 2 * kMargin;
-    const int colw = (content_w - kGap) / 2;
-    int y[2] = { kTitleH + 66, kTitleH + 66 };
-
-    for (int ci = 0; ci < kCardCount; ++ci) {
-        const CardDef& cd = kCards[ci];
-        const int col = cd.col;
-        const int x = main_x + kMargin + col * (colw + kGap);
-        const int top = y[col];
-        int body = 0;
-        for (int r = 0; r < cd.n; ++r) { body += row_h(cd.rows[r].kind); }
-        const int bottom = top + kCardHead + body + kCardTail;
-
-        Item head{};
-        head.rc = RECT{ x, top, x + colw, bottom };
-        head.id = (Id)(1000 + ci);
-        out.push_back(head);
-
-        int ry = top + kCardHead;
-        for (int r = 0; r < cd.n; ++r) {
-            Item it{};
-            it.id = cd.rows[r].id;
-            it.kind = cd.rows[r].kind;
-            it.is_row = true;
-            const int hh = row_h(it.kind);
-            it.rc = RECT{ x + 16, ry, x + colw - 16, ry + hh };
-            ry += hh;
-            it.on = (it.id == ID_JITZ) ? S().jitter_zero
-                  : (it.id == ID_NOMARKER) ? S().no_marker
-                  : (it.id == ID_UPSAMPLE) ? S().upsample
-                  : (it.id == ID_STRAUTO) ? S().stream_auto
-                  : (it.id == ID_STRASYM) ? S().stream_asym
-                  : (it.id == ID_PREFETCH) ? S().input_prefetch
-                  : (it.id == ID_UNLOCK) ? S().unlock_mfg
-                  : (it.id == ID_SLACK) ? S().slack1
-                  : (it.id == ID_TEAR) ? S().tearing
-                  : (it.id == ID_SDR) ? S().sdr
-                  : (it.id == ID_LAYERED) ? S().overlay_layered
-                  : (it.id == ID_RELAY) ? S().relay_input
-                  : (it.id == ID_OSD) ? S().osd
-                  : (it.id == ID_PERF) ? S().perf_no_throttle
-                  : false;
-            out.push_back(it);
-        }
-        y[col] = bottom + kGap;
-    }
-    *content_h = (y[0] > y[1] ? y[0] : y[1]) - (kTitleH + 66) + kMargin;
-}
 
 // ------------------------------------------------------------------ drawing
 static void fill_round(HDC dc, const RECT& r, int rad, COLORREF c)
@@ -1474,6 +3515,7 @@ static void stroke_round(HDC dc, const RECT& r, int rad, COLORREF fill, COLORREF
     DeleteObject(pen);
 }
 
+
 static void txt(HDC dc, HFONT f, const RECT& r, const std::wstring& s, COLORREF c, UINT fmt)
 {
     HGDIOBJ old = SelectObject(dc, f);
@@ -1483,7 +3525,9 @@ static void txt(HDC dc, HFONT f, const RECT& r, const std::wstring& s, COLORREF 
     // whole UI looks like it has no labels at all.
     SetBkMode(dc, TRANSPARENT);
     RECT rc = r;
-    DrawTextW(dc, s.c_str(), -1, &rc, fmt | DT_SINGLELINE | DT_NOPREFIX);
+    const wchar_t* text = s.c_str();
+    if (const wchar_t* e = tr_lookup(text)) { text = e; }
+    DrawTextW(dc, text, -1, &rc, fmt | DT_SINGLELINE | DT_NOPREFIX);
     SelectObject(dc, old);
 }
 
@@ -1539,7 +3583,7 @@ static std::wstring g_edit_buf;
 static void draw_edit(HDC dc, const RECT& r, const std::wstring& value, bool hover,
                       bool editing)
 {
-    RECT b{ r.right - 210, r.top + 4, r.right, r.bottom - 4 };
+    RECT b{ r.right - 240, r.top + 4, r.right, r.bottom - 4 };
     stroke_round(dc, b, 6, (hover || editing) ? C_CTL_HOVER : C_CTL,
                  editing ? RGB(120, 170, 255) : C_BORDER);
     RECT vt{ b.left + 10, b.top, b.right - 26, b.bottom };
@@ -1559,7 +3603,7 @@ static void draw_edit(HDC dc, const RECT& r, const std::wstring& value, bool hov
 
 static void draw_dd(HDC dc, const RECT& r, const std::wstring& value, bool hover, bool open)
 {
-    RECT b{ r.right - 210, r.top + 4, r.right, r.bottom - 4 };
+    RECT b{ r.right - 240, r.top + 4, r.right, r.bottom - 4 };
     stroke_round(dc, b, 6, (hover || open) ? C_CTL_HOVER : C_CTL, C_BORDER);
     RECT vt{ b.left + 10, b.top, b.right - 26, b.bottom };
     txt(dc, g_f_ui, vt, value, C_TEXT, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
@@ -1589,19 +3633,36 @@ static std::wstring dd_caption(Id id)
     return opt_text(id, opt_get(id));
 }
 
+// 简易模式的窗口列表可能很长：先按可用高度压缩行高，再决定向上/向下展开。
+// draw_popup 与 popup_hit 必须用同一套计算，否则会"看得见点不到"。
+static int popup_row_h(int n)
+{
+    int rowH = 30;
+    const int avail = kWinH - kBottomH - kTitleH - 12;
+    while (n * rowH + 8 > avail && rowH > 18) { rowH -= 2; }
+    return rowH;
+}
+
+static int popup_top(int n, int rowH)
+{
+    const int h = n * rowH + 8;
+    int y = g_popup_rect.bottom + 2;
+    if (y + h > kWinH - kBottomH) { y = g_popup_rect.top - h - 2; }   // open upwards
+    if (y < kTitleH + 4) { y = kTitleH + 4; }
+    return y;
+}
+
 static void draw_popup(HDC dc)
 {
     if (!g_popup_id) { return; }
     const Id id = (Id)g_popup_id;
     const int n = opt_count(id);
     if (n <= 0) { return; }
-    const int rowH = 30;
+    const int rowH = popup_row_h(n);
     const int w = (int)(g_popup_rect.right - g_popup_rect.left);
-    int x = g_popup_rect.left;
-    int y = g_popup_rect.bottom + 2;
+    const int x = g_popup_rect.left;
+    const int y = popup_top(n, rowH);
     const int h = n * rowH + 8;
-    if (y + h > kWinH - kBottomH) { y = g_popup_rect.top - h - 2; }   // open upwards
-
     RECT box{ x, y, x + w, y + h };
     stroke_round(dc, box, 8, RGB(40, 40, 40), C_BORDER);
     for (int i = 0; i < n; ++i) {
@@ -1613,65 +3674,143 @@ static void draw_popup(HDC dc)
     }
 }
 
+static bool hit_rect(const RECT& r, int x, int y);
+static RECT help_rect_entry();
+static RECT help_rect_close();
+
+static RECT title_min_rect()   { return RECT{ kWinW - 92, 0, kWinW - 52, kTitleH }; }
+static RECT title_close_rect() { return RECT{ kWinW - 48, 0, kWinW - 8,  kTitleH }; }
+
+// 「高级设置」与安装/还原同一行，右对齐（定义在卡片常量之后）。
+
+// toggle_advanced 定义在抽屉全局变量之后（见 paint_drawer 附近）。
+static void toggle_advanced();
+
 static void draw_titlebar(HDC dc, int W)
 {
-    fill_round(dc, RECT{ 0, 0, W, kTitleH }, 0, RGB(30, 30, 30));
-    RECT t{ 14, 0, W - 200, kTitleH };
-    txt(dc, g_f_small, t, L"MGPU  -  双显卡帧生成", C_TEXT, DT_LEFT | DT_VCENTER);
+    fill_round(dc, RECT{ 0, 0, W, kTitleH }, 0, RGB(28, 28, 28));
+    fill_round(dc, RECT{ 0, kTitleH - 1, W, kTitleH }, 0, RGB(44, 44, 44));
 
-    // START / STOP button (like Lossless Scaling's action button, top right)
-    RECT btn{ W - 190, 7, W - 100, kTitleH - 7 };
-    stroke_round(dc, btn, 6, g_running ? RGB(140, 60, 60) : RGB(56, 96, 70), C_BORDER);
-    txt(dc, g_f_ui, btn, g_running ? L"停止" : L"启动", C_TEXT, DT_CENTER | DT_VCENTER);
+    // 品牌点 + 标题；标题栏只保留最小化/关闭，启动按钮不在这里重复。
+    fill_round(dc, RECT{ 14, 13, 28, 27 }, 4, C_ACCENT);
+    txt(dc, g_f_ui, RECT{ 34, 0, W - 160, kTitleH }, L"MGPU  双显卡帧生成", C_TEXT,
+        DT_LEFT | DT_VCENTER);
 
-    // minimise and close glyphs
-    RECT mn{ W - 88, 0, W - 52, kTitleH };
-    RECT cl{ W - 44, 0, W - 8, kTitleH };
-    HBRUSH nb = CreateSolidBrush(C_TEXT);
-    RECT bar{ mn.left + 8, mn.top + 18, mn.right - 8, mn.top + 20 };
-    FillRect(dc, &bar, nb);
-    DeleteObject(nb);
-    RECT x1{ cl.left + 9, cl.top + 13, cl.right - 9, cl.top + 15 };
-    RECT x2{ cl.left + 9, cl.top + 23, cl.right - 9, cl.top + 25 };
-    (void)x1; (void)x2;
-    txt(dc, g_f_ui, cl, L"\u2715", C_TEXT, DT_CENTER | DT_VCENTER);
+    // 标题栏只保留最小化/关闭；高级入口放到主内容区右上角。
+    const RECT mn = title_min_rect();
+    const RECT cl = title_close_rect();
+    if (hit_rect(mn, g_hover_x, g_hover_y)) { fill_round(dc, mn, 4, RGB(48, 48, 48)); }
+    if (hit_rect(cl, g_hover_x, g_hover_y)) { fill_round(dc, cl, 4, RGB(160, 60, 60)); }
     txt(dc, g_f_ui, mn, L"\u2013", C_TEXT, DT_CENTER | DT_VCENTER);
+    txt(dc, g_f_ui, cl, L"\u2715", C_TEXT, DT_CENTER | DT_VCENTER);
 }
 
+
+static const int kSideRowH = 46;
+static int g_side_scroll = 0;   // 侧栏游戏列表滚动了多少行
+static int side_rows_max()
+{
+    const int top = kTitleH + 42;
+    const int bottom = kWinH - 144;   // 下方只留"帮助"
+    return (bottom > top) ? ((bottom - top) / kSideRowH) : 1;
+}
+static int side_max_scroll()
+{
+    const int m = (int)g_games.size() - side_rows_max();
+    return (m > 0) ? m : 0;
+}
+static void side_ensure_visible(int idx)
+{
+    const int rows = side_rows_max();
+    if (idx < g_side_scroll) { g_side_scroll = idx; }
+    if (idx >= g_side_scroll + rows) { g_side_scroll = idx - rows + 1; }
+    if (g_side_scroll < 0) { g_side_scroll = 0; }
+    if (g_side_scroll > side_max_scroll()) { g_side_scroll = side_max_scroll(); }
+}
+static RECT side_row_rect(int slot)
+{
+    const int y = kTitleH + 42 + slot * kSideRowH;
+    return RECT{ 10, y, kSideW - 10, y + kSideRowH - 2 };
+}
 
 static void draw_sidebar(HDC dc)
 {
     fill_round(dc, RECT{ 0, kTitleH, kSideW, kWinH }, 0, C_SIDEBAR);
-    txt(dc, g_f_small, RECT{ 16, kTitleH + 14, kSideW - 16, kTitleH + 40 },
-        L"游戏配置文件", C_DIM, DT_LEFT | DT_VCENTER);
-
-    int y = kTitleH + 48;
-    for (int i = 0; i < (int)g_profiles.size(); ++i) {
-        RECT rc{ 10, y, kSideW - 10, y + 34 };
-        if (i == g_prof) {
-            fill_round(dc, rc, 6, RGB(42, 42, 42));
-            fill_round(dc, RECT{ rc.left, rc.top, rc.left + 3, rc.bottom }, 2, C_ACCENT);
-        }
-        txt(dc, g_f_ui, RECT{ rc.left + 14, rc.top, rc.right - 10, rc.bottom },
-            g_profiles[i].name, (i == g_prof) ? C_TEXT : C_LABEL,
-            DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
-        y += 38;
+    fill_round(dc, RECT{ kSideW - 1, kTitleH, kSideW, kWinH }, 0, RGB(34, 34, 34));
+    txt(dc, g_f_small, RECT{ 16, kTitleH + 12, kSideW - 16, kTitleH + 34 },
+        T(L"游戏", L"Games"), C_DIM, DT_LEFT | DT_VCENTER);
+    {
+        wchar_t cnt[32]{};
+        _snwprintf_s(cnt, _TRUNCATE, L"%d", (int)g_games.size());
+        txt(dc, g_f_small, RECT{ kSideW - 60, kTitleH + 12, kSideW - 16, kTitleH + 34 },
+            cnt, C_DIM, DT_RIGHT | DT_VCENTER);
     }
 
-    // + / - buttons under the list
-    const int by = y + 6;
-    RECT add{ 10, by, 40, by + 30 };
-    RECT del{ 46, by, 76, by + 30 };
-    stroke_round(dc, add, 6, C_BTN, C_BORDER);
-    txt(dc, g_f_ui, add, L"+", C_TEXT, DT_CENTER | DT_VCENTER);
-    stroke_round(dc, del, 6, C_BTN, C_BORDER);
-    txt(dc, g_f_ui, del, L"\u2212", C_TEXT, DT_CENTER | DT_VCENTER);
+    const int rows = side_rows_max();
+    const int n = (int)g_games.size();
+    if (n == 0) {
+        txt(dc, g_f_small, RECT{ 16, kTitleH + 44, kSideW - 16, kTitleH + 96 },
+            T(L"还没有游戏：点右边[选择游戏]",
+              L"No games yet: click [Choose game] on the right"),
+            C_DIM, DT_LEFT | DT_WORDBREAK);
+    }
 
-    // bottom entries
-    RECT man{ 10, kWinH - kBottomH - 40, kSideW - 10, kWinH - kBottomH - 8 };
-    txt(dc, g_f_ui, RECT{ man.left + 12, man.top, man.right, man.bottom },
-        L"手册", C_LABEL, DT_LEFT | DT_VCENTER);
+    const GameEntry* cur = find_game(g_game_dir);
+    const int first = g_side_scroll;
+    for (int slot = 0; slot < rows && first + slot < n; ++slot) {
+        const GameEntry& e = g_games[(size_t)(first + slot)];
+        const RECT rc = side_row_rect(slot);
+        const bool sel = (cur == &e);
+        const bool hv = hit_rect(rc, g_hover_x, g_hover_y);
+        if (sel || hv) {
+            fill_round(dc, rc, RAD_CTL, sel ? RGB(44, 44, 44) : RGB(32, 32, 32));
+        }
+        if (sel) {
+            fill_round(dc, RECT{ rc.left, rc.top + 8, rc.left + 3, rc.bottom - 8 }, 2, C_ACCENT);
+        }
+        const bool inst = game_entry_installed(e);
+        draw_dot(dc, rc.left + 12, (rc.top + rc.bottom) / 2, inst ? C_OK : C_DIM);
+        txt(dc, g_f_ui, RECT{ rc.left + 24, rc.top, rc.right - 8, rc.bottom }, e.name,
+            sel ? C_TEXT : C_LABEL, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+    }
+    // 超出可见行数：右侧细滚动条（滚轮可直接翻）
+    if (n > rows) {
+        const int top = kTitleH + 42;
+        const int track = rows * kSideRowH - 4;
+        const int thumb = (int)((long long)track * rows / n);
+        const int maxs = side_max_scroll();
+        const int ty = top + 2 + (int)((long long)(track - thumb) * g_side_scroll /
+                                      (maxs ? maxs : 1));
+        fill_round(dc, RECT{ kSideW - 7, top + 2, kSideW - 3, top + 2 + track }, 2,
+                   RGB(34, 34, 34));
+        fill_round(dc, RECT{ kSideW - 7, ty, kSideW - 3, ty + thumb }, 2, RGB(90, 90, 90));
+    }
+
+    // 底部：帮助 + 版本（选游戏 / 高级入口都不再放在侧栏）
+    const RECT help = help_rect_entry();
+    if (hit_rect(help, g_hover_x, g_hover_y)) {
+        fill_round(dc, help, RAD_CTL, RGB(32, 32, 32));
+    }
+    txt(dc, g_f_ui, RECT{ help.left + 14, help.top, help.right - 8, help.bottom },
+        L"帮助 / 快捷键 (F1)", C_LABEL, DT_LEFT | DT_VCENTER);
+
+    wchar_t ver[96]{};
+    _snwprintf_s(ver, _TRUNCATE, T(L"v%s · 协议 v%u", L"v%s · protocol v%u"),
+                 LOCK_FRAME_VERSION_WSTRING, mgpu::kSharedVersion);
+    txt(dc, g_f_small, RECT{ 16, kWinH - 34, kSideW - 16, kWinH - 10 }, ver, C_DIM,
+        DT_LEFT | DT_VCENTER);
 }
+
+// 简易模式的绘制在 paint() 之后定义（它要用全部 draw_* 助手）。
+static void paint_simple(HDC dc);
+static void paint_drawer(HDC dc);
+static void draw_tip(HDC dc);
+static void layout_drawer_items(std::vector<Item>& out, int* content_h);
+static void draw_log_view(HDC dc);
+static void draw_welcome(HDC dc);
+static void draw_library(HDC dc);
+static void draw_help(HDC dc);
+static void draw_exe_picker(HDC dc);
 
 static void paint(HWND hwnd)
 {
@@ -1687,31 +3826,1164 @@ static void paint(HWND hwnd)
     HBITMAP bmp = CreateCompatibleBitmap(wdc, cl.right, cl.bottom);
     HGDIOBJ old_bmp = SelectObject(dc, bmp);
 
-    fill_round(dc, cl, 0, C_BG);
-    draw_titlebar(dc, cl.right);
+    // 逻辑坐标 -> 设备像素。窗口按 g_scale 建好尺寸，这里只做等比映射；离屏位图
+    // 仍是设备尺寸，所以文字是"按目标大小重新栅格化"的，不是把 1200x620 拉大。
+    const int vw = (cl.right > 0) ? (int)cl.right : kWinW;
+    const int vh = (cl.bottom > 0) ? (int)cl.bottom : kWinH;
+    SetMapMode(dc, MM_ANISOTROPIC);
+    SetWindowExtEx(dc, kWinW, kWinH, nullptr);
+    SetViewportExtEx(dc, vw, vh, nullptr);
+    SetWindowOrgEx(dc, 0, 0, nullptr);
+    SetViewportOrgEx(dc, 0, 0, nullptr);
+
+    auto finish = [&]() {
+        SetMapMode(dc, MM_TEXT);              // 还原成 1:1 设备拷贝
+        BitBlt(wdc, 0, 0, vw, vh, dc, 0, 0, SRCCOPY);
+        SelectObject(dc, old_bmp);
+        DeleteObject(bmp);
+        DeleteDC(dc);
+        EndPaint(hwnd, &ps);
+    };
+
+    fill_round(dc, RECT{ 0, 0, kWinW, kWinH }, 0, C_BG);
+    draw_titlebar(dc, kWinW);
     draw_sidebar(dc);
 
-    // profile title
-    {
-        wchar_t b[128]{};
-        _snwprintf_s(b, _TRUNCATE, L"配置：\"%s\"", g_profiles[g_prof].name.c_str());
-        txt(dc, g_f_title, RECT{ kSideW + kMargin, kTitleH + 14, cl.right - kMargin,
-                                 kTitleH + 54 }, b, C_TEXT, DT_LEFT | DT_VCENTER);
+    // 单页布局：三步卡片始终在；高级设置改成右侧抽屉覆盖，不再整页切换。
+    paint_simple(dc);
+    paint_drawer(dc);
+    draw_log_view(dc);
+    draw_library(dc);
+    draw_exe_picker(dc);
+    draw_help(dc);
+    draw_welcome(dc);
+    draw_popup(dc);
+    draw_tip(dc);
+    finish();
+    return;
+
+}
+
+
+// ============================================================================
+//  简易模式（P0）：三步 + 状态卡
+//  小白只需要：① 装进游戏  ② 选中游戏窗口  ③ 选倍率并启动。
+//  老手点左侧「高级设置」回到原来的卡片视图，两套界面共享同一份 State。
+// ============================================================================
+static const int kSC1 = 94,  kSC1B = 308;      // 当前游戏（选择 + 安装/还原/高级 + 配置）
+static const int kSC2 = 322, kSC2B = 528;      // 启动补帧（窗口 + 倍率 + 启动）
+static const int kSST = 542, kSSTB = 700;      // 运行状态
+
+// 与安装/还原同一行，右对齐：高级设置（次级）在主程序… 左侧。
+static RECT adv_rect()
+{
+    const int x1 = kWinW - kMargin;
+    return RECT{ x1 - 266, kSC1B - 48, x1 - 146, kSC1B - 12 };
+}
+
+struct SBtn { Id id; RECT rc; };
+
+// 键盘焦点：Tab 在简易模式的按钮之间循环，Enter/Space 触发。
+static int g_focus = -1;
+
+static bool hit_rect(const RECT& r, int x, int y)
+{
+    return x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+}
+
+// paint 与 click 共用这一份坐标，避免"看得见点不到"。
+static const std::vector<SBtn>& simple_buttons()
+{
+    static std::vector<SBtn> v;
+    const int x0 = kSideW + kMargin, x1 = kWinW - kMargin;
+    v.clear();
+    v.push_back({ ID_S_INSTALL,  RECT{ x0 + 16,  kSC1B - 48, x0 + 266, kSC1B - 12 } });
+    v.push_back({ ID_S_UNDEPLOY, RECT{ x0 + 278, kSC1B - 48, x0 + 508, kSC1B - 12 } });
+    v.push_back({ ID_S_PICKEXE,  RECT{ x1 - 136, kSC1B - 48, x1 - 16,  kSC1B - 12 } });
+    // 唯一的"选择游戏"按钮：当前游戏卡片的右上角，强调色。
+    v.push_back({ ID_S_GAMELIB,  RECT{ x1 - 160, kSC1 + 6, x1 - 16, kSC1 + 34 } });
+    v.push_back({ ID_S_WINDOW,   RECT{ x0 + 16,  kSC2 + 62, x1 - 148,  kSC2 + 100 } });
+    v.push_back({ ID_S_REFRESH,  RECT{ x1 - 136, kSC2 + 62, x1 - 16,   kSC2 + 100 } });
+    // 倍率按钮铺满左侧（启动按钮固定 200 px 在右端）
+    const int mw = (x1 - 216 - 12 - (x0 + 16) - 12) / 3;
+    for (int i = 0; i < 3; ++i) {
+        RECT r{ x0 + 16 + i * (mw + 6), kSC2 + 112, x0 + 16 + i * (mw + 6) + mw, kSC2 + 172 };
+        v.push_back({ (Id)(ID_S_2X + i), r });
+    }
+    v.push_back({ ID_S_START, RECT{ x1 - 216, kSC2 + 112, x1 - 16, kSC2 + 172 } });
+    v.push_back({ ID_S_LOGVIEW, RECT{ x1 - 316, kSST + 4, x1 - 176, kSST + 40 } });
+    v.push_back({ ID_S_DIAG,  RECT{ x1 - 164, kSST + 4,  x1 - 16,  kSST + 40 } });
+    return v;
+}
+
+static void draw_btn(HDC dc, const RECT& r, const std::wstring& s, bool primary, bool hover,
+                     bool disabled = false)
+{
+    COLORREF fill = C_BTN;
+    COLORREF border = C_BORDER;
+    COLORREF text = C_TEXT;
+    if (disabled) {
+        fill = RGB(33, 33, 33);
+        border = RGB(44, 44, 44);
+        text = C_DIM;
+    } else if (primary) {
+        fill = hover ? RGB(74, 136, 212) : RGB(62, 120, 196);
+        border = fill;
+        text = RGB(252, 252, 252);
+    } else {
+        fill = hover ? C_BTN_HOVER : C_BTN;
+    }
+    stroke_round(dc, r, RAD_CTL, fill, border);
+    txt(dc, g_f_ui, r, s, text, DT_CENTER | DT_VCENTER);
+}
+
+// 步骤徽章：① ② ③ 用圆形数字，完成态用绿色描边。
+static void draw_step_badge(HDC dc, int cx, int cy, int n, bool done)
+{
+    const COLORREF edge = done ? C_OK : C_ACCENT;
+    HBRUSH br = CreateSolidBrush(done ? RGB(38, 74, 52) : RGB(42, 56, 76));
+    HPEN pen = CreatePen(PS_SOLID, 1, edge);
+    HGDIOBJ ob = SelectObject(dc, br);
+    HGDIOBJ op = SelectObject(dc, pen);
+    Ellipse(dc, cx - 12, cy - 12, cx + 12, cy + 12);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(br);
+    DeleteObject(pen);
+    wchar_t b[8]{};
+    _snwprintf_s(b, _TRUNCATE, L"%d", n);
+    txt(dc, g_f_ui, RECT{ cx - 12, cy - 12, cx + 12, cy + 12 }, b, C_TEXT,
+        DT_CENTER | DT_VCENTER);
+}
+
+static void draw_dot(HDC dc, int cx, int cy, COLORREF c)
+{
+    HBRUSH br = CreateSolidBrush(c);
+    HPEN pen = CreatePen(PS_SOLID, 1, c);
+    HGDIOBJ ob = SelectObject(dc, br);
+    HGDIOBJ op = SelectObject(dc, pen);
+    Ellipse(dc, cx - 5, cy - 5, cx + 5, cy + 5);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(br);
+    DeleteObject(pen);
+}
+
+static void draw_focus(HDC dc, const RECT& r)
+{
+    RECT b = r;
+    InflateRect(&b, 2, 2);
+    HPEN pen = CreatePen(PS_SOLID, 2, RGB(150, 200, 255));
+    HGDIOBJ op = SelectObject(dc, pen);
+    HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    RoundRect(dc, b.left, b.top, b.right, b.bottom, 9, 9);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(pen);
+}
+
+// ------------------------------------------------------------------ 日志面板
+// 模态覆盖层：整窗压暗 + 面板，显示最近 400 行（consumer stdout + UI 消息）。
+static const int kLogL = kSideW + 40;
+static const int kLogT = kTitleH + 26;
+static const int kLogR = kWinW - 40;
+static const int kLogB = kWinH - 34;
+static const int kLogLineH = 20;
+
+static RECT log_rect_refresh() { return RECT{ kLogR - 206, kLogT + 4, kLogR - 118, kLogT + 34 }; }
+static RECT log_rect_close()   { return RECT{ kLogR - 104, kLogT + 4, kLogR - 14,  kLogT + 34 }; }
+static RECT log_rect_folder()  { return RECT{ kLogR - 320, kLogT + 4, kLogR - 216, kLogT + 34 }; }
+static RECT log_rect_copy()    { return RECT{ kLogR - 432, kLogT + 4, kLogR - 330, kLogT + 34 }; }
+
+static void copy_to_clipboard(const std::wstring& s)
+{
+    if (s.empty()) { return; }
+    if (!OpenClipboard(g_hwnd)) { set_msg(L"复制失败：剪贴板被占用"); return; }
+    EmptyClipboard();
+    const size_t bytes = (s.size() + 1) * sizeof(wchar_t);
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (mem != nullptr) {
+        void* p = GlobalLock(mem);
+        if (p != nullptr) {
+            memcpy(p, s.c_str(), bytes);
+            GlobalUnlock(mem);
+            SetClipboardData(CF_UNICODETEXT, mem);
+        } else {
+            GlobalFree(mem);
+        }
+    }
+    CloseClipboard();
+    set_msg(L"已复制到剪贴板");
+}
+
+static int log_view_rows()
+{
+    const int top = kLogT + 42, bottom = kLogB - 40;
+    const int rows = (bottom - top) / kLogLineH;
+    return (rows > 0) ? rows : 1;
+}
+
+static int log_max_scroll()
+{
+    const int rows = log_view_rows();
+    const int total = (int)g_log_snap.size();
+    return (total > rows) ? (total - rows) : 0;
+}
+
+static void open_log_view()
+{
+    close_advanced_silent();
+    std::vector<std::wstring> snap;
+    if (g_line_cs_ready) {
+        EnterCriticalSection(&g_line_cs);
+        snap.assign(g_log_lines.begin(), g_log_lines.end());
+        LeaveCriticalSection(&g_line_cs);
+    }
+    if (snap.empty()) {
+        snap.push_back(T(L"（还没有日志：点「启动」跑一次消费端，这里会显示它的输出）",
+                         L"(no log yet: click [Start] once and the consumer output will show here)"));
+    }
+    g_log_snap.swap(snap);
+    g_log_view = true;
+    g_log_scroll = 0;
+    g_popup_id = 0;
+    g_msg.clear();                     // 别让 4 秒提示盖住面板底部
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void close_log_view()
+{
+    g_log_view = false;
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void log_view_scroll(int lines)
+{
+    g_log_scroll += lines;
+    if (g_log_scroll < 0) { g_log_scroll = 0; }
+    const int maxs = log_max_scroll();
+    if (g_log_scroll > maxs) { g_log_scroll = maxs; }
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void draw_log_view(HDC dc)
+{
+    if (!g_log_view) { return; }
+
+    fill_round(dc, RECT{ 0, 0, kWinW, kWinH }, 0, RGB(12, 12, 12));
+    RECT panel{ kLogL, kLogT, kLogR, kLogB };
+    stroke_round(dc, panel, 10, RGB(30, 30, 30), C_BORDER);
+
+    txt(dc, g_f_card, RECT{ panel.left + 16, panel.top + 4, panel.right - 450,
+                            panel.top + 34 },
+        L"运行日志（最近 400 行）", C_TEXT, DT_LEFT | DT_VCENTER);
+    const RECT fo = log_rect_folder();
+    const RECT rb = log_rect_refresh();
+    const RECT cb = log_rect_close();
+    const RECT cp = log_rect_copy();
+    draw_btn(dc, cp, L"复制全部", false, hit_rect(cp, g_hover_x, g_hover_y));
+    draw_btn(dc, fo, L"打开目录", false, hit_rect(fo, g_hover_x, g_hover_y));
+    draw_btn(dc, rb, L"刷新", false, hit_rect(rb, g_hover_x, g_hover_y));
+    draw_btn(dc, cb, L"关闭", false, hit_rect(cb, g_hover_x, g_hover_y));
+
+    const int top = panel.top + 42;
+    const int rows = log_view_rows();
+    const int total = (int)g_log_snap.size();
+    int first = total - rows - g_log_scroll;
+    if (first < 0) { first = 0; }
+    for (int i = 0; i < rows && first + i < total; ++i) {
+        RECT lr{ panel.left + 12, top + i * kLogLineH, panel.right - 12,
+                 top + (i + 1) * kLogLineH };
+        const std::wstring& s = g_log_snap[(size_t)(first + i)];
+        const bool warn = (s.find(L"WARNING") != std::wstring::npos) ||
+                          (s.find(L"ERR") != std::wstring::npos) ||
+                          (s.find(L"失败") != std::wstring::npos);
+        txt(dc, g_f_mono, lr, s, warn ? C_WARN : C_LABEL,
+            DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
     }
 
-    std::vector<Item> items;
-    int content_h = 0;
-    layout_items(items, &content_h);
-    g_content_h = content_h;
+    wchar_t foot[220]{};
+    _snwprintf_s(foot, _TRUNCATE,
+                 T(L"共 %d 行 · 滚轮 / PageUp / PageDown 翻页 · Esc 关闭 · 完整日志在 exe 旁的 txt",
+                   L"%d lines | wheel / PageUp / PageDown | Esc close | full log in the txt next to the exe"),
+                 total);
+    txt(dc, g_f_small, RECT{ panel.left + 14, panel.bottom - 34, panel.right - 14,
+                             panel.bottom - 8 },
+        foot, C_DIM, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+}
 
-    // clip the scrollable area so cards cannot paint over the title/bottom bars
-    HRGN clip = CreateRectRgn(kSideW, kTitleH + 58, cl.right, kWinH - kBottomH);
-    SelectClipRgn(dc, clip);
+// ------------------------------------------------------------------ 欢迎页
+// 首次运行一次性提示："双卡 + 无边框 + 开 FG"三件事，点一下开始就不再出现。
+static const int kWL = 220, kWT = 140, kWR = kWinW - 220, kWBT = 500;
 
+static RECT welcome_rect_ok()
+{
+    const int cx = (kWL + kWR) / 2;
+    return RECT{ cx - 90, kWBT - 64, cx + 90, kWBT - 32 };
+}
+
+static void dismiss_welcome()
+{
+    g_welcome = false;
+    ini_w(L"ui", L"welcomed", 1);
+    save_all();
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void draw_welcome(HDC dc)
+{
+    if (!g_welcome) { return; }
+
+    fill_round(dc, RECT{ 0, 0, kWinW, kWinH }, 0, RGB(12, 12, 12));
+    RECT p{ kWL, kWT, kWR, kWBT };
+    stroke_round(dc, p, 10, RGB(30, 30, 30), C_BORDER);
+    txt(dc, g_f_title, RECT{ p.left + 24, p.top + 12, p.right - 24, p.top + 48 },
+        L"第一次使用？先确认这三件事", C_TEXT, DT_LEFT | DT_VCENTER);
+
+    struct Bullet { const wchar_t* head; const wchar_t* body; };
+    const Bullet bs[] = {
+        { L"1  需要两块 GPU",
+          L"游戏在自己的卡上渲染，帧生成在另一块卡上跑。单卡也能试，但会和游戏抢性能。" },
+        { L"2  游戏要开 DLSS 帧生成",
+          L"用「无边框 / 窗口化全屏」，并在游戏设置里开启 DLSS Frame Generation；"
+          L"进入实际画面后再点[刷新]。" },
+        { L"3  一个游戏一份配置",
+          L"先在[当前游戏]卡片右上角[选择游戏]挑游戏；它的倍率和安装状态会一直保存。"
+          L"装好、游戏在跑、状态变绿，就能启动补帧。" },
+    };
+    int y = p.top + 56;
+    for (const Bullet& b : bs) {
+        txt(dc, g_f_card, RECT{ p.left + 24, y, p.right - 24, y + 24 }, b.head,
+            C_ACCENT, DT_LEFT | DT_VCENTER);
+        RECT br{ p.left + 24, y + 24, p.right - 24, y + 70 };
+        HGDIOBJ old = SelectObject(dc, g_f_ui);
+        SetTextColor(dc, C_LABEL);
+        SetBkMode(dc, TRANSPARENT);
+        DrawTextW(dc, b.body, -1, &br, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
+        SelectObject(dc, old);
+        y += 76;
+    }
+
+    const RECT okr = welcome_rect_ok();
+    draw_btn(dc, okr, L"知道了，开始", true, hit_rect(okr, g_hover_x, g_hover_y));
+    txt(dc, g_f_small, RECT{ p.left + 24, p.bottom - 34, p.right - 24, p.bottom - 10 },
+        L"提示：这个窗口随时可以关掉，游戏不受影响；按热键可随时开关插帧。",
+        C_DIM, DT_LEFT | DT_VCENTER);
+}
+
+// ---------------------------------------------------------------- 游戏库面板
+// 扫描结果 / 手动添加 / 已配置的游戏都放这里：名称 + 来源 + 安装位置 + 状态。
+// 索引是"已解析的 exe 目录 > 安装根目录"，两者都做规范化比较。
+static bool         g_lib_view = false;
+static int          g_lib_sel = -1;
+static int          g_lib_scroll = 0;
+static std::wstring g_lib_msg;
+
+static const int kLibL = 260, kLibT = 72, kLibR = kWinW - 30;
+static const int kLibRowH = 52;
+
+static int lib_bottom()
+{
+    const int n = (int)g_games.size();
+    int h = 54 + ((n > 0) ? n : 1) * kLibRowH + 62;
+    if (h < 210) { h = 210; }
+    const int maxh = kWinH - 2 * kLibT;
+    if (h > maxh) { h = maxh; }
+    return kLibT + h;
+}
+static RECT lib_panel() { return RECT{ kLibL, kLibT, kLibR, lib_bottom() }; }
+
+static int lib_list_top() { return kLibT + 54; }
+static int lib_list_bottom() { return lib_bottom() - 58; }
+static int lib_rows_visible()
+{
+    const int h = lib_list_bottom() - lib_list_top();
+    return (h > 0) ? (h / kLibRowH) : 1;
+}
+
+static RECT lib_rect_manual()  { return RECT{ kLibR - 228, kLibT + 8, kLibR - 118, kLibT + 42 }; }
+static RECT lib_rect_close()   { return RECT{ kLibR - 110, kLibT + 8, kLibR - 16,  kLibT + 42 }; }
+
+static RECT lib_row_rect(int i)
+{
+    const int y = lib_list_top() + i * kLibRowH - g_lib_scroll;
+    return RECT{ kLibL + 18, y, kLibR - 18, y + kLibRowH };
+}
+
+static bool game_entry_installed(const GameEntry& e)
+{
+    const std::wstring d = !e.dir.empty() ? e.dir : e.root;
+    return file_in_dir(d, L"fakerFG.dll");
+}
+
+static bool game_entry_running(const GameEntry& e)
+{
+    HWND w = (S().win_hwnd && IsWindow(S().win_hwnd)) ? S().win_hwnd : nullptr;
+    if (w == nullptr || !g_ready.producer) { return false; }
+    const std::wstring d = game_dir_for_window(w);
+    return !d.empty() && find_game(d) == &e;
+}
+
+static std::wstring game_entry_path(const GameEntry& e)
+{
+    if (!e.dir.empty()) { return e.dir; }
+    if (!e.root.empty()) { return e.root; }
+    return L"(未设置路径)";
+}
+
+static void lib_ensure_visible()
+{
+    if (g_lib_sel < 0) { return; }
+    const int top = g_lib_sel * kLibRowH;
+    const int view = lib_rows_visible() * kLibRowH;
+    if (top < g_lib_scroll) { g_lib_scroll = top; }
+    if (top + kLibRowH > g_lib_scroll + view) { g_lib_scroll = top + kLibRowH - view; }
+    if (g_lib_scroll < 0) { g_lib_scroll = 0; }
+    const int maxs = (int)g_games.size() * kLibRowH - view;
+    if (g_lib_scroll > maxs) { g_lib_scroll = (maxs > 0) ? maxs : 0; }
+}
+
+static void open_library()
+{
+    name_edit_commit(false);
+    close_advanced_silent();   // 子页互斥：先收高级抽屉
+    // 最近用过的排前面；名字做次级排序，顺序稳定。
+    std::stable_sort(g_games.begin(), g_games.end(),
+                     [](const GameEntry& a, const GameEntry& b) {
+                         if (a.last_use != b.last_use) { return a.last_use > b.last_use; }
+                         return a.name < b.name;
+                     });
+    save_games();
+    g_lib_view = true;
+    g_lib_scroll = 0;
+    g_lib_sel = -1;
+    if (!g_game_dir.empty()) {
+        for (int i = 0; i < (int)g_games.size(); ++i) {
+            if (norm_path(game_entry_path(g_games[(size_t)i])) == norm_path(g_game_dir)) {
+                g_lib_sel = i;
+                break;
+            }
+        }
+    }
+    if (g_lib_sel < 0 && !g_games.empty()) { g_lib_sel = 0; }
+    g_lib_msg.clear();
+    lib_ensure_visible();
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// 扫描/已安装的游戏在后台逐个完成初始化（4 s 一个，不卡界面）。
+static void background_initialize()
+{
+    if (g_running || g_lib_view || g_log_view || g_help_view || g_pick_view || g_welcome) {
+        return;
+    }
+    if (g_games.empty()) { return; }
+    const size_t n = g_games.size();
+    for (size_t k = 0; k < n; ++k) {
+        const size_t i = (g_resolve_cursor + k) % n;
+        GameEntry& e = g_games[i];
+        if (e.root.empty() || !e.exe.empty() || !e.dir.empty()) { continue; }
+        ensure_entry_resolved(e);
+        g_resolve_cursor = i + 1;
+        if (!e.exe.empty() || !e.dir.empty()) {
+            uilog("bg-init: resolved entry %d", (int)i);
+            save_games();
+            InvalidateRect(g_hwnd, nullptr, FALSE);
+        }
+        return;
+    }
+}
+
+static void close_library()
+{
+    g_lib_view = false;
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// ------------------------------------------------------------ 主程序候选面板
+// 自动解析不确定时，把候选 exe 按分数排序列出来，点一行即设为主程序。
+static int                    g_pick_owner = -1;
+static std::vector<ExePick>   g_pick_list;
+static bool                   g_pick_then_install = false;
+
+static const int kPickL = 280, kPickT = 100, kPickR = kWinW - 280;
+static const int kPickRowH = 54;
+
+static int pick_bottom()
+{
+    int h = 60 + (int)g_pick_list.size() * kPickRowH + 48;
+    if (h < 150) { h = 150; }
+    const int b = kPickT + h;
+    return (b > kWinH - 80) ? (kWinH - 80) : b;
+}
+static RECT pick_panel_rect() { return RECT{ kPickL, kPickT, kPickR, pick_bottom() }; }
+static RECT pick_rect_close() { return RECT{ kPickR - 104, kPickT + 8, kPickR - 16, kPickT + 38 }; }
+static RECT pick_row_rect(int i)
+{
+    const int y = kPickT + 60 + i * kPickRowH;
+    return RECT{ kPickL + 16, y, kPickR - 16, y + kPickRowH };
+}
+
+static void close_exe_picker()
+{
+    g_pick_view = false;
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void library_install_selected();   // 前向声明（选完候选后可继续安装）
+
+static bool open_exe_picker(int owner, bool then_install)
+{
+    if (owner < 0 || owner >= (int)g_games.size()) { return false; }
+    const GameEntry& e = g_games[(size_t)owner];
+    const std::wstring base = !e.root.empty() ? e.root : e.dir;
+    if (base.empty()) { return false; }
+    g_pick_list.clear();
+    resolve_game_exes(base, &g_pick_list, 8);
+    if (g_pick_list.empty()) {
+        g_lib_msg = T(L"这个目录里没有可用的 exe：请用[自选 exe…]指定",
+                      L"No usable exe in this folder: use [Pick exe...]");
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+        return false;
+    }
+    g_pick_owner = owner;
+    g_pick_then_install = then_install;
+    g_pick_view = true;
+    g_popup_id = 0;
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+    return true;
+}
+
+static void pick_choose(int i)
+{
+    if (i < 0 || i >= (int)g_pick_list.size()) { return; }
+    if (g_pick_owner < 0 || g_pick_owner >= (int)g_games.size()) { return; }
+    GameEntry& e = g_games[(size_t)g_pick_owner];
+    // 换主程序时，如果名字还是目录名，则跟着新的 exe 名更新。
+    if (e.name.empty() || same_name(e.name, last_component(e.dir.empty() ? e.root : e.dir))) {
+        e.name = file_stem(g_pick_list[(size_t)i].path);
+    }
+    e.exe = g_pick_list[(size_t)i].path;
+    e.dir = g_pick_list[(size_t)i].dir;
+    save_games();
+    const std::wstring msg = T(L"已设置主程序：", L"Main exe set: ") + last_component(e.exe);
+    const bool install_now = g_pick_then_install;
+    close_exe_picker();
+    set_msg(msg.c_str());
+    if (install_now) { library_install_selected(); }
+}
+
+static void draw_exe_picker(HDC dc)
+{
+    if (!g_pick_view) { return; }
+    fill_round(dc, RECT{ 0, 0, kWinW, kWinH }, 0, RGB(12, 12, 12));
+    RECT p = pick_panel_rect();
+    stroke_round(dc, p, RAD_CARD, RGB(28, 28, 28), C_BORDER);
+
+    std::wstring title = T(L"选择主程序", L"Choose the main executable");
+    if (g_pick_owner >= 0 && g_pick_owner < (int)g_games.size()) {
+        title += L"  ·  " + g_games[(size_t)g_pick_owner].name;
+    }
+    txt(dc, g_f_card, RECT{ p.left + 16, p.top + 6, p.right - 120, p.top + 42 }, title,
+        C_TEXT, DT_LEFT | DT_VCENTER);
+    const RECT cb = pick_rect_close();
+    draw_btn(dc, cb, T(L"关闭", L"Close"), false, hit_rect(cb, g_hover_x, g_hover_y));
+
+    txt(dc, g_f_small, RECT{ p.left + 16, p.top + 36, p.right - 120, p.top + 58 },
+        T(L"按匹配分数排序；点击一行即设为主程序并保存", L"Sorted by match score; click a row to set it"),
+        C_DIM, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+
+    const int n = (int)g_pick_list.size();
+    for (int i = 0; i < n; ++i) {
+        const RECT r = pick_row_rect(i);
+        const ExePick& c = g_pick_list[(size_t)i];
+        const bool hv = hit_rect(r, g_hover_x, g_hover_y);
+        const bool cur = (g_pick_owner >= 0 && g_pick_owner < (int)g_games.size() &&
+                          g_games[(size_t)g_pick_owner].exe == c.path);
+        if (hv) { fill_round(dc, r, RAD_CTL, RGB(40, 40, 40)); }
+        txt(dc, g_f_ui, RECT{ r.left + 10, r.top + 4, r.right - 10, r.top + 28 },
+            (cur ? std::wstring(L"✓ ") : std::wstring()) + last_component(c.path),
+            cur ? C_OK : (hv ? C_TEXT : C_LABEL),
+            DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+
+        wchar_t meta[560]{};
+        WIN32_FILE_ATTRIBUTE_DATA fad{};
+        double size_mb = 0.0;
+        if (GetFileAttributesExW(c.path.c_str(), GetFileExInfoStandard, &fad)) {
+            const unsigned long long sz =
+                ((unsigned long long)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+            size_mb = (double)sz / (1024.0 * 1024.0);
+        }
+        _snwprintf_s(meta, _TRUNCATE, L"%.1f MB  ·  score %d  ·  %s", size_mb, c.score,
+                     c.path.c_str());
+        txt(dc, g_f_small, RECT{ r.left + 10, r.top + 26, r.right - 10, r.bottom - 4 },
+            meta, C_DIM, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+    }
+
+    txt(dc, g_f_small, RECT{ p.left + 16, p.bottom - 34, p.right - 16, p.bottom - 8 },
+        T(L"Esc 关闭 · 想换别的 exe 用[自选 exe…]", L"Esc to close · use [Pick exe...] for anything else"),
+        C_DIM, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+}
+
+static void draw_library(HDC dc)
+{
+    if (!g_lib_view) { return; }
+
+    fill_round(dc, RECT{ 0, 0, kWinW, kWinH }, 0, RGB(12, 12, 12));
+    RECT p = lib_panel();
+    stroke_round(dc, p, 10, RGB(28, 28, 28), C_BORDER);
+
+    wchar_t title[96]{};
+    _snwprintf_s(title, _TRUNCATE, T(L"选择游戏（%d）", L"Choose a game (%d)"),
+                 (int)g_games.size());
+    txt(dc, g_f_card, RECT{ p.left + 16, p.top + 4, p.right - 360, p.top + 38 },
+        title, C_TEXT, DT_LEFT | DT_VCENTER);
+    draw_btn(dc, lib_rect_manual(), T(L"添加 exe…", L"Add exe…"), false,
+             hit_rect(lib_rect_manual(), g_hover_x, g_hover_y));
+    draw_btn(dc, lib_rect_close(), T(L"取消", L"Cancel"), false,
+             hit_rect(lib_rect_close(), g_hover_x, g_hover_y));
+    txt(dc, g_f_small, RECT{ p.left + 16, p.top + 40, p.right - 16, p.top + 58 },
+        T(L"点一行即可选择；[添加 exe…] 只往列表里加游戏，不会安装。",
+          L"Click a row to select; [Add exe…] only adds to the list, nothing is installed."),
+        C_DIM, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+
+    RECT list{ p.left + 10, lib_list_top(), p.right - 10, lib_list_bottom() };
+    fill_round(dc, list, 8, RGB(22, 22, 22));
+
+    if (g_games.empty()) {
+        txt(dc, g_f_ui, RECT{ list.left + 16, list.top + 16, list.right - 16, list.top + 46 },
+            T(L"还没有游戏：点右上角[添加 exe…]把游戏加进来。",
+              L"No games yet: use [Add exe…] at the top right."),
+            C_DIM, DT_LEFT | DT_VCENTER);
+    }
+
+    const int n = (int)g_games.size();
+    int first = g_lib_scroll / kLibRowH;
+    if (first < 0) { first = 0; }
+    const int rows = lib_rows_visible();
+    for (int k = 0; k < rows && first + k < n; ++k) {
+        const int i = first + k;
+        const GameEntry& e = g_games[(size_t)i];
+        const RECT r = lib_row_rect(i);
+        if (r.bottom <= lib_list_top() || r.top >= lib_list_bottom()) { continue; }
+        const bool sel = (i == g_lib_sel);
+        const bool hv = hit_rect(r, g_hover_x, g_hover_y);
+        if (sel || hv) {
+            fill_round(dc, RECT{ r.left - 8, r.top + 2, r.right + 8, r.bottom - 2 }, 6,
+                       sel ? RGB(42, 42, 42) : RGB(30, 30, 30));
+        }
+        const bool run = game_entry_running(e);
+        const bool inst = game_entry_installed(e);
+        draw_dot(dc, r.left + 7, r.top + 17, run ? C_OK : (inst ? C_ACCENT : C_DIM));
+        txt(dc, g_f_ui, RECT{ r.left + 22, r.top + 4, r.right - 10, r.top + 30 }, e.name,
+            C_TEXT, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+
+        std::wstring meta = e.source.empty() ? T(L"手动", L"Manual") : e.source;
+        meta += run ? T(L" · 运行中", L" | running")
+                    : (inst ? T(L" · 已安装", L" | installed")
+                            : T(L" · 未安装", L" | not installed"));
+        meta += L" · ";
+        meta += e.exe.empty()
+                    ? std::wstring(T(L"主程序待解析", L"exe not resolved"))
+                    : (std::wstring(T(L"主程序：", L"exe: ")) + last_component(e.exe));
+        meta += L" · ";
+        meta += e.exe.empty() ? game_entry_path(e) : e.exe;
+        txt(dc, g_f_small, RECT{ r.left + 22, r.top + 28, r.right - 10, r.bottom - 4 },
+            meta, C_DIM, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+    }
+
+    // 细滚动条（只有超出时才画）
+    const int total_h = n * kLibRowH;
+    const int view_h = lib_list_bottom() - lib_list_top();
+    if (total_h > view_h) {
+        const int track_h = view_h - 8;
+        const int thumb_h = (int)((long long)track_h * view_h / total_h);
+        const int maxs = total_h - view_h;
+        const int thumb_y = list.top + 4 +
+            (int)((long long)(track_h - thumb_h) * g_lib_scroll / (maxs ? maxs : 1));
+        fill_round(dc, RECT{ list.right - 8, list.top + 4, list.right - 4,
+                             list.top + 4 + track_h }, 2, RGB(34, 34, 34));
+        fill_round(dc, RECT{ list.right - 8, thumb_y, list.right - 4, thumb_y + thumb_h },
+                   2, RGB(90, 90, 90));
+    }
+
+    const GameEntry* e = (g_lib_sel >= 0 && g_lib_sel < n)
+                             ? &g_games[(size_t)g_lib_sel] : nullptr;
+    const std::wstring fl = e ? (T(L"将选择：", L"Will select: ") + e->name)
+                              : T(L"点一行选择，Esc 取消", L"Click a row, Esc to cancel");
+    txt(dc, g_f_small, RECT{ p.left + 16, p.bottom - 46, p.right - 16, p.bottom - 14 },
+        fl, e ? C_LABEL : C_DIM, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+}
+
+static std::wstring last_line_snapshot()
+{
+    EnterCriticalSection(&g_line_cs);
+    std::wstring s = g_last_line;
+    LeaveCriticalSection(&g_line_cs);
+    return s;
+}
+
+// ------------------------------------------------------------ 游戏库操作
+static GameEntry* lib_selected()
+{
+    if (g_lib_sel < 0 || g_lib_sel >= (int)g_games.size()) { return nullptr; }
+    return &g_games[(size_t)g_lib_sel];
+}
+
+// 全局扫描保留实现但默认不暴露：当前筛选规则不够可靠，先只走"添加 exe…"。
+// 添加一个游戏条目（只入列表，不安装）；加完直接选中并关闭选择页。
+static void library_use_selected();     // 定义在下面
+static void library_add_manual()
+{
+    std::wstring exe;
+    if (!pick_game_file(&exe)) { return; }
+    const size_t s = exe.find_last_of(L'\\');
+    if (s == std::wstring::npos) { return; }
+    const std::wstring d = exe.substr(0, s);
+
+    GameEntry* e = find_game_mut(d);
+    if (e == nullptr) {
+        GameEntry n;
+        n.dir = d;
+        n.root = d;
+        n.exe = exe;
+        n.name = file_stem(exe);       // 配置名默认 = 选中的 exe 名
+        n.source = T(L"手动", L"Manual");
+        n.st = baseline_state();
+        g_games.push_back(n);
+        e = &g_games.back();
+    } else {
+        // 以前用目录名自动起的名字：跟着 exe 名一起更新（用户改过的名字不动）。
+        if (e->name.empty() || same_name(e->name, last_component(d))) { e->name = file_stem(exe); }
+    }
+    e->dir = d;
+    e->exe = exe;
+    if (e->root.empty()) { e->root = d; }
+    g_lib_sel = (int)(e - &g_games[0]);
+    save_games();
+    lib_ensure_visible();
+    library_use_selected();
+}
+
+static void library_use_selected()
+{
+    GameEntry* e = lib_selected();
+    if (e == nullptr) { return; }
+    if (!select_game(g_lib_sel)) { InvalidateRect(g_hwnd, nullptr, FALSE); return; }
+    g_focus = -1;
+    side_ensure_visible(g_lib_sel);
+    const std::wstring m = T(L"已选择：", L"Selected: ") + e->name;
+    close_library();
+    set_msg(m.c_str());
+}
+
+static void library_install_selected()
+{
+    GameEntry* e = lib_selected();
+    if (e == nullptr) { return; }
+    ensure_entry_resolved(*e);
+    std::wstring d = e->dir;
+    std::wstring exe = e->exe;
+    if (d.empty()) {
+        if (open_exe_picker(g_lib_sel, true)) { return; }
+        std::wstring picked;
+        if (!pick_game_file(&picked)) {
+            g_lib_msg = T(L"没找到主程序：请用[自选 exe…]指定",
+                          L"Main exe not found: use [Pick exe...]");
+            InvalidateRect(g_hwnd, nullptr, FALSE);
+            return;
+        }
+        const size_t s = picked.find_last_of(L'\\');
+        if (s == std::wstring::npos) { return; }
+        d = picked.substr(0, s);
+        exe = picked;
+    }
+    std::wstring q = T(L"把锁帧组件安装到：\r\n\r\n", L"Install into:\r\n\r\n") + short_path(d);
+    if (game_dir_running(d)) {
+        MessageBoxW(g_hwnd,
+                    T(L"游戏正在运行：请先完全退出游戏再安装。",
+                      L"The game is running: close it completely before installing."),
+                    T(L"请先关闭游戏", L"Close the game first"), MB_OK | MB_ICONWARNING);
+        return;
+    }
+    if (!exe.empty()) { q += T(L"\r\n\r\n主程序：", L"\r\n\r\nexe: ") + last_component(exe); }
+    q += T(L"\r\n\r\n会备份 dxgi.dll，之后可还原。继续？",
+           L"\r\n\r\ndxgi.dll is backed up; [Restore] reverts it. Continue?");
+    if (MessageBoxW(g_hwnd, q.c_str(), T(L"安装到游戏", L"Install to game"),
+                    MB_YESNO | MB_ICONQUESTION) != IDYES) {
+        return;
+    }
+    std::wstring log;
+    const bool ok = deploy_game_dir(d, &log);
+    if (ok) {
+        e->dir = d;
+        if (!exe.empty()) { e->exe = exe; }
+        e->last_use = (unsigned long long)std::time(nullptr);
+        g_game_dir = d;
+        ini_ws(L"ui", L"game_dir", g_game_dir);
+        remember_game(d);
+        apply_config_after_deploy(d);   // 安装 = 把该游戏保存的配置写进 fakerFG.ini
+    }
+    refresh_readiness();
+    MessageBoxW(g_hwnd, log.c_str(), ok ? T(L"安装完成", L"Installed") : T(L"安装失败", L"Install failed"),
+                MB_OK | (ok ? MB_ICONINFORMATION : MB_ICONERROR));
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void status_summary(std::wstring* badge, COLORREF* color, std::wstring* advice)
+{
+    const int total = g_pair_total.load();
+    const int exact = g_pair_exact.load();
+    if (!g_running) {
+        *badge = T(L"未运行", L"Not running");
+        *color = C_DIM;
+        *advice = T(L"点卡片里的[启动补帧]开始；运行中按 ", L"Click [Start] in the card; press ")
+                  + hotkey_name()
+                  + T(L" 可以随时开关。", L" to toggle while running.");
+        return;
+    }
+    if (total == 0) {
+        *badge = T(L"已启动，等待数据", L"Started, waiting");
+        *color = C_WARN;
+        *advice = g_ready.producer
+            ? std::wstring(T(L"正在等第一个统计窗口（约 40 帧）…",
+                             L"Waiting for the first report window (~40 frames)..."))
+            : std::wstring(T(L"还没检测到 producer：确认游戏里已开 DLSS 帧生成，并已进入实际游戏画面。",
+                             L"No producer yet: enable DLSS Frame Generation and reach the in-game scene."));
+        return;
+    }
+    if (exact * 10 >= total * 9) {
+        *badge = T(L"插帧中", L"Interpolating");
+        *color = C_OK;
+        wchar_t b[200]{};
+        _snwprintf_s(b, _TRUNCATE,
+                     T(L"正在补帧：最近一个统计窗口 %d/%d 帧精确配对。",
+                       L"Interpolating: %d/%d frames paired in the last window."),
+                     exact, total);
+        *advice = b;
+        return;
+    }
+    if (exact * 2 >= total) {
+        *badge = T(L"部分插帧", L"Partial interpolation");
+        *color = C_WARN;
+        wchar_t b[240]{};
+        _snwprintf_s(b, _TRUNCATE,
+                     T(L"有 %d/%d 帧没配上（那些帧会退回原生）。常见原因：HUD 挡住画面四角、窗口被缩放、游戏不是无边框全屏。",
+                       L"%d/%d frames were not paired (they fall back to native). Common causes: HUD over the corners, scaled window, exclusive fullscreen."),
+                     total - exact, total);
+        *advice = b;
+        return;
+    }
+    *badge = T(L"几乎没插帧", L"Almost no interpolation");
+    *color = C_BAD;
+    *advice = T(L"配对基本失败，输出接近原生。点「一键诊断」收日志，再按提示排查。",
+                L"Pairing is failing and output is nearly native. Use [Diagnostics] to collect logs.");
+}
+
+// ---------------------------------------------------------------- 高级抽屉
+// 不再整页切换：三步流程始终在，高级设置覆盖在右侧，随时[完成]收起。
+static const int kDrawerW = kWinW - kSideW;   // 抽屉从侧栏右侧开始，不切断卡片文字
+static int g_drawer_scroll = 0;
+static int g_drawer_focus = -1;     // 键盘焦点（抽屉内可操作行的 items 下标）
+static int g_drawer_h = 0;
+
+static int drawer_x0() { return kWinW - kDrawerW; }
+static RECT drawer_rect_close() { return RECT{ kWinW - 110, kTitleH + 6, kWinW - 16, kTitleH + 40 }; }
+
+static void toggle_advanced()
+{
+    g_advanced = !g_advanced;
+    g_drawer_scroll = 0;
+    g_drawer_focus = -1;
+    if (g_advanced) { drawer_focus_step(1); }
+    ini_w(L"ui", L"advanced", g_advanced ? 1 : 0);
+    save_all();
+    set_msg(g_advanced ? T(L"高级设置已展开（Esc/[完成]收起）",
+                          L"Advanced settings opened (Esc/[Done] closes)")
+                       : T(L"已收起高级设置", L"Advanced settings closed"));
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// 子页互斥：打开游戏库 / 日志 / 帮助时，抽屉自动收起（不弹提示）。
+static void close_advanced_silent()
+{
+    if (!g_advanced) { return; }
+    g_advanced = false;
+    g_drawer_focus = -1;
+    ini_w(L"ui", L"advanced", 0);
+}
+
+static void layout_drawer_items(std::vector<Item>& out, int* content_h)
+{
+    out.clear();
+    const int x0 = drawer_x0() + kMargin;
+    const int w = kDrawerW - 2 * kMargin;
+    int y = kTitleH + 52;
+    for (int ci = 0; ci < kCardCount; ++ci) {
+        const CardDef& cd = kCards[ci];
+        int body = 0;
+        for (int r = 0; r < cd.n; ++r) { body += row_h(cd.rows[r].kind, cd.rows[r].id); }
+        const int bottom = y + kCardHead + body + kCardTail;
+
+        Item head{};
+        head.rc = RECT{ x0, y, x0 + w, bottom };
+        head.id = (Id)(1000 + ci);
+        out.push_back(head);
+
+        int ry = y + kCardHead;
+        for (int r = 0; r < cd.n; ++r) {
+            Item it{};
+            it.id = cd.rows[r].id;
+            it.kind = cd.rows[r].kind;
+            it.is_row = true;
+            const int hh = row_h(it.kind, it.id);
+            it.rc = RECT{ x0 + 16, ry, x0 + w - 16, ry + hh };
+            ry += hh;
+            it.on = (it.id == ID_JITZ) ? S().jitter_zero
+                  : (it.id == ID_NOMARKER) ? S().no_marker
+                  : (it.id == ID_UPSAMPLE) ? S().upsample
+                  : (it.id == ID_STRAUTO) ? S().stream_auto
+                  : (it.id == ID_STRASYM) ? S().stream_asym
+                  : (it.id == ID_PREFETCH) ? S().input_prefetch
+                  : (it.id == ID_UNLOCK) ? S().unlock_mfg
+                  : (it.id == ID_SLACK) ? S().slack1
+                  : (it.id == ID_TEAR) ? S().tearing
+                  : (it.id == ID_SDR) ? S().sdr
+                  : (it.id == ID_LAYERED) ? S().overlay_layered
+                  : (it.id == ID_RELAY) ? S().relay_input
+                  : (it.id == ID_OSD) ? S().osd
+                  : (it.id == ID_PERF) ? S().perf_no_throttle
+                  : (it.id == ID_FG_LOG) ? S().fg_log
+                  : false;
+            out.push_back(it);
+        }
+        y = bottom + kGap;
+    }
+    *content_h = y - (kTitleH + 52) + 8;
+}
+
+// --------------------------------------------------------------- 悬浮说明
+static const wchar_t* tip_for(Id id)
+{
+    switch (id) {
+    case ID_S_INSTALL:
+        return L"选择游戏的 exe，把 fakerFG.dll / producer 装进它所在目录。"
+               L"会自动备份原 dxgi.dll，可随时还原。";
+    case ID_S_UNDEPLOY:
+        return L"移除组件并把游戏原来的 dxgi.dll / nvngx_dlssg.dll 换回去；"
+               L"fakerFG.ini 保留。";
+    case ID_S_GAMELIB:
+        return L"从一个游戏的主程序 exe 添加条目；"
+               L"每个游戏单独记住倍率和锁帧。";
+    case ID_S_WINDOW:
+        return L"要抓取并叠加的游戏窗口。先进到实际游戏画面再选；"
+               L"无边框 / 窗口化全屏最稳。";
+    case ID_S_REFRESH:
+        return L"重新枚举当前可见窗口（≥1280×720）。改分辨率或刚进游戏时点一下。";
+    case ID_S_2X:
+        return L"2 倍：每帧补 1 张。120 Hz 面板建议游戏内锁 60 fps，延迟最低。";
+    case ID_S_3X:
+        return L"3 倍：每帧补 2 张。120 Hz 面板建议锁 40 fps。需要 libxell。";
+    case ID_S_4X:
+        return L"4 倍：每帧补 3 张。120 Hz 面板建议锁 30 fps。延迟最高，适合慢节奏游戏。";
+    case ID_S_START:
+        return L"启动 / 停止消费端（lock_frame.exe）。运行中按热键也能开关；"
+               L"关闭这个窗口不会影响游戏。";
+    case ID_S_LOGVIEW:
+        return L"查看最近 400 行运行日志（consumer 输出 + UI 消息），不用离开界面。";
+    case ID_S_DIAG:
+        return L"生成诊断包（系统 / 显卡 / 日志），本地打包不上传，方便发给别人排查。";
+    case ID_S_HELP:
+        return L"三步流程、快捷键、常见问题。按 F1 也能随时打开。";
+    case ID_FG_MODE:
+        return L"固定倍率：每帧输入生成 1/2/3 张插值帧。输入帧率 = 面板刷新率 ÷ 倍率。";
+    case ID_OUT:
+        return L"输出分辨率：1:1 原生最清晰；0.75x / 半分辨率省消费卡性能，但会软一点。";
+    case ID_UPSAMPLE_INFO:
+        return L"消费端把 MV/深度从 StreamPercent 尺寸联合重建到输入画面尺寸后再交给 XeFG。";
+    case ID_FG_INPUT:
+        return L"游戏侧取帧的来源。DLSSG（Streamline）为正式支持；"
+               L"NVNGX / Upscaler / FSR 为实验性。";
+    case ID_STREAM_PCT:
+        return L"跨卡只传 MV/深度的比例：100%=1:1 最清晰、150%=每维 2/3（默认）、"
+               L"200%=每维 1/2、400%=每维 1/4 最省；改动需重启游戏。";
+    case ID_FG_LOG:
+        return L"游戏侧日志（fakerFG.ini 的 Log）：排查问题打开，稳定后可关闭以减少写盘；"
+               L"改动需重启游戏。";
+    case ID_FG_INI:
+        return L"当前游戏目录里的 fakerFG.ini 路径。改 FgInput 后需要重启游戏生效。";
+    case ID_VERSION:
+        return L"UI 与共享协议版本。游戏侧 DLL 必须同版本，否则会提示协议不符。";
+    case ID_CHECK_GPU:
+        return L"DXGI 枚举到的非软件适配器数量。推荐两块：游戏一块、帧生成一块。";
+    case ID_CHECK_RUNTIME:
+        return L"libxess_fg.dll 是 XeSS-FG 运行时；3x/4x 还需要 libxell.dll。"
+               L"正式包默认不内置。";
+    case ID_CHECK_GAME:
+        return L"检查游戏目录 fakerFG.ini：FgOutput 必须是 Capture、"
+               L"Passthrough=0、FgInput 非空。";
+    case ID_CHECK_SHA:
+        return L"启动时用同目录的 SHA256SUMS.txt 校验一次包内文件（不周期采样）；"
+               L"缺文件或哈希不一致会显示在这里。";
+    case ID_CAP_API:
+        return L"颜色抓取方式。锁帧版固定用 WGC（DWM 本来就要搬画面，复用这笔传输）。";
+    case ID_STREAM_INFO:
+        return L"跨卡只传 MV + 深度，比例由 fakerFG.ini 的 StreamPercent 决定（默认 150%）。";
+    case ID_SDR:
+        return L"输出色彩空间。HDR 屏选 SDR 会发灰，SDR 屏保持 HDR10 会发亮——按显示器选。";
+    case ID_POOL:
+        return L"帧池深度：同时排队的输入帧数。越大越抗抖动，但增加延迟。";
+    case ID_LAT:
+        return L"最大帧延迟：允许排队多少帧再上屏。1 最低延迟，3 更平顺。";
+    case ID_GPUSEL:
+        return L"跑帧生成 / 上屏的 GPU。自动 = 按窗口所在显示器选，并尽量避开游戏卡。";
+    case ID_DISPLAY:
+        return L"当前输出显示器的分辨率和刷新率（只读），用于推导建议锁帧。";
+    case ID_UISCALE:
+        return L"界面缩放。自动跟随系统 DPI；也可手动 100%–200%，适合电视或视力不便。";
+    case ID_TARGET:
+        return L"启动时要抓的游戏窗口。选过一次会记住；也可以直接用热键抓前台窗口。";
+    case ID_HOTKEY:
+        return L"全局开关热键（默认 Alt+PageUp）。点击这一行可以重新录制组合键。";
+    case ID_LOCK:
+        return L"建议在游戏里锁的输入帧率 = 面板刷新率 ÷ 倍率。UI 只给建议，不改游戏设置。";
+    case ID_CMD:
+        return L"实际传给 lock_frame.exe 的命令行。默认折叠，需要排查时展开复制。";
+    case ID_LAYERED:
+        return L"A/B：给叠加层加 WS_EX_LAYERED，实测能让游戏菜单收到点击（默认开）。";
+    case ID_RELAY:
+        return L"A/B：叠加层不再穿透，而是把鼠标转发给游戏窗口。和分层窗口二选一。";
+    case ID_OSD:
+        return L"在游戏画面上画一行 OSD：fps / 倍率 / 输入帧率 / GPU 等待 / 丢帧。";
+    default:
+        return L"";
+    }
+}
+
+static Id hover_id_at(int mx, int my)
+{
+    if (g_lib_view || g_log_view || g_welcome || g_help_view) { return ID_NONE; }
+    if (mx < kSideW) {
+        if (hit_rect(help_rect_entry(), mx, my)) { return ID_S_HELP; }
+        return ID_NONE;
+    }
+    if (g_advanced) {
+        if (hit_rect(drawer_rect_close(), mx, my)) { return ID_NONE; }
+        std::vector<Item> items;
+        int ch = 0;
+        layout_drawer_items(items, &ch);
+        for (const Item& it : items) {
+            if (!it.is_row) { continue; }
+            RECT rc = it.rc;
+            OffsetRect(&rc, 0, -g_drawer_scroll);
+            if (hit_rect(rc, mx, my)) { return it.id; }
+        }
+        return ID_NONE;
+    }
+    for (const SBtn& b : simple_buttons()) {
+        if (hit_rect(b.rc, mx, my)) { return b.id; }
+    }
+    return ID_NONE;
+}
+
+// 鼠标是否停在可点击的控件上（用于手型光标）。
+static bool is_clickable_at(int mx, int my)
+{
+    if (g_welcome) { return hit_rect(welcome_rect_ok(), mx, my); }
+    if (g_pick_view) {
+        if (hit_rect(pick_rect_close(), mx, my)) { return true; }
+        for (int i = 0; i < (int)g_pick_list.size(); ++i) {
+            if (hit_rect(pick_row_rect(i), mx, my)) { return true; }
+        }
+        return false;
+    }
+    if (g_lib_view) {
+        if (hit_rect(lib_rect_manual(), mx, my) || hit_rect(lib_rect_close(), mx, my)) {
+            return true;
+        }
+        const int first = g_lib_scroll / kLibRowH;
+        for (int k = 0; k < lib_rows_visible(); ++k) {
+            const int i = first + k;
+            if (i >= (int)g_games.size()) { break; }
+            if (hit_rect(lib_row_rect(i), mx, my)) { return true; }
+        }
+        return false;
+    }
+    if (g_log_view) {
+        return hit_rect(log_rect_folder(), mx, my) || hit_rect(log_rect_copy(), mx, my) ||
+               hit_rect(log_rect_refresh(), mx, my) || hit_rect(log_rect_close(), mx, my);
+    }
+    if (g_help_view) { return hit_rect(help_rect_close(), mx, my); }
+    if (hit_rect(title_min_rect(), mx, my) || hit_rect(title_close_rect(), mx, my)) {
+        return true;
+    }
+    if (mx >= kSideW && hit_rect(adv_rect(), mx, my)) { return true; }
+    if (mx < kSideW) {
+        const int rows = side_rows_max();
+        for (int slot = 0; slot < rows && g_side_scroll + slot < (int)g_games.size(); ++slot) {
+            if (hit_rect(side_row_rect(slot), mx, my)) { return true; }
+        }
+        if (hit_rect(help_rect_entry(), mx, my)) { return true; }
+        return false;
+    }
+    const Id h = hover_id_at(mx, my);
+    switch (h) {
+    case ID_S_INSTALL: case ID_S_UNDEPLOY: case ID_S_GAMELIB: case ID_S_PICKEXE:
+    case ID_S_WINDOW:
+    case ID_S_REFRESH: case ID_S_2X: case ID_S_3X: case ID_S_4X: case ID_S_START:
+    case ID_S_LOGVIEW: case ID_S_DIAG:
+    case ID_FG_MODE: case ID_OUT: case ID_FG_INPUT: case ID_SDR: case ID_POOL:
+    case ID_LAT: case ID_GPUSEL: case ID_UISCALE: case ID_TARGET: case ID_HOTKEY:
+    case ID_CMD: case ID_TMODE: case ID_FOV: case ID_IVL: case ID_UI: case ID_RT:
+    case ID_LOCK: case ID_LAYERED: case ID_RELAY: case ID_OSD: case ID_JITZ:
+    case ID_NOMARKER: case ID_UPSAMPLE: case ID_STRAUTO: case ID_STRASYM:
+    case ID_PREFETCH: case ID_UNLOCK: case ID_SLACK: case ID_TEAR: case ID_PERF:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void draw_tip(HDC dc)
+{
+    if (g_tip_id == ID_NONE) { return; }
+    if (g_lib_view || g_log_view || g_welcome) { return; }
+    if (GetTickCount() - g_tip_since < 450) { return; }
+    const wchar_t* t = tip_for((Id)g_tip_id);
+    if (t == nullptr || t[0] == 0) { return; }
+
+    RECT calc{ 0, 0, 300, 0 };
+    HGDIOBJ old = SelectObject(dc, g_f_small);
+    DrawTextW(dc, t, -1, &calc, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+    SelectObject(dc, old);
+    const int w = calc.right + 20;
+    const int h = calc.bottom + 16;
+    int x = g_hover_x + 16;
+    int y = g_hover_y + 22;
+    if (x + w > kWinW - 8) { x = kWinW - 8 - w; }
+    if (x < 8) { x = 8; }
+    if (y + h > kWinH - 8) { y = g_hover_y - h - 12; }
+    if (y < kTitleH + 4) { y = kTitleH + 4; }
+
+    RECT box{ x, y, x + w, y + h };
+    stroke_round(dc, box, 6, RGB(18, 18, 18), RGB(96, 96, 96));
+    RECT tr{ x + 10, y + 8, x + w - 10, y + h - 8 };
+    HGDIOBJ of = SelectObject(dc, g_f_small);
+    SetTextColor(dc, C_TEXT);
+    SetBkMode(dc, TRANSPARENT);
+    DrawTextW(dc, t, -1, &tr, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
+    SelectObject(dc, of);
+}
+
+// 卡片绘制（抽屉里用；scroll 是内容偏移）
+static int drawer_view_h() { return (kWinH - 52) - (kTitleH + 48); }
+
+static void paint_cards(HDC dc, const std::vector<Item>& items, int scroll)
+{
     for (const Item& it : items) {
         RECT rc = it.rc;
-        OffsetRect(&rc, 0, -g_scroll);
-        if (rc.bottom < kTitleH + 58 || rc.top > kWinH - kBottomH) { continue; }
+        OffsetRect(&rc, 0, -scroll);
+        if (rc.bottom < kTitleH + 40 || rc.top > kWinH) { continue; }
 
         if (!it.is_row) {                       // card
             fill_round(dc, rc, 8, C_CARD);
@@ -1736,15 +5008,21 @@ static void paint(HWND hwnd)
         const bool hover = (g_hover_y >= rc.top && g_hover_y < rc.bottom &&
                             g_hover_x >= rc.left && g_hover_x < rc.right &&
                             (it.kind == RK_DD || it.kind == RK_TOG || it.kind == RK_SPIN ||
-                             it.kind == RK_EDIT));
-        if (hover && it.kind == RK_TOG) { draw_toggle(dc, rc, it.on, true); }
-        else if (it.kind == RK_TOG)     { draw_toggle(dc, rc, it.on, false); }
+                             it.kind == RK_EDIT || it.kind == RK_CMDLINE));
+        if (g_advanced && (int)(&it - items.data()) == g_drawer_focus) {
+            draw_focus(dc, RECT{ rc.left - 6, rc.top + 1, rc.right + 6, rc.bottom - 1 });
+        }
+        if (hover && (it.kind == RK_DD || it.kind == RK_TOG || it.kind == RK_SPIN ||
+                      it.kind == RK_EDIT || it.kind == RK_CMDLINE)) {
+            fill_round(dc, RECT{ rc.left - 6, rc.top + 1, rc.right + 6, rc.bottom - 1 },
+                       RAD_CTL, RGB(44, 44, 44));
+        }
+        if (it.kind == RK_TOG) { draw_toggle(dc, rc, it.on, hover); }
 
         if (it.kind == RK_HEAD) {
-            // 分区标题：小字、暗色、不画控件。
-            RECT hr{ rc.left + 2, rc.top + 6, rc.right, rc.bottom };
             HGDIOBJ old = SelectObject(dc, g_f_small);
-            txt(dc, g_f_small, hr, def->label, C_DIM, DT_LEFT | DT_VCENTER);
+            txt(dc, g_f_small, RECT{ rc.left + 2, rc.top + 6, rc.right, rc.bottom },
+                def->label, C_DIM, DT_LEFT | DT_VCENTER);
             SelectObject(dc, old);
             continue;
         }
@@ -1755,7 +5033,6 @@ static void paint(HWND hwnd)
                 DT_LEFT | DT_VCENTER);
         }
         if (!enabled && it.kind != RK_CMDLINE) {
-            // 灰掉的控件：直接画成只读文本，视觉上明确"这一项当前不生效"。
             txt(dc, g_f_ui, RECT{ rc.left + 210, rc.top, rc.right, rc.bottom },
                 row_value(it.id), C_DIM, DT_RIGHT | DT_VCENTER | DT_END_ELLIPSIS);
             continue;
@@ -1764,20 +5041,28 @@ static void paint(HWND hwnd)
         switch (it.kind) {
         case RK_INFO: draw_info(dc, rc, row_value(it.id)); break;
         case RK_CMDLINE: {
-            // The label sits on the first line, the wrapped command below it.
-            RECT lr{ rc.left, rc.top, rc.right, rc.top + 24 };
-            txt(dc, g_f_ui, lr, def->label, C_LABEL, DT_LEFT | DT_VCENTER);
-            RECT tr{ rc.left, rc.top + 26, rc.right, rc.bottom - 2 };
-            HGDIOBJ old = SelectObject(dc, g_f_small);
-            SetTextColor(dc, C_DIM);
-            SetBkMode(dc, TRANSPARENT);
-            DrawTextW(dc, display_cmdline().c_str(), -1, &tr,
-                      DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
-            SelectObject(dc, old);
+            const int headH = g_show_cmd ? 24 : (rc.bottom - rc.top);
+            txt(dc, g_f_ui, RECT{ rc.left, rc.top, rc.right - 90, rc.top + headH },
+                def->label, C_LABEL, DT_LEFT | DT_VCENTER);
+            txt(dc, g_f_small, RECT{ rc.right - 84, rc.top, rc.right, rc.top + headH },
+                g_show_cmd ? L"收起 \u25B4" : L"展开 \u25BE",
+                hover ? C_TEXT : C_ACCENT, DT_RIGHT | DT_VCENTER);
+            if (g_show_cmd) {
+                txt(dc, g_f_small, RECT{ rc.right - 190, rc.top, rc.right - 96, rc.top + headH },
+                    L"复制", hit_rect(RECT{ rc.right - 190, rc.top, rc.right - 96, rc.top + headH },
+                                      g_hover_x, g_hover_y) ? C_TEXT : C_ACCENT,
+                    DT_RIGHT | DT_VCENTER);
+                RECT tr{ rc.left, rc.top + 26, rc.right, rc.bottom - 2 };
+                HGDIOBJ old = SelectObject(dc, g_f_small);
+                SetTextColor(dc, C_DIM);
+                SetBkMode(dc, TRANSPARENT);
+                DrawTextW(dc, display_cmdline().c_str(), -1, &tr,
+                          DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
+                SelectObject(dc, old);
+            }
             break;
         }
-        case RK_DD:   draw_dd(dc, rc, dd_caption(it.id), hover,
-                              g_popup_id == (int)it.id); break;
+        case RK_DD: draw_dd(dc, rc, dd_caption(it.id), hover, g_popup_id == (int)it.id); break;
         case RK_EDIT: {
             const bool editing = (g_edit_id == it.id);
             draw_edit(dc, rc, editing ? (g_edit_buf + L"_") : row_value(it.id), hover, editing);
@@ -1792,35 +5077,465 @@ static void paint(HWND hwnd)
         default: break;
         }
     }
-
-    SelectClipRgn(dc, nullptr);
-    DeleteObject(clip);
-
-    // bottom bar: live stats
-    fill_round(dc, RECT{ kSideW, kWinH - kBottomH, cl.right, kWinH }, 0, RGB(28, 28, 28));
-    wchar_t s1[256]{};
-    _snwprintf_s(s1, _TRUNCATE,
-                 L"%s    show %d fps    xN %.2f    skip %d    gpu %.1f ms    game %.1f ms",
-                 g_running ? L"运行中" : L"已停止", (int)g_show, (double)g_xn / 100.0,
-                 (int)g_skip, (double)g_gpu, (double)g_game);
-    txt(dc, g_f_small, RECT{ kSideW + 16, kWinH - kBottomH, cl.right - 300, kWinH },
-        s1, C_LABEL, DT_LEFT | DT_VCENTER);
-
-    std::wstring right = (!g_msg.empty() && GetTickCount() < g_msg_until) ? g_msg : g_last_line;
-    if (!right.empty()) {
-        txt(dc, g_f_small, RECT{ cl.right - 640, kWinH - kBottomH, cl.right - 16, kWinH },
-            right, C_DIM, DT_RIGHT | DT_VCENTER | DT_END_ELLIPSIS);
-    }
-
-    draw_popup(dc);
-
-    BitBlt(wdc, 0, 0, cl.right, cl.bottom, dc, 0, 0, SRCCOPY);
-    SelectObject(dc, old_bmp);
-    DeleteObject(bmp);
-    DeleteDC(dc);
-    EndPaint(hwnd, &ps);
 }
 
+static void paint_drawer(HDC dc)
+{
+    if (!g_advanced) { return; }
+
+    const int x0 = drawer_x0();
+    fill_round(dc, RECT{ x0, 0, kWinW, kWinH }, 0, RGB(22, 22, 22));
+    fill_round(dc, RECT{ x0, 0, x0 + 2, kWinH }, 0, RGB(62, 62, 62));
+
+    txt(dc, g_f_card, RECT{ x0 + 18, kTitleH + 2, kWinW - 260, kTitleH + 28 },
+        L"高级设置", C_TEXT, DT_LEFT | DT_VCENTER);
+    {
+        const GameEntry* de = find_game(g_game_dir);
+        const std::wstring who = de
+            ? (std::wstring(T(L"正在编辑：", L"Editing: ")) + de->name)
+            : std::wstring(T(L"未选择游戏（改的是通用配置）",
+                             L"No game selected (editing the generic config)"));
+        txt(dc, g_f_small, RECT{ x0 + 18, kTitleH + 28, kWinW - 260, kTitleH + 44 },
+            who, de ? C_LABEL : C_WARN, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+    }
+    const RECT cb = drawer_rect_close();
+    draw_btn(dc, cb, T(L"完成", L"Done"), false, hit_rect(cb, g_hover_x, g_hover_y));
+
+    std::vector<Item> items;
+    int content_h = 0;
+    layout_drawer_items(items, &content_h);
+    g_drawer_h = content_h;
+
+    const int view_top = kTitleH + 52;
+    const int view_bottom = kWinH - 52;
+    const int saved = SaveDC(dc);
+    IntersectClipRect(dc, x0, view_top, kWinW, view_bottom);
+    paint_cards(dc, items, g_drawer_scroll);
+    RestoreDC(dc, saved);
+
+    fill_round(dc, RECT{ x0, kWinH - 52, kWinW, kWinH }, 0, RGB(22, 22, 22));
+    txt(dc, g_f_small, RECT{ x0 + 18, kWinH - 46, kWinW - 18, kWinH - 20 },
+        L"滚轮翻页 · Tab/上下切换 · Enter 激活 · Esc 收起",
+        C_DIM, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+}
+
+// ---------------------------------------------------------------- 帮助面板
+static const int kHelpL = 200, kHelpT = 100, kHelpR = kWinW - 200, kHelpB = kWinH - 190;
+static RECT help_rect_entry() { return RECT{ 10, kWinH - 84, kSideW - 10, kWinH - 44 }; }
+static RECT help_rect_close() { return RECT{ kHelpR - 104, kHelpT + 8, kHelpR - 16, kHelpT + 38 }; }
+
+static void open_help()
+{
+    close_advanced_silent();
+    g_help_view = true;
+    g_popup_id = 0;
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void close_help()
+{
+    g_help_view = false;
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void draw_help(HDC dc)
+{
+    if (!g_help_view) { return; }
+
+    fill_round(dc, RECT{ 0, 0, kWinW, kWinH }, 0, RGB(12, 12, 12));
+    RECT p{ kHelpL, kHelpT, kHelpR, kHelpB };
+    stroke_round(dc, p, RAD_CARD, RGB(28, 28, 28), C_BORDER);
+
+    txt(dc, g_f_card, RECT{ p.left + 20, p.top + 6, p.right - 120, p.top + 42 },
+        L"帮助与快捷键", C_TEXT, DT_LEFT | DT_VCENTER);
+    const RECT cb = help_rect_close();
+    draw_btn(dc, cb, L"关闭", false, hit_rect(cb, g_hover_x, g_hover_y));
+
+    auto section = [&](int y, const wchar_t* t) {
+        txt(dc, g_f_small, RECT{ p.left + 20, y, p.right - 20, y + 20 }, t, C_ACCENT,
+            DT_LEFT | DT_VCENTER);
+    };
+    auto line = [&](int y, const std::wstring& t) {
+        txt(dc, g_f_ui, RECT{ p.left + 20, y, p.right - 20, y + 22 }, t, C_LABEL,
+            DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+    };
+
+    int y = p.top + 52;
+    section(y, L"上手顺序"); y += 24;
+    line(y, L"1. 点[当前游戏]右上角[选择游戏]：从列表里挑一个游戏（配置随游戏保存）。"); y += 24;
+    line(y, L"2. 点[安装 / 应用配置]：把组件和当前配置一起写进游戏目录。"); y += 24;
+    line(y, L"3. 进游戏（无边框 + DLSS 帧生成）；窗口和 producer 就绪后点[启动补帧]。"); y += 34;
+
+    section(y, L"快捷键"); y += 24;
+    line(y, std::wstring(T(L"开关插帧：", L"Toggle interpolation: ")) + hotkey_name()); y += 24;
+    line(y, L"Tab / Shift+Tab 切换焦点　Enter / Space 触发　Esc 关闭面板"); y += 24;
+    line(y, L"PageUp / PageDown / Home / End：列表翻页　F1：打开本帮助"); y += 34;
+
+    section(y, L"常见问题"); y += 24;
+    line(y, L"看不到游戏窗口：先进实际画面再点[刷新]；确认游戏不是独占全屏。"); y += 24;
+    line(y, L"状态是“部分插帧”：HUD 可能挡住画面四角，或窗口被缩放。"); y += 24;
+    line(y, L"只有 1 块 GPU：能跑，但插帧会和游戏抢性能；建议双卡。");
+
+    wchar_t foot[128]{};
+    _snwprintf_s(foot, _TRUNCATE,
+                 T(L"v%s · 协议 v%u · 完整日志与诊断在状态卡下方",
+                   L"v%s · protocol v%u · log and diagnostics are on the status card"),
+                 LOCK_FRAME_VERSION_WSTRING, mgpu::kSharedVersion);
+    txt(dc, g_f_small, RECT{ p.left + 20, p.bottom - 34, p.right - 20, p.bottom - 10 },
+        foot, C_DIM, DT_LEFT | DT_VCENTER);
+}
+
+static void paint_simple(HDC dc)
+{
+    const int x0 = kSideW + kMargin, x1 = kWinW - kMargin;
+    const unsigned hz = (g_refresh > 1) ? g_refresh : 120;
+    const int mul = S().fg_mode + 2;
+
+    auto btn = [&](Id id) -> RECT {
+        for (const SBtn& b : simple_buttons()) {
+            if (b.id == id) { return b.rc; }
+        }
+        return RECT{ 0, 0, 0, 0 };
+    };
+    auto hover = [&](Id id) { return hit_rect(btn(id), g_hover_x, g_hover_y); };
+
+    // 卡片头：40px，左侧标题，右侧状态文字 + 状态点。
+    auto card = [&](int top, int bottom, const wchar_t* title, bool ok,
+                    const wchar_t* state) {
+        fill_round(dc, RECT{ x0, top, x1, bottom }, RAD_CARD, C_CARD);
+        RECT head{ x0, top, x1, top + 40 };
+        fill_round(dc, head, RAD_CARD, C_CARD_HEAD);
+        fill_round(dc, RECT{ head.left, head.bottom - 12, head.right, head.bottom },
+                   RAD_CARD, C_CARD_HEAD);
+        fill_round(dc, RECT{ head.left, head.bottom - 1, head.right, head.bottom }, 0,
+                   RGB(46, 46, 46));
+        txt(dc, g_f_card, RECT{ head.left + 18, head.top, head.right - 200, head.bottom },
+            title, C_TEXT, DT_LEFT | DT_VCENTER);
+        if (state != nullptr && state[0] != 0) {
+            txt(dc, g_f_small, RECT{ head.right - 190, head.top, head.right - 34, head.bottom },
+                state, ok ? C_OK : C_DIM, DT_RIGHT | DT_VCENTER | DT_END_ELLIPSIS);
+        }
+        draw_dot(dc, head.right - 20, (head.top + head.bottom) / 2, ok ? C_OK : C_WARN);
+    };
+
+    const GameEntry* ge = find_game(g_game_dir);
+    const bool gsel = (ge != nullptr);
+
+    // ------------------------------------------------------------ 当前游戏
+    card(kSC1, kSC1B, T(L"当前游戏", L"Current game"), gsel && g_ready.deployed, nullptr);
+    {
+        const int name_x = x0 + 18;
+        g_name_hit = RECT{ name_x - 4, kSC1 + 40, name_x + 320, kSC1 + 72 };
+        if (gsel && g_name_edit) {
+            RECT er = g_name_hit;
+            fill_round(dc, er, 6, RGB(24, 24, 24));
+            stroke_round(dc, er, 6, RGB(24, 24, 24), C_ACCENT);
+            txt(dc, g_f_card, RECT{ er.left + 8, er.top, er.right - 8, er.bottom },
+                g_name_buf + L"|", C_TEXT, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+        } else {
+            txt(dc, g_f_card, RECT{ name_x, kSC1 + 42, x1 - 200, kSC1 + 70 },
+                gsel ? ge->name : std::wstring(T(L"还没有选择游戏", L"No game selected")),
+                gsel ? C_TEXT : C_DIM, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+            if (gsel) {
+                // 名字可点：悬停时给一个浅底 + 提示
+                if (hit_rect(g_name_hit, g_hover_x, g_hover_y)) {
+                    txt(dc, g_f_small,
+                        RECT{ g_name_hit.right - 90, g_name_hit.top, g_name_hit.right,
+                              g_name_hit.bottom },
+                        T(L"点击改名", L"click to rename"), C_DIM,
+                        DT_RIGHT | DT_VCENTER);
+                }
+                SIZE ns{};
+                HGDIOBJ nf = SelectObject(dc, g_f_card);
+                GetTextExtentPoint32W(dc, ge->name.c_str(), (int)ge->name.size(), &ns);
+                SelectObject(dc, nf);
+                const int bx = name_x + ns.cx + 12;
+                if (bx + 96 < x1 - 200) {
+                    const wchar_t* st = g_ready.deployed ? T(L"已安装", L"Installed")
+                                                         : T(L"未安装", L"Not installed");
+                    RECT br{ bx, kSC1 + 48, bx + 84, kSC1 + 68 };
+                    fill_round(dc, br, 10, RGB(30, 30, 30));
+                    stroke_round(dc, br, 10, RGB(30, 30, 30),
+                                 g_ready.deployed ? C_OK : C_BORDER);
+                    txt(dc, g_f_small, br, st, g_ready.deployed ? C_OK : C_DIM,
+                        DT_CENTER | DT_VCENTER);
+                }
+            }
+        }
+        txt(dc, g_f_small, RECT{ x0 + 18, kSC1 + 72, x1 - 18, kSC1 + 94 },
+            gsel ? (!ge->exe.empty() ? ge->exe : game_entry_path(*ge))
+                 : std::wstring(T(L"点右上角[选择游戏]从列表挑一个：配置和安装状态都跟着游戏保存。",
+                                  L"Click [Choose game...]: settings and install state are saved per game.")),
+            C_DIM, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+
+        wchar_t cfg[256]{};
+        if (gsel) {
+            _snwprintf_s(cfg, _TRUNCATE,
+                         T(L"%dx  ·  输入 %.1f fps  ·  FgInput %s  ·  MV 比例 %d%%%s%s",
+                           L"%dx  |  input %.1f fps  |  FgInput %s  |  MV %d%%%s%s"),
+                         mul, static_cast<double>((g_refresh > 1) ? g_refresh : 120) / mul,
+                         fg_input_ini_value(S().fg_input), S().stream_pct,
+                         g_ready.deployed ? T(L"  ·  已写入游戏", L"  |  applied to game") : L"",
+                         g_ini_drift ? T(L"  ·  ini 被改过，点[重新应用配置]",
+                                          L"  |  ini changed, click [Re-apply config]")
+                                     : L"");
+        } else {
+            _snwprintf_s(cfg, _TRUNCATE,
+                         T(L"选择游戏后，这里显示它保存的倍率 / 输入源 / MV 比例。",
+                           L"After picking a game, its saved multiplier / input / MV ratio appears here."));
+        }
+        txt(dc, g_f_ui, RECT{ x0 + 18, kSC1 + 96, x1 - 18, kSC1 + 118 }, cfg,
+            gsel ? (g_ini_drift ? C_WARN : C_LABEL) : C_DIM,
+            DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+
+        struct Chip { const wchar_t* label; bool ok; };
+        const Chip chips[] = {
+            { L"Intel 运行时", g_ready.runtime },
+            { L"fakerFG.ini",  g_ready.ini },
+            { L"producer",     g_ready.producer },
+        };
+        int cx = x0 + 18;
+        for (const Chip& c : chips) {
+            SIZE cs{};
+            const wchar_t* label = c.label;
+            if (const wchar_t* e = tr_lookup(label)) { label = e; }
+            HGDIOBJ cf = SelectObject(dc, g_f_small);
+            GetTextExtentPoint32W(dc, label, (int)wcslen(label), &cs);
+            SelectObject(dc, cf);
+            RECT cr{ cx, kSC1 + 122, cx + cs.cx + 38, kSC1 + 148 };
+            stroke_round(dc, cr, 12, RGB(32, 32, 32), C_BORDER);
+            draw_dot(dc, cr.left + 13, (cr.top + cr.bottom) / 2, c.ok ? C_OK : C_WARN);
+            txt(dc, g_f_small, RECT{ cr.left + 24, cr.top, cr.right - 8, cr.bottom },
+                label, c.ok ? C_LABEL : C_WARN, DT_LEFT | DT_VCENTER);
+            cx = cr.right + 10;
+        }
+
+        draw_btn(dc, btn(ID_S_INSTALL),
+                 g_ready.deployed ? T(L"重新应用配置", L"Re-apply config")
+                                  : T(L"安装 / 应用配置", L"Install / apply"),
+                 true, hover(ID_S_INSTALL), !gsel);
+        draw_btn(dc, btn(ID_S_UNDEPLOY), T(L"还原 / 移除组件", L"Restore / remove"), false,
+                 hover(ID_S_UNDEPLOY), !gsel || !g_ready.deployed);
+        draw_btn(dc, btn(ID_S_PICKEXE), T(L"主程序…", L"Main exe…"), false,
+                 hover(ID_S_PICKEXE), !gsel);
+        // 与安装/还原同一行的「高级设置」（次级样式 + 左侧强调条）。
+        {
+            const RECT ar = adv_rect();
+            const bool ha = hit_rect(ar, g_hover_x, g_hover_y);
+            fill_round(dc, ar, RAD_CTL, ha ? C_BTN_HOVER : C_BTN);
+            stroke_round(dc, ar, RAD_CTL, RGB(70, 70, 70), C_BORDER);
+            fill_round(dc, RECT{ ar.left + 1, ar.top + 8, ar.left + 4, ar.bottom - 8 }, 2,
+                       C_ACCENT);
+            txt(dc, g_f_ui, ar, T(L"高级设置", L"Advanced"), C_TEXT,
+                DT_CENTER | DT_VCENTER);
+        }
+        // 唯一的"选择游戏"入口：卡片标题右侧，强调色（放在标题行）。
+        draw_btn(dc, btn(ID_S_GAMELIB),
+                 gsel ? T(L"更换游戏", L"Change game") : T(L"选择游戏", L"Choose game"),
+                 true, hover(ID_S_GAMELIB));
+    }
+
+    // ------------------------------------------------------------ 启动补帧
+    const bool ready = g_ready.deployed && g_ready.window && g_ready.runtime;
+    const wchar_t* bstate = !gsel ? T(L"未选择游戏", L"No game")
+                          : !g_ready.deployed ? T(L"未安装", L"Not installed")
+                          : !g_ready.window ? T(L"等待游戏窗口", L"Waiting for window")
+                          : !g_ready.producer ? T(L"等待 producer", L"Waiting for producer")
+                                              : T(L"就绪", L"Ready");
+    card(kSC2, kSC2B, T(L"启动补帧", L"Start frame generation"),
+         g_ready.deployed && g_ready.window && g_ready.producer, bstate);
+    {
+        txt(dc, g_f_small, RECT{ x0 + 18, kSC2 + 42, x1 - 18, kSC2 + 62 },
+            !gsel ? T(L"先在[当前游戏]卡片点[选择游戏]；再进游戏（无边框 + DLSS 帧生成）。",
+                      L"Pick a game with [Choose game] in the Current game card; then enter the game (borderless + DLSS FG).")
+                  : g_ready.window ? T(L"已找到这个游戏的窗口；确认无边框 / 窗口化全屏，并已开启 DLSS 帧生成。",
+                                       L"Window for this game found; make sure it is borderless and DLSS FG is on.")
+                                   : T(L"还没有找到这个游戏的窗口：先进游戏画面，再点[刷新]。",
+                                       L"No window for this game yet: enter the game, then click [Refresh]."),
+            !gsel ? C_DIM : (g_ready.window ? (g_ready.producer ? C_OK : C_WARN) : C_LABEL),
+            DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+
+        std::wstring wt = T(L"（还没有该游戏的窗口）", L"(no window for this game yet)");
+        if (g_ready.window && g_win_sel >= 0 && g_win_sel < (int)g_wins.size()) {
+            wt = g_wins[(size_t)g_win_sel].title;
+            wchar_t sz[128]{};
+            _snwprintf_s(sz, _TRUNCATE, L"   %dx%d", g_wins[(size_t)g_win_sel].w,
+                         g_wins[(size_t)g_win_sel].h);
+            wt += sz;
+        }
+        RECT wr = btn(ID_S_WINDOW);
+        stroke_round(dc, wr, RAD_CTL, hit_rect(wr, g_hover_x, g_hover_y) ? C_CTL_HOVER : C_CTL,
+                     C_BORDER);
+        txt(dc, g_f_ui, RECT{ wr.left + 12, wr.top, wr.right - 28, wr.bottom }, wt, C_TEXT,
+            DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+        draw_chevron(dc, wr.right - 15, (wr.top + wr.bottom) / 2 + 1, +1, C_DIM);
+        draw_btn(dc, btn(ID_S_REFRESH), T(L"刷新", L"Refresh"), false, hover(ID_S_REFRESH));
+    }
+
+    // 倍率 + 启动（同一张卡片：改倍率立即保存到当前游戏）
+    {
+        for (int i = 0; i < 3; ++i) {
+            const int m = i + 2;
+            RECT r = btn((Id)(ID_S_2X + i));
+            const bool sel = (S().fg_mode == i) && gsel;
+            const bool hv = hit_rect(r, g_hover_x, g_hover_y);
+            const bool on = gsel;   // 没选游戏时按钮置灰（避免写进"通用配置"）
+            stroke_round(dc, r, RAD_CTL, sel ? RGB(52, 80, 118) : (hv ? C_CTL_HOVER : C_CTL),
+                         sel ? C_ACCENT : C_BORDER);
+            wchar_t t1[16]{}, t2[48]{};
+            _snwprintf_s(t1, _TRUNCATE, L"%dx", m);
+            _snwprintf_s(t2, _TRUNCATE, T(L"输入 %.1f fps", L"input %.1f fps"),
+                         static_cast<double>(hz) / m);
+            txt(dc, g_f_card, RECT{ r.left, r.top + 9, r.right, r.top + 37 }, t1,
+                on ? (sel ? C_TEXT : C_LABEL) : C_DIM, DT_CENTER | DT_VCENTER);
+            txt(dc, g_f_small, RECT{ r.left, r.top + 37, r.right, r.bottom - 7 }, t2,
+                on ? (sel ? RGB(200, 220, 245) : C_DIM) : RGB(90, 90, 90),
+                DT_CENTER | DT_VCENTER);
+        }
+
+        std::wstring hint;
+        COLORREF hc = C_LABEL;
+        if (!gsel) {
+            hint = T(L"先点[当前游戏]卡片右上角的[选择游戏]。",
+                     L"Pick a game first with [Choose game] at the top right.");
+            hc = C_WARN;
+        } else if (!g_ready.deployed) {
+            hint = T(L"还没安装到游戏：点[安装 / 应用配置]把当前配置写进去。",
+                     L"Not installed yet: click [Install / apply] to write this config.");
+            hc = C_WARN;
+        } else if (!g_ready.window) {
+            hint = T(L"游戏还没运行：启动游戏并进入画面（无边框 + DLSS 帧生成）。",
+                     L"Game not running: launch it and enter the game (borderless + DLSS FG).");
+            hc = C_WARN;
+        } else if (!g_ready.producer) {
+            hint = T(L"窗口已找到，但 producer 未加载：确认游戏侧组件已生效、DLSS 帧生成已开。",
+                     L"Window found but producer is not loaded: check the game-side files and DLSS FG.");
+            hc = C_WARN;
+        } else {
+            hint = T(L"一切就绪，可以启动补帧了。",
+                     L"Everything is ready: you can start frame generation.");
+            hc = C_OK;
+        }
+        txt(dc, g_f_ui, RECT{ x0 + 18, kSC2 + 176, x1 - 232, kSC2 + 198 }, hint, hc,
+            DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+
+        RECT sr = btn(ID_S_START);
+        const bool sh = hit_rect(sr, g_hover_x, g_hover_y);
+        const bool can = g_running || ready;
+        COLORREF sc;
+        if (g_running) { sc = sh ? RGB(176, 78, 78) : RGB(148, 62, 62); }
+        else if (!can)  { sc = RGB(58, 58, 58); }
+        else            { sc = sh ? RGB(74, 136, 212) : RGB(62, 120, 196); }
+        stroke_round(dc, sr, RAD_CARD, sc, sc);
+        txt(dc, g_f_card, sr, g_running ? L"停止" : T(L"启动补帧", L"Start"),
+            can ? RGB(252, 252, 252) : RGB(150, 150, 150), DT_CENTER | DT_VCENTER);
+    }
+
+    // ---------------------------------------------------------------- 状态
+    {
+        std::wstring badge, advice;
+        COLORREF bc = C_DIM;
+        status_summary(&badge, &bc, &advice);
+
+        fill_round(dc, RECT{ x0, kSST, x1, kSSTB }, RAD_CARD, C_CARD);
+        txt(dc, g_f_small, RECT{ x0 + 18, kSST + 4, x0 + 96, kSST + 40 }, L"运行状态",
+            C_DIM, DT_LEFT | DT_VCENTER);
+
+        SIZE sz{};
+        HGDIOBJ of = SelectObject(dc, g_f_ui);
+        GetTextExtentPoint32W(dc, badge.c_str(), (int)badge.size(), &sz);
+        SelectObject(dc, of);
+        RECT bd{ x0 + 96, kSST + 4, x0 + 96 + sz.cx + 40, kSST + 40 };
+        stroke_round(dc, bd, 18, RGB(32, 32, 32), bc);
+        draw_dot(dc, bd.left + 15, (bd.top + bd.bottom) / 2, bc);
+        txt(dc, g_f_ui, RECT{ bd.left + 28, bd.top, bd.right - 10, bd.bottom }, badge,
+            bc, DT_LEFT | DT_VCENTER);
+
+        draw_btn(dc, btn(ID_S_LOGVIEW), L"查看日志", false, hover(ID_S_LOGVIEW));
+        draw_btn(dc, btn(ID_S_DIAG), L"一键诊断", false, hover(ID_S_DIAG));
+
+        // 运行数据：5 个 KPI（标签 + 大数字）
+        struct Kpi { const wchar_t* label; std::wstring value; };
+        wchar_t v[32]{};
+        std::vector<Kpi> kpis;
+        _snwprintf_s(v, _TRUNCATE, L"%d", (int)g_show);
+        kpis.push_back({ T(L"输出 fps", L"output fps"), v });
+        _snwprintf_s(v, _TRUNCATE, L"%.2fx", static_cast<double>(g_xn) / 100.0);
+        kpis.push_back({ T(L"插帧", L"interp"), v });
+        _snwprintf_s(v, _TRUNCATE, L"%.1f", (double)g_gpu);
+        kpis.push_back({ T(L"消费卡 ms", L"gpu ms"), v });
+        _snwprintf_s(v, _TRUNCATE, L"%.1f", (double)g_game);
+        kpis.push_back({ T(L"游戏 ms", L"game ms"), v });
+        _snwprintf_s(v, _TRUNCATE, L"%d", (int)g_skip);
+        kpis.push_back({ T(L"丢帧", L"dropped"), v });
+
+        const int kw = (x1 - x0 - 36) / 5;
+        for (int i = 0; i < (int)kpis.size(); ++i) {
+            const int kx = x0 + 18 + i * kw;
+            txt(dc, g_f_small, RECT{ kx, kSST + 42, kx + kw - 8, kSST + 62 },
+                kpis[(size_t)i].label, C_DIM, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+            txt(dc, g_f_card, RECT{ kx, kSST + 62, kx + kw - 8, kSST + 94 },
+                kpis[(size_t)i].value, C_TEXT, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+        }
+
+        txt(dc, g_f_ui, RECT{ x0 + 18, kSST + 100, x1 - 18, kSST + 124 }, advice, C_TEXT,
+            DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+
+        const std::wstring last = (!g_msg.empty() && GetTickCount() < g_msg_until)
+                                      ? g_msg : last_line_snapshot();
+        if (!last.empty()) {
+            txt(dc, g_f_small, RECT{ x0 + 18, kSST + 130, x1 - 18, kSST + 152 },
+                L"日志：" + last, C_DIM, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+        } else {
+            txt(dc, g_f_small, RECT{ x0 + 18, kSST + 130, x1 - 18, kSST + 152 },
+                L"需要细调（GPU / 色彩 / 热键 / 帧池）？点[高级设置]；快捷键与常见问题按 F1。",
+                C_DIM, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+        }
+    }
+
+    if (g_focus >= 0) {
+        const std::vector<SBtn>& v = simple_buttons();
+        if (g_focus < (int)v.size()) { draw_focus(dc, v[g_focus].rc); }
+    }
+}
+
+// 自动发现游戏窗口：游戏刚起来（producer 已加载）时直接选中它，省掉"刷新列表"。
+// 只在用户没手动选过窗口、且当前没在跑插帧时生效；每 2 s 由定时器调用。
+static void auto_detect_tick()
+{
+    if (g_running || g_user_picked) { return; }
+    rescan_windows();
+    int idx = -1;
+    for (int i = 0; i < (int)g_wins.size(); ++i) {
+        if (proc_has_module(g_wins[(size_t)i].pid, L"xess_mfg_producer.dll")) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx < 0) { return; }
+    const WinEntry& w = g_wins[(size_t)idx];
+    if (g_last_auto_hwnd == w.hwnd) { return; }
+    g_last_auto_hwnd = w.hwnd;
+
+    g_win_sel = idx;
+    S().win_hwnd = w.hwnd;
+    S().win_title = w.title;
+    S().target_mode = 1;
+    g_refresh = refresh_for_window(w.hwnd);
+    sync_fg_input_from_target();
+    const std::wstring dir = game_dir_for_window(w.hwnd);
+    if (!dir.empty()) {
+        if (g_game_dir.empty() || file_in_dir(dir, L"fakerFG.dll")) { g_game_dir = dir; }
+        apply_game(dir);
+        sync_fg_input_from_dir(dir);
+    }
+    save_all();
+
+    wchar_t m[220]{};
+    _snwprintf_s(m, _TRUNCATE, L"已自动选中游戏：%s（直接点启动即可）", w.title.c_str());
+    set_msg(m);
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
 
 // ------------------------------------------------------------ input handling
 static std::wstring hotkey_name()
@@ -1899,6 +5614,10 @@ static void toggle_field(Id id)
 {
     switch (id) {
     case ID_JITZ:    S().jitter_zero = !S().jitter_zero; break;
+    case ID_FG_LOG:
+        S().fg_log = !S().fg_log;
+        apply_fg_input();
+        break;
     case ID_NOMARKER:
         S().no_marker = !S().no_marker;
         set_msg(S().no_marker
@@ -1971,6 +5690,24 @@ static void bump_spin(Id id, int dir)
     }
 }
 
+// 手动缩放：按逻辑尺寸 * 比例重新摆窗口，并居中到当前显示器。
+static void apply_ui_scale()
+{
+    g_scale = effective_scale(g_hwnd);
+    if (g_hwnd == nullptr) { return; }
+    HMONITOR mon = MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(mon, &mi)) {
+        const int w = (int)(kWinW * g_scale + 0.5);
+        const int h = (int)(kWinH * g_scale + 0.5);
+        const int x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - w) / 2;
+        const int y = mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - h) / 2;
+        SetWindowPos(g_hwnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    InvalidateRect(g_hwnd, nullptr, TRUE);
+}
+
 static void set_opt(Id id, int idx)
 {
     switch (id) {
@@ -1980,6 +5717,11 @@ static void set_opt(Id id, int idx)
         break;
     case ID_FG_INPUT:
         S().fg_input = (idx < 0 || idx > 3) ? 0 : idx;
+        apply_fg_input();
+        remember_game(g_game_dir);
+        break;
+    case ID_STREAM_PCT:
+        S().stream_pct = kStreamPct[(idx < 0 || idx > 3) ? 1 : idx];
         apply_fg_input();
         break;
     case ID_OUT:     S().out_mode = idx % 3; break;
@@ -1994,6 +5736,20 @@ static void set_opt(Id id, int idx)
     case ID_RT:      S().rt_sel = idx % 2; break;
     case ID_LOCK:    S().lock_fps = idx % 5; break;
     case ID_TMODE:   S().target_mode = idx % 2; break;
+    case ID_UISCALE: {
+        const int k = (idx < 0 || idx > 6) ? 0 : idx;
+        g_scale_pct = kUiScalePct[k];
+        apply_ui_scale();
+        set_msg(g_scale_pct == 0 ? T(L"界面缩放：跟随系统", L"UI scale: follow system")
+                                 : T(L"界面缩放已更新", L"UI scale updated"));
+        break;
+    }
+    case ID_LANG:
+        g_lang = (idx % 2 == 0) ? 0 : 1;
+        ini_w(L"ui", L"lang", g_lang);
+        set_msg(g_lang == 0 ? L"界面语言：中文" : L"Language: English");
+        InvalidateRect(g_hwnd, nullptr, TRUE);
+        break;
     case ID_GPUSEL:  S().gpu_sel = idx % (1 + (int)g_adapters.size()); break;
     case ID_HOTKEY:
         S().hotkey = idx % kHotkeyCount;
@@ -2002,12 +5758,23 @@ static void set_opt(Id id, int idx)
         break;
     case ID_TARGET:
         if (idx >= 0 && idx < (int)g_wins.size()) {
+            g_user_picked = true;
             g_win_sel = idx;
             S().win_title = g_wins[idx].title;
             S().win_hwnd = g_wins[idx].hwnd;
             S().target_mode = 1;      // a picked window wins over "foreground at hotkey"
             g_refresh = refresh_for_window(g_wins[idx].hwnd);
+            // 游戏库：这个游戏以前用过的倍率/锁帧先铺上，FgInput 以游戏目录的
+            // fakerFG.ini 为准（sync_fg_input_from_target 会覆盖）。
+            {
+                const std::wstring dir = game_dir_for_window(g_wins[idx].hwnd);
+                if (!dir.empty()) {
+                    g_game_dir = dir;
+                    apply_game(dir);
+                }
+            }
             sync_fg_input_from_target();
+            refresh_readiness();
         }
         break;
     default: break;
@@ -2020,18 +5787,301 @@ static int popup_hit(int mx, int my)      // -> option index or -1
     if (!g_popup_id) { return -1; }
     const Id id = (Id)g_popup_id;
     const int n = opt_count(id);
-    const int rowH = 30;
+    const int rowH = popup_row_h(n);
     const int w = (int)(g_popup_rect.right - g_popup_rect.left);
-    int x = g_popup_rect.left;
-    int y = g_popup_rect.bottom + 2;
-    const int h = n * rowH + 8;
-    if (y + h > kWinH - kBottomH) { y = g_popup_rect.top - h - 2; }
+    const int x = g_popup_rect.left;
+    const int y = popup_top(n, rowH);
     if (mx < x || mx >= x + w || my < y + 4 || my >= y + 4 + n * rowH) { return -1; }
     return (my - (y + 4)) / rowH;
 }
 
 
 // ------------------------------------------------------------------- actions
+static void drawer_focus_step(int dir);   // 抽屉键盘焦点（供 simple_action 使用）
+static void uia_notify_focus();           // UIA 焦点事件（Tab 改变焦点时）
+
+static void simple_action(Id id)
+{
+    switch (id) {
+    case ID_S_INSTALL: {
+        // 有选中游戏时直接装到它自己的目录（不再每次都弹文件选择框）。
+        std::wstring dir = g_game_dir;
+        if (dir.empty() || find_game_mut(dir) == nullptr) {
+            if (!pick_game_exe(&dir)) { return; }
+        }
+        if (game_dir_running(dir)) {
+            uilog("install: blocked (game running)");
+            MessageBoxW(g_hwnd,
+                        T(L"游戏正在运行：请先完全退出游戏再安装。\r\n\r\n"
+                           L"替换 dxgi.dll 时文件被占用会失败。",
+                          L"The game is running: close it completely before installing.\r\n\r\n"
+                          L"dxgi.dll is locked while the game runs."),
+                        T(L"请先关闭游戏", L"Close the game first"),
+                        MB_OK | MB_ICONWARNING);
+            return;
+        }
+        wchar_t cfg[160]{};
+        _snwprintf_s(cfg, _TRUNCATE,
+                     T(L"\r\n\r\n同时写入当前配置：%dx / %s。",
+                       L"\r\n\r\nCurrent config will be written: %dx / %s."),
+                     S().fg_mode + 2, fg_input_ini_value(S().fg_input));
+        const std::wstring q = T(L"把锁帧组件安装到：\r\n\r\n", L"Install into:\r\n\r\n") + short_path(dir) +
+                               cfg +
+                               T(L"\r\n\r\n会备份 dxgi.dll，之后可还原。继续？",
+                                 L"\r\n\r\ndxgi.dll is backed up; [Restore] reverts it. Continue?");
+        if (MessageBoxW(g_hwnd, q.c_str(), T(L"安装到游戏", L"Install to game"),
+                        MB_YESNO | MB_ICONQUESTION) != IDYES) {
+            return;
+        }
+        std::wstring log;
+        const bool ok = deploy_game_dir(dir, &log);
+        if (ok) {
+            g_game_dir = dir;
+            remember_game(dir);
+            if (GameEntry* ge2 = find_game_mut(dir)) { ensure_entry_resolved(*ge2); }
+            apply_config_after_deploy(dir);   // 安装 = 应用该游戏保存的配置
+        }
+        ini_ws(L"ui", L"game_dir", g_game_dir);
+        refresh_readiness();
+        uilog("deploy: %ls -> %d", dir.c_str(), ok ? 1 : 0);
+        MessageBoxW(g_hwnd, log.c_str(),
+                    ok ? T(L"安装完成", L"Installed") : T(L"安装失败", L"Install failed"),
+                    MB_OK | (ok ? MB_ICONINFORMATION : MB_ICONERROR));
+        break;
+    }
+    case ID_S_UNDEPLOY: {
+        if (g_game_dir.empty()) { set_msg(L"还没有选择游戏目录，无法还原"); break; }
+        if (game_dir_running(g_game_dir)) {
+            MessageBoxW(g_hwnd,
+                        T(L"游戏正在运行：请先完全退出游戏再还原。",
+                          L"The game is running: close it completely before restoring."),
+                        T(L"请先关闭游戏", L"Close the game first"),
+                        MB_OK | MB_ICONWARNING);
+            break;
+        }
+        const std::wstring q = L"要从下面目录移除锁帧组件吗？\r\n\r\n" + short_path(g_game_dir) +
+                               L"\r\n\r\n会还原游戏原来的 dxgi.dll；fakerFG.ini 会保留。";
+        if (MessageBoxW(g_hwnd, q.c_str(), L"还原游戏目录",
+                        MB_YESNO | MB_ICONWARNING) != IDYES) {
+            return;
+        }
+        std::wstring log;
+        const bool ok = undeploy_game_dir(g_game_dir, &log);
+        refresh_readiness();
+        uilog("undeploy: %ls -> %d", g_game_dir.c_str(), ok ? 1 : 0);
+        MessageBoxW(g_hwnd, log.c_str(), ok ? L"已还原" : L"无需还原",
+                    MB_OK | (ok ? MB_ICONINFORMATION : MB_ICONWARNING));
+        break;
+    }
+    case ID_S_WINDOW: {
+        rescan_windows();
+        refresh_readiness();
+        if (g_wins.empty()) {
+            set_msg(L"没找到游戏窗口：先进游戏画面，再点[刷新列表]");
+            break;
+        }
+        for (const SBtn& b : simple_buttons()) {
+            if (b.id == ID_S_WINDOW) { g_popup_rect = b.rc; }
+        }
+        g_popup_id = (int)ID_TARGET;
+        g_popup_hover = -1;
+        break;
+    }
+    case ID_S_REFRESH:
+        rescan_windows();
+        refresh_readiness();
+        set_msg(g_wins.empty() ? L"没找到游戏窗口（需要 ≥1280x720 的可见窗口）"
+                               : L"窗口列表已刷新");
+        break;
+    case ID_S_GAMELIB:
+        open_library();
+        break;
+    case ID_S_PICKEXE: {
+        GameEntry* e = find_game_mut(g_game_dir);
+        if (e == nullptr) {
+            set_msg(T(L"先选择一个游戏，再改它的主程序",
+                      L"Select a game first, then change its main exe"));
+            break;
+        }
+        open_exe_picker((int)(e - &g_games[0]), false);
+        break;
+    }
+    case ID_S_2X:
+    case ID_S_3X:
+    case ID_S_4X:
+        if (find_game_mut(g_game_dir) == nullptr) {
+            set_msg(T(L"先在左上角选择一个游戏，再改倍率",
+                      L"Pick a game at the top right before changing the multiplier"));
+            break;
+        }
+        set_opt(ID_FG_MODE, (int)id - (int)ID_S_2X);
+        refresh_readiness();
+        break;
+    case ID_S_START:
+        if (!g_running) {
+            if (!g_ready.deployed) {
+                set_msg(T(L"先安装到游戏：点[安装 / 应用配置]",
+                          L"Install to the game first: click [Install / apply]"));
+                break;
+            }
+            if (!g_ready.window) {
+                set_msg(T(L"还没检测到游戏窗口：先进游戏画面，再点[刷新]",
+                          L"No game window yet: enter the game, then click [Refresh]"));
+                break;
+            }
+        }
+        toggle_bridge(true);
+        break;
+    case ID_S_DIAG:  run_diagnostics(); break;
+    case ID_S_LOGVIEW: open_log_view(); break;
+    case ID_S_HELP:  open_help(); break;
+    case ID_S_ADV: {
+        toggle_advanced();
+        break;
+    }
+    default: break;
+    }
+    // 配置属于当前游戏：任何一步改动都立刻落盘（倍率 / 输入源 / 锁帧…）。
+    save_all();
+}
+static bool simple_key(UINT vk)
+{
+    const std::vector<SBtn>& v = simple_buttons();
+    const int n = (int)v.size();
+    if (n == 0) { return false; }
+
+    // 下拉列表优先：方向键选择、Enter 确认、Esc 关闭。
+    if (g_popup_id) {
+        const int cnt = opt_count((Id)g_popup_id);
+        if (vk == VK_ESCAPE) {
+            g_popup_id = 0;
+            InvalidateRect(g_hwnd, nullptr, FALSE);
+            return true;
+        }
+        if (vk == VK_DOWN || vk == VK_UP) {
+            if (cnt > 0) {
+                g_popup_hover = (g_popup_hover < 0) ? 0 : g_popup_hover;
+                g_popup_hover += (vk == VK_DOWN) ? 1 : -1;
+                if (g_popup_hover < 0) { g_popup_hover = cnt - 1; }
+                if (g_popup_hover >= cnt) { g_popup_hover = 0; }
+                InvalidateRect(g_hwnd, nullptr, FALSE);
+            }
+            return true;
+        }
+        if (vk == VK_RETURN) {
+            if (g_popup_hover >= 0) { set_opt((Id)g_popup_id, g_popup_hover); }
+            g_popup_id = 0;
+            InvalidateRect(g_hwnd, nullptr, FALSE);
+            return true;
+        }
+        return false;
+    }
+
+    if (vk == VK_TAB) {
+        const bool back = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        if (g_focus < 0) { g_focus = back ? n - 1 : 0; }
+        else { g_focus = (g_focus + (back ? n - 1 : 1)) % n; }
+        uia_notify_focus();
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+        return true;
+    }
+    if (vk == VK_RETURN || vk == VK_SPACE) {
+        if (g_focus >= 0 && g_focus < n) {
+            simple_action(v[(size_t)g_focus].id);
+            InvalidateRect(g_hwnd, nullptr, FALSE);
+            return true;
+        }
+        return false;
+    }
+    if (vk == VK_ESCAPE) {
+        if (g_focus >= 0) {
+            g_focus = -1;
+            InvalidateRect(g_hwnd, nullptr, FALSE);
+            return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+// 抽屉键盘：Tab/上下移动焦点，Enter/Space 激活；下拉打开时方向键+Enter。
+static bool drawer_row_focusable(const Item& it)
+{
+    if (!it.is_row) { return false; }
+    switch (it.kind) {
+    case RK_DD: case RK_TOG: case RK_SPIN: case RK_EDIT: case RK_CMDLINE: return true;
+    case RK_INFO: return it.id == ID_HOTKEY;
+    default: return false;
+    }
+}
+
+static void drawer_focus_step(int dir)
+{
+    std::vector<Item> items;
+    int ch = 0;
+    layout_drawer_items(items, &ch);
+    std::vector<int> idxs;
+    for (int i = 0; i < (int)items.size(); ++i) {
+        if (drawer_row_focusable(items[(size_t)i])) { idxs.push_back(i); }
+    }
+    if (idxs.empty()) { g_drawer_focus = -1; return; }
+    int cur = -1;
+    for (int k = 0; k < (int)idxs.size(); ++k) {
+        if (idxs[(size_t)k] == g_drawer_focus) { cur = k; break; }
+    }
+    if (cur < 0) { cur = (dir >= 0) ? 0 : (int)idxs.size() - 1; }
+    else { cur = (cur + dir + (int)idxs.size()) % (int)idxs.size(); }
+    g_drawer_focus = idxs[(size_t)cur];
+
+    const int view = drawer_view_h();
+    const int top = items[(size_t)g_drawer_focus].rc.top - (kTitleH + 52);
+    const int bottom = items[(size_t)g_drawer_focus].rc.bottom - (kTitleH + 52);
+    if (top < g_drawer_scroll) { g_drawer_scroll = top; }
+    if (bottom > g_drawer_scroll + view) { g_drawer_scroll = bottom - view; }
+    const int maxs = (ch > view) ? (ch - view) : 0;
+    if (g_drawer_scroll < 0) { g_drawer_scroll = 0; }
+    if (g_drawer_scroll > maxs) { g_drawer_scroll = maxs; }
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void drawer_activate()
+{
+    std::vector<Item> items;
+    int ch = 0;
+    layout_drawer_items(items, &ch);
+    if (g_drawer_focus < 0 || g_drawer_focus >= (int)items.size()) { return; }
+    const Item& it = items[(size_t)g_drawer_focus];
+    RECT rc = it.rc;
+    OffsetRect(&rc, 0, -g_drawer_scroll);
+    switch (it.kind) {
+    case RK_TOG: toggle_field(it.id); break;
+    case RK_DD:
+        g_popup_id = (int)it.id;
+        g_popup_rect = RECT{ rc.right - 240, rc.top + 4, rc.right, rc.bottom - 4 };
+        g_popup_hover = opt_get(it.id);
+        break;
+    case RK_SPIN: bump_spin(it.id, +1); break;
+    case RK_EDIT:
+        g_edit_id = it.id;
+        g_edit_buf.clear();
+        set_msg(L"输入数字，Enter 确认，Esc 取消");
+        break;
+    case RK_CMDLINE:
+        g_show_cmd = !g_show_cmd;
+        ini_w(L"ui", L"show_cmd", g_show_cmd ? 1 : 0);
+        break;
+    case RK_INFO:
+        if (it.id == ID_HOTKEY) {
+            g_capture_hotkey = true;
+            set_msg(L"按下新的组合键（Esc 取消）");
+        }
+        break;
+    default: break;
+    }
+    save_all();
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
 static void on_click(int mx, int my)
 {
     // 0) 正在手输数字：点到别处就把当前内容提交（空 = 0 = 面板刷新）
@@ -2046,7 +6096,61 @@ static void on_click(int mx, int my)
         InvalidateRect(g_hwnd, nullptr, FALSE);
     }
 
-    // 1) an open dropdown eats the click first
+    // 0.5) 欢迎页：只有一个"知道了"
+    if (g_welcome) {
+        if (hit_rect(welcome_rect_ok(), mx, my)) { dismiss_welcome(); }
+        return;
+    }
+
+    // 0.55) 主程序候选面板（盖在游戏库之上）
+    if (g_pick_view) {
+        if (hit_rect(pick_rect_close(), mx, my)) { close_exe_picker(); return; }
+        for (int i = 0; i < (int)g_pick_list.size(); ++i) {
+            if (hit_rect(pick_row_rect(i), mx, my)) { pick_choose(i); return; }
+        }
+        if (!hit_rect(pick_panel_rect(), mx, my)) { close_exe_picker(); }
+        return;
+    }
+
+    // 0.6) 选择游戏面板：只负责"选择 / 添加"
+    if (g_lib_view) {
+        if (hit_rect(lib_rect_close(), mx, my)) { close_library(); return; }
+        if (hit_rect(lib_rect_manual(), mx, my)) { library_add_manual(); return; }
+        const int first = g_lib_scroll / kLibRowH;
+        for (int k = 0; k < lib_rows_visible(); ++k) {
+            const int i = first + k;
+            if (i >= (int)g_games.size()) { break; }
+            if (hit_rect(lib_row_rect(i), mx, my)) {
+                g_lib_sel = i;
+                g_lib_msg.clear();
+                library_use_selected();     // 点一行 = 选择并关闭
+                return;
+            }
+        }
+        return;
+    }
+
+    // 0.7) 帮助面板
+    if (g_help_view) {
+        if (hit_rect(help_rect_close(), mx, my)) { close_help(); }
+        return;
+    }
+
+    // 1) 日志面板是模态的：只认刷新/关闭
+    if (g_log_view) {
+        if (hit_rect(log_rect_close(), mx, my)) { close_log_view(); return; }
+        if (hit_rect(log_rect_refresh(), mx, my)) { open_log_view(); return; }
+        if (hit_rect(log_rect_folder(), mx, my)) { open_log_folder(); return; }
+        if (hit_rect(log_rect_copy(), mx, my)) {
+            std::wstring all;
+            for (const std::wstring& s : g_log_snap) { all += s; all += L"\r\n"; }
+            copy_to_clipboard(all);
+            return;
+        }
+        return;
+    }
+
+    // 2) an open dropdown eats the click first
     if (g_popup_id) {
         const int idx = popup_hit(mx, my);
         if (idx >= 0) { set_opt((Id)g_popup_id, idx); }
@@ -2057,134 +6161,600 @@ static void on_click(int mx, int my)
 
     // 2) title bar
     if (my < kTitleH) {
-        RECT cl{};
-        GetClientRect(g_hwnd, &cl);
-        const int W = cl.right;
-        if (mx >= W - 190 && mx < W - 100) { toggle_bridge(); return; }
-        if (mx >= W - 88 && mx < W - 52) { ShowWindow(g_hwnd, SW_MINIMIZE); return; }
-        if (mx >= W - 44) { SendMessageW(g_hwnd, WM_CLOSE, 0, 0); return; }
+        if (hit_rect(title_min_rect(), mx, my)) { ShowWindow(g_hwnd, SW_MINIMIZE); return; }
+        if (hit_rect(title_close_rect(), mx, my)) { SendMessageW(g_hwnd, WM_CLOSE, 0, 0); return; }
         return;
     }
 
-    // 3) sidebar
+    // 3) sidebar：游戏列表（选中即切换该游戏的配置；滚轮翻页）
     if (mx < kSideW) {
-        int y = kTitleH + 48;
-        for (int i = 0; i < (int)g_profiles.size(); ++i) {
-            if (my >= y && my < y + 34) {
-                g_prof = i;
+        const int rows = side_rows_max();
+        for (int slot = 0; slot < rows; ++slot) {
+            const int idx = g_side_scroll + slot;
+            if (idx >= (int)g_games.size()) { break; }
+            if (!hit_rect(side_row_rect(slot), mx, my)) { continue; }
+            g_lib_sel = idx;
+            if (select_game(idx)) {
+                g_focus = -1;
+                g_user_picked = false;
+                g_last_auto_hwnd = nullptr;
                 rescan_windows();
                 apply_hotkey();
-                save_all();
+                refresh_readiness();
+                const std::wstring m = T(L"已切换到：", L"Switched to: ") +
+                                       g_games[(size_t)idx].name;
+                set_msg(m.c_str());
+            }
+            side_ensure_visible(idx);
+            InvalidateRect(g_hwnd, nullptr, FALSE);
+            return;
+        }
+        if (hit_rect(help_rect_entry(), mx, my)) {
+            open_help();
+            return;
+        }
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+        return;
+    }
+
+    // 3.4) 当前游戏名字：点击进入行内重命名；点到别处则提交
+    if (g_name_edit) {
+        if (hit_rect(g_name_hit, mx, my)) { return; }
+        name_edit_commit(true);
+    }
+    if (!g_advanced && mx >= kSideW && hit_rect(g_name_hit, mx, my) &&
+        find_game_mut(g_game_dir) != nullptr) {
+        name_edit_start();
+        return;
+    }
+
+    // 3.5) 安装/还原同一行的「高级设置」按钮（抽屉打开时它被抽屉盖住，不可点）
+    if (hit_rect(adv_rect(), mx, my)) { toggle_advanced(); return; }
+
+    // 3.6) 抽屉打开时，点击归抽屉（后面的三步流程不响应）
+    if (g_advanced) {
+        if (hit_rect(drawer_rect_close(), mx, my)) {
+            g_advanced = false;
+            g_drawer_focus = -1;
+            ini_w(L"ui", L"advanced", 0);
+            save_all();
+            InvalidateRect(g_hwnd, nullptr, FALSE);
+            return;
+        }
+        std::vector<Item> items;
+        int content_h = 0;
+        layout_drawer_items(items, &content_h);
+        for (const Item& it : items) {
+            if (!it.is_row) { continue; }
+            RECT rc = it.rc;
+            OffsetRect(&rc, 0, -g_drawer_scroll);
+            if (it.kind == RK_HEAD) { continue; }
+            if (my < rc.top || my >= rc.bottom) { continue; }
+            if (mx < rc.left || mx >= rc.right) { continue; }
+            if (!row_enabled(it.id)) { return; }
+
+            switch (it.kind) {
+            case RK_TOG: {
+                RECT sw{ rc.right - 68, rc.top + 4, rc.right, rc.bottom - 4 };
+                if (mx < sw.left || mx > sw.right || my < sw.top || my > sw.bottom) { return; }
+                toggle_field(it.id);
+                break;
+            }
+            case RK_DD: {
+                RECT box{ rc.right - 240, rc.top + 4, rc.right, rc.bottom - 4 };
+                if (mx < box.left || mx > box.right || my < box.top || my > box.bottom) { return; }
+                g_popup_id = (int)it.id;
+                g_popup_rect = box;
+                g_popup_hover = -1;
+                break;
+            }
+            case RK_SPIN: {
+                RECT box{ rc.right - 116, rc.top + 4, rc.right, rc.bottom - 4 };
+                if (mx < box.left || mx > box.right || my < box.top || my > box.bottom) { return; }
+                const int mid = (box.top + box.bottom) / 2;
+                bump_spin(it.id, (my < mid) ? +1 : -1);
+                break;
+            }
+            case RK_EDIT: {
+                RECT box{ rc.right - 240, rc.top + 4, rc.right, rc.bottom - 4 };
+                if (mx < box.left || mx > box.right || my < box.top || my > box.bottom) { return; }
+                g_edit_id = it.id;
+                g_edit_buf.clear();
+                set_msg(L"输入数字，Enter 确认，Esc 取消");
+                break;
+            }
+            case RK_INFO:
+                if (it.id == ID_HOTKEY) {
+                    g_capture_hotkey = true;
+                    set_msg(L"按下新的组合键（Esc 取消）");
+                    InvalidateRect(g_hwnd, nullptr, FALSE);
+                }
+                return;
+            case RK_CMDLINE:
+                if (it.id == ID_CMD) {
+                    if (g_show_cmd && mx >= rc.right - 190 && mx < rc.right - 96 &&
+                        my >= rc.top && my < rc.top + 24) {
+                        copy_to_clipboard(display_cmdline());
+                        return;
+                    }
+                    g_show_cmd = !g_show_cmd;
+                    g_drawer_scroll = 0;
+                    ini_w(L"ui", L"show_cmd", g_show_cmd ? 1 : 0);
+                    save_all();
+                }
+                break;
+            default:
+                return;
+            }
+            save_all();
+            InvalidateRect(g_hwnd, nullptr, FALSE);
+            return;
+        }
+        return;
+    }
+
+    // 4) 简易模式：只有卡片上的按钮响应
+    {
+        const std::vector<SBtn>& v = simple_buttons();
+        for (size_t i = 0; i < v.size(); ++i) {
+            if (hit_rect(v[i].rc, mx, my)) {
+                g_focus = (int)i;
+                uia_notify_focus();
+                simple_action(v[i].id);
                 InvalidateRect(g_hwnd, nullptr, FALSE);
                 return;
             }
-            y += 38;
         }
-        const int by = y + 6;
-        if (my >= by && my < by + 30) {
-            if (mx < 40) {
-                if (g_profiles.size() < 8) {
-                    Profile p{};
-                    wchar_t b[32]{};
-                    _snwprintf_s(b, _TRUNCATE, L"配置 %d", (int)g_profiles.size() + 1);
-                    p.name = b;
-                    g_profiles.push_back(p);
-                    g_prof = (int)g_profiles.size() - 1;
-                    rescan_windows();
-                    save_all();
-                }
-            } else if (mx < 76) {
-                if (g_profiles.size() > 1) {
-                    g_profiles.erase(g_profiles.begin() + g_prof);
-                    if (g_prof >= (int)g_profiles.size()) { g_prof = (int)g_profiles.size() - 1; }
-                    rescan_windows();
-                    save_all();
-                }
-            }
-        }
-        if (my >= kWinH - kBottomH - 40 && my < kWinH - kBottomH - 8) {
-            const std::wstring help = exe_dir() + L"\\docs\\UI.md";
-            if (GetFileAttributesW(help.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                ShellExecuteW(nullptr, L"open", help.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-            } else {
-                set_msg(L"docs\\UI.md 不在 exe 旁边");
-            }
-        }
-        InvalidateRect(g_hwnd, nullptr, FALSE);
-        return;
-    }
-
-    // 4) main area: only the control itself reacts, never the whole row
-    std::vector<Item> items;
-    int content_h = 0;
-    layout_items(items, &content_h);
-    for (const Item& it : items) {
-        if (!it.is_row) { continue; }
-        RECT rc = it.rc;
-        OffsetRect(&rc, 0, -g_scroll);
-        if (it.kind == RK_HEAD) { continue; }            // 分区标题不可点
-        // 命中必须同时看 x：只比 y 的话，左列那条 106px 高的"启动命令"行会把
-        // 右列同一 y 区间的点击全吃掉（叠加层两个开关点不动就是这个原因）。
-        if (my < rc.top || my >= rc.bottom) { continue; }
-        if (mx < rc.left || mx >= rc.right) { continue; }
-        if (!row_enabled(it.id)) { return; }              // 模式外的控件点不动
-
-        switch (it.kind) {
-        case RK_TOG: {
-            // 开关图形只有 40x17，可点区域放宽到 68x25 更好按
-            RECT sw{ rc.right - 68, rc.top + 4, rc.right, rc.bottom - 4 };
-            if (mx < sw.left || mx > sw.right || my < sw.top || my > sw.bottom) { return; }
-            toggle_field(it.id);
-            break;
-        }
-        case RK_DD: {
-            RECT box{ rc.right - 210, rc.top + 4, rc.right, rc.bottom - 4 };
-            if (mx < box.left || mx > box.right || my < box.top || my > box.bottom) { return; }
-            g_popup_id = (int)it.id;
-            g_popup_rect = box;
-            g_popup_hover = -1;
-            break;
-        }
-        case RK_SPIN: {
-            RECT box{ rc.right - 116, rc.top + 4, rc.right, rc.bottom - 4 };
-            if (mx < box.left || mx > box.right || my < box.top || my > box.bottom) { return; }
-            const int mid = (box.top + box.bottom) / 2;
-            bump_spin(it.id, (my < mid) ? +1 : -1);
-            break;
-        }
-        case RK_EDIT: {
-            RECT box{ rc.right - 210, rc.top + 4, rc.right, rc.bottom - 4 };
-            if (mx < box.left || mx > box.right || my < box.top || my > box.bottom) { return; }
-            // 点一下开始编辑：清空缓冲，让用户直接输数字（和"覆盖输入"的习惯一致）。
-            g_edit_id = it.id;
-            g_edit_buf.clear();
-            set_msg(L"输入数字，Enter 确认，Esc 取消");
-            break;
-        }
-        case RK_INFO:
-            if (it.id == ID_HOTKEY) {
-                g_capture_hotkey = true;
-                set_msg(L"按下新的组合键（Esc 取消）");
-                InvalidateRect(g_hwnd, nullptr, FALSE);
-            }
-            return;
-        default:
-            return;          // info rows do nothing
-        }
-        save_all();
-        InvalidateRect(g_hwnd, nullptr, FALSE);
-        return;
     }
 }
 
+
+// ============================================================================
+//  UIA 可访问性：把"简易模式"的按钮与运行状态暴露给讲述人 / NVDA。
+//  只读属性 + Invoke 模式；抽屉与模态面板暂不暴露（收起抽屉后即可读取）。
+// ============================================================================
+static const int kUiaCount = 15;   // 1..12 = 简易按钮，13 帮助，14 高级，15 状态
+static void uia_notify_focus();
+
+static const Id kUiaIds[14] = {
+    ID_S_INSTALL, ID_S_UNDEPLOY, ID_S_PICKEXE, ID_S_GAMELIB, ID_S_WINDOW,
+    ID_S_REFRESH, ID_S_2X, ID_S_3X, ID_S_4X, ID_S_START, ID_S_LOGVIEW,
+    ID_S_DIAG, ID_S_HELP, ID_S_ADV
+};
+
+static bool uia_children_visible()
+{
+    return !(g_advanced || g_lib_view || g_log_view || g_help_view || g_welcome);
+}
+
+static std::wstring uia_name(int elem)
+{
+    if (elem <= 0) { return L"MGPU 双显卡帧生成"; }
+    if (elem == 15) {
+        std::wstring badge, advice;
+        COLORREF c = C_DIM;
+        status_summary(&badge, &c, &advice);
+        return L"运行状态：" + badge + L"。 " + advice;
+    }
+    if (elem == 13) { return L"帮助与快捷键"; }
+    if (elem == 14) { return g_advanced ? L"收起高级设置" : L"高级设置"; }
+    if (elem < 1 || elem > 12) { return L""; }
+    switch (kUiaIds[elem - 1]) {
+    case ID_S_INSTALL: return L"安装 / 应用配置";
+    case ID_S_UNDEPLOY: return L"还原游戏目录";
+    case ID_S_PICKEXE: return L"更换主程序";
+    case ID_S_GAMELIB: return L"选择游戏";
+    case ID_S_WINDOW: return L"选择游戏窗口";
+    case ID_S_REFRESH: return L"刷新窗口列表";
+    case ID_S_2X: return L"2 倍插帧";
+    case ID_S_3X: return L"3 倍插帧";
+    case ID_S_4X: return L"4 倍插帧";
+    case ID_S_START: return g_running ? L"停止" : L"启动";
+    case ID_S_LOGVIEW: return L"查看日志";
+    case ID_S_DIAG: return L"一键诊断";
+    default: return L"";
+    }
+}
+
+static const wchar_t* uia_automation_id(int elem)
+{
+    static const wchar_t* ids[kUiaCount + 1] = {
+        L"root", L"install", L"undeploy", L"pickexe", L"gamelib", L"window",
+        L"refresh", L"2x", L"3x", L"4x", L"start", L"logview", L"diag",
+        L"help", L"advanced", L"status"
+    };
+    return (elem >= 0 && elem <= kUiaCount) ? ids[elem] : L"";
+}
+
+static bool uia_logical_rect(int elem, RECT* out)
+{
+    if (elem >= 1 && elem <= 12) {
+        const std::vector<SBtn>& v = simple_buttons();
+        if (elem - 1 >= (int)v.size()) { return false; }
+        *out = v[(size_t)(elem - 1)].rc;
+        return true;
+    }
+    if (elem == 13) { *out = help_rect_entry(); return true; }
+    if (elem == 14) { *out = adv_rect(); return true; }
+    if (elem == 15) { *out = RECT{ kSideW + kMargin, kSST, kWinW - kMargin, kSSTB }; return true; }
+    return false;
+}
+
+static RECT uia_to_screen(const RECT& r)
+{
+    RECT cr{};
+    GetClientRect(g_hwnd, &cr);
+    const double sx = (cr.right > 0) ? (double)cr.right / kWinW : 1.0;
+    const double sy = (cr.bottom > 0) ? (double)cr.bottom / kWinH : 1.0;
+    POINT p{ (LONG)(r.left * sx), (LONG)(r.top * sy) };
+    ClientToScreen(g_hwnd, &p);
+    RECT out{ p.x, p.y,
+              p.x + (LONG)((r.right - r.left) * sx),
+              p.y + (LONG)((r.bottom - r.top) * sy) };
+    return out;
+}
+
+static HRESULT uia_set_str(VARIANT* v, const wchar_t* s)
+{
+    v->vt = VT_BSTR;
+    v->bstrVal = SysAllocString(s != nullptr ? s : L"");
+    return (v->bstrVal != nullptr) ? S_OK : E_OUTOFMEMORY;
+}
+
+static HRESULT uia_set_int(VARIANT* v, int n)
+{
+    v->vt = VT_I4;
+    v->lVal = n;
+    return S_OK;
+}
+
+static HRESULT uia_set_bool(VARIANT* v, bool b)
+{
+    v->vt = VT_BOOL;
+    v->boolVal = b ? VARIANT_TRUE : VARIANT_FALSE;
+    return S_OK;
+}
+
+static HRESULT uia_set_rect(VARIANT* v, const RECT& r)
+{
+    SAFEARRAY* sa = SafeArrayCreateVector(VT_R8, 0, 4);
+    if (sa == nullptr) { return E_OUTOFMEMORY; }
+    double* p = nullptr;
+    SafeArrayAccessData(sa, reinterpret_cast<void**>(&p));
+    p[0] = (double)r.left;
+    p[1] = (double)r.top;
+    p[2] = (double)(r.right - r.left);
+    p[3] = (double)(r.bottom - r.top);
+    SafeArrayUnaccessData(sa);
+    v->vt = VT_ARRAY | VT_R8;
+    v->parray = sa;
+    return S_OK;
+}
+
+static SAFEARRAY* uia_runtime_id(int elem)
+{
+    SAFEARRAY* sa = SafeArrayCreateVector(VT_I4, 0, (elem == 0) ? 1 : 2);
+    if (sa == nullptr) { return nullptr; }
+    LONG* p = nullptr;
+    SafeArrayAccessData(sa, reinterpret_cast<void**>(&p));
+    p[0] = UiaAppendRuntimeId;
+    if (elem != 0) { p[1] = elem; }
+    SafeArrayUnaccessData(sa);
+    return sa;
+}
+
+class UiaProvider;
+static UiaProvider* uia_root_ptr();
+static UiaProvider* uia_child_ptr(int elem);
+
+class UiaProvider final : public IRawElementProviderSimple,
+                          public IRawElementProviderFragment,
+                          public IRawElementProviderFragmentRoot,
+                          public IInvokeProvider
+{
+public:
+    explicit UiaProvider(int elem) : m_elem(elem) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override
+    {
+        if (ppv == nullptr) { return E_INVALIDARG; }
+        *ppv = nullptr;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IRawElementProviderSimple)) {
+            *ppv = static_cast<IRawElementProviderSimple*>(this);
+        } else if (riid == __uuidof(IRawElementProviderFragment)) {
+            *ppv = static_cast<IRawElementProviderFragment*>(this);
+        } else if (riid == __uuidof(IRawElementProviderFragmentRoot) && m_elem == 0) {
+            *ppv = static_cast<IRawElementProviderFragmentRoot*>(this);
+        } else if (riid == __uuidof(IInvokeProvider) && m_elem >= 1 && m_elem <= 14) {
+            *ppv = static_cast<IInvokeProvider*>(this);
+        } else {
+            return E_NOINTERFACE;
+        }
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override
+    {
+        return (ULONG)InterlockedIncrement(&m_ref);
+    }
+    ULONG STDMETHODCALLTYPE Release() override
+    {
+        // 进程级单例，不 delete：避免 UIA 异步回调时的悬空引用。
+        const long r = InterlockedDecrement(&m_ref);
+        return (ULONG)(r > 0 ? r : 0);
+    }
+
+    HRESULT STDMETHODCALLTYPE get_ProviderOptions(ProviderOptions* p) override
+    {
+        if (p == nullptr) { return E_INVALIDARG; }
+        *p = ProviderOptions_ServerSideProvider;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetPatternProvider(PATTERNID id, IUnknown** ret) override
+    {
+        if (ret == nullptr) { return E_INVALIDARG; }
+        *ret = nullptr;
+        if (id == UIA_InvokePatternId && m_elem >= 1 && m_elem <= 14) {
+            *ret = static_cast<IInvokeProvider*>(this);
+            AddRef();
+        }
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetPropertyValue(PROPERTYID id, VARIANT* v) override
+    {
+        if (v == nullptr) { return E_INVALIDARG; }
+        VariantInit(v);
+        const bool root = (m_elem == 0);
+        const bool shown = uia_children_visible();
+
+        if (id == UIA_NamePropertyId) {
+            return uia_set_str(v, root ? L"MGPU 双显卡帧生成" : uia_name(m_elem).c_str());
+        }
+        if (id == UIA_AutomationIdPropertyId) {
+            return uia_set_str(v, root ? L"root" : uia_automation_id(m_elem));
+        }
+        if (id == UIA_FrameworkIdPropertyId) { return uia_set_str(v, L"Win32"); }
+        if (id == UIA_ClassNamePropertyId) { return uia_set_str(v, L"MGPU"); }
+        if (id == UIA_IsControlElementPropertyId || id == UIA_IsContentElementPropertyId) {
+            return uia_set_bool(v, true);
+        }
+        if (id == UIA_IsEnabledPropertyId) { return uia_set_bool(v, root || shown); }
+        if (id == UIA_IsKeyboardFocusablePropertyId) {
+            return uia_set_bool(v, !root && shown && m_elem <= 14);
+        }
+        if (id == UIA_HasKeyboardFocusPropertyId) {
+            return uia_set_bool(v, !root && m_elem >= 1 && m_elem <= 12 && g_focus == m_elem - 1);
+        }
+        if (id == UIA_IsOffscreenPropertyId) { return uia_set_bool(v, !root && !shown); }
+        if (id == UIA_ControlTypePropertyId) {
+            if (root) { return uia_set_int(v, UIA_WindowControlTypeId); }
+            return uia_set_int(v, (m_elem == 15) ? UIA_TextControlTypeId
+                                                 : UIA_ButtonControlTypeId);
+        }
+        if (id == UIA_BoundingRectanglePropertyId) {
+            RECT wr{};
+            if (root) {
+                GetWindowRect(g_hwnd, &wr);
+            } else {
+                RECT lr{};
+                if (!uia_logical_rect(m_elem, &lr)) { return S_OK; }
+                wr = uia_to_screen(lr);
+            }
+            return uia_set_rect(v, wr);
+        }
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE get_HostRawElementProvider(IRawElementProviderSimple** p) override
+    {
+        if (p == nullptr) { return E_INVALIDARG; }
+        *p = nullptr;
+        if (m_elem != 0) { return S_OK; }
+        return UiaHostProviderFromHwnd(g_hwnd, p);
+    }
+
+    HRESULT STDMETHODCALLTYPE Navigate(NavigateDirection dir,
+                                       IRawElementProviderFragment** ret) override
+    {
+        if (ret == nullptr) { return E_INVALIDARG; }
+        *ret = nullptr;
+        if (m_elem == 0) {
+            if (!uia_children_visible()) { return S_OK; }
+            int target = 0;
+            if (dir == NavigateDirection_FirstChild) { target = 1; }
+            else if (dir == NavigateDirection_LastChild) { target = kUiaCount; }
+            if (target != 0) {
+                UiaProvider* c = uia_child_ptr(target);
+                if (c != nullptr) {
+                    c->AddRef();
+                    *ret = static_cast<IRawElementProviderFragment*>(c);
+                }
+            }
+            return S_OK;
+        }
+        UiaProvider* target = nullptr;
+        if (dir == NavigateDirection_Parent) {
+            target = uia_root_ptr();
+        } else if (dir == NavigateDirection_NextSibling && m_elem < kUiaCount) {
+            target = uia_child_ptr(m_elem + 1);
+        } else if (dir == NavigateDirection_PreviousSibling && m_elem > 1) {
+            target = uia_child_ptr(m_elem - 1);
+        }
+        if (target != nullptr) {
+            target->AddRef();
+            *ret = static_cast<IRawElementProviderFragment*>(target);
+        }
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetRuntimeId(SAFEARRAY** ret) override
+    {
+        if (ret == nullptr) { return E_INVALIDARG; }
+        *ret = uia_runtime_id(m_elem);
+        return (*ret != nullptr) ? S_OK : E_OUTOFMEMORY;
+    }
+
+    HRESULT STDMETHODCALLTYPE get_BoundingRectangle(UiaRect* r) override
+    {
+        if (r == nullptr) { return E_INVALIDARG; }
+        RECT wr{};
+        if (m_elem == 0) {
+            GetWindowRect(g_hwnd, &wr);
+        } else {
+            RECT lr{};
+            if (!uia_logical_rect(m_elem, &lr)) {
+                r->left = r->top = r->width = r->height = 0.0;
+                return S_OK;
+            }
+            wr = uia_to_screen(lr);
+        }
+        r->left = (double)wr.left;
+        r->top = (double)wr.top;
+        r->width = (double)(wr.right - wr.left);
+        r->height = (double)(wr.bottom - wr.top);
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetEmbeddedFragmentRoots(SAFEARRAY** ret) override
+    {
+        if (ret == nullptr) { return E_INVALIDARG; }
+        *ret = nullptr;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE SetFocus() override
+    {
+        if (m_elem >= 1 && m_elem <= 12 && uia_children_visible()) {
+            g_focus = m_elem - 1;
+            InvalidateRect(g_hwnd, nullptr, FALSE);
+            uia_notify_focus();
+        }
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE get_FragmentRoot(IRawElementProviderFragmentRoot** ret) override
+    {
+        if (ret == nullptr) { return E_INVALIDARG; }
+        *ret = nullptr;
+        UiaProvider* root = uia_root_ptr();
+        if (root != nullptr) {
+            root->AddRef();
+            *ret = static_cast<IRawElementProviderFragmentRoot*>(root);
+        }
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE ElementProviderFromPoint(double x, double y,
+                                                       IRawElementProviderFragment** ret) override
+    {
+        if (ret == nullptr) { return E_INVALIDARG; }
+        *ret = nullptr;
+        if (!uia_children_visible()) { return S_OK; }
+        const POINT pt{ (LONG)x, (LONG)y };
+        for (int elem = 1; elem <= kUiaCount; ++elem) {
+            RECT lr{};
+            if (!uia_logical_rect(elem, &lr)) { continue; }
+            const RECT sr = uia_to_screen(lr);
+            if (pt.x >= sr.left && pt.x < sr.right && pt.y >= sr.top && pt.y < sr.bottom) {
+                UiaProvider* c = uia_child_ptr(elem);
+                if (c != nullptr) {
+                    c->AddRef();
+                    *ret = static_cast<IRawElementProviderFragment*>(c);
+                }
+                return S_OK;
+            }
+        }
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE GetFocus(IRawElementProviderFragment** ret) override
+    {
+        if (ret == nullptr) { return E_INVALIDARG; }
+        *ret = nullptr;
+        if (!uia_children_visible()) { return S_OK; }
+        if (g_focus >= 0 && g_focus <= 10) {
+            UiaProvider* c = uia_child_ptr(g_focus + 1);
+            if (c != nullptr) {
+                c->AddRef();
+                *ret = static_cast<IRawElementProviderFragment*>(c);
+            }
+        }
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE Invoke() override
+    {
+        if (!uia_children_visible() || m_elem < 1 || m_elem > 14) {
+            return UIA_E_ELEMENTNOTENABLED;
+        }
+        PostMessageW(g_hwnd, WM_APP + 2, (WPARAM)kUiaIds[m_elem - 1], 0);
+        return S_OK;
+    }
+
+private:
+    long m_ref = 1;
+    int m_elem = 0;
+};
+
+static UiaProvider* g_uia_root = nullptr;
+static UiaProvider* g_uia_child[kUiaCount + 1] = {};
+
+static UiaProvider* uia_root_ptr()
+{
+    if (g_uia_root == nullptr) { g_uia_root = new UiaProvider(0); }
+    return g_uia_root;
+}
+
+static UiaProvider* uia_child_ptr(int elem)
+{
+    if (elem < 1 || elem > kUiaCount) { return nullptr; }
+    if (g_uia_child[elem] == nullptr) { g_uia_child[elem] = new UiaProvider(elem); }
+    return g_uia_child[elem];
+}
+
+static void uia_notify_focus()
+{
+    if (g_hwnd == nullptr || !uia_children_visible()) { return; }
+    if (g_focus < 0 || g_focus > 10) { return; }
+    UiaProvider* c = uia_child_ptr(g_focus + 1);
+    if (c == nullptr) { return; }
+    if (UiaClientsAreListening()) {
+        UiaRaiseAutomationEvent(static_cast<IRawElementProviderSimple*>(c),
+                                UIA_AutomationFocusChangedEventId);
+    }
+    NotifyWinEvent(EVENT_OBJECT_FOCUS, g_hwnd, OBJID_CLIENT, g_focus + 1);
+}
 
 // ------------------------------------------------------------ window procedure
 static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
+    case WM_GETOBJECT:
+        if ((LONG)lp == (LONG)UiaRootObjectId) {
+            return (LRESULT)UiaReturnRawElementProvider(
+                h, wp, lp, static_cast<IRawElementProviderSimple*>(uia_root_ptr()));
+        }
+        break;
+
+    case WM_APP + 2:
+        simple_action((Id)wp);
+        return 0;
+
     case WM_CREATE:
         g_hwnd = h;
+        g_scale = effective_scale(h);
+        {
+            RECT cr{};
+            GetClientRect(h, &cr);
+            uilog("dpi: aware_call=%d dpi=%u scale=%.2f client=%ldx%ld",
+                  (int)g_dpi_aware, GetDpiForWindow(h), g_scale,
+                  (long)cr.right, (long)cr.bottom);
+        }
+        verify_package();
         InitializeCriticalSection(&g_line_cs);
+        g_line_cs_ready = true;
         // Rounded corners + a hairline border, like the reference UI (Win11 only; the
         // call fails harmlessly on older builds).
         {
@@ -2194,18 +6764,21 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             const COLORREF border = RGB(48, 48, 48);
             DwmSetWindowAttribute(h, 34 /* DWMWA_BORDER_COLOR */, &border, sizeof(border));
         }
-        g_f_title = CreateFontW(-24, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
+        g_f_title = CreateFontW(-26, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                                 DEFAULT_PITCH, L"Microsoft YaHei UI");
-        g_f_card = CreateFontW(-17, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
+        g_f_card = CreateFontW(-18, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
                                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                                DEFAULT_PITCH, L"Microsoft YaHei UI");
-        g_f_ui = CreateFontW(-15, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+        g_f_ui = CreateFontW(-16, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                              DEFAULT_PITCH, L"Microsoft YaHei UI");
-        g_f_small = CreateFontW(-14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+        g_f_small = CreateFontW(-15, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                                 DEFAULT_PITCH, L"Microsoft YaHei UI");
+        g_f_mono = CreateFontW(-13, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                               OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                               FIXED_PITCH, L"Consolas");
         {
             DEVMODEW dm{}; dm.dmSize = sizeof(dm);
             if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1) {
@@ -2218,7 +6791,10 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         prune_old_logs();
         rescan_windows();
         sync_fg_input_from_target();
+        // 用游戏库选中的目录覆盖（它才是 UI 里显示的"当前游戏"）。
+        if (!g_game_dir.empty()) { sync_fg_input_from_dir(g_game_dir); }
         if (HWND t = config_target_window()) { g_refresh = refresh_for_window(t); }
+        refresh_readiness();
         apply_hotkey();
         SetTimer(h, 1, 500, nullptr);
         return 0;
@@ -2234,6 +6810,12 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
                 set_msg(L"消费端已退出");
             }
         }
+        // 就绪状态 2 s 刷新一次（模块枚举比 UI 重绘贵，不跟着 500 ms 跑）。
+        static int tick = 0;
+        ++tick;
+        if ((tick & 3) == 0) { auto_detect_tick(); }      // 自动找游戏窗口：4 s 一次
+        if ((tick & 7) == 0) { background_initialize(); } // 后台初始化游戏条目：4 s 一个
+        if ((tick & 1) == 0) { refresh_readiness(); }     // 就绪状态：2 s 一次
         InvalidateRect(h, nullptr, FALSE);
         return 0;
     }
@@ -2242,12 +6824,18 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_HOTKEY:
         uilog("WM_HOTKEY id=%u", (unsigned)wp);
-        if (wp == 1) { toggle_bridge(); }
+        if (wp == 1) { toggle_bridge(false); }
         return 0;
 
     case WM_MOUSEMOVE: {
-        g_hover_x = GET_X_LPARAM(lp);
-        g_hover_y = GET_Y_LPARAM(lp);
+        const POINT lp_ = to_logical(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+        g_hover_x = lp_.x;
+        g_hover_y = lp_.y;
+        const Id hid = hover_id_at(g_hover_x, g_hover_y);
+        if (hid != (Id)g_tip_id) {
+            g_tip_id = (int)hid;
+            g_tip_since = GetTickCount();
+        }
         if (g_popup_id) { g_popup_hover = popup_hit(g_hover_x, g_hover_y); }
         TRACKMOUSEEVENT tme{ sizeof(tme), TME_LEAVE, h, 0 };
         TrackMouseEvent(&tme);
@@ -2258,36 +6846,99 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     case WM_MOUSELEAVE:
         g_hover_x = g_hover_y = -1;
         g_popup_hover = -1;
+        g_tip_id = 0;
         InvalidateRect(h, nullptr, FALSE);
         return 0;
 
-    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDOWN: {
         if (g_capture_hotkey) { return 0; }
-        on_click(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+        const POINT lp_ = to_logical(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+        on_click(lp_.x, lp_.y);
         return 0;
+    }
 
     case WM_MOUSEWHEEL: {
         const int delta = GET_WHEEL_DELTA_WPARAM(wp);
-        const int avail = kWinH - kBottomH - (kTitleH + 58);
-        const int maxs = (g_content_h > avail) ? (g_content_h - avail) : 0;
-        g_scroll -= (delta / WHEEL_DELTA) * 60;
-        if (g_scroll < 0) { g_scroll = 0; }
-        if (g_scroll > maxs) { g_scroll = maxs; }
-        InvalidateRect(h, nullptr, FALSE);
+        if (g_lib_view) {
+            const int view = lib_rows_visible() * kLibRowH;
+            g_lib_scroll += (delta / WHEEL_DELTA) * (kLibRowH * 3);
+            if (g_lib_scroll < 0) { g_lib_scroll = 0; }
+            const int maxs = (int)g_games.size() * kLibRowH - view;
+            if (g_lib_scroll > maxs) { g_lib_scroll = (maxs > 0) ? maxs : 0; }
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        }
+        if (g_log_view) {
+            log_view_scroll((delta / WHEEL_DELTA) * 3);
+            return 0;
+        }
+        if (g_advanced) {
+            const int view = drawer_view_h();
+            const int maxs = (g_drawer_h > view) ? (g_drawer_h - view) : 0;
+            g_drawer_scroll -= (delta / WHEEL_DELTA) * 60;
+            if (g_drawer_scroll < 0) { g_drawer_scroll = 0; }
+            if (g_drawer_scroll > maxs) { g_drawer_scroll = maxs; }
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        }
+        {   // 侧栏游戏列表翻页
+            POINT mp{};
+            GetCursorPos(&mp);
+            ScreenToClient(h, &mp);
+            const POINT lq = to_logical(mp.x, mp.y);
+            if (lq.x < kSideW && lq.y > kTitleH) {
+                g_side_scroll -= (delta / WHEEL_DELTA) * 3;
+                if (g_side_scroll < 0) { g_side_scroll = 0; }
+                if (g_side_scroll > side_max_scroll()) { g_side_scroll = side_max_scroll(); }
+                InvalidateRect(h, nullptr, FALSE);
+                return 0;
+            }
+        }
         return 0;
     }
+
+    case WM_SETCURSOR:
+        if (LOWORD(lp) == HTCLIENT) {
+            POINT p{};
+            GetCursorPos(&p);
+            ScreenToClient(h, &p);
+            const POINT q = to_logical(p.x, p.y);
+            SetCursor(LoadCursorW(nullptr, is_clickable_at(q.x, q.y) ? IDC_HAND : IDC_ARROW));
+            return TRUE;
+        }
+        break;
 
     case WM_NCHITTEST: {
         const LRESULT r = DefWindowProcW(h, msg, wp, lp);
         if (r == HTCLIENT) {
             POINT p{ GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
             ScreenToClient(h, &p);
-            if (p.y < kTitleH && p.x < kWinW - 200) { return HTCAPTION; }
+            const POINT q = to_logical(p.x, p.y);
+            if (q.y < kTitleH && q.x < kWinW - 200) { return HTCAPTION; }
         }
         return r;
     }
 
     case WM_CHAR:
+        // 游戏配置名的行内编辑
+        if (g_name_edit) {
+            const wchar_t ch = (wchar_t)wp;
+            if (ch == 8) {
+                if (g_name_fresh) { g_name_buf.clear(); g_name_fresh = false; }
+                else if (!g_name_buf.empty()) { g_name_buf.pop_back(); }
+            } else if (ch == 13) {
+                name_edit_commit(true);
+                return 0;
+            } else if (ch == 27) {
+                name_edit_commit(false);
+                return 0;
+            } else if (ch >= 32 && g_name_buf.size() < 64) {
+                if (g_name_fresh) { g_name_buf.clear(); g_name_fresh = false; }
+                g_name_buf.push_back(ch);
+            }
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        }
         // 手输数字框（输出帧率上限）。只吃 0-9 / 退格 / 回车 / Esc，其余丢掉，
         // 免得一次误按把别的字母塞进去。
         if (g_edit_id != ID_NONE) {
@@ -2326,6 +6977,12 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_KEYDOWN:
+        // 行内重命名时不响应热键 / 焦点切换；Esc 取消、Enter 保存。
+        if (g_name_edit) {
+            if (wp == VK_ESCAPE) { name_edit_commit(false); }
+            else if (wp == VK_RETURN) { name_edit_commit(true); }
+            return 0;
+        }
         if (g_capture_hotkey) {
             if (wp == VK_ESCAPE) { g_capture_hotkey = false; InvalidateRect(h, nullptr, FALSE); return 0; }
             if (wp == VK_CONTROL || wp == VK_MENU || wp == VK_SHIFT ||
@@ -2344,8 +7001,128 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
             save_all();
             set_msg(L"热键已更新");
             InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        }
+        // 简易模式：Tab / Enter / Space / Esc / 方向键（下拉列表）
+        if (g_help_view) {
+            if (wp == VK_ESCAPE || wp == VK_F1) { close_help(); }
+            return 0;
+        }
+        if (wp == VK_F1) { open_help(); return 0; }
+        if (g_pick_view) {
+            if (wp == VK_ESCAPE) { close_exe_picker(); }
+            else if (wp == VK_RETURN && !g_pick_list.empty()) { pick_choose(0); }
+            return 0;
+        }
+        if (g_lib_view) {
+            const int n = (int)g_games.size();
+            if (wp == VK_ESCAPE) { close_library(); return 0; }
+            if (wp == VK_DOWN || wp == VK_UP) {
+                if (n > 0) {
+                    if (g_lib_sel < 0) { g_lib_sel = 0; }
+                    else { g_lib_sel += (wp == VK_DOWN) ? 1 : -1; }
+                    if (g_lib_sel < 0) { g_lib_sel = 0; }
+                    if (g_lib_sel >= n) { g_lib_sel = n - 1; }
+                    lib_ensure_visible();
+                    InvalidateRect(h, nullptr, FALSE);
+                }
+                return 0;
+            }
+            if (wp == VK_RETURN) { library_use_selected(); return 0; }
+            if (wp == VK_PRIOR || wp == VK_NEXT) {
+                const int step = (wp == VK_PRIOR) ? lib_rows_visible() : -lib_rows_visible();
+                if (n > 0) {
+                    if (g_lib_sel < 0) { g_lib_sel = 0; }
+                    else { g_lib_sel += step; }
+                    if (g_lib_sel < 0) { g_lib_sel = 0; }
+                    if (g_lib_sel >= n) { g_lib_sel = n - 1; }
+                    lib_ensure_visible();
+                    InvalidateRect(h, nullptr, FALSE);
+                }
+                return 0;
+            }
+            return 0;
+        }
+        if (g_welcome) {
+            if (wp == VK_RETURN || wp == VK_ESCAPE || wp == VK_SPACE) { dismiss_welcome(); }
+            return 0;
+        }
+        if (g_log_view) {
+            if (wp == VK_ESCAPE) { close_log_view(); return 0; }
+            if (wp == VK_PRIOR)  { log_view_scroll(log_view_rows()); return 0; }
+            if (wp == VK_NEXT)   { log_view_scroll(-log_view_rows()); return 0; }
+            if (wp == VK_HOME)   { g_log_scroll = log_max_scroll();
+                                   InvalidateRect(h, nullptr, FALSE); return 0; }
+            if (wp == VK_END)    { g_log_scroll = 0;
+                                   InvalidateRect(h, nullptr, FALSE); return 0; }
+            return 0;
+        }
+        if (!g_advanced && simple_key((UINT)wp)) { return 0; }
+        if (g_advanced) {
+            if (g_popup_id) {
+                const int cnt = opt_count((Id)g_popup_id);
+                if (wp == VK_ESCAPE) {
+                    g_popup_id = 0;
+                } else if (wp == VK_DOWN || wp == VK_UP) {
+                    if (cnt > 0) {
+                        g_popup_hover = (g_popup_hover < 0) ? 0 : g_popup_hover;
+                        g_popup_hover += (wp == VK_DOWN) ? 1 : -1;
+                        if (g_popup_hover < 0) { g_popup_hover = cnt - 1; }
+                        if (g_popup_hover >= cnt) { g_popup_hover = 0; }
+                    }
+                } else if (wp == VK_RETURN) {
+                    if (g_popup_hover >= 0) { set_opt((Id)g_popup_id, g_popup_hover); }
+                    g_popup_id = 0;
+                }
+                InvalidateRect(h, nullptr, FALSE);
+                return 0;
+            }
+            const int view = drawer_view_h();
+            const int maxs = (g_drawer_h > view) ? (g_drawer_h - view) : 0;
+            if (wp == VK_ESCAPE) {
+                g_advanced = false;
+                g_drawer_focus = -1;
+                ini_w(L"ui", L"advanced", 0);
+                save_all();
+            } else if (wp == VK_TAB) {
+                const bool back = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+                drawer_focus_step(back ? -1 : 1);
+            } else if (wp == VK_DOWN || wp == VK_UP) {
+                drawer_focus_step((wp == VK_DOWN) ? 1 : -1);
+            } else if (wp == VK_RETURN || wp == VK_SPACE) {
+                drawer_activate();
+            } else if (wp == VK_PRIOR) {
+                g_drawer_scroll -= view - 40;
+            } else if (wp == VK_NEXT) {
+                g_drawer_scroll += view - 40;
+            } else if (wp == VK_HOME) {
+                g_drawer_scroll = 0;
+            } else if (wp == VK_END) {
+                g_drawer_scroll = maxs;
+            }
+            if (g_drawer_scroll < 0) { g_drawer_scroll = 0; }
+            if (g_drawer_scroll > maxs) { g_drawer_scroll = maxs; }
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
         }
         return 0;
+
+    case WM_DPICHANGED: {
+        if (g_scale_pct >= 80) {                 // 手动缩放优先，不跟显示器 DPI 变
+            g_scale = (double)g_scale_pct / 100.0;
+            InvalidateRect(h, nullptr, TRUE);
+            return 0;
+        }
+        const UINT dpi = (UINT)LOWORD(wp);
+        g_scale = (dpi < 96 ? 96.0 : (double)dpi) / 96.0;
+        const RECT* r = reinterpret_cast<const RECT*>(lp);
+        if (r != nullptr) {
+            SetWindowPos(h, nullptr, r->left, r->top, r->right - r->left,
+                         r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        InvalidateRect(h, nullptr, TRUE);
+        return 0;
+    }
 
     case WM_CLOSE:
         if (g_running) { stop_bridge(); }
@@ -2353,6 +7130,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_DESTROY:
+        UiaDisconnectAllProviders();
         KillTimer(h, 1);
         UnregisterHotKey(h, 1);
         PostQuitMessage(0);
@@ -2369,12 +7147,14 @@ static HANDLE g_consumer_present_ev = nullptr;
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
 {
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    g_dpi_aware = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     g_consumer_present_ev = CreateEventW(nullptr, TRUE, FALSE, mgpu::kConsumerPresentEvent);
     if (g_consumer_present_ev != nullptr) { SetEvent(g_consumer_present_ev); }
     enum_adapters();      // must precede load_all(): the GPU row is index-based
     load_all();
     if (g_profiles.empty()) { g_profiles.push_back(Profile{}); }
+    g_scale = effective_scale(nullptr);   // 手动缩放（ini）优先，否则跟随系统 DPI
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -2385,9 +7165,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
     RegisterClassExW(&wc);
 
     HWND hwnd = CreateWindowExW(0, L"lock_frame_ui", L"MGPU 固定倍率 2x / 3x / 4x", WS_POPUP | WS_MINIMIZEBOX,
-                                (GetSystemMetrics(SM_CXSCREEN) - kWinW) / 2,
-                                (GetSystemMetrics(SM_CYSCREEN) - kWinH) / 2,
-                                kWinW, kWinH, nullptr, nullptr, inst, nullptr);
+                                (GetSystemMetrics(SM_CXSCREEN) - (int)(kWinW * g_scale)) / 2,
+                                (GetSystemMetrics(SM_CYSCREEN) - (int)(kWinH * g_scale)) / 2,
+                                (int)(kWinW * g_scale + 0.5), (int)(kWinH * g_scale + 0.5),
+                                nullptr, nullptr, inst, nullptr);
     if (!hwnd) { return 1; }
     ShowWindow(hwnd, show);
     UpdateWindow(hwnd);
@@ -2397,6 +7178,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show)
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    CoUninitialize();
     return 0;
 }
 

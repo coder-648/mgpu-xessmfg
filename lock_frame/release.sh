@@ -73,10 +73,10 @@ cp -f "$REPO/LICENSE"                         "$OUT/"
 cp -f "$REPO/NOTICE"                          "$OUT/"
 
 # --- optional Intel runtime --------------------------------------------------
-# Intel's licence allows unmodified redistribution with the notice. The default
-# package leaves them out so the user obtains them from Intel; WITH_XESS=1 is
-# for a self-contained local build.
-if [ "${WITH_XESS:-0}" = "1" ]; then
+# Intel's licence allows unmodified redistribution with the notice. Since 1.2.0 the
+# default package is self-contained (includes the runtime + Intel licence); set
+# WITH_XESS=0 for a slim package that asks the user to obtain them from Intel.
+if [ "${WITH_XESS:-1}" = "1" ]; then
     for dll in libxess_fg.dll libxell.dll; do
         [ -f "$REPO/third_party/xess/bin/$dll" ] || die "missing third_party/xess/bin/$dll"
         cp -f "$REPO/third_party/xess/bin/$dll" "$OUT/"
