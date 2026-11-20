@@ -110,7 +110,7 @@ uint32_t g_colour_format = 0;
 uint32_t g_ui_w = 0, g_ui_h = 0;               // source UI size
 uint32_t g_ui_format = 0;                     // transport format (R10 or RGBA8)
 uint32_t g_ui_slot_w = 0, g_ui_slot_h = 0;     // placed capacity (downsampled)
-bool     g_want_ui_session = true;             // UI stream is enabled when a record has one
+bool     g_want_ui_session = false;            // UI stream is OFF by default (unverified, see below)
 bool     g_ui_premultiplied = true;            // source UI.rgb already premultiplied (Streamline default)
 // 锁帧版：颜色走消费者侧的 WGC，producer 不再发布 colour 流。默认关闭；
 // 需要 A/B 时在 fakerFG.ini 写 ColourStream=1。
@@ -1569,7 +1569,11 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
             if (!s_colour_ini) {
                 s_colour_ini = true;
                 g_want_colour_session = ini_int(L"ColourStream", 0) != 0;
-                g_want_ui_session = ini_int(L"UiStream", 1) != 0;
+                // UI stream is an unverified experiment: default OFF and not exposed anywhere
+                // (no UI toggle, no key in the shipped fakerFG.ini). Set UiStream=1 by hand
+                // only for a local A/B. With it off, stream 3 has no slot size and the
+                // consumer keeps XeFG's default UI composition (DISABLED).
+                g_want_ui_session = ini_int(L"UiStream", 0) != 0;
                 g_ui_premultiplied = ini_int(L"UiPremultiplied", 1) != 0;
                 g_force_inline = ini_int(L"CopyInline", 0) != 0;
                 if (!g_want_colour_session) {

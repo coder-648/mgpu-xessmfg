@@ -190,8 +190,10 @@ int main()
         if (wcsncmp(rt + 8, L"0", 1) == 0) { g_fg_rt_zero = true; }
     }
     if (wcsstr(GetCommandLineW(), L"--fg-ui none")) { g_fg_ui_none = true; }
-    // B mode 4 A/B: keep the UI stream but skip the consumer unblend pass. The tag then
-    // falls back to UI-only (mode 2), which is the "composited backbuffer + UI" control.
+    // B mode 4 (UI stream + unblend) is not accepted yet: OFF by default, no user-facing
+    // switch. These two flags are internal A/B only and are deliberately undocumented
+    // (not in the UI, not in fakerFG.ini, not in the release notes).
+    if (wcsstr(GetCommandLineW(), L"--ui-unblend")) { g_ui_unblend = true; }
     if (wcsstr(GetCommandLineW(), L"--no-ui-unblend")) { g_ui_unblend = false; }
     if (const wchar_t* sc = wcsstr(GetCommandLineW(), L"--fg-scene ")) {
         const float v = static_cast<float>(_wtof(sc + 11));

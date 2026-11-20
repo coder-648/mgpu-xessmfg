@@ -1,5 +1,11 @@
 # B 方案定案：UI 流 + 消费端 unblend + XeFG mode 4（2026-11-20）
 
+> **状态（2026-11-20）**：代码已落地但**未通过验收**。因此发布上：
+> `UiStream` 默认 **0**（producer 不发布 UI 流）、消费端 unblend 默认 **关闭**，
+> 且**不提供任何开关**（UI 无项、`fakerFG.ini` 无键、发布说明不提及）。
+> 只有本机 A/B 才用内部参数 `--ui-unblend` + 手写 `fakerFG.ini` 的 `UiStream=1`。
+> 这份文档记录的是设计意图与后续验收计划，不代表已发布能力。
+
 > 结论：只增加 **一条降采样 UI 流**。UI 流是启用 XeFG UI composition 的唯一门控。
 > 生产端不做 HUDless 传输、不做 HUDless 呈现拷贝；消费端用 OptiScaler 的思路
 > （`UiUnblend`）把 UI 从含 UI 的画面里去掉，重建 HUDless，再交给 XeFG。

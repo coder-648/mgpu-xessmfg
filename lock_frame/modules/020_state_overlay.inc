@@ -430,9 +430,10 @@ float               g_fg_near_z = 10.0f;
 static bool         g_fg_consts_logged = false;
 static bool         g_fg_ui_none = false;
 // B mode 4: UI stream + consumer unblend -> HUDless -> XeFG BACKBUFFER_HUDLESS.
-// The UI stream exists is the only gate for XeFG UI composition; if the producer does not
-// publish stream 3 the flag is harmless (no UI local, no tag, no unblend).
-static bool         g_ui_unblend = true;
+// NOT accepted yet, so it is OFF by default and has no user-facing switch: the UI stream is
+// not published by default either (producer `UiStream`, default 0), which is the actual gate
+// for XeFG UI composition. `--ui-unblend` exists only for a local A/B.
+static bool         g_ui_unblend = false;
 static bool         g_ui_unblend_ready_logged = false;
 static bool         g_mv_gate_off = false;   // this frame has no MV -> 1X, no tagging
 static float        g_fg_scene = 0.0f;

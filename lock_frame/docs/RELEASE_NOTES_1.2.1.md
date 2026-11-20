@@ -1,8 +1,12 @@
 # lock_frame 1.2.1 发布说明
 
-**1.2.1 是 1.2.0 的现场修复版**：解决"装好了、游戏能跑，但按热键一直提示
-`target ... is not the producer (producer_pid=0)`、producer 从不启动"的问题
+**1.2.1 只做一件事：修复 1.2.0 的现场部署问题** —— 装好了、游戏也能跑，但按热键一直提示
+`target ... is not the producer (producer_pid=0)`，producer 从不启动
 （Cyberpunk 2077 实测）。
+
+> 本次**不含新功能**：UI 流（UI-only 纹理跨卡 + 消费端 unblend）尚未通过验收，
+> 相关代码默认关闭，也不提供任何开关（UI 里没有、`fakerFG.ini` 里没有）。
+> 2x/3x/4x、UI 组合行为与 1.2.0 保持一致。
 
 ## 根因
 
@@ -57,3 +61,4 @@ XeFG 接不到 swap chain ⇒ 游戏 Present 没有 detour ⇒ `producer_present
 - 共享协议仍为 **v28**；游戏侧 `fakerFG.dll` / `xess_mfg_producer.dll`
   必须与本包同版本（本包三者是一起构建的）。
 - 其余功能与 1.2.0 相同（2x/3x/4x、游戏为中心配置、安装/还原、中英双语）。
+

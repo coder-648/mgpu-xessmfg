@@ -52,10 +52,15 @@ UI: producer_pid=0 → "not the producer"（不是颜色格式，也不是版本
   把包里的 `libxess_fg.dll` 放进 `<game>\fakerFG\`）。
 
 构建验证：`./lock_frame/build.sh ui|producer|faker|consumer` 全部 `EXIT=0`
-（MSVC 14.44，无新增 warning）。运行时验证待现场：装 1.2.0 → 点
+（MSVC 14.44，无新增 warning）。运行时验证待现场：装 1.2.1 → 点
 [重新应用配置] → 重启游戏，`Cyberpunk2077_fakerFG.log` 应出现
 `xefg: libxess_fg <path>` + `xefg: the title keeps the library's swap chain object`，
 `Cyberpunk2077_mfg_producer.log` 应出现 `shared ready: name=Local\mgpu_mailbox_v1`。
+
+**本版不发布 UI 流**：B 方案（UI-only 纹理跨卡 + 消费端 unblend + XeFG mode 4）
+尚未验收，`UiStream` 默认 0、消费端 `g_ui_unblend` 默认 false，且不暴露开关
+（UI 无项、`fakerFG.ini` 无键）。代码保留在树里供后续验收，只留内部
+`--ui-unblend` 做本机 A/B。
 
 ### chore(release): 精简发布包（1.2.0 独立软件形态）(2026-11-19)
 
