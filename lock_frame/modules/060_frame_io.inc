@@ -327,6 +327,7 @@ static void wait_slot(UINT slot)
 // vector resource as missing.
 static ComPtr<ID3D12Resource> g_mv_local[mgpu::kMaxSlots];
 static ComPtr<ID3D12Resource> g_ui_local[mgpu::kMaxSlots];
+static bool                   g_ui_fresh[mgpu::kMaxSlots] = {};
 static ComPtr<ID3D12Resource> g_depth_local[mgpu::kMaxSlots];
 // --depth-lag N: our own ring of local depth copies. The shared ring must always be read
 // at its newest completed slot (reading an older one collides with the producer's write),
@@ -580,6 +581,7 @@ static void of_bind_hist();                              // ditto (history colou
 static void copy_inputs_local(UINT slot)
 {
     if (slot >= mgpu::kMaxSlots) { return; }
+    g_ui_fresh[slot] = false;
     // --fg-colour shared: the colour rides the same path as MV/depth - one cross-adapter
     // CopyTextureRegion of the live rectangle into the sink the convert draw reads.
     if (g_fg_colour_shared && g_colour[slot] && g_shared12) {
@@ -716,6 +718,7 @@ static void copy_inputs_local(UINT slot)
                       su.width, su.height);
             }
             copy_content(g_ui_local[slot].Get(), g_ui[slot].Get(), su.width, su.height);
+            g_ui_fresh[slot] = true;
         }
     }
 

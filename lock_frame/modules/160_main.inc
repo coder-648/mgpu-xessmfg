@@ -7,6 +7,12 @@
 //  Modules are in dependency order; a module may use only symbols declared above it.
 // ============================================================================
 
+// The producer only creates the shared mapping while this named event exists. The GUI
+// creates it for its whole lifetime, but a direct lock_frame.exe launch (run_2x.bat) must
+// create it too, otherwise the producer reports "no consumer present" and the consumer
+// waits forever for Local\mgpu_mailbox_v1.
+static HANDLE g_consumer_present_event = nullptr;
+
 int main()
 {
     // Must happen before any window is created: otherwise Windows virtualizes the
@@ -15,6 +21,15 @@ int main()
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     logf_("[lock] lock_frame %s (shared protocol v%u)\n",
           LOCK_FRAME_VERSION_STRING, mgpu::kSharedVersion);
+
+    g_consumer_present_event = CreateEventW(nullptr, TRUE, FALSE,
+                                            mgpu::kConsumerPresentEvent);
+    if (g_consumer_present_event != nullptr) {
+        SetEvent(g_consumer_present_event);
+    } else {
+        logf_("[lock] CreateEvent(%ls) FAILED err=%lu - the producer will not create"
+              " the shared mapping\n", mgpu::kConsumerPresentEvent, GetLastError());
+    }
 
     if (wcsstr(GetCommandLineW(), L"--no-fg")) { g_no_fg = true; }
     if (wcsstr(GetCommandLineW(), L"--no-pair-key")) { g_pair_frame_key = false; }
@@ -175,6 +190,9 @@ int main()
         if (wcsncmp(rt + 8, L"0", 1) == 0) { g_fg_rt_zero = true; }
     }
     if (wcsstr(GetCommandLineW(), L"--fg-ui none")) { g_fg_ui_none = true; }
+    // B mode 4 A/B: keep the UI stream but skip the consumer unblend pass. The tag then
+    // falls back to UI-only (mode 2), which is the "composited backbuffer + UI" control.
+    if (wcsstr(GetCommandLineW(), L"--no-ui-unblend")) { g_ui_unblend = false; }
     if (const wchar_t* sc = wcsstr(GetCommandLineW(), L"--fg-scene ")) {
         const float v = static_cast<float>(_wtof(sc + 11));
         if (v > 0.0f && v <= 10.0f) { g_fg_scene = v; }
@@ -755,7 +773,7 @@ int main()
     // 用 080 模块的联合重建 pass 还原到 frames[].render_w/h（输入画面尺寸）再 tag。
     g_upsample         = true;
     if (!g_stream_mask_explicit) {
-        g_stream_mask = mgpu::kRequestMv | mgpu::kRequestDepth;
+        g_stream_mask = mgpu::kRequestMv | mgpu::kRequestDepth | mgpu::kRequestUi;
     }
     logf_("[lock] --upsample: ON by default - MV/depth 150%% transfer, reconstructed to the"
           " input picture size before tagging\n");

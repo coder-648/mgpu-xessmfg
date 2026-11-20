@@ -925,10 +925,18 @@ void sl_publish_staged()
 
     static unsigned logged = 0;
     if (++logged <= 3 || (logged % 600) == 0) {
-        logf("sl: present fallback publish #%u render=%ux%u mv=%p depth=%p hudless=%p\n",
+        logf("sl: present fallback publish #%u render=%ux%u mv=%p depth=%p"
+             " hudless=%p ui=%p hudless_size=%ux%u fmt=%u ui_size=%ux%u fmt=%u\n",
              logged, f.render_w, f.render_h, f.stream[MGPU_FG_STREAM_MV].resource,
              f.stream[MGPU_FG_STREAM_DEPTH].resource,
-             f.stream[MGPU_FG_STREAM_HUDLESS].resource);
+             f.stream[MGPU_FG_STREAM_HUDLESS].resource,
+             f.stream[MGPU_FG_STREAM_UI_COLOR].resource,
+             f.stream[MGPU_FG_STREAM_HUDLESS].width,
+             f.stream[MGPU_FG_STREAM_HUDLESS].height,
+             f.stream[MGPU_FG_STREAM_HUDLESS].format,
+             f.stream[MGPU_FG_STREAM_UI_COLOR].width,
+             f.stream[MGPU_FG_STREAM_UI_COLOR].height,
+             f.stream[MGPU_FG_STREAM_UI_COLOR].format);
     }
 }
 

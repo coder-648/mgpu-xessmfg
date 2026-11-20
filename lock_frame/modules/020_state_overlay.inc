@@ -89,7 +89,7 @@ static bool g_no_inputs = false;
 static bool g_no_depth = false;
 // v14 switch board: which non-essential streams the producer should put on the wire. The
 // defaults mirror the pre-v14 behaviour (MV + depth), so nothing changes unless asked.
-static uint32_t g_stream_mask = mgpu::kRequestMv | mgpu::kRequestDepth;
+static uint32_t g_stream_mask = mgpu::kRequestMv | mgpu::kRequestDepth | mgpu::kRequestUi;
 // Link estimate for the OSD's occupancy figure. We cannot query the PCIe width from D3D12,
 // so this is a declared number: 13 GB/s is PCIe 4.0 x8 (~80% of its 16 GB/s theoretical),
 // which is what a bifurcated x8/x8 dual-GPU box actually delivers. --link=NN overrides.
@@ -429,6 +429,11 @@ float               g_fg_fov_y = 60.0f;
 float               g_fg_near_z = 10.0f;
 static bool         g_fg_consts_logged = false;
 static bool         g_fg_ui_none = false;
+// B mode 4: UI stream + consumer unblend -> HUDless -> XeFG BACKBUFFER_HUDLESS.
+// The UI stream exists is the only gate for XeFG UI composition; if the producer does not
+// publish stream 3 the flag is harmless (no UI local, no tag, no unblend).
+static bool         g_ui_unblend = true;
+static bool         g_ui_unblend_ready_logged = false;
 static bool         g_mv_gate_off = false;   // this frame has no MV -> 1X, no tagging
 static float        g_fg_scene = 0.0f;
 static bool         g_fg_depth_inv = false;

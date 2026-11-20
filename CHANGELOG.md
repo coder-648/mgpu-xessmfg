@@ -3,6 +3,60 @@
 只记**用户能感知**的变化与对应实测依据。每条结论的原始数据在
 `docs/findings/PERF_BASELINE.md` / `FINAL_CONFIG.md`。
 
+### fix(deploy): Intel 运行时写进游戏目录 + XeFG 加载/传输自愈 (2026-11-20, 1.2.1)
+
+**现场（Cyberpunk 2077，lock_frame 1.2.0）**：UI 每次按热键都报
+`start: target ... is not the producer (pid=... producer_pid=0 version=0 expect=28)`，
+三局游戏进程（pid 4388 / 15952 / 11972）都一样。游戏侧日志给出的真因是一条链：
+
+```text
+fakerFG: xefg: libxess_fg not loadable (missing exports: xefgSwapChainD3D12GetProperties)
+fakerFG: dxgi: XeFG could not take the swap chain - the game keeps its own
+   ↓ fg_hook_swapchain() 从未执行 ⇒ 游戏 Present 没有 detour
+   ↓ producer_present() 只在那个 detour 里调用 ⇒ fg_present_done() 从不执行
+   ↓ g_record_pending 一直为 true ⇒ 之后每帧都 "present-staged skipped"
+   ↓ producer 只收到 1 条 record ⇒ 过了 1200 ms publish gate 后再无记录
+   ↓ producer 从未 start_shared_init ⇒ Local\mgpu_mailbox_v1 不存在
+UI: producer_pid=0 → "not the producer"（不是颜色格式，也不是版本不符）
+```
+
+根因：`deploy` 只把 `fakerFG.dll`（三个别名）/`xess_mfg_producer.dll`/`fakerFG.ini`
+写进游戏目录，**Intel 运行时只留在 UI 旁边**；而 XeFG 是在游戏进程里加载
+`libxess_fg.dll` 的（`xefg_dyn.h`：`<游戏>\fakerFG\` → `<游戏>\` → 搜索路径），
+于是加载到游戏自带那份旧 DLL。UI 的 `refresh_readiness()` 只查自己目录，
+胶囊还显示"运行时 OK"。
+
+改动：
+
+- **`mgpu_ui.cpp` deploy**：把包里的 `libxess_fg.dll` / `libxell.dll` 复制到
+  `<游戏>\fakerFG\`（自己的子目录，不覆盖游戏文件），日志写 `已写入 Intel 运行时 n/n 个`。
+  `undeploy` 同步清掉这两个文件（目录非空时 `RemoveDirectory` 失败，天然保护）。
+- **`mgpu_ui.cpp` 自检/启动前检查**：新增 `game_runtime_ok()`，开始按钮要求
+  `<游戏>\fakerFG\libxess_fg.dll` 存在（只认我们写入的那份——游戏自带的同名文件
+  存在也不代表能用）；胶囊文案改为
+  `游戏目录 fakerFG 里缺少 libxess_fg.dll（点[重新应用配置]自动写入）`，
+  启动前弹窗加一条同样的警告。
+- **`src/xefg_dyn.h`**：`Load()` 现在会把**每个**候选都试一遍（而不是第一个能
+  `LoadLibrary` 的就停），失败时错误串列出每个路径的结果
+  （`<path> -> LoadLibrary err=N` / `<path> -> missing exports: ...`），
+  所以"游戏自带旧 DLL + 我们的新 DLL 都在"时能自动选对，且日志能直接看出原因。
+- **`faker_fg.cpp`**：`g_record_pending` 增加超时兜底（`kStalePendingMs = 100`）。
+  Present 边界一直不来时，比它老 100 ms 以上的新 record 会释放挂起位并照常发布，
+  打 `record: pending record never reached a present (... ms older) - publishing anyway;
+  is the swap chain hooked?`。原来一次 swapchain 接管失败会让整局传输彻底死掉，
+  而且日志只提示"a record is already pending"。
+- **`producer.cpp`**：`present_watchdog()`——映射已就绪但 5 s 内一个 present tick 都没
+  收到时，明确打
+  `producer: transport ready for N ms but no present tick arrived - fakerFG's Present
+  detour is NOT installed`，并给出下一步（查 `<exe>_fakerFG.log` 的 `xefg:` 行 /
+  把包里的 `libxess_fg.dll` 放进 `<game>\fakerFG\`）。
+
+构建验证：`./lock_frame/build.sh ui|producer|faker|consumer` 全部 `EXIT=0`
+（MSVC 14.44，无新增 warning）。运行时验证待现场：装 1.2.0 → 点
+[重新应用配置] → 重启游戏，`Cyberpunk2077_fakerFG.log` 应出现
+`xefg: libxess_fg <path>` + `xefg: the title keeps the library's swap chain object`，
+`Cyberpunk2077_mfg_producer.log` 应出现 `shared ready: name=Local\mgpu_mailbox_v1`。
+
 ### chore(release): 精简发布包（1.2.0 独立软件形态）(2026-11-19)
 
 - 移除与 GUI 重复/无关的文件：`deploy_game.bat`、`run_2x/3x/4x/30x4/40x3.bat`、

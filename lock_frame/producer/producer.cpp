@@ -31,6 +31,7 @@
 #include "mgpu_shared.h"
 #include "downsample_mv_cso.h"
 #include "downsample_depth_cso.h"
+#include "downsample_ui_cso.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -82,6 +83,10 @@ ComPtr<ID3D12Fence>    g_back[mgpu::kMaxSlots];
 uint64_t g_fwd_value[mgpu::kMaxSlots] = {};
 
 bool     g_ready = false;
+// When g_ready flipped: the transport can publish, but nothing is published until fakerFG's
+// Present detour calls MgpuProducerPresent. The watchdog below reports a ready transport
+// that never receives that tick.
+ULONGLONG g_ready_ms = 0;
 volatile LONG g_init_started = 0;
 volatile LONG g_init_failed = 0;
 uint32_t g_render_w = 0, g_render_h = 0;      // the game's render size (published as render)
@@ -99,6 +104,14 @@ uint32_t g_mv_format = 0, g_depth_format = 0; // slot formats (follow the source
 uint32_t g_colour_w = 0, g_colour_h = 0;      // live content size (output size)
 uint32_t g_colour_slot_w = 0, g_colour_slot_h = 0;   // placed capacity
 uint32_t g_colour_format = 0;
+// B mode 4: stream 3 is the UI-only texture, downsampled and optionally colour-converted
+// on the render card. The consumer unblends it from the presented backbuffer to rebuild a
+// HUDless frame. It never receives HUDless or colour from this producer.
+uint32_t g_ui_w = 0, g_ui_h = 0;               // source UI size
+uint32_t g_ui_format = 0;                     // transport format (R10 or RGBA8)
+uint32_t g_ui_slot_w = 0, g_ui_slot_h = 0;     // placed capacity (downsampled)
+bool     g_want_ui_session = true;             // UI stream is enabled when a record has one
+bool     g_ui_premultiplied = true;            // source UI.rgb already premultiplied (Streamline default)
 // 锁帧版：颜色走消费者侧的 WGC，producer 不再发布 colour 流。默认关闭；
 // 需要 A/B 时在 fakerFG.ini 写 ColourStream=1。
 bool     g_want_colour_session = false;       // ColourStream=0 (lock_frame default)
@@ -173,8 +186,8 @@ ID3D12GraphicsCommandList* g_copy_active_list = nullptr;
 // 颜色不再跨卡，省下的带宽留给渲染卡；1 和 2 分别是 MV/depth。
 // 消费端 lock_frame.exe 默认 --upsample，把 150% 的 MV/depth 联合重建到输入画面
 // 尺寸后再交给 XeFG，所以 150 的精度不会原样带进插帧。
-uint32_t g_percent[mgpu::kMaxStreams] = { 100, 150, 150, 100, 100 };   // effective (request or ini)
-uint32_t g_ini_percent[mgpu::kMaxStreams] = { 100, 150, 150, 100, 100 }; // fakerFG.ini values, restored when request = 0
+uint32_t g_percent[mgpu::kMaxStreams] = { 100, 150, 150, 200, 100 };   // effective (request or ini)
+uint32_t g_ini_percent[mgpu::kMaxStreams] = { 100, 150, 150, 200, 100 }; // fakerFG.ini values, restored when request = 0
 bool     g_scaled[mgpu::kMaxStreams] = {};
 // A COPY-only command list cannot take the downscale Dispatch. The first time that is
 // seen we fall back to 1:1 for the rest of the session instead of publishing nothing;
@@ -242,7 +255,9 @@ mgpu::SharedControl* ctl()
 bool layout_streams(ID3D12Device* device, mgpu::SharedControl* c,
                     uint32_t slot_w, uint32_t slot_h,
                     uint32_t colour_w, uint32_t colour_h,
-                    uint32_t colour_slot_w, uint32_t colour_slot_h, uint32_t colour_format)
+                    uint32_t colour_slot_w, uint32_t colour_slot_h, uint32_t colour_format,
+                    uint32_t ui_w, uint32_t ui_h, uint32_t ui_slot_w, uint32_t ui_slot_h,
+                    uint32_t ui_format)
 {
     struct Spec { DXGI_FORMAT format; uint32_t w, h, sw, sh; };
     const Spec specs[mgpu::kMaxStreams] = {
@@ -253,7 +268,9 @@ bool layout_streams(ID3D12Device* device, mgpu::SharedControl* c,
           colour_slot_w, colour_slot_h },
         { static_cast<DXGI_FORMAT>(g_mv_format),    g_stream_w[1], g_stream_h[1], slot_w, slot_h },
         { static_cast<DXGI_FORMAT>(g_depth_format), g_stream_w[2], g_stream_h[2], slot_w, slot_h },
-        { DXGI_FORMAT_UNKNOWN,      0, 0, 0, 0 },                        // ui: reserved
+        // B mode 4: UI-only texture, downsampled on the render card and unblended on the
+        // consumer. Its live rectangle is the downsampled size, not the output size.
+        { static_cast<DXGI_FORMAT>(ui_format), ui_w, ui_h, ui_slot_w, ui_slot_h },
         // v22: the scar/marker stream is retired with WGC; kept as an empty slot.
         { DXGI_FORMAT_UNKNOWN,      0, 0, 0, 0 },
     };
@@ -261,7 +278,8 @@ bool layout_streams(ID3D12Device* device, mgpu::SharedControl* c,
     for (int i = 0; i < static_cast<int>(mgpu::kMaxStreams); ++i) {
         const bool needed = (i == static_cast<int>(mgpu::kStreamColour) ||
                              i == static_cast<int>(mgpu::kStreamMv) ||
-                             i == static_cast<int>(mgpu::kStreamDepth));
+                             i == static_cast<int>(mgpu::kStreamDepth) ||
+                             i == static_cast<int>(mgpu::kStreamUi));
         uint64_t slot_size = 0;
         if (needed && specs[i].sw >= 16 && specs[i].sh >= 16 &&
             specs[i].format != DXGI_FORMAT_UNKNOWN) {
@@ -329,7 +347,9 @@ uint32_t read_percent(int stream)
     if (wchar_t* slash = wcsrchr(path, L'\\')) { *slash = L'\0'; }
     wcscat_s(path, MAX_PATH, L"\\fakerFG.ini");
     const int fallback = GetPrivateProfileIntW(L"fakerFG", L"StreamPercent", 150, path);
-    const wchar_t* key = (stream == 1) ? L"StreamPercentMv" : L"StreamPercentDepth";
+    const wchar_t* key = (stream == 1) ? L"StreamPercentMv"
+                       : (stream == 2) ? L"StreamPercentDepth"
+                                       : L"StreamPercentUi";
     int v = GetPrivateProfileIntW(L"fakerFG", key, fallback, path);
     if (v < 100) { v = 100; }
     if (v > 400) { v = 400; }
@@ -377,7 +397,61 @@ void compute_target(uint32_t render_w, uint32_t render_h)
     }
 }
 
-// ---------------------------------------------------------------- downscale pass
+// UI transport format. R10/RGBA8 keep their format; FP16 scRGB becomes R10 PQ (the
+// downsample shader converts); anything else falls back to RGBA8.
+DXGI_FORMAT ui_transport_format(DXGI_FORMAT src)
+{
+    switch (src) {
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+        return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+        return DXGI_FORMAT_R10G10B10A2_UNORM;   // downsample_ui.hlsl applies PQ
+    default:
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+    }
+}
+
+void compute_ui_target(uint32_t ui_w, uint32_t ui_h, DXGI_FORMAT src_format)
+{
+    if (ui_w < 64 || ui_h < 64) {
+        g_ui_w = g_ui_h = 0;
+        g_stream_w[3] = g_stream_h[3] = 0;
+        g_ui_format = 0;
+        g_scaled[3] = false;
+        return;
+    }
+    static bool s_ui_percent_read = false;
+    if (!s_ui_percent_read) {
+        s_ui_percent_read = true;
+        g_percent[3] = read_percent(3);
+        g_ini_percent[3] = g_percent[3];
+    }
+    g_ui_w = ui_w;
+    g_ui_h = ui_h;
+    g_ui_format = static_cast<uint32_t>(ui_transport_format(src_format));
+    const bool convert = (g_ui_format != static_cast<uint32_t>(src_format));
+    g_scaled[3] = (g_percent[3] > 100) || convert;
+    if (!g_scaled[3]) {
+        g_stream_w[3] = ui_w;
+        g_stream_h[3] = ui_h;
+        return;
+    }
+    g_stream_w[3] = target_dim(ui_w, g_percent[3]);
+    g_stream_h[3] = target_dim(ui_h, g_percent[3]);
+    if (g_stream_w[3] >= ui_w && g_stream_h[3] >= ui_h && !convert) {
+        g_scaled[3] = false;
+        g_stream_w[3] = ui_w;
+        g_stream_h[3] = ui_h;
+    }
+}
+
+
 // One compute dispatch per stream, on the title's list (must be DIRECT or COMPUTE).
 void barrier(ID3D12GraphicsCommandList* list, ID3D12Resource* res,
              D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after);   // below
@@ -386,7 +460,7 @@ void barrier(ID3D12GraphicsCommandList* list, ID3D12Resource* res,
 // for MV, R32_FLOAT/D32_FLOAT for depth.
 bool ensure_scale_objects(ID3D12Device* device)
 {
-    if (g_ds_rs && g_ds_pso[1] && g_ds_pso[2]) { return true; }
+    if (g_ds_rs && g_ds_pso[1] && g_ds_pso[2] && g_ds_pso[3]) { return true; }
 
     D3D12_DESCRIPTOR_RANGE range_srv{};
     range_srv.RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
@@ -400,7 +474,7 @@ bool ensure_scale_objects(ID3D12Device* device)
     D3D12_ROOT_PARAMETER p[3]{};
     p[0].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     p[0].Constants.ShaderRegister  = 0;
-    p[0].Constants.Num32BitValues  = 4;
+    p[0].Constants.Num32BitValues  = 6;      // src w/h, dst w/h, mode, premultiplied
     p[0].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
     // Textures cannot be root descriptors (only raw/structured buffers can), so both the
     // source and the target go through a small descriptor table.
@@ -432,17 +506,19 @@ bool ensure_scale_objects(ID3D12Device* device)
 
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = 4;          // mv srv,uav | depth srv,uav
+    hd.NumDescriptors = 6;          // mv srv,uav | depth srv,uav | ui srv,uav
     hd.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_ds_heap)))) {
         logf("downscale: CreateDescriptorHeap FAILED\n");
         return false;
     }
 
-    static const unsigned char* kCs[3] = { nullptr, kDownsampleMVCSO, kDownsampleDepthCSO };
-    static const size_t kCsSize[3] = { 0, sizeof(kDownsampleMVCSO),
-                                       sizeof(kDownsampleDepthCSO) };
-    for (int stream = 1; stream <= 2; ++stream) {
+    static const unsigned char* kCs[4] = { nullptr, kDownsampleMVCSO, kDownsampleDepthCSO,
+                                          kDownsampleUICSO };
+    static const size_t kCsSize[4] = { 0, sizeof(kDownsampleMVCSO),
+                                       sizeof(kDownsampleDepthCSO),
+                                       sizeof(kDownsampleUICSO) };
+    for (int stream = 1; stream <= 3; ++stream) {
         D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
         pd.pRootSignature    = g_ds_rs.Get();
         pd.CS.pShaderBytecode = kCs[stream];
@@ -509,10 +585,20 @@ bool scale_dispatch(ID3D12GraphicsCommandList* list, ID3D12Resource* src,
     // on PBZ. R32_TYPELESS / D32_FLOAT / R32_FLOAT use plain R32_FLOAT.
     const bool wide_depth = (sd.Format == DXGI_FORMAT_R32G8X24_TYPELESS ||
                              sd.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT);
-    const DXGI_FORMAT srv_fmt = (stream == 2)
-        ? (wide_depth ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS : DXGI_FORMAT_R32_FLOAT)
-        : sd.Format;
-    const DXGI_FORMAT target_fmt = (stream == 2) ? DXGI_FORMAT_R32_FLOAT : sd.Format;
+    const bool is_ui = (stream == 3);
+    DXGI_FORMAT ui_srv_fmt = sd.Format;
+    if (is_ui) {
+        if (sd.Format == DXGI_FORMAT_R10G10B10A2_TYPELESS) { ui_srv_fmt = DXGI_FORMAT_R10G10B10A2_UNORM; }
+        if (sd.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS)    { ui_srv_fmt = DXGI_FORMAT_R8G8B8A8_UNORM; }
+    }
+    const DXGI_FORMAT srv_fmt = is_ui
+        ? ui_srv_fmt
+        : ((stream == 2)
+               ? (wide_depth ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS : DXGI_FORMAT_R32_FLOAT)
+               : sd.Format);
+    const DXGI_FORMAT target_fmt = is_ui
+        ? static_cast<DXGI_FORMAT>(g_ui_format)
+        : ((stream == 2) ? DXGI_FORMAT_R32_FLOAT : sd.Format);
     if (!ensure_scale_target(device, stream, target_fmt)) { return false; }
     g_ds_w[stream] = g_stream_w[stream];
     g_ds_h[stream] = g_stream_h[stream];
@@ -530,14 +616,18 @@ bool scale_dispatch(ID3D12GraphicsCommandList* list, ID3D12Resource* src,
         g_ds_state[stream] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     }
 
-    const uint32_t params[4] = {
+    uint32_t params[6] = {
         static_cast<uint32_t>(sd.Width), static_cast<uint32_t>(sd.Height),
-        g_stream_w[stream], g_stream_h[stream]
+        g_stream_w[stream], g_stream_h[stream],
+        (is_ui && sd.Format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+         g_ui_format == DXGI_FORMAT_R10G10B10A2_UNORM) ? 1u : 0u,
+        1u   // ignore for MV/depth
     };
+    params[5] = g_ui_premultiplied ? 1u : 0u;
 
     // Descriptors: textures need a table (root SRV/UAV would only accept raw buffers).
     ID3D12Resource* dst = g_ds_tex[stream].Get();
-    const uint32_t slot = (stream == 1) ? 0u : 2u;
+    const uint32_t slot = (stream == 1) ? 0u : (stream == 2) ? 2u : 4u;
     const UINT inc = g_device->GetDescriptorHandleIncrementSize(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     D3D12_CPU_DESCRIPTOR_HANDLE cpu =
@@ -574,7 +664,7 @@ bool scale_dispatch(ID3D12GraphicsCommandList* list, ID3D12Resource* src,
     // own heaps before every pass, so this is restored by its next draw/dispatch.
     ID3D12DescriptorHeap* heaps[1] = { g_ds_heap.Get() };
     list->SetDescriptorHeaps(1, heaps);
-    list->SetComputeRoot32BitConstants(0, 4, params, 0);
+    list->SetComputeRoot32BitConstants(0, 6, params, 0);
     list->SetComputeRootDescriptorTable(1, gpu);
     list->SetComputeRootDescriptorTable(2, gpu_uav);
     list->Dispatch((g_stream_w[stream] + 7) / 8, (g_stream_h[stream] + 7) / 8, 1);
@@ -589,14 +679,15 @@ bool scale_dispatch(ID3D12GraphicsCommandList* list, ID3D12Resource* src,
     g_ds_state[stream] = D3D12_RESOURCE_STATE_COPY_SOURCE;
     if (before != read_state) { barrier(list, src, read_state, before); }
 
-    static bool told[3] = {};
+    static bool told[4] = {};
     if (!told[stream]) {
         told[stream] = true;
-        logf("downscale: %s %llux%llu -> %ux%u (StreamPercent=%u)\n",
-             stream == 1 ? "mv" : "depth",
+        logf("downscale: %s %llux%llu -> %ux%u fmt %u (StreamPercent=%u)\n",
+             stream == 1 ? "mv" : (stream == 2 ? "depth" : "ui"),
              static_cast<unsigned long long>(sd.Width),
              static_cast<unsigned long long>(sd.Height),
-             g_stream_w[stream], g_stream_h[stream], g_percent[stream]);
+             g_stream_w[stream], g_stream_h[stream], static_cast<unsigned>(target_fmt),
+             g_percent[stream]);
     }
     return true;
 }
@@ -652,7 +743,8 @@ void copy_begin_frame()
 
 bool ensure_shared(ID3D12Device* device, uint32_t render_w, uint32_t render_h,
                    uint32_t mv_format, uint32_t colour_w, uint32_t colour_h,
-                   uint32_t colour_format)
+                   uint32_t colour_format, uint32_t ui_w, uint32_t ui_h,
+                   uint32_t ui_format)
 {
     if (g_ready) { return true; }
     if (device == nullptr || render_w < 256 || render_h < 256) { return false; }
@@ -695,6 +787,31 @@ bool ensure_shared(ID3D12Device* device, uint32_t render_w, uint32_t render_h,
         g_colour_format = 0;
     }
 
+    // B mode 4: the UI stream is laid out once, at its downsampled size. If the title has
+    // no UI resource this stays zero and the consumer never sees stream 3.
+    if (g_want_ui_session && ui_w >= 64 && ui_h >= 64 && ui_format != 0) {
+        compute_ui_target(ui_w, ui_h, static_cast<DXGI_FORMAT>(ui_format));
+        g_ui_slot_w = cap_dim(g_stream_w[3]);
+        g_ui_slot_h = cap_dim(g_stream_h[3]);
+        if (g_ui_slot_w < g_stream_w[3] || g_ui_slot_h < g_stream_h[3]) {
+            logf("producer: UI %ux%u is above the %ux%u mapping capacity - UI stream disabled\n",
+                 ui_w, ui_h, mgpu::kStreamMaxW, mgpu::kStreamMaxH);
+            g_ui_w = g_ui_h = 0;
+            g_ui_slot_w = g_ui_slot_h = 0;
+            g_ui_format = 0;
+            g_stream_w[3] = g_stream_h[3] = 0;
+        } else {
+            logf("producer: UI %ux%u fmt %u -> %ux%u fmt %u (StreamPercentUi=%u)\n",
+                 ui_w, ui_h, ui_format, g_stream_w[3], g_stream_h[3], g_ui_format,
+                 g_percent[3]);
+        }
+    } else {
+        g_ui_w = g_ui_h = 0;
+        g_ui_slot_w = g_ui_slot_h = 0;
+        g_ui_format = 0;
+        g_stream_w[3] = g_stream_h[3] = 0;
+    }
+
     compute_target(render_w, render_h);
     // Capacity follows the actual stream size, not the render size. lock_frame fixes
     // StreamPercent (150), so there is no runtime request that can grow the streams; sizing
@@ -725,7 +842,8 @@ bool ensure_shared(ID3D12Device* device, uint32_t render_w, uint32_t render_h,
                    g_want_colour_session ? g_colour_h : 0,
                    g_want_colour_session ? g_colour_slot_w : 0,
                    g_want_colour_session ? g_colour_slot_h : 0,
-                   g_want_colour_session ? g_colour_format : 0);
+                   g_want_colour_session ? g_colour_format : 0,
+                   g_ui_w, g_ui_h, g_ui_slot_w, g_ui_slot_h, g_ui_format);
 
     uint64_t reserve = mgpu::kDataStart;
     for (int i = 0; i < static_cast<int>(mgpu::kMaxStreams); ++i) {
@@ -773,7 +891,11 @@ bool ensure_shared(ID3D12Device* device, uint32_t render_w, uint32_t render_h,
                      probe.streams[mgpu::kStreamMv].slot_size) ||
         !place_slots(device, mgpu::kStreamDepth, g_depth_format, g_slot_w, g_slot_h,
                      probe.streams[mgpu::kStreamDepth].offset,
-                     probe.streams[mgpu::kStreamDepth].slot_size)) {
+                     probe.streams[mgpu::kStreamDepth].slot_size) ||
+        (g_ui_format != 0 &&
+         !place_slots(device, mgpu::kStreamUi, g_ui_format, g_ui_slot_w, g_ui_slot_h,
+                      probe.streams[mgpu::kStreamUi].offset,
+                      probe.streams[mgpu::kStreamUi].slot_size))) {
         return false;
     }
     logf("shared: placed textures ready\n");
@@ -895,6 +1017,7 @@ bool ensure_shared(ID3D12Device* device, uint32_t render_w, uint32_t render_h,
 
     g_device = device;
     g_ready  = true;
+    g_ready_ms = GetTickCount64();
     logf("shared ready: name=%hs pid=%lu used=%.1f MB slots=%u mv %ux%u fmt %u"
          " depth %ux%u fmt %u\n",
          mgpu::kMappingName, GetCurrentProcessId(),
@@ -914,6 +1037,7 @@ struct SharedInitArgs {
     uint32_t render_w = 0, render_h = 0;
     uint32_t mv_format = 0;
     uint32_t colour_w = 0, colour_h = 0, colour_format = 0;
+    uint32_t ui_w = 0, ui_h = 0, ui_format = 0;
 };
 
 DWORD WINAPI shared_init_thread(void* p)
@@ -922,7 +1046,8 @@ DWORD WINAPI shared_init_thread(void* p)
     if (a == nullptr) { return 1; }
     const ULONGLONG t0 = GetTickCount64();
     const bool ok = ensure_shared(a->device, a->render_w, a->render_h, a->mv_format,
-                                  a->colour_w, a->colour_h, a->colour_format);
+                                  a->colour_w, a->colour_h, a->colour_format,
+                                  a->ui_w, a->ui_h, a->ui_format);
     logf("producer: shared init worker %s after %llu ms\n",
          ok ? "ready" : "FAILED",
          static_cast<unsigned long long>(GetTickCount64() - t0));
@@ -934,7 +1059,8 @@ DWORD WINAPI shared_init_thread(void* p)
 
 void start_shared_init(ID3D12Device* device, uint32_t render_w, uint32_t render_h,
                        uint32_t mv_format, uint32_t colour_w, uint32_t colour_h,
-                       uint32_t colour_format)
+                       uint32_t colour_format, uint32_t ui_w, uint32_t ui_h,
+                       uint32_t ui_format)
 {
     SharedInitArgs* a = new SharedInitArgs{};
     a->device = device;
@@ -944,6 +1070,9 @@ void start_shared_init(ID3D12Device* device, uint32_t render_w, uint32_t render_
     a->colour_w = colour_w;
     a->colour_h = colour_h;
     a->colour_format = colour_format;
+    a->ui_w = ui_w;
+    a->ui_h = ui_h;
+    a->ui_format = ui_format;
     a->device->AddRef();
     HANDLE th = CreateThread(nullptr, 0, &shared_init_thread, a, 0, nullptr);
     if (th != nullptr) {
@@ -1076,8 +1205,8 @@ bool copy_stream(ID3D12GraphicsCommandList* list, ID3D12Resource* src, int strea
 
     const D3D12_RESOURCE_DESC sd = src->GetDesc();
     const D3D12_RESOURCE_DESC dd = dst->GetDesc();
-    static const char* const kStreamName[3] = { "colour", "mv", "depth" };
-    const char* sname = (stream >= 0 && stream <= 2) ? kStreamName[stream] : "stream";
+    static const char* const kStreamName[4] = { "colour", "mv", "depth", "ui" };
+    const char* sname = (stream >= 0 && stream <= 3) ? kStreamName[stream] : "stream";
     if (sd.Width == 0 || sd.Height == 0) { return false; }
     if (static_cast<uint32_t>(sd.Width) > static_cast<uint32_t>(dd.Width) ||
         sd.Height > dd.Height) {
@@ -1114,11 +1243,11 @@ bool copy_stream(ID3D12GraphicsCommandList* list, ID3D12Resource* src, int strea
     // v22: colour always needs a transition out of the game's declared state. If the only
     // list available is a COPY list (some UE5 tag lanes), skip the colour instead of
     // issuing an invalid copy; MV/depth may still be copied.
-    if (stream == 0 && !can_barrier) {
+    if ((stream == 0 || stream == 3) && !can_barrier) {
         static bool told = false;
         if (!told) {
             told = true;
-            logf("[colour] COPY list has no barriers - colour stream skipped\n");
+            logf("[%s] COPY list has no barriers - stream skipped\n", sname);
         }
         return false;
     }
@@ -1138,7 +1267,9 @@ bool copy_stream(ID3D12GraphicsCommandList* list, ID3D12Resource* src, int strea
                                                               : (stream == 1
                                                                      ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
                                                                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
-                                                                     : D3D12_RESOURCE_STATE_DEPTH_READ))));
+                                                                     : (stream == 3
+                                                                            ? D3D12_RESOURCE_STATE_COMMON
+                                                                            : D3D12_RESOURCE_STATE_DEPTH_READ)))));
 
     if (can_barrier && before != D3D12_RESOURCE_STATE_COPY_SOURCE) {
         barrier(list, src, before, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1155,8 +1286,8 @@ bool copy_stream(ID3D12GraphicsCommandList* list, ID3D12Resource* src, int strea
         barrier(list, src, D3D12_RESOURCE_STATE_COPY_SOURCE, before);
     }
 
-    static bool told[3] = {};
-    if (stream >= 0 && stream <= 2 && !told[stream]) {
+    static bool told[4] = {};
+    if (stream >= 0 && stream <= 3 && !told[stream]) {
         told[stream] = true;
         logf("[%s] copy %ux%u fmt %u (declared state 0x%X, list type %d)\n",
              sname, w, h, static_cast<unsigned>(sd.Format),
@@ -1313,8 +1444,32 @@ const MgpuFgResource& colour_source(const MgpuFgFrame& f)
     return f.stream[MGPU_FG_STREAM_HUDLESS];
 }
 
+// A ready transport that never gets a present tick cannot publish anything: the only
+// publisher entry point is MgpuProducerPresent(), which fakerFG calls from the Present
+// detour it installs after xefg_dyn::Load() succeeded (XeFG has to take the swap chain).
+// When that fails - libxess_fg.dll without xefgSwapChainD3D12GetProperties, the cyberpunk
+// 1.2.0 field case - the mapping exists but every publication is skipped, and the UI keeps
+// saying "not the producer". Report the real reason once, from the record path (the only
+// callback that still ticks in that state).
+void present_watchdog()
+{
+    if (!g_ready || g_ready_ms == 0 || g_present_calls != 0) { return; }
+    static bool told = false;
+    if (told) { return; }
+    const ULONGLONG now = GetTickCount64();
+    if (now - g_ready_ms < 5000) { return; }
+    told = true;
+    logf("producer: transport ready for %llu ms but no present tick arrived - fakerFG's"
+         " Present detour is NOT installed.\n"
+         "producer:   check <exe>_fakerFG.log for \"xefg: libxess_fg not loadable\" /"
+         " \"XeFG could not take the swap chain\"; the title's own libxess_fg.dll may be too"
+         " old - deploy the packaged one to <game>\\fakerFG\\libxess_fg.dll\n",
+         static_cast<unsigned long long>(now - g_ready_ms));
+}
+
 void on_record(const MgpuFgFrame* f, void* /*user*/)
 {
+    present_watchdog();
     ++g_record_in;
     if (g_t0 == 0) { g_t0 = GetTickCount64(); }
     static uint64_t s_last_hb = 0;
@@ -1353,6 +1508,7 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
     const MgpuFgResource& mv = f->stream[MGPU_FG_STREAM_MV];
     const MgpuFgResource& dp = f->stream[MGPU_FG_STREAM_DEPTH];
     const MgpuFgResource& col = colour_source(*f);
+    const MgpuFgResource& ui = f->stream[MGPU_FG_STREAM_UI_COLOR];
     if (mv.resource == nullptr && dp.resource == nullptr && col.resource == nullptr) {
         return;
     }
@@ -1413,6 +1569,8 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
             if (!s_colour_ini) {
                 s_colour_ini = true;
                 g_want_colour_session = ini_int(L"ColourStream", 0) != 0;
+                g_want_ui_session = ini_int(L"UiStream", 1) != 0;
+                g_ui_premultiplied = ini_int(L"UiPremultiplied", 1) != 0;
                 g_force_inline = ini_int(L"CopyInline", 0) != 0;
                 if (!g_want_colour_session) {
                     logf("producer: ColourStream=0 - colour is not published"
@@ -1432,6 +1590,15 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
             if (cf == 0) { cf = static_cast<uint32_t>(cd.Format); }
         }
         if (cw < 256 || ch < 256) { cw = f->output_w; ch = f->output_h; }
+        uint32_t uw = ui.width, uh = ui.height, uf = ui.format;
+        if ((uw == 0 || uh == 0) && ui.resource != nullptr) {
+            const D3D12_RESOURCE_DESC ud =
+                static_cast<ID3D12Resource*>(ui.resource)->GetDesc();
+            uw = static_cast<uint32_t>(ud.Width);
+            uh = ud.Height;
+            if (uf == 0) { uf = static_cast<uint32_t>(ud.Format); }
+        }
+        if (uw < 64 || uh < 64 || uf == 0) { uw = uh = uf = 0; }
         // A depth-only record (no motion vectors) still has to size the transport.
         // f.render_w/h used to come only from the MV stream; fakerFG now falls back to
         // depth there, and this second fallback keeps an older fakerFG working too.
@@ -1442,7 +1609,7 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
         }
         ID3D12Device* dev = static_cast<ID3D12Device*>(f->device);
         if (InterlockedCompareExchange(&g_init_started, 1, 0) == 0) {
-            start_shared_init(dev, eff_rw, eff_rh, fmt, cw, ch, cf);
+            start_shared_init(dev, eff_rw, eff_rh, fmt, cw, ch, cf, uw, uh, uf);
         }
         if (InterlockedCompareExchange(&g_init_failed, 0, 0) != 0) {
             static bool told_fail = false;
@@ -1485,7 +1652,19 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
     const bool want_colour = g_want_colour_session &&
                              (want & mgpu::kRequestColor) != 0 &&
                              col.resource != nullptr;
-    if (!want_mv && !want_depth && !want_colour) {
+    const bool want_ui = g_want_ui_session &&
+                         (want & mgpu::kRequestUi) != 0 &&
+                         ui.resource != nullptr && g_ui_format != 0 &&
+                         g_stream_w[3] >= 64 && g_stream_h[3] >= 64;
+    if ((want & mgpu::kRequestUi) && ui.resource == nullptr) {
+        static bool told_no_ui = false;
+        if (!told_no_ui) {
+            told_no_ui = true;
+            logf("producer: consumer requested UI but this record has no UI resource"
+                 " - stream 3 cannot be published\n");
+        }
+    }
+    if (!want_mv && !want_depth && !want_colour && !want_ui) {
         static bool told = false;
         if (!told) {
             told = true;
@@ -1639,7 +1818,9 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
             static_cast<D3D12_RESOURCE_STATES>(mv.state) == D3D12_RESOURCE_STATE_COPY_SOURCE;
         const bool dp_ok = !want_depth || g_scaled[2] ||
             static_cast<D3D12_RESOURCE_STATES>(dp.state) == D3D12_RESOURCE_STATE_COPY_SOURCE;
-        use_dma = mv_ok && dp_ok;
+        const bool ui_ok = !want_ui || g_scaled[3] ||
+            static_cast<D3D12_RESOURCE_STATES>(ui.state) == D3D12_RESOURCE_STATE_COPY_SOURCE;
+        use_dma = mv_ok && dp_ok && ui_ok;
     }
     auto* copy_list = g_force_inline
                           ? list
@@ -1661,7 +1842,7 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
     // sending one scaled and one full-size texture.
     // Wide depth additionally needs the pass at any percent, including 100: the source
     // is R32G8X24 (8 B/px) and the slot is R32 (4 B/px).
-    bool scaled_mv = false, scaled_depth = false;
+    bool scaled_mv = false, scaled_depth = false, scaled_ui = false;
     const bool need_depth_convert = want_depth && dp.resource != nullptr &&
                                     wide_depth_format(static_cast<DXGI_FORMAT>(dp.format));
     // Only pass a stream through the downscale when its source actually exists. A
@@ -1672,7 +1853,8 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
     const bool need_scaled_mv = want_mv && mv.resource != nullptr && g_scaled[1];
     const bool need_scaled_depth = want_depth && dp.resource != nullptr &&
                                    (g_scaled[2] || need_depth_convert);
-    if (need_scaled_mv || need_scaled_depth) {
+    const bool need_scaled_ui = want_ui && ui.resource != nullptr && g_scaled[3];
+    if (need_scaled_mv || need_scaled_depth || need_scaled_ui) {
         const bool can_dispatch =
             list != nullptr && (list->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT ||
                                 list->GetType() == D3D12_COMMAND_LIST_TYPE_COMPUTE);
@@ -1692,6 +1874,9 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
         if (ok && need_scaled_depth) {
             ok = scale_dispatch(list, static_cast<ID3D12Resource*>(dp.resource), dp.state, 2);
         }
+        if (ok && need_scaled_ui) {
+            ok = scale_dispatch(list, static_cast<ID3D12Resource*>(ui.resource), ui.state, 3);
+        }
         if (!ok) {
             static bool told = false;
             if (!told) { told = true; logf("downscale: pass failed - frames skipped\n"); }
@@ -1699,6 +1884,7 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
         }
         scaled_mv = need_scaled_mv;
         scaled_depth = need_scaled_depth;
+        scaled_ui = need_scaled_ui;
         if (need_depth_convert) {
             static bool told_wide = false;
             if (!told_wide) {
@@ -1722,6 +1908,13 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
         const uint32_t state = scaled_depth ? static_cast<uint32_t>(D3D12_RESOURCE_STATE_COPY_SOURCE)
                                             : dp.state;
         if (copy_stream(copy_list, src, 2, state)) { g_copied_mask |= mgpu::kRequestDepth; }
+    }
+    if (want_ui && (g_copied_mask & mgpu::kRequestUi) == 0) {
+        ID3D12Resource* src = scaled_ui ? g_ds_tex[3].Get()
+                                        : static_cast<ID3D12Resource*>(ui.resource);
+        const uint32_t state = scaled_ui ? static_cast<uint32_t>(D3D12_RESOURCE_STATE_COPY_SOURCE)
+                                         : ui.state;
+        if (copy_stream(copy_list, src, 3, state)) { g_copied_mask |= mgpu::kRequestUi; }
     }
     // v22: colour, verbatim, into the same publication slot. Its declared state is used
     // for the barrier exactly like MV/depth.
@@ -1898,6 +2091,7 @@ void publish_frame(void* queue_ptr)
         if (g_copied_mask & mgpu::kRequestColor) { active |= mgpu::kRequestColor; }
         if (g_copied_mask & mgpu::kRequestMv)    { active |= mgpu::kRequestMv; }
         if (g_copied_mask & mgpu::kRequestDepth) { active |= mgpu::kRequestDepth; }
+        if (g_copied_mask & mgpu::kRequestUi)    { active |= mgpu::kRequestUi; }
         c->active_mask    = active;
         c->stream_bytes[mgpu::kStreamColour] = (active & mgpu::kRequestColor)
                                  ? g_colour_w * g_colour_h *
@@ -1907,6 +2101,10 @@ void publish_frame(void* queue_ptr)
                                  ? g_stream_w[1] * g_stream_h[1] * 4u : 0u;
         c->stream_bytes[mgpu::kStreamDepth] = (active & mgpu::kRequestDepth)
                                  ? g_stream_w[2] * g_stream_h[2] * 4u : 0u;
+        c->stream_bytes[mgpu::kStreamUi] = (active & mgpu::kRequestUi)
+                                 ? g_stream_w[3] * g_stream_h[3] *
+                                   ((g_ui_format == DXGI_FORMAT_R10G10B10A2_UNORM) ? 4u : 4u)
+                                 : 0u;
         c->frame_published = f.seq;
         g_last_published_seq = f.seq;
         static int trace_pub = -1;

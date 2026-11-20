@@ -72,6 +72,9 @@
 // from lock_frame/shaders/upsample_joint.hlsl by lock_frame/build.sh and embedded, so
 // the exe never needs d3dcompiler at runtime (same convention as the producer's shaders).
 #include "upsample_joint_cso.h"
+// B mode 4: consumer-side UI unblend (HUDless = present - UI). The CSO is compiled from
+// lock_frame/shaders/unblend_ui.hlsl by lock_frame/build.sh and embedded like the others.
+#include "unblend_ui_cso.h"
 
 // AMD FidelityFX optical flow: compute the motion vectors locally on the AMD card
 // instead of trusting the producer's MV stream (that stream measured as garbage on
@@ -112,6 +115,7 @@ using Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess;
 #include "modules/060_frame_io.inc"
 #include "modules/070_osd.inc"
 #include "modules/080_warp_upsample.inc"
+#include "modules/085_ui_unblend.inc"
 #include "modules/090_stream_auto.inc"
 #include "modules/110_pair_dump.inc"
 #include "modules/115_marker.inc"     // WGC 颜色四角 marker -> 精确配对

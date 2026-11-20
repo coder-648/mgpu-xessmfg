@@ -890,14 +890,15 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     g_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_list->DrawInstanced(3, 1, 0, 0);
 
+    // B mode 4: the chain buffer now contains the presented backbuffer (UI included).
+    // The unblend pass needs this frame's local UI copy, so it is recorded after
+    // copy_inputs_local() below, not here. Keep the chain buffer in RENDER_TARGET until
+    // then; it is transitioned to PRESENT after the pass.
+    ID3D12Resource* hudless_res = nullptr;
+
     bb[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     bb[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
     g_list->ResourceBarrier(1, &bb[1]);
-
-    bb[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    bb[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-    g_list->ResourceBarrier(1, &bb[0]);
-    bb_state = D3D12_RESOURCE_STATE_PRESENT;
 
     // 4. tag the FG inputs. The producer's resources live on a heap imported from a file
     //    mapping with ALLOW_CROSS_ADAPTER; XeSS-FG fails to copy those ("Failed to
@@ -930,6 +931,19 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     // Copy-on-publication: on a hit the reconstruction pass has the prefetched local
     // copies available (the copy-fence wait is already queued before this list).
     if (g_upsample && pf_hit) { record_upsample(slot); }
+
+    // B mode 4: only after this frame's UI copy exists. A failed/missing UI stream leaves
+    // hudless_res null, so the tag section below falls back to tagging UI (mode 2).
+    if (pair_ok && !g_of_miss && !g_no_inputs && !cq) {
+        hudless_res = record_ui_unblend(slot, bbres, draw_w, draw_h);
+    }
+
+    // The chain buffer stayed in RENDER_TARGET through the unblend pass so the pass could
+    // read it as an SRV; hand it to the presenter now.
+    bb[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    bb[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    g_list->ResourceBarrier(1, &bb[0]);
+    bb_state = D3D12_RESOURCE_STATE_PRESENT;
 
     // Policy (2026-11-11): no motion vectors -> no frame generation. Menus, loading screens and
     // transitions legitimately carry no MV, and the capture (correctly) refuses to invent a
@@ -1049,12 +1063,21 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     rd.type = XEFG_SWAPCHAIN_RES_DEPTH;
     if (!g_mv_gate_off) { g_api.D3D12TagFrameResource(g_fg, tag_list, present_id, &rd); }
 
-    // The UI travels as its own stream so the picture above can stay HUDless. Only tagged
-    // when the UI stream exists (uiMode AUTO was chosen at init from the same condition).
-    // Only tag a UI that the producer actually wrote this frame. A stale UI texture is worse
-    // than none: XeFG would composite the previous frame's overlay at the new frame's geometry.
-    if (g_ui_local[slot] && (g_ctl->active_mask & mgpu::kRequestUi) != 0 &&
-        g_ctl->streams[3].width >= 64 && g_ctl->streams[3].height >= 64) {
+    // B mode 4: if the unblend pass produced a HUDless this frame, tag it and do NOT tag
+    // UI. XeFG's AUTO mode then selects BACKBUFFER_HUDLESS (mode 4): interpolate HUDless,
+    // extract UI from the chain buffer. If unblend did not run, fall back to tagging UI
+    // alone (BACKBUFFER_UITEXTURE, mode 2). Tagging both would select mode 5, which is not
+    // what this path promises (and needs a higher-quality UI texture than we transport).
+    const bool ui_active = g_ui_local[slot] && g_ui_fresh[slot] && pair_ok && !g_of_miss &&
+                           (g_ctl->active_mask & mgpu::kRequestUi) != 0 &&
+                           g_ctl->streams[3].width >= 64 && g_ctl->streams[3].height >= 64;
+    if (hudless_res != nullptr) {
+        rd.resourceSize = { draw_w, draw_h };
+        rd.pResource = hudless_res;
+        rd.incomingState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        rd.type = XEFG_SWAPCHAIN_RES_HUDLESS_COLOR;
+        if (!g_mv_gate_off) { g_api.D3D12TagFrameResource(g_fg, tag_list, present_id, &rd); }
+    } else if (ui_active) {
         rd.resourceSize = { g_ctl->streams[3].width, g_ctl->streams[3].height };
         rd.pResource = g_ui_local[slot].Get();
         rd.incomingState = D3D12_RESOURCE_STATE_COMMON;

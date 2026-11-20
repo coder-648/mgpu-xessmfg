@@ -51,6 +51,7 @@ typedef decltype(&xefgSwapChainGetLastPresentStatus)       PFN_GetLastPresentSta
 typedef decltype(&xefgSwapChainTagFrameConstants)          PFN_TagFrameConstants;
 typedef decltype(&xefgSwapChainSetNumInterpolatedFrames)   PFN_SetNumInterpolatedFrames;
 typedef decltype(&xefgSwapChainSetSceneChangeThreshold)    PFN_SetSceneChangeThreshold;
+typedef decltype(&xefgSwapChainSetUiCompositionState)      PFN_SetUiCompositionState;
 typedef decltype(&xefgSwapChainDestroy)                    PFN_Destroy;
 
 typedef decltype(&xefgSwapChainD3D12CreateContext)         PFN_D3D12CreateContext;
@@ -91,10 +92,12 @@ struct Api
     PFN_SetNumInterpolatedFrames   SetNumInterpolatedFrames   = nullptr;
     PFN_D3D12GetInitParams         D3D12GetInitParams         = nullptr;
     PFN_SetSceneChangeThreshold    SetSceneChangeThreshold    = nullptr;
+    PFN_SetUiCompositionState      SetUiCompositionState      = nullptr;
     PFN_Destroy                    Destroy                    = nullptr;
     PFN_EnableDebugFeature         EnableDebugFeature         = nullptr;
 
     bool has_mfg() const { return SetNumInterpolatedFrames != nullptr; }
+    bool has_ui_composition() const { return SetUiCompositionState != nullptr; }
     bool ok() const { return dll != nullptr; }
 };
 
@@ -120,12 +123,68 @@ inline std::wstring exe_dir()
     return (slash == std::wstring::npos) ? std::wstring() : s.substr(0, slash + 1);
 }
 
+// The error string ends up in a byte log (fprintf "%s"), so match the ANSI code page the
+// rest of the log uses for "%ls" paths.
+inline std::string narrow(const std::wstring& s)
+{
+    if (s.empty()) { return std::string(); }
+    const int n = WideCharToMultiByte(CP_ACP, 0, s.c_str(), static_cast<int>(s.size()),
+                                      nullptr, 0, nullptr, nullptr);
+    if (n <= 0) { return std::string(); }
+    std::string out(static_cast<size_t>(n), '\0');
+    WideCharToMultiByte(CP_ACP, 0, s.c_str(), static_cast<int>(s.size()), &out[0], n,
+                        nullptr, nullptr);
+    return out;
+}
+
+// Required entry points. A DLL that cannot provide all of them is not a runtime we can
+// drive, and the reason (which names are missing) is what makes a field log answerable.
+inline void resolve_required(HMODULE m, Api& api, std::string* missing)
+{
+    resolve(m, "xefgSwapChainGetVersion",                 api.GetVersion,                 missing);
+    resolve(m, "xefgSwapChainGetProperties",              api.GetProperties,              missing);
+    resolve(m, "xefgSwapChainSetLoggingCallback",         api.SetLoggingCallback,         missing);
+    resolve(m, "xefgSwapChainSetLatencyReduction",        api.SetLatencyReduction,        missing);
+    resolve(m, "xefgSwapChainSetEnabled",                 api.SetEnabled,                 missing);
+    resolve(m, "xefgSwapChainSetPresentId",               api.SetPresentId,               missing);
+    resolve(m, "xefgSwapChainGetLastPresentStatus",       api.GetLastPresentStatus,       missing);
+    resolve(m, "xefgSwapChainTagFrameConstants",          api.TagFrameConstants,          missing);
+    resolve(m, "xefgSwapChainD3D12CreateContext",         api.D3D12CreateContext,         missing);
+    resolve(m, "xefgSwapChainD3D12GetProperties",         api.D3D12GetProperties,         missing);
+    resolve(m, "xefgSwapChainD3D12InitFromSwapChain",     api.D3D12InitFromSwapChain,     missing);
+    resolve(m, "xefgSwapChainD3D12InitFromSwapChainDesc", api.D3D12InitFromSwapChainDesc, missing);
+    resolve(m, "xefgSwapChainD3D12GetSwapChainPtr",       api.D3D12GetSwapChainPtr,       missing);
+    resolve(m, "xefgSwapChainD3D12TagFrameResource",      api.D3D12TagFrameResource,      missing);
+}
+
+// Optional: a missing one stays NULL and is simply never called.
+inline void resolve_optional(HMODULE m, Api& api)
+{
+    std::string unused;
+    resolve(m, "xefgSwapChainSetNumInterpolatedFrames",   api.SetNumInterpolatedFrames,   &unused);
+    resolve(m, "xefgSwapChainD3D12GetInitializationParameters",
+                                                          api.D3D12GetInitParams,         &unused);
+    resolve(m, "xefgSwapChainSetSceneChangeThreshold",    api.SetSceneChangeThreshold,    &unused);
+    resolve(m, "xefgSwapChainSetUiCompositionState",      api.SetUiCompositionState,      &unused);
+    resolve(m, "xefgSwapChainEnableDebugFeature",         api.EnableDebugFeature,         &unused);
+    resolve(m, "xefgSwapChainDestroy",                    api.Destroy,                    &unused);
+}
+
 } // namespace detail
 
 // Loads the DLL and resolves the table.
 //
 //   override_path - from --fg-lib; when set it is the only candidate.
-//   err           - human readable reason on failure (may be nullptr).
+//   err           - human readable reason on failure (may be nullptr). On failure it
+//                   names EVERY candidate that was tried and why it was rejected.
+//
+// Every candidate is tried, not just the first one that loads. A title can ship its own
+// libxess_fg.dll built against a different XeSS SDK: LoadLibrary succeeds, but the
+// required entry points are not all there (Cyberpunk 2077, 2026-11-20:
+// "missing exports: xefgSwapChainD3D12GetProperties"). Stopping at that candidate hid
+// the good copy our own "fakerFG\" folder was carrying, and the failure then cascaded
+// into "producer never started" because producer_present() lives on XeFG's present
+// detour.
 //
 // Returns true only when every required entry point was found.
 inline bool Load(Api& api, const std::wstring& override_path, std::string* err)
@@ -145,56 +204,49 @@ inline bool Load(Api& api, const std::wstring& override_path, std::string* err)
         tries[n++] = L"libxess_fg.dll";
     }
 
+    std::string problems;
     DWORD last_error = 0;
-    for (int i = 0; i < n && api.dll == nullptr; ++i) {
+    auto note = [&problems](const std::string& s) {
+        if (!problems.empty()) { problems += "; "; }
+        problems += s;
+    };
+
+    for (int i = 0; i < n; ++i) {
         if (tries[i].empty()) { continue; }
+
         // LOAD_WITH_ALTERED_SEARCH_PATH so a DLL picked from another folder finds
         // the libxell.dll next to *it*, not the one next to us.
-        api.dll = LoadLibraryExW(tries[i].c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-        if (api.dll) {
-            api.path = tries[i];
-        } else {
+        HMODULE dll = LoadLibraryExW(tries[i].c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (dll == nullptr) {
             last_error = GetLastError();
+            note(detail::narrow(tries[i]) + " -> LoadLibrary err=" + std::to_string(last_error));
+            continue;
         }
+
+        Api candidate{};
+        std::string missing;
+        detail::resolve_required(dll, candidate, &missing);
+        if (!missing.empty()) {
+            // Keep looking: our own folder may hold a runtime this title's build is
+            // missing (that is the whole reason fakerFG\ comes first).
+            note(detail::narrow(tries[i]) + " -> missing exports: " + missing);
+            FreeLibrary(dll);
+            continue;
+        }
+
+        detail::resolve_optional(dll, candidate);
+        candidate.dll  = dll;
+        candidate.path = tries[i];
+        api = candidate;
+        return true;
     }
 
-    if (!api.dll) {
-        if (err) { *err = "LoadLibrary failed, GetLastError=" + std::to_string(last_error); }
-        return false;
+    if (err) {
+        *err = problems.empty()
+                   ? ("LoadLibrary failed, GetLastError=" + std::to_string(last_error))
+                   : problems;
     }
-
-    std::string missing;
-    detail::resolve(api.dll, "xefgSwapChainGetVersion",                 api.GetVersion,                 &missing);
-    detail::resolve(api.dll, "xefgSwapChainGetProperties",              api.GetProperties,              &missing);
-    detail::resolve(api.dll, "xefgSwapChainSetLoggingCallback",         api.SetLoggingCallback,         &missing);
-    detail::resolve(api.dll, "xefgSwapChainSetLatencyReduction",        api.SetLatencyReduction,        &missing);
-    detail::resolve(api.dll, "xefgSwapChainSetEnabled",                 api.SetEnabled,                 &missing);
-    detail::resolve(api.dll, "xefgSwapChainSetPresentId",               api.SetPresentId,               &missing);
-    detail::resolve(api.dll, "xefgSwapChainGetLastPresentStatus",       api.GetLastPresentStatus,       &missing);
-    detail::resolve(api.dll, "xefgSwapChainTagFrameConstants",          api.TagFrameConstants,          &missing);
-    detail::resolve(api.dll, "xefgSwapChainD3D12CreateContext",         api.D3D12CreateContext,         &missing);
-    detail::resolve(api.dll, "xefgSwapChainD3D12GetProperties",         api.D3D12GetProperties,         &missing);
-    detail::resolve(api.dll, "xefgSwapChainD3D12InitFromSwapChain",     api.D3D12InitFromSwapChain,     &missing);
-    detail::resolve(api.dll, "xefgSwapChainD3D12InitFromSwapChainDesc", api.D3D12InitFromSwapChainDesc, &missing);
-    detail::resolve(api.dll, "xefgSwapChainD3D12GetSwapChainPtr",       api.D3D12GetSwapChainPtr,       &missing);
-    detail::resolve(api.dll, "xefgSwapChainD3D12TagFrameResource",      api.D3D12TagFrameResource,      &missing);
-
-    // Optional: a missing one stays NULL and is simply never called.
-    std::string optional_missing;
-    detail::resolve(api.dll, "xefgSwapChainSetNumInterpolatedFrames",   api.SetNumInterpolatedFrames,   &optional_missing);
-    detail::resolve(api.dll, "xefgSwapChainD3D12GetInitializationParameters",
-                                                                       api.D3D12GetInitParams,         &optional_missing);
-    detail::resolve(api.dll, "xefgSwapChainSetSceneChangeThreshold",    api.SetSceneChangeThreshold,    &optional_missing);
-    detail::resolve(api.dll, "xefgSwapChainEnableDebugFeature",         api.EnableDebugFeature,         &optional_missing);
-    detail::resolve(api.dll, "xefgSwapChainDestroy",                    api.Destroy,                    &optional_missing);
-
-    if (!missing.empty()) {
-        if (err) { *err = "missing exports: " + missing; }
-        FreeLibrary(api.dll);
-        api = Api{};
-        return false;
-    }
-    return true;
+    return false;
 }
 
 } // namespace xefg_dyn

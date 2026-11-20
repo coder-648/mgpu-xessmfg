@@ -4,8 +4,9 @@
 `lock_frame` 在另一块显卡上用 XeSS-FG 插帧，再叠加回游戏窗口上屏——
 目标是在不换显卡的情况下把帧数翻倍到 4 倍。
 
-当前正式版：**lock_frame 1.2.0**（共享协议 v28，GPL-3.0）。
-发布包**自带 Intel 运行时**（`libxess_fg.dll` / `libxell.dll`），解压即用。
+当前正式版：**lock_frame 1.2.1**（共享协议 v28，GPL-3.0）。
+发布包**自带 Intel 运行时**（`libxess_fg.dll` / `libxell.dll`），解压即用；
+安装时它们会被写入 `<游戏>\fakerFG\`（1.2.1 修复：游戏进程里的 XeFG 只从这里加载）。
 
 ![主界面](docs/bilibili/images/01-main.png)
 

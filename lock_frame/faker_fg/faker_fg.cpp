@@ -665,6 +665,17 @@ Config& cfg()
 static bool g_record_pending = false;
 static unsigned g_collapsed_same_present = 0;
 
+// Releasing the flag is producer_present()'s job, and that call lives on the Present
+// detour XeFG installs only after it has taken the swap chain. When that never happens
+// (libxess_fg.dll without xefgSwapChainD3D12GetProperties -> "XeFG could not take the
+// swap chain"), the flag stayed true for the whole session and every later record was
+// collapsed into "same present": exactly ONE record reached the producer, its 1.2 s
+// publish gate expired and Local\mgpu_mailbox_v1 was never created, so the UI reported
+// "target ... is not the producer (producer_pid=0)" (Cyberpunk 2077, 2026-11-20).
+// A record this much newer than the pending one cannot belong to the same presentation;
+// release the stale slot instead of wedging the transport for the rest of the session.
+inline constexpr uint64_t kStalePendingMs = 100;
+
 // ---------------------------------------------------------------- record
 void publish_record(const MgpuFgFrame& f)
 {
@@ -679,7 +690,10 @@ void publish_record(const MgpuFgFrame& f)
     // made the present ring's seq miss the producer's frame_id. Collapse them here.
     bool duplicate = false;
     bool same_present = false;
+    bool stale_present = false;
+    uint64_t prev_qpc = 0;
     lock_record();
+    prev_qpc = g_record.frame_qpc_ms;
     if (f.frame_qpc_ms != 0 && g_record.frame_qpc_ms != 0 &&
         f.stream[MGPU_FG_STREAM_MV].resource == g_record.stream[MGPU_FG_STREAM_MV].resource &&
         f.stream[MGPU_FG_STREAM_DEPTH].resource == g_record.stream[MGPU_FG_STREAM_DEPTH].resource &&
@@ -691,9 +705,26 @@ void publish_record(const MgpuFgFrame& f)
     // present's seq and the producer publishes it. A second seq would only make the marker
     // point at a frame_id that never reaches frames[] (the classic no_slot).
     // The producer_present() boundary is the authoritative "same presentation" scope.
-    if (g_record_pending) { same_present = true; }
+    if (g_record_pending) {
+        if (f.frame_qpc_ms != 0 && prev_qpc != 0 && f.frame_qpc_ms > prev_qpc &&
+            f.frame_qpc_ms - prev_qpc > kStalePendingMs) {
+            stale_present = true;      // no present boundary ever arrived for the old one
+        } else {
+            same_present = true;
+        }
+    }
     unlock_record();
     if (duplicate) { return; }
+    if (stale_present) {
+        static unsigned told_stall = 0;
+        ++told_stall;
+        if (told_stall <= 5 || (told_stall % 600u) == 0u) {
+            logf("record: pending record never reached a present (%llu ms older) -"
+                 " publishing anyway; is the swap chain hooked? (XeFG/libxess_fg; %u so far)\n",
+                 static_cast<unsigned long long>(f.frame_qpc_ms - prev_qpc), told_stall);
+        }
+        fg_present_done();
+    }
     if (same_present) {
         ++g_collapsed_same_present;
         if ((g_collapsed_same_present % 600u) == 0u) {

@@ -7,5 +7,5 @@ rem ===========================================================================
 setlocal
 cd /d "%~dp0"
 "%~dp0lock_frame.exe" --game Cyberpunk2077.exe --mode 4x --interp 3 ^
-  --unlock-mfg --fg-ui none --fg-rt-mode auto --report 40 --pool 4 --latency 1 ^
+  --unlock-mfg --fg-rt-mode auto --report 40 --pool 4 --latency 1 ^
   > "%~dp0lock_frame_4x.log" 2>&1

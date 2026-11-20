@@ -51,6 +51,14 @@ build_consumer() {
             || { echo "[build] fxc failed for $name"; return 1; }
     done
 
+    "$FXC_WIN" -nologo -T cs_5_0 -E CSMain \
+        -Fo "$(wslpath -w "$stage/unblend_ui.cso")" \
+        "$(wslpath -w "$HERE/shaders/unblend_ui.hlsl")" \
+        || { echo "[build] fxc failed for unblend_ui"; return 1; }
+    python3 "$REPO/scripts/embed_cso.py" "$stage/unblend_ui.cso" \
+        "$stage/unblend_ui_cso.h" "UnblendUI" \
+        || { echo "[build] embed failed for unblend_ui"; return 1; }
+
     ( cd "$stage" && cmd.exe /c build.bat "$REPO_WIN" > build.log 2>&1 )
     local rc=$?
     echo "[build] cl exit code: $rc"
@@ -70,7 +78,8 @@ build_producer() {
     cp "$HERE/producer"/*.cpp "$HERE/producer"/*.h "$stage/"
     [ -x "$FXC_WIN" ] || { echo "[build] fxc.exe not found"; return 1; }
     for spec in "downsample_mv:cs_5_0:CSMain:DownsampleMV:downsample_mv" \
-                "downsample_depth:cs_5_0:CSMain:DownsampleDepth:downsample_depth"; do
+                "downsample_depth:cs_5_0:CSMain:DownsampleDepth:downsample_depth" \
+                "downsample_ui:cs_5_0:CSMain:DownsampleUI:downsample_ui"; do
         IFS=: read -r base prof entry sym out <<< "$spec"
         "$FXC_WIN" -nologo -T "$prof" -E "$entry" \
             -Fo "$(wslpath -w "$stage/$out.cso")" \

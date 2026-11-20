@@ -209,6 +209,8 @@ static const TrPair kTr[] = {
     { L"缺少 libxess_fg.dll / libxell.dll", L"Missing libxess_fg.dll / libxell.dll" },
     { L"缺少 libxell.dll", L"Missing libxell.dll" },
     { L"缺少 libxess_fg.dll", L"Missing libxess_fg.dll" },
+    { L"游戏目录 fakerFG 里缺少 libxess_fg.dll（点[重新应用配置]自动写入）",
+      L"libxess_fg.dll missing in <game>\\fakerFG (Re-apply config writes it)" },
     { L"未提供 SHA256SUMS.txt（开发构建）", L"SHA256SUMS.txt not provided (dev build)" },
     { L"无匹配文件（开发构建）", L"No matching files (dev build)" },
     { L"未校验", L"Not checked" },
@@ -822,6 +824,8 @@ static int opt_get(Id id)
 static bool target_game_ini(std::wstring* out);
 static std::wstring exe_dir();
 static bool exe_file_exists(const wchar_t* name);
+static bool game_runtime_ok(const std::wstring& dir);
+static bool file_in_dir(const std::wstring& dir, const wchar_t* name);
 static std::wstring row_value(Id id)
 {
     wchar_t buf[128]{};
@@ -866,9 +870,15 @@ static std::wstring row_value(Id id)
     case ID_CHECK_RUNTIME: {
         const bool fg = exe_file_exists(L"libxess_fg.dll");
         const bool xell = exe_file_exists(L"libxell.dll");
-        if (fg && xell) { return L"libxess_fg + libxell OK"; }
         if (!fg && !xell) { return L"缺少 libxess_fg.dll / libxell.dll"; }
-        return fg ? L"缺少 libxell.dll" : L"缺少 libxess_fg.dll";
+        if (!fg) { return L"缺少 libxess_fg.dll"; }
+        if (!xell) { return L"缺少 libxell.dll"; }
+        // 运行时还得在游戏目录的 fakerFG\ 里（XeFG 是在游戏进程里加载的，
+        // 游戏自带那份可能缺导出）。
+        if (!g_game_dir.empty() && !game_runtime_ok(g_game_dir)) {
+            return L"游戏目录 fakerFG 里缺少 libxess_fg.dll（点[重新应用配置]自动写入）";
+        }
+        return L"libxess_fg + libxell OK";
     }
     case ID_CHECK_GAME: {
         std::wstring ini;
@@ -1191,6 +1201,19 @@ static bool file_in_dir(const std::wstring& dir, const wchar_t* name)
 {
     if (dir.empty() || name == nullptr) { return false; }
     return GetFileAttributesW((dir + L"\\" + name).c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+// XeFG runs inside the game process and loads its runtime from
+//   <game>\fakerFG\libxess_fg.dll  ->  <game>\libxess_fg.dll  ->  search path   (xefg_dyn.h)
+// Only OUR copy counts here. A title's own libxess_fg.dll is "found" but can be a build
+// that lacks xefgSwapChainD3D12GetProperties (Cyberpunk 2077, 2026-11-20) - then XeFG
+// never takes the swap chain, producer_present() never runs and the MV/depth transport
+// dies with it. Existence of <game>\libxess_fg.dll therefore proves nothing; existence of
+// fakerFG\libxess_fg.dll proves the packaged runtime is the one that will be loaded.
+static bool game_runtime_ok(const std::wstring& dir)
+{
+    if (dir.empty()) { return false; }
+    return file_in_dir(dir, L"fakerFG\\libxess_fg.dll");
 }
 
 static std::wstring game_dir_for_window(HWND hwnd)
@@ -1516,6 +1539,41 @@ static bool deploy_game_dir(const std::wstring& dir, std::wstring* out)
         line(L"[注意] 发布包里没有 xess_mfg_producer.dll");
     }
 
+    // Intel 运行时必须进**游戏目录**：XeFG 在游戏进程里加载它（先找 <游戏>\fakerFG\，
+    // 再找 <游戏>\ 本身 —— 见 src/xefg_dyn.h）。只放在 UI 旁边的 1.2.0 打包方式会让
+    // 游戏加载到它自己那份旧 DLL（LoadLibrary 成功、但缺 xefgSwapChainD3D12GetProperties），
+    // XeFG 拿不到 swap chain ⇒ producer_present() 从不执行 ⇒ 共享内存不创建，
+    // UI 报 “target ... is not the producer (producer_pid=0)”。放在我们自己的子目录，
+    // 不覆盖游戏自带文件。
+    {
+        const std::wstring rt_dir = dir + L"\\fakerFG";
+        CreateDirectoryW(rt_dir.c_str(), nullptr);   // 已存在时失败无妨
+        const wchar_t* runtime[] = { L"libxess_fg.dll", L"libxell.dll" };
+        int want = 0, copied = 0;
+        for (const wchar_t* name : runtime) {
+            if (!exe_file_exists(name)) { continue; }
+            ++want;
+            if (CopyFileW((src + L"\\" + name).c_str(),
+                          (rt_dir + L"\\" + name).c_str(), FALSE)) {
+                ++copied;
+            }
+        }
+        wchar_t b[360]{};
+        if (copied > 0) {
+            _snwprintf_s(b, _TRUNCATE,
+                         L"已写入 Intel 运行时 %d/%d 个到 %s（XeFG 需要，producer 靠它启动）",
+                         copied, want, rt_dir.c_str());
+            line(b);
+            if (copied < want) {
+                line(L"[注意] 有运行时文件没复制成功（游戏是否正在运行？）");
+            }
+        } else if (want > 0) {
+            line(L"[注意] Intel 运行时复制失败：XeFG 无法接管，producer 不会启动");
+        } else {
+            line(L"[注意] 发布包里没有 libxess_fg.dll / libxell.dll：游戏侧 XeFG 无法接管");
+        }
+    }
+
     if (!file_in_dir(dir, L"fakerFG.ini")) {
         if (exe_file_exists(L"fakerFG.ini") &&
             CopyFileW((src + L"\\fakerFG.ini").c_str(),
@@ -1553,6 +1611,29 @@ static bool undeploy_game_dir(const std::wstring& dir, std::wstring* out)
     const wchar_t* ours[] = { L"nvngx_dlssg.dll", L"fakerFG.dll", L"xess_mfg_producer.dll" };
     for (const wchar_t* name : ours) {
         DeleteFileW((dir + L"\\" + name).c_str());
+    }
+
+    // 部署时写进 <游戏>\fakerFG\ 的 Intel 运行时也要一起清掉（那是我们自己的子目录，
+    // 游戏原文不会在里面）。只删与发布包同尺寸的那份，避免把用户自己放进去的
+    // 其他版本运行时误删；目录非空时 RemoveDirectory 也会失败，作为第二道保护。
+    {
+        const std::wstring rt_dir = dir + L"\\fakerFG";
+        int removed = 0;
+        const wchar_t* runtime[] = { L"libxess_fg.dll", L"libxell.dll" };
+        for (const wchar_t* name : runtime) {
+            const std::wstring dst = rt_dir + L"\\" + name;
+            const std::wstring ours_path = exe_dir() + L"\\" + name;
+            WIN32_FILE_ATTRIBUTE_DATA a{}, b{};
+            if (GetFileAttributesExW(dst.c_str(), GetFileExInfoStandard, &a) &&
+                GetFileAttributesExW(ours_path.c_str(), GetFileExInfoStandard, &b) &&
+                a.nFileSizeHigh == b.nFileSizeHigh && a.nFileSizeLow == b.nFileSizeLow) {
+                if (DeleteFileW(dst.c_str())) { ++removed; }
+            }
+        }
+        if (removed > 0) {
+            RemoveDirectoryW(rt_dir.c_str());
+            line(L"已移除 fakerFG 子目录里的 Intel 运行时");
+        }
     }
 
     // dxgi.dll 单独特判：有 .bak 才能安全删（随后会还原）；没有 .bak 时只有确认它
@@ -1651,7 +1732,8 @@ static void refresh_readiness()
     r.deployed = !g_game_dir.empty() && file_in_dir(g_game_dir, L"fakerFG.dll") &&
                  file_in_dir(g_game_dir, L"dxgi.dll");
     r.runtime = exe_file_exists(L"libxess_fg.dll") &&
-                (S().fg_mode < 1 || exe_file_exists(L"libxell.dll"));
+                (S().fg_mode < 1 || exe_file_exists(L"libxell.dll")) &&
+                (g_game_dir.empty() || game_runtime_ok(g_game_dir));
     r.ini = !g_game_dir.empty() && faker_ini_ok(g_game_dir);
     g_ini_drift = false;
     if (r.deployed && !g_game_dir.empty()) {
@@ -3059,7 +3141,10 @@ static std::wstring build_cmdline(HWND target, bool display)
     // Current pipeline: publications are consumed in order and the in-frame marker is the
     // pairing key (see docs/findings/PERF_ROUND_HANDOVER.md). --report 40 keeps the log
     // readable while still showing every phase of a slow frame.
-    cmd += L" --fg-ui none --fg-rt-mode auto --upsample --report 40";
+    // B mode 4: do NOT force --fg-ui none. UI composition is gated by the producer's
+    // UI stream; with no stream XeFG stays on its default (NONE), with one the consumer
+    // unblends a HUDless and falls back to UI-only mode 2 if that fails.
+    cmd += L" --fg-rt-mode auto --upsample --report 40";
     // 2x 不需要解锁：原版库就支持 1 张插值帧。3x/4x 继续沿用现有的字节补丁，
     // 保证非 Intel 卡上开箱即用；补丁失败时 consumer 会回退并打日志。
     if (mul > 2) { cmd += L" --unlock-mfg"; }
@@ -3331,6 +3416,11 @@ static void start_bridge(bool user_initiated)
         }
         if (!exe_file_exists(L"libxess_fg.dll")) {
             warn += L"· 缺少 libxess_fg.dll（Intel XeSS-FG 运行时，正式包默认不内置）\r\n";
+        } else if (!g_game_dir.empty() && !game_runtime_ok(g_game_dir)) {
+            // XeFG 在游戏进程里加载它；没有这份运行时，swap chain 拿不到，
+            // producer_present() 不执行，共享内存不创建（UI 会报 not the producer）。
+            warn += L"· 游戏目录里没有 XeSS-FG 运行时（<游戏>\\fakerFG\\libxess_fg.dll）："
+                    L"点[重新应用配置]会自动写入，否则 producer 不会启动\r\n";
         }
         if (S().fg_mode >= 1 && !exe_file_exists(L"libxell.dll")) {
             warn += L"· 缺少 libxell.dll（3x / 4x 需要）\r\n";

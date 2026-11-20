@@ -1,9 +1,11 @@
-# lock_frame 1.2.0
+# lock_frame 1.2.1
 
 **双显卡插帧工具。** 游戏在自己的显卡上渲染，`lock_frame` 在另一块显卡上用
 XeSS-FG 插帧，再叠加回游戏窗口。支持固定 **2x / 3x / 4x**。
 
 本包**自带 Intel 运行时**（`libxess_fg.dll` / `libxell.dll`），解压即用。
+安装时这两个 DLL 会被写入 `<游戏>\fakerFG\`，供游戏进程里的 XeFG 使用
+（1.2.1 修复：此前只放在工具目录，游戏会加载它自带的旧版运行时）。
 
 ---
 
@@ -49,6 +51,8 @@ XeSS-FG 插帧，再叠加回游戏窗口。支持固定 **2x / 3x / 4x**。
 ## 四、常见问题
 
 - **「启动补帧」是灰的**：看按钮上方提示——没选游戏 / 没安装 / 游戏没跑 / producer 未加载。
+- **提示「游戏目录 fakerFG 里缺少 libxess_fg.dll」**：点一次 **重新应用配置**，
+  它会把本包的 Intel 运行时写进 `<游戏>\fakerFG\`；然后重启游戏。
 - **提示"请先关闭游戏"**：安装/还原会替换 `dxgi.dll`，必须完全退出游戏（含托盘）。
 - **3x/4x 实际只有 2x**：确认 `libxell.dll` 在工具目录；部分游戏只支持 2x。
 - **画面撕裂/菜单点不动**：高级设置里检查 `分层窗口 / 输入转发 / OSD`，或先试 2x。
@@ -63,7 +67,8 @@ XeSS-FG 插帧，再叠加回游戏窗口。支持固定 **2x / 3x / 4x**。
 - 只卸载某个游戏：选中它 →「还原 / 移除组件」；
 - 完全卸载：删掉整个工具目录即可（不写注册表、不写 AppData）；
 - 游戏目录里如需手工清理：删除 `dxgi.dll`、`fakerFG.dll`、`nvngx_dlssg.dll`、
-  `xess_mfg_producer.dll`，并把 `dxgi.dll.bak` / `nvngx_dlssg_real.dll` 改回原名。
+  `xess_mfg_producer.dll`，删除 `fakerFG\` 子目录（安装时写入的 Intel 运行时），
+  并把 `dxgi.dll.bak` / `nvngx_dlssg_real.dll` 改回原名。
 
 ## 六、许可
 

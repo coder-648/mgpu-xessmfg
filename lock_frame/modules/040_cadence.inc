@@ -1348,6 +1348,26 @@ static bool init_fg()
     logf_("[lock] SetEnabled: %s (%d)\n", xefg_str(r), (int)r);
     if (r != XEFG_SWAPCHAIN_RESULT_SUCCESS) { return false; }
 
+    // B mode 4 gate: the UI stream existence is the only switch for XeFG UI composition.
+    // unblend success tags HUDless (mode 4); failure tags UI (mode 2). If the producer has
+    // no UI stream there is nothing to compose, so keep the library default (DISABLED).
+    {
+        const bool have_ui_stream = g_ctl && g_ctl->streams[3].slot_size != 0 &&
+                                    g_ctl->streams[3].width >= 64;
+        if (g_api.has_ui_composition()) {
+            const auto st = (have_ui_stream && !g_fg_ui_none)
+                                ? XEFG_SWAPCHAIN_UI_COMPOSITION_STATE_ENABLED
+                                : XEFG_SWAPCHAIN_UI_COMPOSITION_STATE_DISABLED;
+            const xefg_swapchain_result_t ur = g_api.SetUiCompositionState(g_fg, st);
+            logf_("[lock] SetUiCompositionState(%s): %s (%d) (ui_stream=%d unblend=%d)\n",
+                  st == XEFG_SWAPCHAIN_UI_COMPOSITION_STATE_ENABLED ? "ENABLED" : "DISABLED",
+                  xefg_str(ur), (int)ur, have_ui_stream ? 1 : 0, g_ui_unblend ? 1 : 0);
+        } else if (have_ui_stream) {
+            logf_("[lock] UI stream present but this libxess_fg has no SetUiCompositionState -"
+                  " composition stays off\n");
+        }
+    }
+
     // If the init parameter could not express the request (older DLL, or a
     // mismatch after the library clamped it) try the runtime call as well.
     fg_apply_interp("after SetEnabled");
