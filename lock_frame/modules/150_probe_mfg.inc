@@ -208,7 +208,7 @@ static bool apply_unlock_mfg()
         const std::wstring dir = mfg_program_dir();
         xefg_mfg::SetDataRoot(std::filesystem::path(dir));
         std::string perr;
-        if (xefg_mfg::Install(g_api.dll, g_consumer_vendor, &perr)) {
+        if (xefg_mfg::Install(g_api.dll, g_consumer_vendor, &perr, g_mfg_replace_all)) {
             if (xefg_unlock::Apply(g_api.dll, ll, want, &uerr, false)) {
                 g_fg_interp = static_cast<int>(want);
                 g_fg_interp_max = want;

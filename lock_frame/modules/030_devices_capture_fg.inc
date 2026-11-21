@@ -456,6 +456,14 @@ static void fg_apply_interp(const char* when)
     // Without this the "after SetEnabled" call below overwrote the start with the
     // ceiling and the first run began at 6x (bridge_pbz_dynmfg.txt: gpu 47 ms, skip 67).
     if (g_dyn_mfg) { want = (g_fg_interp_max >= 3) ? 3u : g_fg_interp_max; }
+    // --interp-start: one shot, right after SetEnabled. The capacity stays --interp (the
+    // unlock patched that in); the live-count patch keeps the switch free of a re-init.
+    if (g_fg_interp_start > 0) {
+        want = static_cast<UINT>(g_fg_interp_start);
+        g_fg_interp_start = 0;
+        logf_("[lock] --interp-start: applying %ux once (capacity %ux)\n",
+              want + 1, g_fg_interp_max + 1);
+    }
     fg_set_interp(want, when);
 }
 

@@ -100,7 +100,9 @@
 #include <cmath>
 #include <cstdlib>
 #include <cwctype>
+#include <algorithm>
 #include <deque>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -123,6 +125,7 @@ using Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess;
 // Dependency order. Keep this list in sync with lock_frame/docs/README.md.
 #include "modules/010_platform.inc"
 #include "modules/020_state_overlay.inc"
+#include "modules/025_input_quirks.inc"
 #include "modules/030_devices_capture_fg.inc"
 #include "modules/040_cadence.inc"
 #include "modules/050_shaders.inc"

@@ -321,6 +321,12 @@ xefg-mfg: model_port_applied ... "edits":167
 jitter/scene 调整都没有改善。因此 **3x/4x 默认回到 keep2x**，true model 只保留为
 `run_3x_true_model.bat` / `run_4x_true_model.bat` 的可选实验入口。
 
+> **2026-11-22 复核**：port 路线已实机确认在跑（`model_port_applied 15->16`、`shader_supplied=28`），
+> fail-black 三条都不黑说明 4x 的合成是成功的；但 4x 画质明显更差，
+> `--mfg-replace-all` 与 capacity 4/count 3 均无改善，jitter0 还会让 port 合成静默消失。
+> **决定：所有倍率保持 keep2x**，port 只作为显式实验入口。
+> 证据链见 `docs/design/OPTISCALER_XEFG_MFG_SCHEDULING.md` §9–§10。
+
 **捕获结论**：2x/3x/4x 的 WGC 捕获都使用 `--overlay-layered --wgc-minint 0`；
 `--wgc-minint -1`（Windows 默认 15–16ms）会卡高帧捕获，不再使用；`--capture-monitor` 在 overlay 场景下不可用（捕获 0 帧、画面冻结）。
 ### 8.3 审计记录：init 上限 vs 当前倍率，以及 port 路线的倍率策略（2026-11-21）

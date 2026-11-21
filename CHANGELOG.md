@@ -3,6 +3,30 @@
 只记**用户能感知**的变化与对应实测依据。每条结论的原始数据在
 `docs/findings/PERF_BASELINE.md` / `FINAL_CONFIG.md`。
 
+### release: lock_frame 1.2.7 —— 输入侧正确性 + OptiScaler 逐游戏适配（2026-11-22）
+
+发布说明见 `lock_frame/docs/RELEASE_NOTES_1.2.7.md`。协议仍 **v30**、`MgpuFgFrame` 布局与
+`fakerFG.ini` 默认值不变；模型仍是 **keep2x（model 18，所有倍率）**。
+
+- **逐游戏输入表（默认启用）**：把 OptiScaler `misc/GameConfigs.cpp` 里与 FG 输入相关的行
+  数据化移植（99→49 行；`scripts/gen_input_quirks.py` → `modules/input_quirks_data.h`）。
+  启动按 `--game` 匹配并打印；`--game-quirks apply|log|off`（默认 apply，CLI 优先），
+  `--list-quirks` 打印全表。UI「游戏侧配置」新增开关，按游戏持久化（`game_quirks`）。
+- **修复投影每帧翻转**：生产端每帧发布两条记录、只有一条带 `sl::Constants`，导致
+  `have_matrix` 隔帧翻转（FOV 51°↔60°、near/far 0.02/16777↔10/10000、矩阵真实↔合成）。
+  现在矩阵派生结果缓存 2 s（`near/far: ... matrix=2 cached`），keep2x 帧常量稳定。
+- **near/far 从游戏矩阵派生**：CP2077 实际 `zn=0.02 / zf=16777`（原来固定 10/10000）；
+  `--fg-far-finite` 仅在 far 为无限时生效。
+- **新增实验开关**：`--interp-start M`（容量/当前倍率解耦）、`--mfg-replace-all`（port 全替换）、
+  `--fg-debug-{tag-interp,only-interp,fail-black}`（此前只解析未调用，现已接
+  `xefgSwapChainEnableDebugFeature`）。
+- **模型结论（实测）**：ported model 15 确实在跑（15→16、54/5 程序、运行期 28 个 key），
+  fail-black 三条都不黑（合成被判成功），但 3x 仅略好、**4x 明显更差**（gpu 16.1 vs 17.6 ms），
+  `--mfg-replace-all` 与 capacity 4/count 3 均无改善 ⇒ **所有倍率回到 keep2x**，
+  port 仅作显式实验入口（见 `docs/design/OPTISCALER_XEFG_MFG_SCHEDULING.md` §9–§10）。
+- 文档：`docs/design/INPUT_QUIRKS_PORT.md`（输入层审计与移植）、`.../OPTISCALER_XEFG_MFG_SCHEDULING.md`
+  （调度与伪影归因）、`lock_frame/scripts/cp2077_ab/`（本地 A/B 脚本，不随包分发）。
+
 ### release: lock_frame 1.2.6 —— PBZ 双卡 FG 两个 bug 修复（2026-11-22）
 
 发布说明见 `lock_frame/docs/RELEASE_NOTES_1.2.6.md`。只改传输端两处所有权/描述符错误，

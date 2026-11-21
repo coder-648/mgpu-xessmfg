@@ -486,9 +486,14 @@ bridge.exe --game PBZ.exe --den 1 --pool 4 --interp 2 --unlock-mfg --fg-ui none 
 | `--fg-ui none` | `AUTO` | `[XeFG] UIComposition=false` | `uiMode = UI_MODE_NONE`，不再探测我们从不提供的 UI 纹理。三次 A/B 显示差异在噪声内（`gpu` sd≈5.5 ms），但**零风险**（初始化期静态开关、我们本就不提供 UI 纹理），故保留 |
 | `--fg-scene F` | 关（库内默认 0.7） | MFG-Unlocker 的 scene-decision detour | `xefgSwapChainSetSceneChangeThreshold(F)`；调大=更少"大角度转视角时插值帧变复制帧" |
 | `--fg-depth-inv` | 关 | `[XeFG] DepthInverted` | 置 `INVERTED_DEPTH`（逆向/无限远 Z 深度）。**CP2077 是否适用未验证**，开了要立刻看画面 |
+| `--fg-gate N` | `0`（关 = 旧行为） | `XeFG_Dx12::Dispatch()` 的 `Depth`/`Velocity` 未就绪早退（`XeFG_Dx12.cpp:696-703`） | 连续 N 帧"只是缺 MV 流"时不关 FG：生成保持开，但这一帧不给 XeFG 输入、也不发 present id；第 N+1 帧仍缺才 `SetEnabled(0)`。配对失败（`pair_ok=0`）永不宽限。2026-11-22 新增，见 `docs/design/OPTISCALER_XEFG_MFG_SCHEDULING.md` §7 |
+| `--fg-gate-up M` | `1`（旧行为） | — | 需要 M 帧连续有 MV 才重新 `SetEnabled(1)`，避免 hit/miss 交替时每帧开关 |
+| `--fg-far-finite <Z\|auto>` | `0`（保留无限远） | `XeFG_Inputs_Dx12.cpp:464-478`（UE 用 75000） | far 为无限时（producer 声明或从游戏 view-to-clip 派生）换成有限值并切到有限投影；`auto` = 75000 |
 
-开任意一个都会在启动日志多打一行 `XeFG tuning: rt=.. ui=.. scene=.. depthInv=..`，
-方便确认真的生效。
+开任意一个（含 `--fg-gate*` / `--fg-far-finite`）都会在启动日志多打一行
+`XeFG tuning: rt=.. ui=.. scene=.. depthInv=.. gate=../.. farFinite=..`，
+方便确认真的生效。near/far 的来源与无限远处理另有一行
+`[lock] near/far: zn=.. zf=.. (infinite|derived from the game's view-to-clip) ..`。
 
 ### 4.8 HDR 亮度
 
@@ -752,6 +757,9 @@ bridge.exe --fg-probe --producer-luid 0:10392
     FSR 档虽然能拿到真相机，但对 FG 也没用）；
   - 它们**仍然影响我们自己的路径**（`--fg-warp` 的双帧 warp、`--fg-of` 的光流），那些代码真的用投影/MV；
   - 想真正改善画质的旋钮只剩两个：**MV 开/关** 与 **jitter 怎么传**（见 §2.1.2 第 1/3 条）。
+- 2026-11-22：near/far 现在优先从游戏自己的 view-to-clip 派生（`near/far:` 日志行，
+  `derive_near_far_from_matrix()`），所以不再固定 10/10000；但这不改变上面结论 ——
+  keep2x 路径下投影仍不影响画面，它的价值在语义正确性 / `--mfg-model=port` / 其它库版本。
 
 ### 5.17 3x/4x + 原生 MV 的闪烁是 MFG 补丁的固有限制（丢帧可以治，闪烁不能）
 

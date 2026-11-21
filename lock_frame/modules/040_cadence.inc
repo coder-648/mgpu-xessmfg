@@ -1356,6 +1356,23 @@ static bool init_fg()
         }
     }
 
+    // Debug views (2026-11-22): --fg-debug-tag-interp marks generated frames,
+    // --fg-debug-only-interp shows ONLY generated frames. They are the only way to see
+    // whether count=3 really produces three distinct phases (true MFG) or repeats one.
+    if (g_api.EnableDebugFeature != nullptr &&
+        (g_fg_tag_interp || g_fg_only_interp || g_fg_fail_black)) {
+        const auto a = g_api.EnableDebugFeature(g_fg, XEFG_SWAPCHAIN_DEBUG_FEATURE_TAG_INTERPOLATED_FRAMES,
+                                                g_fg_tag_interp ? 1u : 0u, nullptr);
+        const auto b = g_api.EnableDebugFeature(g_fg, XEFG_SWAPCHAIN_DEBUG_FEATURE_SHOW_ONLY_INTERPOLATION,
+                                                g_fg_only_interp ? 1u : 0u, nullptr);
+        const auto c = g_api.EnableDebugFeature(g_fg, XEFG_SWAPCHAIN_DEBUG_FEATURE_PRESENT_FAILED_INTERPOLATION,
+                                                g_fg_fail_black ? 1u : 0u, nullptr);
+        logf_("[lock] debug views: tag-interp=%d (%d) only-interp=%d (%d) fail-black=%d (%d)\n",
+              g_fg_tag_interp ? 1 : 0, static_cast<int>(a),
+              g_fg_only_interp ? 1 : 0, static_cast<int>(b),
+              g_fg_fail_black ? 1 : 0, static_cast<int>(c));
+    }
+
     r = g_api.SetEnabled(g_fg, 1);
     logf_("[lock] SetEnabled: %s (%d)\n", xefg_str(r), (int)r);
     if (r != XEFG_SWAPCHAIN_RESULT_SUCCESS) { return false; }

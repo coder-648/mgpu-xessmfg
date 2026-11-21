@@ -385,6 +385,16 @@ OptiScaler 的 DynamicMFG 目标是"贴着目标帧率选最小倍数"，那套�
   frame uses the 2x model”，建议在 UI 选择 3x/4x 时也显示同一句话（现在只在日志里），
   避免用户把 4x 的稀疏感当成 bug。
 
+> **2026-11-22 复核（实机 A/B，CP2077 4K/120 Hz）**：ported model 15 已经在 consumer 里
+> 真正跑起来（`model_port_applied 15->16`、`shader_supplied=28`），但结论是**不建议使用**：
+> 3x 仅略好（差距很小），**4x 明显更差**（gpu 16.1 vs 17.6，成本几乎一样）；
+> `--mfg-replace-all`（不保留两个 Intel U-Net）与 capacity 4/count 3 都无改善；
+> `--fg-jitter-zero` 会让 port 合成静默消失，`--fg-jittered-mv` 直接打死生成。
+> fail-black（`PRESENT_FAILED_INTERPOLATION`）三条都不黑 ⇒ 4x 的合成是"成功"的，
+> 不是失败退回 —— 问题在移植后的 model 15 在 t=1/4、3/4 的数值本身。
+> **决定：所有倍率保持 keep2x（model 18）**，`--mfg-model=port` 只保留为实验入口。
+> 详细证据与决策见 `docs/design/OPTISCALER_XEFG_MFG_SCHEDULING.md` §9–§10。
+
 ### 7.6 代码对齐（2026-11-21）
 
 已把 `lock_frame` 的 MFG 路径按 MFG-Unlocker 的推荐方式（`PreparePort`）对齐：

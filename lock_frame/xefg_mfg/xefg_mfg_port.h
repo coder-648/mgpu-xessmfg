@@ -108,6 +108,16 @@ inline bool AssetsPresent(std::string* err)
         if (xess_payload::Root().empty() ||
             !std::filesystem::is_regular_file(xess_payload::Root() / L"programs.tsv") ||
             !xess_payload::HaveReplacementShaders()) {
+            // Say which of the three failed: the directory is passed in from the
+            // consumer, and "assets_incomplete" alone cannot be told apart from a
+            // wrong root path when the payload sits in the expected place.
+            const std::string root = xess_payload::Root().u8string();
+            logEvent("model_port_assets",
+                     "\"root\":\"" + escape(root) + "\",\"empty\":" +
+                     (xess_payload::Root().empty() ? "true" : "false") + ",\"tsv\":" +
+                     (std::filesystem::is_regular_file(xess_payload::Root() / L"programs.tsv")
+                          ? "true" : "false") +
+                     ",\"shaders\":" + (xess_payload::HaveReplacementShaders() ? "true" : "false"));
             if (err) { *err = "assets_incomplete"; }
             return false;
         }
@@ -129,7 +139,7 @@ inline bool AssetsPresent(std::string* err)
 // Installs ShaderPort then ModelPort. Returns false without leaving anything
 // patched when the payload, the provider build or the model layout does not
 // match; the caller then falls back to the 2x-model unlock.
-inline bool Install(HMODULE fg, UINT adapterVendor, std::string* err)
+inline bool Install(HMODULE fg, UINT adapterVendor, std::string* err, bool replaceAllIntel = false)
 {
     if (State()) { return true; }
     if (!fg) {
@@ -149,7 +159,8 @@ inline bool Install(HMODULE fg, UINT adapterVendor, std::string* err)
         // Self() in MFG-Unlocker is the module that holds the RCDATA payload; our
         // payload loader reads the directory instead, so the module is unused.
         port->shaders = std::make_unique<ShaderPort>(fg, GetModuleHandleW(nullptr),
-                                                     xess_payload::Root(), adapterVendor);
+                                                     xess_payload::Root(),
+                                                     replaceAllIntel ? 0u : adapterVendor);
         for (const char* key : kReconstructionPrograms) {
             if (!port->shaders->hasProgram(key)) {
                 throw std::runtime_error("reconstruction_program_pair_missing");

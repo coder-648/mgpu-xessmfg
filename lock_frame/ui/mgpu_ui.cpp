@@ -398,6 +398,8 @@ struct State
     bool ui_none = true;
     int  rt_sel = 1;           // 0 ema, 1 median
     bool unlock_mfg = true;
+    // --game-quirks apply|off: OptiScaler's per-game FG-input table (default on).
+    bool game_quirks = true;
     bool slack1 = false;
     // 渲染
     bool tearing = false;
@@ -592,7 +594,7 @@ enum Id
     ID_FG_INPUT, ID_FG_INI, ID_STREAM_PCT, ID_CODEC, ID_FG_LOG,
     ID_VERSION, ID_CHECK_GPU, ID_CHECK_RUNTIME, ID_CHECK_GAME,
     ID_CAP_API, ID_POOL, ID_LAT, ID_STREAM_INFO,
-    ID_JITZ, ID_FOV, ID_NOMARKER, ID_UPSAMPLE, ID_STRAUTO, ID_STRASYM, ID_PREFETCH, ID_UI, ID_RT, ID_UNLOCK, ID_SLACK, ID_IVL,
+    ID_JITZ, ID_FOV, ID_NOMARKER, ID_UPSAMPLE, ID_STRAUTO, ID_STRASYM, ID_PREFETCH, ID_UI, ID_RT, ID_UNLOCK, ID_GAME_QUIRKS, ID_SLACK, ID_IVL,
     ID_OUTFPS, ID_HEAD_FIXED, ID_HEAD_DYN,
     ID_TEAR, ID_SDR, ID_LAYERED, ID_RELAY, ID_OSD,
     ID_GPU, ID_GPUSEL, ID_DISPLAY, ID_UISCALE, ID_CHECK_SHA, ID_LANG,
@@ -628,6 +630,7 @@ static const RowDef kRowsGame[] = {
     { ID_FG_INPUT,   L"fakerFG 输入源",     RK_DD   },
     { ID_STREAM_PCT, L"MV/深度传输比例",    RK_DD   },
     { ID_CODEC,      L"无损传输（码流）",   RK_DD   },
+    { ID_GAME_QUIRKS, L"游戏适配（OptiScaler 表）", RK_TOG },
     { ID_FG_LOG,     L"游戏侧日志 (Log)",   RK_TOG  },
     { ID_FG_INI,     L"fakerFG.ini 路径",   RK_INFO },
 };
@@ -1803,6 +1806,7 @@ static void save_state(const std::wstring& sec, const State& s, const wchar_t* f
     ini_w(sec, L"input_prefetch", s.input_prefetch ? 1 : 0);
     ini_w(sec, L"ui_none", s.ui_none ? 1 : 0);
     ini_w(sec, L"unlock", s.unlock_mfg ? 1 : 0);
+    ini_w(sec, L"game_quirks", s.game_quirks ? 1 : 0);
     ini_w(sec, L"slack1", s.slack1 ? 1 : 0);
     ini_w(sec, L"tearing", s.tearing ? 1 : 0);
     ini_w(sec, L"sdr", s.sdr ? 1 : 0);
@@ -1860,6 +1864,7 @@ static void load_state(const std::wstring& sec, State& s, const wchar_t* file = 
     s.input_prefetch = ini_r(sec, L"input_prefetch", s.input_prefetch ? 1 : 0) != 0;
     s.ui_none     = ini_r(sec, L"ui_none", s.ui_none ? 1 : 0) != 0;
     s.unlock_mfg  = ini_r(sec, L"unlock", s.unlock_mfg ? 1 : 0) != 0;
+    s.game_quirks = ini_r(sec, L"game_quirks", s.game_quirks ? 1 : 0) != 0;
     s.slack1      = ini_r(sec, L"slack1", s.slack1 ? 1 : 0) != 0;
     s.tearing     = ini_r(sec, L"tearing", s.tearing ? 1 : 0) != 0;
     s.sdr         = ini_r(sec, L"sdr", s.sdr ? 1 : 0) != 0;
@@ -3185,6 +3190,8 @@ static std::wstring build_cmdline(HWND target, bool display)
     // keep2x is the consumer default (150_probe_mfg.inc: g_mfg_model = 2), but the verified
     // recipe states it explicitly; keep the UI command identical so logs line up.
     cmd += L" --mfg-model=keep2x";
+    // OptiScaler 的逐游戏输入表：默认 apply（只套用安全项，CLI 优先）。
+    cmd += S().game_quirks ? L" --game-quirks apply" : L" --game-quirks off";
     // FOV and 输入间隔 are no longer exposed in the UI (2026-11-08): FOV only feeds the
     // synthetic projection, which the XeFG frame-generation path ignores (5.16), and
     // --input-ms no longer matters for pacing now that frameRenderTime is vblank-snapped.
@@ -4873,6 +4880,7 @@ static void layout_drawer_items(std::vector<Item>& out, int* content_h)
                   : (it.id == ID_STRASYM) ? S().stream_asym
                   : (it.id == ID_PREFETCH) ? S().input_prefetch
                   : (it.id == ID_UNLOCK) ? S().unlock_mfg
+                  : (it.id == ID_GAME_QUIRKS) ? S().game_quirks
                   : (it.id == ID_SLACK) ? S().slack1
                   : (it.id == ID_TEAR) ? S().tearing
                   : (it.id == ID_SDR) ? S().sdr
@@ -4928,6 +4936,9 @@ static const wchar_t* tip_for(Id id)
         return L"输出分辨率：1:1 原生最清晰；0.75x / 半分辨率省消费卡性能，但会软一点。";
     case ID_UPSAMPLE_INFO:
         return L"消费端把 MV/深度从 StreamPercent 尺寸联合重建到输入画面尺寸后再交给 XeFG。";
+    case ID_GAME_QUIRKS:
+        return L"OptiScaler 的逐游戏 FG 输入表（49 行）。开启时按游戏 exe 自动套用："
+               L"UE 无限远平面、jittered MV、inverted depth 等；日志会打印命中的行。";
     case ID_FG_INPUT:
         return L"游戏侧取帧的来源。DLSSG（Streamline）为正式支持；"
                L"NVNGX / Upscaler / FSR 为实验性。";
@@ -5786,6 +5797,12 @@ static void toggle_field(Id id)
                     : L"输入预拷关闭：WGC 到达后再拷（旧顺序）");
         break;
     case ID_UNLOCK:  S().unlock_mfg = !S().unlock_mfg; break;
+    case ID_GAME_QUIRKS:
+        S().game_quirks = !S().game_quirks;
+        set_msg(S().game_quirks
+                    ? L"游戏适配开启：启动时套用 OptiScaler 的逐游戏输入表（默认）"
+                    : L"游戏适配关闭：不套用逐游戏输入表（仅命令行 --game-quirks off 时）");
+        break;
     case ID_SLACK:   S().slack1 = !S().slack1; break;
     case ID_TEAR:    S().tearing = !S().tearing; break;
     // ID_SDR is a dropdown (色彩空间 HDR10/SDR), handled in set_opt() - not a toggle.

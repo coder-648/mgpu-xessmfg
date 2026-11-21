@@ -282,6 +282,7 @@ static void lock_note_mv_source(bool native, bool flow)
 // presenting *only* interpolated frames - the real frames otherwise hide the artifacts.
 static bool  g_fg_tag_interp = false;    // --fg-debug-tag-interp
 static bool  g_fg_only_interp = false;   // --fg-debug-only-interp
+static bool  g_fg_fail_black = false;   // --fg-debug-fail-black (black instead of a failed interpolation)
 // --capture-monitor: capture the display instead of the game window. Removes any
 // window/swap-chain size mismatch between what the game renders and what WGC hands over.
 // Kept for experiments
@@ -318,6 +319,12 @@ static bool g_no_xell = true;   // skip XeLL per-frame pacing by default (--xell
 // raises it (src/xefg_dyn.h).
 static int          g_fg_interp = 0;
 static bool         g_fg_interp_set = false;  // --interp was given (1 = 2x is a valid ask)
+// --interp-start M: initialize at capacity --interp N (the unlock patches that capacity in),
+// then apply M once after SetEnabled. Lets the ported model run at a lower count than the
+// capacity (e.g. capacity 2 = 3x, start 1 = 2x -> model 15's t=1/2 frame). 0 = use --interp.
+static int          g_fg_interp_start = 0;
+// --mfg-replace-all: do not keep Intel's two U-Net programs on AMD (replace all 7).
+static bool         g_mfg_replace_all = false;
 static UINT         g_fg_interp_actual = 1;   // what XeSS-FG really applies
 static UINT         g_fg_interp_max = 1;      // maxSupportedInterpolations of the loaded DLL
 static std::wstring g_fg_lib;              // --fg-lib <path>: alternative libxess_fg.dll
@@ -453,6 +460,15 @@ static bool         g_fg_use_matrix = false;
 // vectors (docs/findings/FINAL_CONFIG.md 5.16). Left as a switch for our own --fg-warp /
 // --fg-of paths; not needed by the shipping data plane.
 static bool         g_fg_proj_rz = false;
+// --fg-far-finite <Z|auto>: OptiScaler replaces the far plane of an infinite (UE-style)
+// projection with a finite 75000 before it hands the camera to XeFG
+// (inputs/FG/XeFG_Inputs_Dx12.cpp:464-478, "Unreal's own DLSSG integration sends this one
+// instead"). 0 (default) keeps today's infinite form; `auto` = 75000; a number = that far.
+// Only takes effect when the far plane actually is infinite (declared or matrix-derived).
+static float        g_fg_far_finite = 0.0f;
+// Whether the detected game is an Unreal shipping build (set by the game-window setup in
+// 160_main.inc). Only used to say so in the projection log.
+static bool         g_game_is_unreal = false;
 // The projection is the one frame constant we can only approximate, so its two numbers are
 // tunable: --fg-fov (vertical field of view, degrees) and --fg-zn (near plane). UE5's
 // defaults are ~58.7 deg vertical (90 horizontal at 16:9) and a near plane of 10.
@@ -476,6 +492,18 @@ static int          g_ui_source_mode = 0;
 // value is 0..255; 8 is a good first cut for an 8-bit-equivalent HUD overlay.
 static float        g_ui_synth_threshold = 8.0f / 255.0f;
 static bool         g_mv_gate_off = false;   // this frame has no MV -> 1X, no tagging
+// --fg-gate N (default 0 = current behaviour): tolerate up to N *consecutive* frames that
+// only lack the motion-vector stream before turning generation off. Menus, loading screens
+// and a single dropped publication then no longer cost a SetEnabled(0)/SetEnabled(1) cycle,
+// which resets XeFG's history (and, for 1<->2, rebuilds inside the library). During the
+// tolerated frames XeFG gets no inputs and no present id, i.e. OptiScaler's Dispatch
+// early-out shape (XeFG_Dx12.cpp:696-703). A missing *pairing* is never tolerated.
+static int          g_fg_gate_hold = 0;
+// --fg-gate-up M (default 1 = current behaviour): consecutive MV frames required before
+// generation is switched back on. Keeps an alternating hit/miss pattern from flapping.
+static int          g_fg_gate_up = 1;
+// Set by the gate for the current frame: FG is left enabled but nothing is sent downstream.
+static bool         g_mv_gate_tolerated = false;
 static float        g_fg_scene = 0.0f;
 static bool         g_fg_depth_inv = false;
 // --fg-jittered-mv / --fg-no-jittered-mv: XEFG_SWAPCHAIN_INIT_FLAG_JITTERED_MV, which the
@@ -785,6 +813,52 @@ static void approx_projection(float* m, float aspect, float fov_y_rad, float zn,
     m[10] = zf / (zn - zf);
     m[11] = -1.0f;
     m[14] = (zn * zf) / (zn - zf);
+}
+
+// near/far from the game's own view-to-clip, used only when the producer declared no
+// camera (previously that case fell back to the --fg-zn constant and a hard-coded far of
+// 10000, which is wrong for every reversed-Z title).
+//
+// Derived generically instead of by copying OptiScaler's sign cases: with
+//     depth(z) = (c*z + d) / (e*z),   c = m[10], d = m[14], e = m[11],
+// depth is 0 at z0 = -d/c and 1 at z1 = d/(e-c), so the nearer of |z0| and |z1| is the
+// near plane and the other is the far plane - whichever handedness, sign of w, or
+// row/column layout the title uses. c == 0 means the far plane is infinite and the near
+// plane is d (depth 1 at |z| = d).
+//
+// Measured on CP2077 (2026-11-22), its view-to-clip is
+//     [1.1792 0 0 0][0 2.0963 0 0][0 0 0 1][0 0 0.02 0]
+// i.e. w = +z, near = 0.02, far = infinity. The previous sign-guarded version rejected
+// that matrix (it required w = -1) and silently kept zn=10/zf=10000.
+// The infinite case is exact; a finite reconstruction inherits the float precision of the
+// stored matrix (a far/near ratio of 1e5 loses ~1% of the far plane - harmless).
+static bool derive_near_far_from_matrix(const float* m, float& zn, float& zf, bool& infinite)
+{
+    const double c = m[10];
+    const double d = m[14];
+    const double e = m[11];
+    if (std::fabs(std::fabs(e) - 1.0) > 1.0e-3) { return false; }
+    if (!std::isfinite(d)) { return false; }
+
+    if (std::fabs(c) <= 1.0e-9) {
+        // Infinite far plane (UE5 / CP2077 reversed-Z): depth 1 at |z| = d.
+        if (!(d > 0.0)) { return false; }
+        zn = static_cast<float>(d / std::fabs(e));
+        zf = std::numeric_limits<float>::infinity();
+        infinite = true;
+        return true;
+    }
+
+    const double z0 = std::fabs(-d / c);          // depth == 0
+    const double z1 = std::fabs(d / (e - c));     // depth == 1
+    if (!std::isfinite(z0) || !std::isfinite(z1)) { return false; }
+    const double n = std::min(z0, z1);
+    const double f = std::max(z0, z1);
+    if (!(n > 0.0) || !(f > n * 1.001)) { return false; }
+    zn = static_cast<float>(n);
+    zf = static_cast<float>(f);
+    infinite = false;
+    return true;
 }
 
 static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)

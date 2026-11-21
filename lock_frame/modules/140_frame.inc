@@ -952,8 +952,19 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     // transitions legitimately carry no MV, and the capture (correctly) refuses to invent a
     // state for a texture the title never transitions. Presenting the real frame there is the
     // right answer; generating from a stale field is what produced artefacts.
+    //
+    // 2026-11-22 (--fg-gate): one frame without the MV stream used to cost a full
+    // SetEnabled(0) -> SetEnabled(1) cycle, which resets XeFG's history (and, for the 1<->2
+    // crossing, rebuilds inside the library). With `--fg-gate N` up to N consecutive such
+    // frames are tolerated: generation stays ON, but this frame hands XeFG no inputs and no
+    // present id - OptiScaler's Dispatch early-out (XeFG_Dx12.cpp:696-703). `--fg-gate-up M`
+    // needs M consecutive MV frames before switching back on. Both default to the old
+    // behaviour (0 / 1); a missing *pairing* is never tolerated.
     {
         static bool gated_off = false;
+        static int miss_run = 0;
+        static int ok_run = 0;
+        static bool tolerated_run = false;
         // 只有"marker 配对成功 + producer 这一帧确实发布了 MV"才允许插帧。
         // Wuchang/Unreal uses optical flow and deliberately requests no producer MV
         // (streams -> mv=0 depth=1). The gate must accept the OF field in that case:
@@ -983,28 +994,63 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
         const bool flow_mv = false;
 #endif
         const bool mv_available = pair_ok && g_ctl && (producer_mv || flow_mv);
+        const bool hard_miss = !mv_available && !pair_ok;   // pairing unverified: never tolerate
+
+        if (mv_available) { if (ok_run < 1000) { ++ok_run; } miss_run = 0; }
+        else { if (miss_run < 1000) { ++miss_run; } ok_run = 0; }
+
+        g_mv_gate_tolerated = false;
         if (!mv_available && !gated_off) {
-            const xefg_swapchain_result_t r = g_api.SetEnabled(g_fg, 0);
-            logf_("[lock] %s -> 1X (%s, %d) [pair=%d producer_mv=%d of=%d/%d]\n",
-                  pair_ok ? "MV missing this frame" : "colour/motion pairing unverified",
-                  xefg_str(r), (int)r, pair_ok ? 1 : 0, producer_mv ? 1 : 0,
+            // Tolerate a short run of MV-missing frames (menu blip, one dropped publication)
+            // instead of resetting XeFG's history for it.
+            if (!hard_miss && g_fg_gate_hold > 0 && miss_run <= g_fg_gate_hold) {
+                g_mv_gate_tolerated = true;
+                if (!tolerated_run) {
+                    tolerated_run = true;
+                    logf_("[lock] MV missing this frame -> holding FG on (%d/%d tolerated)"
+                          " [pair=%d producer_mv=%d of=%d/%d]\n",
+                          miss_run, g_fg_gate_hold, pair_ok ? 1 : 0, producer_mv ? 1 : 0,
 #if MGPU_FG_OF
-                  g_of_ready ? 1 : 0, g_of_fresh ? 1 : 0
+                          g_of_ready ? 1 : 0, g_of_fresh ? 1 : 0
 #else
-                  0, 0
+                          0, 0
 #endif
-                  );
-            if (r == XEFG_SWAPCHAIN_RESULT_SUCCESS) { gated_off = true; }
+                          );
+                }
+            } else {
+                const xefg_swapchain_result_t r = g_api.SetEnabled(g_fg, 0);
+                logf_("[lock] %s -> 1X (%s, %d) [pair=%d producer_mv=%d of=%d/%d]\n",
+                      pair_ok ? "MV missing this frame" : "colour/motion pairing unverified",
+                      xefg_str(r), (int)r, pair_ok ? 1 : 0, producer_mv ? 1 : 0,
+#if MGPU_FG_OF
+                      g_of_ready ? 1 : 0, g_of_fresh ? 1 : 0
+#else
+                      0, 0
+#endif
+                      );
+                if (r == XEFG_SWAPCHAIN_RESULT_SUCCESS) { gated_off = true; }
+                tolerated_run = false;
+            }
         } else if (mv_available && gated_off) {
-            const xefg_swapchain_result_t r = g_api.SetEnabled(g_fg, 1);
-            logf_("[lock] MV back -> FG on (%s, %d)\n", xefg_str(r), (int)r);
-            if (r == XEFG_SWAPCHAIN_RESULT_SUCCESS) { gated_off = false; }
+            // --fg-gate-up: require a short run of good frames, so an alternating hit/miss
+            // pattern cannot make SetEnabled flap every frame.
+            if (ok_run >= g_fg_gate_up) {
+                const xefg_swapchain_result_t r = g_api.SetEnabled(g_fg, 1);
+                logf_("[lock] MV back -> FG on (%s, %d) [%d consecutive]\n",
+                      xefg_str(r), (int)r, ok_run);
+                if (r == XEFG_SWAPCHAIN_RESULT_SUCCESS) { gated_off = false; }
+            } else if (ok_run == 1 && g_fg_gate_up > 1) {
+                logf_("[lock] MV back - waiting for %d consecutive frames before FG on\n",
+                      g_fg_gate_up);
+            }
         }
+        if (mv_available) { tolerated_run = false; }
         // Nothing to tag while the gate is closed: the swap chain is in 1X and the real frame
         // goes straight out. (An early return here would skip Close()/Present.)
         // `|| !pair_ok` keeps the tag guard closed even if SetEnabled(0) itself failed.
-        g_mv_gate_off = gated_off || !pair_ok;
+        g_mv_gate_off = gated_off || !pair_ok || g_mv_gate_tolerated;
     }
+
 
     xefg_swapchain_d3d12_resource_data_t rd{};
     rd.validity = XEFG_SWAPCHAIN_RV_UNTIL_NEXT_PRESENT;
@@ -1247,10 +1293,48 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
                   m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
         }
     }
-    const float proj_fov = (have_matrix && mtx_fov > 0.05f)
-                               ? mtx_fov
+    // ---- projection cache (2026-11-22) ------------------------------------------
+    // The producer publishes TWO records per game frame (evaluate-time and the
+    // present-time fallback) and only one of them carries sl::Constants, so
+    // `have_matrix` alternates every frame (measured: 50/50 over every ab_1x log).
+    // Falling back to the synthetic 60deg/10/10000 on the other half would flip FOV,
+    // near/far and the whole matrix at half the input rate - a far worse input than
+    // either value being slightly off. Keep the last matrix-derived projection and
+    // reuse it while a record without a matrix arrives.
+    static bool     pc_matrix = false;      // a real matrix has been seen
+    static float    pc_m[16]{};
+    static float    pc_fov = 0.0f, pc_aspect = 0.0f;
+    static bool     pc_planes = false;
+    static float    pc_zn = 0.0f, pc_zf = 0.0f;
+    static bool     pc_inf = false;
+    static uint64_t pc_tick = 0;
+    const uint64_t proj_now = GetTickCount64();
+    const bool pc_fresh = pc_matrix && proj_now >= pc_tick && (proj_now - pc_tick) < 2000ull;
+    if (have_matrix) {
+        memcpy(pc_m, fr.view_to_clip, sizeof(pc_m));
+        if (mtx_fov > 0.05f) { pc_fov = mtx_fov; }
+        pc_aspect = mtx_aspect;
+        pc_matrix = true;
+        pc_tick = proj_now;
+    } else if (pc_fresh) {
+        static bool told_cache = false;
+        if (!told_cache) {
+            told_cache = true;
+            logf_("[lock] note: record without a view-to-clip - keeping the last derived"
+                  " projection (two publications per frame, cache <2 s)\n");
+        }
+    }
+    // 0 = no matrix, 1 = this frame's own matrix, 2 = cached (this record had none)
+    const int mtx_src = have_matrix ? 1 : (pc_fresh ? 2 : 0);
+    const bool mtx_eff = mtx_src != 0;
+    const float eff_fov = have_matrix ? mtx_fov : pc_fov;
+    const float eff_aspect = have_matrix ? mtx_aspect : pc_aspect;
+    const float proj_fov = (mtx_eff && eff_fov > 0.05f)
+                               ? eff_fov
                                : (cam_ok ? fr.vfov_rad : (g_fg_fov_y * 3.14159265f / 180.0f));
-    const float proj_aspect = have_matrix ? mtx_aspect : const_aspect;
+    const float proj_aspect = (mtx_eff && eff_aspect > 0.1f && eff_aspect < 10.0f)
+                                  ? eff_aspect
+                                  : const_aspect;
     // The game's own projection wins, unconditionally (decision 2026-11-10). We do *not*
     // second-guess it against --fg-fov: some integrations hand XeFG a plain 60 deg placeholder,
     // and that is still the game's own answer for its own FG - overriding it with our guess was
@@ -1264,13 +1348,68 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
                   mtx_fov * 57.2957795f, g_fg_fov_y);
         }
     }
-    const float proj_zn  = cam_ok ? fr.near_plane : g_fg_near_z;
-    const float proj_zf  = cam_ok ? fr.far_plane : 10000.0f;
-    // An infinite far plane (what a reversed-Z game reports) only makes sense in the
-    // reversed-Z form; the finite form divides by infinity and produces NaNs.
-    const bool use_rz = g_fg_proj_rz || !std::isfinite(proj_zf);
-    if (have_matrix && g_fg_use_matrix) {
-        for (int i = 0; i < 16; ++i) { cd.projectionMatrix[i] = fr.view_to_clip[i]; }
+    // ---- near/far --------------------------------------------------------------
+    // 1) the producer's declared camera wins (FSR 3.1 exports near/far/vfov);
+    // 2) otherwise derive them from the game's own view-to-clip, when that matrix is fresh
+    //    and looks like a projection. This replaces the old hard-coded `--fg-zn` / 10000
+    //    fallback, which is wrong for every reversed-Z title (and is where the far plane
+    //    of a UE game silently became 10000 instead of infinity);
+    // 3) --fg-far-finite then replaces an infinite far plane with a finite one, exactly what
+    //    OptiScaler hands UE titles (75000; XeFG_Inputs_Dx12.cpp:464-478).
+    float proj_zn = cam_ok ? fr.near_plane : g_fg_near_z;
+    float proj_zf = cam_ok ? fr.far_plane : 10000.0f;
+    bool far_infinite = !std::isfinite(proj_zf) || proj_zf <= 0.0f;
+    bool zn_zf_derived = false;
+    if (!cam_ok) {
+        if (have_matrix) {
+            float dn = 0.0f, df = 0.0f;
+            bool dinf = false;
+            if (derive_near_far_from_matrix(fr.view_to_clip, dn, df, dinf)) {
+                pc_zn = dn;
+                pc_zf = df;
+                pc_inf = dinf;
+                pc_planes = true;
+            }
+        }
+        if (pc_planes) {          // this record's matrix, or the cached one
+            proj_zn = pc_zn;
+            proj_zf = pc_zf;
+            far_infinite = pc_inf;
+            zn_zf_derived = true;
+        }
+    }
+    if (g_fg_far_finite > 0.0f && far_infinite) {
+        proj_zf = g_fg_far_finite;
+        far_infinite = false;
+    }
+    // An infinite far plane only makes sense in the reversed-Z form; the finite form
+    // divides by infinity and produces NaNs.
+    const bool use_rz = g_fg_proj_rz || far_infinite;
+    {
+        // One line per change: which of the three sources produced the planes, and whether
+        // an infinite far was kept or replaced. This is the first thing to read when the
+        // edge artifacts are blamed on the projection.
+        static bool told_planes = false;
+        static float told_zn = -1.0f, told_zf = -1.0f;
+        static bool told_inf = false;
+        if (!told_planes || told_zn != proj_zn || told_zf != proj_zf || told_inf != far_infinite) {
+            told_planes = true;
+            told_zn = proj_zn;
+            told_zf = proj_zf;
+            told_inf = far_infinite;
+            logf_("[lock] near/far: zn=%.3f zf=%.0f%s%s%s (camera=%d matrix=%d%s"
+                  " farFinite=%.0f)\n",
+                  proj_zn, proj_zf,
+                  far_infinite ? " (infinite)" : "",
+                  zn_zf_derived ? " (derived from the game's view-to-clip)" : "",
+                  g_game_is_unreal ? ", Unreal shipping build" : "",
+                  cam_ok ? 1 : 0, mtx_src, (mtx_src == 2) ? " cached" : "",
+                  g_fg_far_finite);
+        }
+    }
+    if (mtx_eff && g_fg_use_matrix) {
+        const float* src = have_matrix ? fr.view_to_clip : pc_m;
+        for (int i = 0; i < 16; ++i) { cd.projectionMatrix[i] = src[i]; }
     } else if (use_rz) { approx_projection_rz(cd.projectionMatrix, proj_aspect, proj_fov, proj_zn); }
     else { approx_projection(cd.projectionMatrix, proj_aspect, proj_fov, proj_zn, proj_zf); }
     cd.viewMatrix[0] = 1.0f;
@@ -1344,11 +1483,16 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     cd.resetHistory = (fr.fg_flags & mgpu::kInputFlagResetHistory) ? 1u : 0u;
     if (!g_fg_consts_logged) {
         g_fg_consts_logged = true;
-        char fov_buf[64]{};
+        char fov_buf[96]{};
         if (cam_ok) {
             _snprintf_s(fov_buf, sizeof(fov_buf), _TRUNCATE,
                         "camera=producer fov=%.1fdeg zn=%.2f zf=%.0f",
                         proj_fov * 180.0f / 3.14159265f, proj_zn, proj_zf);
+        } else if (zn_zf_derived) {
+            _snprintf_s(fov_buf, sizeof(fov_buf), _TRUNCATE,
+                        "camera=derived fov=%.1fdeg zn=%.3f zf=%.0f%s",
+                        proj_fov * 180.0f / 3.14159265f, proj_zn, proj_zf,
+                        far_infinite ? " (infinite)" : "");
         } else {
             _snprintf_s(fov_buf, sizeof(fov_buf), _TRUNCATE,
                         "camera=synthetic (--fg-fov %.1f, --fg-zn %.2f)",
@@ -1430,9 +1574,14 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
         }
     }
     const double fg0 = qpc_ms();
-    g_api.TagFrameConstants(g_fg, present_id, &cd);
-
-    g_api.SetPresentId(g_fg, present_id);
+    // A tolerated MV-missing frame sends nothing downstream: this is OptiScaler's Dispatch
+    // early-out (XeFG_Dx12.cpp:696-703), which returns before TagFrameConstants/SetPresentId.
+    // Calling SetPresentId with no inputs for that id is a different (unproven) shape, so the
+    // id gaps by one here - a not-ready dispatch upstream does exactly the same.
+    if (!g_mv_gate_tolerated) {
+        g_api.TagFrameConstants(g_fg, present_id, &cd);
+        g_api.SetPresentId(g_fg, present_id);
+    }
     const double fg1 = qpc_ms();
     g_ms_fg = g_ms_fg * 0.9 + (fg1 - fg0) * 0.1;
     if (fg1 - fg0 > g_max_fg) { g_max_fg = fg1 - fg0; }

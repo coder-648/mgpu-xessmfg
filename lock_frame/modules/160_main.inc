@@ -126,6 +126,16 @@ int main()
             g_game_exe_set = true;
         }
     }
+    // --game-quirks off|log|apply / --list-quirks: the FG-input rows of OptiScaler's
+    // per-game table (modules/025_input_quirks.inc).
+    if (const wchar_t* gq = wcsstr(GetCommandLineW(), L"--game-quirks ")) {
+        const wchar_t* p = gq + 14;
+        while (*p == L' ') { ++p; }
+        if (wcsncmp(p, L"off", 3) == 0)        { g_input_quirk_mode = QUIRK_OFF; }
+        else if (wcsncmp(p, L"apply", 5) == 0) { g_input_quirk_mode = QUIRK_APPLY; }
+        else                                   { g_input_quirk_mode = QUIRK_LOG; }
+    }
+    if (wcsstr(GetCommandLineW(), L"--list-quirks")) { g_list_quirks = true; }
     // --gpu <spec>: which adapter runs XeSS-FG. Default is "the one that drives the
     // game window's monitor", which is also the only one the overlay can present on.
     //   --gpu 0 / 1                          adapter index (EnumAdapters1 order)
@@ -172,12 +182,37 @@ int main()
         const float v = static_cast<float>(_wtof(nz + 8));
         if (v > 0.001f && v < 1000.0f) { g_fg_near_z = v; }
     }
+    // --fg-far-finite <Z|auto>: replace an infinite far plane with a finite one, which is
+    // what OptiScaler feeds UE titles (75000). Off by default (= today's infinite form).
+    if (const wchar_t* ff = wcsstr(GetCommandLineW(), L"--fg-far-finite ")) {
+        const wchar_t* p = ff + 16;
+        if (wcsncmp(p, L"auto", 4) == 0) {
+            g_fg_far_finite = 75000.0f;
+        } else {
+            const float v = static_cast<float>(_wtof(p));
+            if (v > 1.0f && v < 1.0e7f) { g_fg_far_finite = v; }
+        }
+    }
+    // --fg-gate N / --fg-gate-up M: MV gate de-bounce (see the globals).
+    if (const wchar_t* gt = wcsstr(GetCommandLineW(), L"--fg-gate ")) {
+        const int n = _wtoi(gt + 10);
+        if (n >= 0 && n <= 60) { g_fg_gate_hold = n; }
+    }
+    if (const wchar_t* gu = wcsstr(GetCommandLineW(), L"--fg-gate-up ")) {
+        const int n = _wtoi(gu + 13);
+        if (n >= 1 && n <= 60) { g_fg_gate_up = n; }
+    }
     // MFG. --interp N is the number of *interpolated* frames per real frame:
     // 1 = 2x, 2 = 3x, 3 = 4x. 0 (default) = the most the loaded DLL allows, which
     // is what we always did (XEFG_SWAPCHAIN_USE_MAX_SUPPORTED_INTERPOLATED_FRAMES).
     if (const wchar_t* it = wcsstr(GetCommandLineW(), L"--interp ")) {
         const int n = _wtoi(it + 9);
         if (n >= 0 && n <= 7) { g_fg_interp = n; g_fg_interp_set = (n > 0); }
+    }
+    // --interp-start M: capacity from --interp, first applied count from M (one shot).
+    if (const wchar_t* ist = wcsstr(GetCommandLineW(), L"--interp-start ")) {
+        const int n = _wtoi(ist + 15);
+        if (n >= 1 && n <= 7) { g_fg_interp_start = n; }
     }
     if (const wchar_t* fl = wcsstr(GetCommandLineW(), L"--fg-lib ")) {
         const wchar_t* p = fl + 9;
@@ -191,6 +226,7 @@ int main()
     if (wcsstr(GetCommandLineW(), L"--unlock-mfg")) { g_unlock_mfg = true; }
     // MFG model route: auto (default) tries the ported model and falls back to
     // the 2x-model unlock, exactly like MFG-Unlocker's PreparePort().
+    if (wcsstr(GetCommandLineW(), L"--mfg-replace-all")) { g_mfg_replace_all = true; }
     if (wcsstr(GetCommandLineW(), L"--mfg-model=port")) { g_mfg_model = 1; }
     else if (wcsstr(GetCommandLineW(), L"--mfg-model=keep2x")) { g_mfg_model = 2; }
     // XeFG tuning (see the globals above).
@@ -314,6 +350,7 @@ int main()
     }
     if (wcsstr(GetCommandLineW(), L"--fg-debug-tag-interp")) { g_fg_tag_interp = true; }
     if (wcsstr(GetCommandLineW(), L"--fg-debug-only-interp")) { g_fg_only_interp = true; }
+    if (wcsstr(GetCommandLineW(), L"--fg-debug-fail-black")) { g_fg_fail_black = true; }
     // --version: print the product and wire versions, then exit. Useful for support
     // ("which build is this?") and for the release check script.
     if (wcsstr(GetCommandLineW(), L"--version")) {
@@ -906,13 +943,16 @@ int main()
     }
 
     if (g_fg_rt_zero || g_fg_ui_none || g_fg_scene > 0.0f || g_fg_depth_inv ||
-        g_fg_jittered_mv_forced) {
-        logf_("[lock] XeFG tuning: rt=%s ui=%s scene=%.2f depthInv=%d jitteredMV=%d%s\n",
+        g_fg_jittered_mv_forced || g_fg_gate_hold > 0 || g_fg_gate_up > 1 ||
+        g_fg_far_finite != 0.0f) {
+        logf_("[lock] XeFG tuning: rt=%s ui=%s scene=%.2f depthInv=%d jitteredMV=%d%s"
+              " gate=%d/%d farFinite=%.0f\n",
               g_fg_rt_zero ? "zero" : "input",
               g_fg_ui_none ? "none" : "auto",
               g_fg_scene, g_fg_depth_inv ? 1 : 0, g_fg_jittered_mv ? 1 : 0,
               g_fg_jittered_mv_forced ? (g_fg_jittered_mv ? " (forced ON)" : " (forced OFF)")
-                                      : " (automatic: follows the producer's DLSS flag)");
+                                      : " (automatic: follows the producer's DLSS flag)",
+              g_fg_gate_hold, g_fg_gate_up, g_fg_far_finite);
     }
     if (g_slack > 0) {
         logf_("[lock] --slack %u: holding up to %u captured frames, processing the oldest"
@@ -951,6 +991,9 @@ int main()
     // adapter: there the clamp is not in the way and the native MFG model exists, so
     // patching would replace real multi-frame generation with repeated 2x frames
     // (docs/findings/MFG.md 1). The vendor is only known once the consumer adapter is picked.
+
+    if (g_list_quirks) { print_input_quirks(); return 0; }
+    apply_input_quirks();
 
     if (FAILED(RoInitialize(RO_INIT_MULTITHREADED))) {
         logf_("[lock] RoInitialize FAILED\n");
@@ -1016,6 +1059,7 @@ int main()
                     const wchar_t* bn = wcsrchr(image, L'\\');
                     bn = (bn != nullptr) ? bn + 1 : image;
                     if (wcs_ends_with_ci(bn, L"-Win64-Shipping.exe")) {
+                        g_game_is_unreal = true;
                         g_fg_of = true;
                         logf_("[lock] %ls is an Unreal shipping build - using our optical flow"
                               " for the motion vectors (its own MVs ghosted here; override with"
