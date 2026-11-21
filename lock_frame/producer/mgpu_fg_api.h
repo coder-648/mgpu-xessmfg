@@ -27,6 +27,12 @@
 //      copies on it is how the old tag lane worked (CAPTURE_RULES 4/5), but the
 //      record also carries the declared states, so a consumer-owned list is
 //      possible later without changing this ABI.
+//    * the open-list promise only holds for the Evaluate lane, so it is signalled
+//      explicitly with MGPU_FG_FRAME_CMD_OPEN. A record published from the present
+//      side (titles that stage tags but never Evaluate, e.g. PBZ) carries the list
+//      the title has already closed; recording a Dispatch there is undefined
+//      behaviour (commands dropped, NV UMD faults) and the transport must use its
+//      own queue list instead.
 //
 //  Nothing here is a hook. fakerFG publishes; the capture reads. If fakerFG is
 //  absent (old deployment), the capture falls back to its own lanes.
@@ -84,7 +90,14 @@ typedef enum MgpuFgFrameFlag
     MGPU_FG_FRAME_MV_DILATED     = 1u << 10,
     MGPU_FG_FRAME_MV_3D          = 1u << 11,
     MGPU_FG_FRAME_CAMERA_MOTION  = 1u << 12,
-    MGPU_FG_FRAME_FROM_FG        = 1u << 13
+    MGPU_FG_FRAME_FROM_FG        = 1u << 13,
+    // `cmd_list` is still the title's *open* recording list, so the capture may append its
+    // own passes to it (Evaluate lane). NOT set by a record published from the present
+    // side: there `cmd_list` is the list the title has already closed and executed.
+    // Bits 14/15 are the shared protocol's kInputFlagMvSuspect / kInputFlagColourActive,
+    // and the transport forwards `flags` into ProducerInfo.input_flags, so this one lives
+    // above them.
+    MGPU_FG_FRAME_CMD_OPEN       = 1u << 16
 } MgpuFgFrameFlag;
 
 // How long a resource stays usable, in the XeFG sense; the capture only needs

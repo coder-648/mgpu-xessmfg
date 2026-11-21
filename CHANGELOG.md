@@ -3,6 +3,159 @@
 只记**用户能感知**的变化与对应实测依据。每条结论的原始数据在
 `docs/findings/PERF_BASELINE.md` / `FINAL_CONFIG.md`。
 
+### release: lock_frame 1.2.6 —— PBZ 双卡 FG 两个 bug 修复（2026-11-22）
+
+发布说明见 `lock_frame/docs/RELEASE_NOTES_1.2.6.md`。只改传输端两处所有权/描述符错误，
+协议仍是 **v30**、`MgpuFgFrame` 布局不变、`fakerFG.ini` 默认值不变：
+
+- **崩溃**：present-staged 车道（PBZ 从不 `slEvaluateFeature`）把 Dispatch 记在标题
+  已 `Close()`/提交的命令列表上（UB）→ 命令被静默丢弃（`fr: coded ... 0.00 MB/frame` 整场）、
+  且会在标题重建资源的时刻（boss 战结束→过场）让 `nvwgf2umx` 直接 AV。
+  现在：`MGPU_FG_FRAME_CMD_OPEN` 只由 Evaluate 车道置位；present 车道把 pass 记到
+  生产端自己的 DIRECT 队列列表（提交前 `Wait(标题帧围栏)`），拿不到自己的列表就拒绝记录。
+- **MV 码流恒为 0**：MV/depth 两次 encode 共用 3 个描述符槽，depth 的描写在提交前覆盖了
+  MV 的，GPU 上两个 dispatch 都按 depth 的表跑 → MV 槽与 `TileLen[0]` 从未写入。
+  现在描述符堆 6 个（`mv srv,uav,tl | depth srv,uav,tl`），按 `d32 ? 3 : 0` 取基址。
+- **实测（PBZ 2562×1441）**：`fr: coded mv` avg **7.50 MB/帧**（1.54–3.08x，130/130 非零）、
+  depth avg **7.15 MB/帧**（1.67–2.56x），合计 ≈14.65 MB/帧（raw 28.64）⇒ **1.96x / ≈0.58 GB/s**；
+  同会话 crash 0、`already published` 0、credit/watermark 告警 0、slot 正常轮转、
+  present 101 窗口 avg 13.18 ms。
+- 顺带纠正：PBZ 提供的是**真实可用的 MV**；“PBZ MV 不可用”的旧结论由第 2 个 bug 造成。
+
+
+
+上一条修好"记到关闭的 list"之后（见下一条 2026-11-22 的 transport 修复），02:02 的会话跑了 13 分钟**不再崩溃**，并且出现了预期的
+`record lane has no open title list - downscale/codec passes run on the producer's DIRECT queue list (CopyInline=0)`。
+但新日志立刻暴露了下一个 bug：
+
+```text
+fr: coded mv    0.00 MB/frame (raw 14.32, 0.00x)     ← 612 次，全程
+fr: coded depth 7.59 MB/frame (raw 14.32, 1.89x)     ← 深度真的在传
+```
+
+**根因：`g_fr_heap` 只有 3 个描述符（srv | uav | TileLen），MV 与 depth 两次 encode 共用。**
+
+两次 encode 都记在**同一张命令列表**里、提交前才由 CPU 写描述符，而 GPU 是在执行时才读描述符堆。
+于是 depth 那次 `CreateShaderResourceView/CreateUnorderedAccessView` 把同一组槽覆盖成 depth 的：
+
+- MV 的 dispatch 执行时用的是 depth 的 SRV/UAV/TileLen → **读 depth 纹理、写 depth 槽、写 TileLen[1]**；
+- 于是 depth 槽被写两遍（内容相同，所以深度看着正常）、**TileLen[0] 与 MV 槽永远没人写**；
+- TileLen 只是诊断/落盘长度，不是传输内容，所以消费端不会报错——它把 MV 槽里的零字节当合法
+  tile 解出来，等于**全程零速度场**。注意这不是"游戏没给 MV"：修好之后实测 MV 平均 7.5 MB/帧
+  （见下），说明 PBZ 提供的 MV 是真实数据，之前"PBZ MV 不可用"的印象由这个 bug 造成。
+
+**修**：`ensure_fr_objects()` 的描述符堆改成 6 个（`mv srv,uav,tl | depth srv,uav,tl`），
+`fr_encode_dispatch()` 按 `d32 ? 3 : 0` 取基址。消费端本来就是两个独立堆（`g_fr_heap` /
+`g_fr_d_heap`），不受影响。
+
+**验证判据**：`fr: coded mv` 应从 `0.00` 变成与深度同量级（1.5–2.5x 压缩比）。
+
+**实机结果（2026-11-22 02:27 会话，`xess_mfg_producer` = a038e073，约 2.5 分钟）——确认修好：**
+
+```text
+fr: coded mv    9.21 / 7.56 / 8.32 / 4.65 ... MB/frame   (130 次采样，min 2.68, avg 7.50, max 10.91)
+fr: coded depth 7.49 / 8.14 / 7.77 ... MB/frame          (130 次，min 5.60, avg 7.15, max 8.56)
+```
+
+- 两条流**130/130 次都非零**，MV 压缩比 1.54–3.08x 且随画面变化（静止/加载时段 4.6–5.8 MB、
+  战斗时段 8–11 MB）→ **PBZ 的 MV 是真实、有熵的数据**，"游戏不提供 MV"这个假设被证伪；
+  早先"PBZ MV 与真实位移相关性≈0"的结论很可能是被这个 bug（MV 槽从未写入）污染的，需要重测。
+- 合计 MV+depth ≈ **14.65 MB/帧**（raw 每流 14.32 MB，两流 28.64 MB）⇒ 码流把跨卡流量压到
+  **≈1.96x**、按 39.8 发布/秒算约 **0.58 GB/s**（原来 150% 直接拷贝是 1.14 GB/s 且 MV 还是错的）。
+- 同会话：`crash` 0、`already published` 0、`stale colour ACK` / `reclaimed oldest slot` /
+  `watermark skip` / `credit window OFF` 全 0，`publish ... slot=` 正常轮转（0,1,2,…,8,…,0）。
+
+### 观察: boss 战结束→过场动画的那个瞬间（会话 23624，02:13:30）
+
+这次没崩，但**两次崩溃的前兆签名原样重演**，所以可以确认崩溃窗口就是"标题重建渲染资源"的那一刻：
+
+```text
+02:13:30.977 sl: frame token 26463 already published - present-staged duplicate collapsed
+02:13:31.011 sl: frame token 26464 ... collapsed
+02:13:31.077 sl: frame token 26467 ... collapsed
+02:13:31.856 present: 120 frames avg=9.09 min=0.05 max=81.14 ms, 1 long     ← 12.5 ms → 8.3 ms（80→120 fps）
+02:13:32.323 xefg: 1X present status framesPresented=1 ... srFresh=0        ← DLSS-SR 不再出帧（过场）
+02:13:35.772 sl: publish calls=24000 collapsed=97 ...                       ← 这一个窗口 97 次重复 token
+```
+
+同时段 producer 侧：`present fallback publish ... depth=00000003DEB1F8E0` → `depth=000000192EA9BB60`
+（标题重建了 depth 纹理）、`stale colour ACK seq=20688 ack=20655 (ahead=33 > ring 32)`、
+`shared: credit window OFF (round-robin) - consumer silent for 30 frames`、
+`NEW consumer session ... (generation 3)`（消费端重连），之后 slot 从长期固定 0 恢复轮转。
+
+也就是说这个窗口里**标题关/重开命令列表、重建 depth/MV、消费端重连**同时发生。旧代码偏偏在
+present 侧往标题已关闭的列表里记 Dispatch（见下一条 transport 修复），驱动在这类"列表/资源状态
+正在翻新"的时刻最容易 AV；现在记录落在自己的 DIRECT 队列、由标题帧围栏排序，这个窗口不再碰
+标题的 list。
+
+遗留（未改，先记录）：`colour watermark skip` / `stale colour ACK` 会在过场这类 MV 与 WGC 颜色
+速率错开的时刻刷几条，属于既有节流逻辑，不影响正确性；`publish ... slot=0` 长时间固定是
+credit 窗口 + colour ACK 落后的结果，重连后自行恢复。
+
+
+
+**现象**（`F:\steam\...\PBZ\platform\steam\PBZ_fakerFG.log`，两次会话完全同形）：
+
+```text
+sl: frame token 72927/72928/72930 already published - present-staged duplicate collapsed
+present: 120 frames avg=11.04 min=0.06 max=83.47 ms, 1 long
+crash: first-chance code=0xC0000005 at ... nvwgf2umx.dll+0x6E1ABB
+crash:   stack ... nvwgf2umx.dll+0x6DB3F0
+```
+
+```text
+sl: frame token 19387/19389/19390 ... duplicate collapsed
+crash: first-chance code=0xC0000005 at 00007FF984E4B77C = nvwgf2umx.dll+0x6DB77C
+crash:   stack ... D3D12Core.dll+0x2A1EAD
+crash:   stack ... D3D12Core.dll+0x151494
+crash:   stack 00007FF9813B4570 = xess_mfg_producer.dll+0x4570
+```
+
+`xess_mfg_producer.dll+0x4570` 用 `.pdata` 反查落在 `fr_encode_dispatch`（RVA
+`0x3FC0-0x46CD`）里，正好是 `SetComputeRootDescriptorTable(2, gpu_uav)` 的**返回地址**
+（`call *0xf8(%rax)` @ `0x456a`）——即崩溃发生在生产端往命令列表里记 compute pass 的时候，
+调用链 `producer → D3D12Core → nvwgf2umx`。
+
+**根因：把 pass 记到了游戏已经 `Close()` 并提交过的列表上。**
+PBZ 从不用 `slEvaluateFeature(DLSS_G)`（整个会话 `eval token=0`，所有记录都来自
+`slPCLSetMarker(ePresentStart)` 的 present-staged 兜底），而那条路径交给生产端的
+`f->cmd_list` 是 `g_stage.cmd`——标题在 present 之前就已经关闭并 `ExecuteCommandLists`
+的列表。往已关闭的列表追加命令是 D3D12 的未定义行为：
+
+- 命令被静默丢弃 —— 证据是同一次会话里 `fr: coded mv/depth 0.00 MB/frame` 连续 456 次
+  （每帧一次、整整 7 分钟）。也就是说 PBZ 的 MV/depth **从来没有真正编码过**，
+  消费端解的是全零 tile；以前"PBZ codec 解码成功"只是解了空数据。
+- 驱动偶尔直接崩 —— 记 `SetComputeRootDescriptorTable` / `Dispatch` 时 `nvwgf2umx`
+  访问到被标题回收/重置的列表内部状态，秒级前兆就是那几行
+  `present-staged duplicate collapsed`（present 侧一帧内多次 publish，列表状态最乱）。
+
+**改动**：
+
+- `mgpu_fg_api.h`：新增 `MGPU_FG_FRAME_CMD_OPEN`（`1u << 16`，避开共享协议已用的
+  14/15 位），语义是"`cmd_list` 仍是标题正在记录的列表"。Evaluate / NGX / FFX / DLSSG
+  evaluate 车道都置位，只有 `sl_publish_staged()`（present 车道）不置位。
+  `MgpuFgFrame` 布局不变，API 仍是 v2。
+- `producer.cpp`：新增 `gpu_list` 选择 —— Evaluate 车道继续用标题的列表（行为不变、
+  不多一条队列/围栏）；present 车道改用**生产端自己的 DIRECT 队列列表**
+  （`g_copy_list`/`g_copy_q`，在 `publish_frame()` 里 `Wait(标题帧围栏)` 之后提交，
+  读 MV/depth 的时机与原来的拷贝路径完全一致）。scale / codec / TileLen 回读三处
+  一起改；`want_dispatch` 时强制 `use_dma=false`（COPY 队列不能跑 Dispatch）。
+- 兜底：present 车道又拿不到自己的 DIRECT 列表（`CopyInline=1` 或异步队列创建失败）时
+  **拒绝记录**并打一行 `no open title list and no own DIRECT list ...`，而不是继续往
+  关闭的列表里写。
+- `ProducerInfo.input_flags` 里把新 flag 掩掉（它是传输元数据，不是输入语义）。
+
+**验证**：`./lock_frame/build.sh producer` / `faker` 均通过（MSVC 14.44，0 warning）。
+实机预期：producer 日志新增
+`record lane has no open title list - downscale/codec passes run on the producer's DIRECT queue list (CopyInline=0)`，
+`fr: coded mv/depth` 从 `0.00 MB/frame` 变成真实码率，长跑不再出现
+`nvwgf2umx` 的 AV。两个 DLL 已同步部署到 `F:\steam\...\PBZ\platform\steam\`
+（旧文件备份为 `*.bak_20261122_015644`）；消费端 `lock_frame.exe` 无需改动。
+
+**实机结果（2026-11-22 02:02 会话，13 分钟）**：不再崩溃，新日志行出现，`fr: coded depth`
+变成 7.5 MB/帧（1.8–2.1x）；`fr: coded mv` 仍为 0.00 —— 这是下一个独立 bug（描述符槽共用），
+见上一条。boss 战结束→过场的时刻仍会重演崩溃前兆（`already published` ×3），但不再 AV。
+
 ### release: lock_frame 1.2.5 —— 整理 1.2.2 → 1.2.5（2026-11-21）
 
 公开版上一个 tag 是 **v1.2.1**，本次把本地积累的改动整理成一个版本（发布说明见

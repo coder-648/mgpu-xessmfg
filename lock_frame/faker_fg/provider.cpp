@@ -171,6 +171,10 @@ void harvest(void* params, ID3D12GraphicsCommandList* list, MgpuFgFrame& f)
     f.declared_frames = mf_count;
 
     f.flags = flags;
+    // `list` came from an Evaluate call: the title is still recording into it, so the
+    // transport may append its passes (MGPU_FG_FRAME_CMD_OPEN). Only the present-staged
+    // lane in proxy_streamline.cpp must NOT claim this.
+    f.flags |= MGPU_FG_FRAME_CMD_OPEN;
 
     // Camera declared? `CameraFOV` alone is enough to call it a camera.
     if (f.camera_near > 0.0f && f.camera_far > f.camera_near) {

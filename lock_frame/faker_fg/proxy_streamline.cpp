@@ -901,6 +901,10 @@ sl::Result hk_evaluate(sl::Feature feature, const sl::FrameToken& frame,
     }
     f.present_id = present_id;
 
+    // `cmd` came in with slEvaluateFeature, so it is the title's still-open list: the
+    // transport may append its own passes to it (see MGPU_FG_FRAME_CMD_OPEN).
+    f.flags |= MGPU_FG_FRAME_CMD_OPEN;
+
     g_sl_eval_token = static_cast<uint32_t>(frame);
     sl_publish_record(f, g_sl_eval_token, "evaluate");
     // FGInput=DLSSG only: this lane is Sl_Inputs, so it must not tag anything when the
@@ -1201,6 +1205,14 @@ void sl_publish_staged()
     }
     f.flags = flags;
     f.present_id = xefg_next_frame_id();
+
+    // NO MGPU_FG_FRAME_CMD_OPEN here: this lane runs from slPCLSetMarker(ePresentStart),
+    // i.e. after the title closed and submitted `g_stage.cmd`. Recording a Dispatch on a
+    // closed list is undefined behaviour - the commands are dropped (the codec's TileLen
+    // read back 0.00 MB/frame for whole PBZ sessions) and the NV UMD intermittently
+    // faults (PBZ 2026-11-22, 0xC0000005 in nvwgf2umx.dll inside
+    // fr_encode_dispatch's SetComputeRootDescriptorTable). The producer now records its
+    // own passes on its DIRECT queue list, which is submitted after the frame fence.
 
     // The producer's transport needs the D3D12 device; the staged tags do not carry it.
     ID3D12Resource* res = static_cast<ID3D12Resource*>(

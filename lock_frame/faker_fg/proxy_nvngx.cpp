@@ -241,6 +241,7 @@ void publish_upscaler_record(ID3D12GraphicsCommandList* list, bool tagged)
     }
 
     f.cmd_list     = list;                    // still OPEN: this is the copy window
+    f.flags       |= MGPU_FG_FRAME_CMD_OPEN;  // ...so the transport may record on it
     f.mode         = api_mode();
     // The record needs the device too: the transport places its slots on it. In the
     // upscaler lane nothing set it (provider's harvest does), so take the chain's.

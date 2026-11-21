@@ -227,7 +227,7 @@ void fr_resolve_codec(ID3D12Device* device);   // resolves "auto" before the lay
 constexpr uint32_t kFrTileW = 32, kFrTileH = 8;
 constexpr uint32_t kFrSlotWords = 264;          // (4 + 256*4) bytes / 4, rounded up
 ComPtr<ID3D12RootSignature>  g_fr_rs;
-ComPtr<ID3D12DescriptorHeap> g_fr_heap;         // srv(texture) | uav(slot) | uav(TileLen)
+ComPtr<ID3D12DescriptorHeap> g_fr_heap;         // per stream: mv srv,uav,tl | depth srv,uav,tl
 ComPtr<ID3D12PipelineState>  g_fr_pso;     // MV: fp16 pairs
 ComPtr<ID3D12PipelineState>  g_fr_pso_d32; // depth: one R32 value per pixel
 ComPtr<ID3D12Resource>       g_fr_tilelen[2];   // [0] = MV, [1] = depth
@@ -963,7 +963,13 @@ bool ensure_fr_objects(ID3D12Device* device)
 
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = 3;                 // srv(texture) | uav(slot) | uav(TileLen)
+    // Per stream: mv srv,uav,tl | depth srv,uav,tl. MV and depth are recorded into the
+    // SAME command list before it is submitted, and the GPU reads the heap at execution,
+    // so sharing three slots made the depth encode's views overwrite the MV encode's:
+    // both dispatches then ran with the depth tables and only depth was written
+    // (measured on PBZ 2026-11-22: `fr: coded mv 0.00 MB/frame` for the whole session
+    // while depth encoded fine - TileLen[0] was never written).
+    hd.NumDescriptors = 6;
     hd.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_fr_heap)))) {
         logf("fr: descriptor heap FAILED\n");
@@ -1106,8 +1112,13 @@ bool fr_encode_dispatch(ID3D12GraphicsCommandList* list, ID3D12Resource* src,
 
     const UINT inc = device->GetDescriptorHandleIncrementSize(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    // MV -> slots 0..2, depth -> slots 3..5. Both encodes are recorded into the same
+    // list before it is submitted, so the two streams must never share a slot.
+    const UINT base_index = d32 ? 3u : 0u;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_fr_heap->GetCPUDescriptorHandleForHeapStart();
+    cpu.ptr += static_cast<SIZE_T>(inc) * base_index;
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = g_fr_heap->GetGPUDescriptorHandleForHeapStart();
+    gpu.ptr += static_cast<UINT64>(inc) * base_index;
 
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     srv.Format                  = codec_srv_fmt;          // R16G16_FLOAT / R32_FLOAT
@@ -2513,6 +2524,31 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
         }
     }
 
+    auto* list = static_cast<ID3D12GraphicsCommandList*>(f->cmd_list);
+    // Only the Evaluate lane hands us a list the title is still recording into. A record
+    // published from the present side (PBZ stages its tags and never evaluates DLSS-G)
+    // carries the list the title closed and submitted before the marker. Appending a
+    // Dispatch, a barrier or even a copy to it is undefined behaviour: the commands are
+    // silently dropped (that is why `fr: coded` reported 0.00 MB/frame for whole PBZ
+    // sessions) and the NV UMD intermittently faults while recording (PBZ 2026-11-22,
+    // 0xC0000005 in nvwgf2umx.dll from fr_encode_dispatch's
+    // SetComputeRootDescriptorTable).
+    const bool title_list_open = (f->flags & MGPU_FG_FRAME_CMD_OPEN) != 0;
+    // Our own DIRECT queue list is the safe target for that lane: it is submitted in
+    // publish_frame() after Wait(title frame fence), so the title's frame is complete when
+    // the passes read MV/depth. CopyInline=1 asks for the title's list, which does not
+    // exist as an open list here - refuse rather than corrupt it.
+    const bool own_direct_ok = !g_force_inline && g_copy_enabled;
+    if (!title_list_open && !own_direct_ok) {
+        static bool told_closed_lane = false;
+        if (!told_closed_lane) {
+            told_closed_lane = true;
+            logf("producer: no open title list and no own DIRECT list - nothing can be"
+                 " recorded on this lane, publication stays off (set CopyInline=0)\n");
+        }
+        return;
+    }
+
     if (!g_slot_locked) {
         if (!claim_slot()) {
             static unsigned told_noslot = 0;
@@ -2550,11 +2586,12 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
         }
     }
 
-    auto* list = static_cast<ID3D12GraphicsCommandList*>(f->cmd_list);
     // A COPY-only list (some UE5 tag lanes) cannot accept the downscale Dispatch. Fall
     // back to 1:1 for the rest of the session; update_content() rewrites the stream
     // rectangles and bumps `generation`, so the consumer rebuilds its local copies.
-    if ((g_scaled[1] || g_scaled[2]) && list != nullptr && g_copied_mask == 0 &&
+    // Only the open-list lane can hit this; the present lane records on our own list.
+    if (title_list_open && (g_scaled[1] || g_scaled[2]) && list != nullptr &&
+        g_copied_mask == 0 &&
         f->render_w <= g_slot_w && f->render_h <= g_slot_h &&
         list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT &&
         list->GetType() != D3D12_COMMAND_LIST_TYPE_COMPUTE) {
@@ -2570,8 +2607,9 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
                  " StreamPercent=100 for this title\n", static_cast<int>(list->GetType()));
         }
     }
-    // Copies go to a second queue; the scale pass (if any) MUST stay on the game's list
-    // because the source texture is only valid there and Dispatch is illegal on COPY.
+    // Copies go to a second queue; the Dispatch passes go to the title's list when it is
+    // still open, else to that same DIRECT copy queue (gpu_list below). A COPY (DMA)
+    // queue itself can never execute a Dispatch.
     bool use_dma = false;
     // v22: colour needs a barrier (the game's back buffer is not in COPY_SOURCE), and a
     // COPY list cannot express one. One list carries all three streams so a publication
@@ -2580,6 +2618,16 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
     // keep those frames on the DIRECT copy queue even when StreamPercent=100.
     const bool depth_convert = want_depth && dp.resource != nullptr &&
                                wide_depth_format(static_cast<DXGI_FORMAT>(dp.format));
+    // Does this frame need a compute pass at all (downscale and/or codec encode)?
+    // Over-approximated on purpose: it only has to be true when one of the passes below
+    // really records a Dispatch, because a COPY queue cannot execute one.
+    const bool want_dispatch = (want_mv && mv.resource != nullptr && mv_codec() != 0) ||
+                               (want_depth && dp.resource != nullptr &&
+                                (depth_codec() != 0 || depth_convert)) ||
+                               g_scaled[1] || g_scaled[2] || g_scaled[3];
+    // Present lane: the passes go on our own DIRECT queue list (gpu_list below), so the
+    // DMA/COPY queue must not be the only list we opened for this frame.
+    if (want_dispatch && !title_list_open && own_direct_ok) { use_dma = false; }
     if (!g_force_inline && g_dma_enabled && !want_colour && !depth_convert) {
         const bool mv_ok = !want_mv || g_scaled[1] ||
             static_cast<D3D12_RESOURCE_STATES>(mv.state) == D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -2602,6 +2650,31 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
                              ? nullptr
                              : (use_dma ? g_dma_list.Get()
                                         : (g_copy_enabled ? g_copy_list.Get() : nullptr));
+
+    // Which list carries the Dispatch passes (downscale + codec encode + TileLen copy):
+    //  * Evaluate lane  -> the title's own open list, exactly as before (no extra queue,
+    //                      no extra fence, the pass sits inside the title's frame);
+    //  * present lane   -> our DIRECT queue list. Recording on the title's closed list
+    //                      silently drops every command (that is why `fr: coded` reported
+    //                      0.00 MB/frame for whole PBZ sessions) and the NV UMD
+    //                      intermittently faults while recording it (PBZ 2026-11-22,
+    //                      nvwgf2umx AV at fr_encode_dispatch's
+    //                      SetComputeRootDescriptorTable). The list is submitted in
+    //                      publish_frame() after Wait(title frame fence), so the title's
+    //                      frame is complete when the encode reads MV/depth.
+    ID3D12GraphicsCommandList* gpu_list = list;
+    if (!title_list_open) {
+        gpu_list = g_copy_list.Get();   // own_direct_ok guarantees this list exists
+        static bool told_own = false;
+        if (!told_own) {
+            told_own = true;
+            logf("producer: record lane has no open title list - downscale/codec passes run"
+                 " on the producer's DIRECT queue list (CopyInline=0)\n");
+        }
+    }
+    // A Dispatch is only legal on a list that is still open: the Evaluate lane's title
+    // list, or our own list. Never the title's closed list.
+    const bool dispatch_lane_ok = (gpu_list != nullptr);
 
     // StreamPercent > 100: scale MV+depth to the stream size with one compute pass,
     // then copy what the pass wrote. Both streams must end up at the SAME size (XeFG
@@ -2630,14 +2703,15 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
     bool need_scaled_ui = want_ui && ui_aux != nullptr && g_scaled[3];
     if (need_scaled_mv || need_scaled_depth || need_scaled_ui) {
         const bool can_dispatch =
-            list != nullptr && (list->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT ||
-                                list->GetType() == D3D12_COMMAND_LIST_TYPE_COMPUTE);
+            dispatch_lane_ok &&
+            (gpu_list->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT ||
+             gpu_list->GetType() == D3D12_COMMAND_LIST_TYPE_COMPUTE);
         if (!can_dispatch) {
             static bool told = false;
             if (!told) {
                 told = true;
                 logf("downscale: list type %d cannot take a Dispatch - set StreamPercent=100\n",
-                     list != nullptr ? static_cast<int>(list->GetType()) : -1);
+                     (gpu_list != nullptr) ? static_cast<int>(gpu_list->GetType()) : -1);
             }
             // UI is optional: drop it for this frame instead of losing MV/depth too.
             if (need_scaled_ui) {
@@ -2654,13 +2728,13 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
         }
         bool ok = true;
         if (ok && need_scaled_mv) {
-            ok = scale_dispatch(list, static_cast<ID3D12Resource*>(mv.resource), mv.state, 1);
+            ok = scale_dispatch(gpu_list, static_cast<ID3D12Resource*>(mv.resource), mv.state, 1);
         }
         if (ok && need_scaled_depth) {
-            ok = scale_dispatch(list, static_cast<ID3D12Resource*>(dp.resource), dp.state, 2);
+            ok = scale_dispatch(gpu_list, static_cast<ID3D12Resource*>(dp.resource), dp.state, 2);
         }
         if (ok && need_scaled_ui) {
-            ok = scale_dispatch(list, static_cast<ID3D12Resource*>(ui_aux->resource),
+            ok = scale_dispatch(gpu_list, static_cast<ID3D12Resource*>(ui_aux->resource),
                                 ui_aux->state, 3);
         }
         if (!ok) {
@@ -2684,10 +2758,11 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
     if (want_mv && (g_copied_mask & mgpu::kRequestMv) == 0) {
         if (mv_codec() != 0 && !scaled_mv && mv.resource != nullptr) {
             // v30: lossless - encode straight from the title's MV into the slot buffer.
-            // Recorded on the game's list because the MV texture is only valid there; the
-            // copy queue waits on the frame fence, so the forward fence covers this write.
-            if (fr_encode_dispatch(list, static_cast<ID3D12Resource*>(mv.resource), mv.state,
-                                   1, g_cur_slot)) {
+            // Evaluate lane: the title's open list. Present lane: our own DIRECT list,
+            // whose submit waits for the title's frame fence - never the closed list.
+            if (dispatch_lane_ok &&
+                fr_encode_dispatch(gpu_list, static_cast<ID3D12Resource*>(mv.resource),
+                                   mv.state, 1, g_cur_slot)) {
                 g_copied_mask |= mgpu::kRequestMv;
             } else {
                 static bool told = false;
@@ -2711,7 +2786,7 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
                                             : dp.state;
         if (depth_codec_on) {
             // v30: lossless depth - encode on the render card, decode on the consumer.
-            if (fr_encode_dispatch(list, src, state, 2, g_cur_slot)) {
+            if (dispatch_lane_ok && fr_encode_dispatch(gpu_list, src, state, 2, g_cur_slot)) {
                 g_copied_mask |= mgpu::kRequestDepth;
             } else {
                 static bool told_dep = false;
@@ -2933,9 +3008,12 @@ void publish_frame(void* queue_ptr)
         }
 
         c->producer.input_api   = mgpu::kInputApiFaker;
-        c->producer.input_flags = (f.flags & ~mgpu::kInputFlagMvActive) |
-                                  ((g_copied_mask & mgpu::kRequestMv) ? mgpu::kInputFlagMvActive : 0u) |
-                                  (unit == 3 ? mgpu::kInputFlagMvNdc : 0u);
+        // MGPU_FG_FRAME_CMD_OPEN is transport metadata (which lane published), not a
+        // producer input flag: keep it out of the shared protocol word.
+        c->producer.input_flags =
+            (f.flags & ~(mgpu::kInputFlagMvActive | MGPU_FG_FRAME_CMD_OPEN)) |
+            ((g_copied_mask & mgpu::kRequestMv) ? mgpu::kInputFlagMvActive : 0u) |
+            (unit == 3 ? mgpu::kInputFlagMvNdc : 0u);
         c->producer.render_w      = g_render_w ? g_render_w : g_stream_w[1];
         c->producer.render_h      = g_render_h ? g_render_h : g_stream_h[1];
         c->producer.output_w      = f.output_w ? f.output_w

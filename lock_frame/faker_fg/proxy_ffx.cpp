@@ -129,7 +129,8 @@ void capture_prepare(const ffxDispatchDescFrameGenerationPrepare* p)
     }
     if (cfg().depth_inverted != 0) { flags |= MGPU_FG_FRAME_DEPTH_INVERTED; }
     if (cfg().mv_jittered != 0)    { flags |= MGPU_FG_FRAME_MV_JITTERED; }
-    f.flags = flags;
+    // Dispatch-desc command list: the title is still recording into it.
+    f.flags = flags | MGPU_FG_FRAME_CMD_OPEN;
 
     const uint32_t present_id = xefg_next_frame_id();
     f.present_id = present_id;
@@ -238,7 +239,8 @@ void capture_legacy(const FfxFrameInterpolationDispatchDescription* p)
     }
     if (cfg().depth_inverted != 0) { flags |= MGPU_FG_FRAME_DEPTH_INVERTED; }
     if (p->reset) { flags |= MGPU_FG_FRAME_RESET_HISTORY; }
-    f.flags = flags;
+    // Legacy interpolation desc: same open-list promise as the Dispatch desc above.
+    f.flags = flags | MGPU_FG_FRAME_CMD_OPEN;
 
     const uint32_t present_id = xefg_next_frame_id();
     f.present_id = present_id;
