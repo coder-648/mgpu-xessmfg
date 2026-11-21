@@ -4,9 +4,13 @@
 `lock_frame` 在另一块显卡上用 XeSS-FG 插帧，再叠加回游戏窗口上屏——
 目标是在不换显卡的情况下把帧数翻倍到 4 倍。
 
-当前正式版：**lock_frame 1.2.1**（共享协议 v28，GPL-3.0）。
+当前正式版：**lock_frame 1.2.5**（共享协议 v30，GPL-3.0）。
+MV/depth 默认走**无损码流**（硬件不支持时自动退回拷贝路径）；
 发布包**自带 Intel 运行时**（`libxess_fg.dll` / `libxell.dll`），解压即用；
-安装时它们会被写入 `<游戏>\fakerFG\`（1.2.1 修复：游戏进程里的 XeFG 只从这里加载）。
+安装时它们会被写入 `<游戏>\fakerFG\`（1.2.1 起的修复：游戏进程里的 XeFG 只从这里加载）。
+
+> UI 合成（HUDless/unblend）在 1.2.5 的结论是**暂无通用解决方案**，发布默认关闭，
+> 只在显式本地 A/B 时可用，见 [`lock_frame/docs/UI_SYNTHESIS_GATE.md`](lock_frame/docs/UI_SYNTHESIS_GATE.md)。
 
 ![主界面](docs/bilibili/images/01-main.png)
 

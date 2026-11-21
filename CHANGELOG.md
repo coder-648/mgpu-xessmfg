@@ -3,6 +3,132 @@
 只记**用户能感知**的变化与对应实测依据。每条结论的原始数据在
 `docs/findings/PERF_BASELINE.md` / `FINAL_CONFIG.md`。
 
+### release: lock_frame 1.2.5 —— 整理 1.2.2 → 1.2.5（2026-11-21）
+
+公开版上一个 tag 是 **v1.2.1**，本次把本地积累的改动整理成一个版本（发布说明见
+`lock_frame/docs/RELEASE_NOTES_1.2.5.md`）。用户能感知的部分：
+
+- **传输**：MV/depth 默认走无损码流（协议 **v30**，`MvCodec`/`DepthCodec` 缺省
+  `auto`，不支持时自动退回拷贝路径）；`fakerFG.dll` 与 `lock_frame.exe` 必须同版本。
+- **fakerFG 输入车道**：`FgInput=DLSSG` 按 OptiScaler 的 Streamline 输入规则补齐
+  （extent 优先、v1 常量提升、相机矩阵反推、`mvecScale`×分辨率、lifecycle 提升与
+  `FG*ValidNow` 覆盖）；`FgInput=NVNGX` 打通并真正在 present 派发；`FgInput=FSR`
+  仍未实现。
+- **UI 合成**：结论是**暂无通用解决方案**，`UiStream=0` / `UiSource=Off` 仍是发布默认。
+  本版只修掉实验路径里“不透明分支保留带 UI 画面导致拖影不消失”的确切 bug，并把入口
+  收敛成显式本地 A/B（`UiSynthesis=1`，或 `UiStream=1 + UiSource=Game|Hudless`；
+  consumer 需 `--ui-unblend`）。见下条与 `docs/UI_SYNTHESIS_GATE.md`。
+- **修复**：`FgInput=NVNGX` + `FgOutput=Capture` 启动后窗口冻死（500 ms 无 native
+  record 即释放 present 门控）；stream 3 已预留但 producer `ui_source=Off` 时不再误开
+  UI composition。
+- **多帧**：XeFG 调用序列审计完毕，运行时不变；动态多帧仍不开放
+  （`docs/design/TRUE_MFG_OPTIONS.md` §8.3）。
+
+下面保留本版逐项改动记录与实测依据。
+
+### fix(ui): unblend 不透明分支改黑 + 本地 A/B 门控 + 失败原因日志（实验路径，默认关）(2026-11-21)
+
+复核 UI 合成（v29 UI 流 + consumer unblend + XeFG mode 4）时找到“代码齐全但验收
+不过”的一个直接原因：`unblend_ui.hlsl` 在不透明 UI（`a≈1`）时保留了**带 UI 的
+present**，于是重建出的 HUDless 仍然含 HUD，mode 4 插值的底图里 HUD 原样存在，
+拖影自然不消失。OptiScaler 的 `UiUnblend.hlsl:41` 在该分支写 **0（黑）**：
+“black still differs from the UI so FG treats it as UI”。
+
+- `lock_frame/shaders/unblend_ui.hlsl`：不透明分支改为 `h = 0`，判定统一为
+  `ui.a < OpaqueAlpha (0.99)`。
+- `lock_frame/producer/producer.cpp`：新增 `fakerFG.ini UiSynthesis=1`，作为
+  `kUiSynthesisGateOpen` 的**本地 A/B 覆盖**（默认仍 `UiStream=0`/`UiSource=Off`，
+  日志写 “local A/B only”）。
+- `lock_frame/modules/085_ui_unblend.inc`：失败路径补一次性
+  `ui-unblend: inactive - <reason>`，验收时能区分“没有 UI 平面 / 不 fresh /
+  stream 3 无效 / synth 失败”。
+- **NVNGX + Capture 启动卡死（2026-11-21）**：`xefg_should_present()` 在没有新的
+  native record 时会丢弃 Present；切到 `FgInput=NVNGX` 后游戏不 evaluate DLSS-G，
+  record 停供，于是所有 Present 被丢（日志 `capture present dropped (no new native
+  record, total 1200)`），窗口看起来冻死。现在超过 **500 ms** 没有 record 就释放
+  present 门控并继续上屏（打一条日志），之后再来 record 会重新挂上。
+- 第一次实测一条数据都没有，根因是三处门控串联：
+  1. consumer `ui_source_now()` 第一行就 `return kUiSourceOff`（`020_state_overlay.inc`），
+     显式 `--ui-source hudless` 也被吞掉；
+  2. `--streams=mv,depth` 覆盖请求位，UI 根本没被请求（日志 `streams -> ... ui=0`）；
+     现在 `--ui-unblend`/`--ui-source` 自动 `|= kRequestUi`；
+  3. producer 只认 `UiSynthesis=1`，而 `UiStream=1 + UiSource=Hudless|Game` 本身现在
+     也算显式 opt-in；`SetUiCompositionState(ENABLED)` 的判据改为 producer
+     `ui_source != Off`（不再只看预留的 slot）。
+- 第二次实测（链路已通）：stream 3 全黑（`ui_XX_hudless.bmp` 0% 非黑、alpha 100% 白），
+  producer 日志显示选的是 `SCALING_OUTPUT`（`state=0x8 lc=1`）。CP2077 在游戏自身 FG
+  关闭、只跑 DLSS-SR 时该 target 为空；改为**优先 `HUDLESS_COLOR` 的 stable snapshot**，
+  `SCALING_OUTPUT` 仅作 fallback，并打 `sl: HUDless source = HUDLESS snapshot` /
+  `= SCALING_OUTPUT (fallback)`。
+- 已知限制：UI 流是 R10G10B10A2，alpha 只有 2 bit，半透明 UI 边缘会量化；
+  下一步针对 `UiSource=Hudless` 做直接 HUDless 重建（本地全精度 mask，不再走
+  UI 颜色/alpha），见 `docs/design/UI_UNBLEND_MODE4.md` §11.3。
+- 构建：`./lock_frame/build.sh producer|consumer` 通过。默认配置下行为不变
+  （`--ui-unblend` 与 `UiStream=1` 都未开时这条路径完全惰性）。
+
+### feat(fakerfg): DLSS FG 输入车道对齐 OptiScaler（2026-11-21）
+
+范围：`lock_frame/faker_fg`（`build.sh faker` 构建的那份；`src/faker_fg` 是旧树，不动）。
+
+**Streamline 车道（`FgInput=DLSSG`）按 `Sl_Inputs` 补齐：**
+
+- `kBufferTypeHiResDepth` / `kBufferTypeLinearDepth` 与 `kBufferTypeDepth` 一样记为
+  Depth（OptiScaler `Streamline_Inputs.cpp:287-300`）。之前只认普通 Depth，只 tag 另两种
+  的标题会没有深度。
+- `sl::ResourceTag::extent` 优先于资源 desc（`Streamline_Inputs.cpp:389-390`），大纹理
+  携带小有效区时尺寸不再被放大。
+- `sl::Constants` 的 v1/v0 版本提升（`Streamline_Inputs.cpp:63-82`）：错误版本的游戏
+  不再把 v2 尾巴当成有效字段读。
+- 相机 near/far/fov 不可用时从 `cameraViewToClip` 反推（OptiScaler `loadCameraMatrix`，
+  含 identity / 正交 / far==0 无穷远）；字段本来就合理的标题不被覆盖。
+- `mvecScale` 乘 MV 分辨率（`Streamline_Inputs.cpp:231-238`）；新增
+  `MvScaleMultiplyResolution=0` 作为“标题已给像素单位”的退路。
+- lifecycle：非 `eValidUntilPresent` 且没有命令缓冲的 tag 提升为 UntilPresent
+  （OptiScaler 的 YOLO）；新增 `FGDepthValidNow` / `FGVelocityValidNow` /
+  `FGHudlessValidNow` 三个逐标题覆盖（默认 0）。
+
+**本地 XeFG 输出（`FgOutput=XeFG`）：**
+
+- 在 Evaluate 里打 tag 的车道（DLSSG / NVNGX / FSR）现在由 present 真正派发：
+  `fg_output_submit()` 记录被接受 tag 的 id，`present_dispatch()` 用同一个 id 调
+  `TagFrameConstants` + `SetPresentId`，一次 tag 一次 dispatch；resize / pause 清 pending。
+  之前 present 只走 Upscaler 的 `sr_apply()` 分支，`FgInput=DLSSG` + `FgOutput=XeFG`
+  打了 tag 却从不下发 present id，等于不出帧。
+
+**`FgInput=NVNGX`（游戏自己的 DLSS-G 参数块，OptiScaler 的 NvngxFG 源）打通：**
+
+- `provider.cpp` 新增该车道：MV/depth 同尺寸才启用，资源无声明状态时用
+  `MvState`/`DepthState`（默认 `NON_PIXEL_SHADER_RESOURCE`）；`FakeSlDlssg` 不再挡住它。
+- `FgInput=FSR` 仍未实现（没有 ffx hook），`fakerFG.ini` 注释已标明。
+
+**验证**：`./lock_frame/build.sh faker`（MSVC 14.44.35207）通过，`build/fakerFG.dll`
+已更新。实机待验证：CP2077 走 `Upscaler` 车道不受影响；DLSSG 车道用 Streamline 标题 +
+`FgOutput=XeFG` 看 `xefg: present dispatch ... lane=2` 与 `framesPresented`。
+
+### docs(xefg): 多帧调用序列审计记录（不改运行时；动态多帧暂不开放）(2026-11-21)
+
+对照 XeSS-FG SDK 头文件、OptiScaler（`framegen/xefg/XeFG_Dx12.cpp`）与 MFG-Unlocker
+（`source/native/xess/d3d12_host.cpp`）逐条核对了 `lock_frame` 调用 XeFG 的方式。结论：
+**每帧顺序、资源 tag、`SetPresentId`、UI composition、XeLL marker、帧常量都与上游一致**，
+没有“调错 API”。唯一偏差是 `maxInterpolatedFrames` 的语义：
+
+- 它是**上限**，不是当前倍率（`xefg_swapchain_d3d12.h:41`；初始化后默认产出 = 该上限，
+  `xefg_swapchain.h:465`；超出上限的 `SetNumInterpolatedFrames` 返回
+  `ERROR_INVALID_ARGUMENT`）。
+- `lock_frame` 现在用当前倍率初始化，因此 `--dyn-mfg` / `--interp-auto` 的动态升档会被
+  库拒绝、实际停在启动值。**动态多帧目前不开放**，固定倍率下两种写法完全等价，所以本次
+  **只记录、不改运行时代码**；将来启用动态多帧时按
+  `docs/design/TRUE_MFG_OPTIONS.md` §8.3 的补丁落地（init 用
+  `maxSupportedInterpolations` 作上限，`SetEnabled` 后再 `SetNumInterpolatedFrames(want)`）。
+- `--mfg-model=port` 请固定倍率：真多帧按 count 选模型（1 帧 = model 18，2+ = model
+  15→16），每次跨越都会切模型/编译着色器（`xefg_swapchain.h:472-473`）。
+- `--interp N` 同时是解锁补丁的容量，要摸到 6x 必须 `--interp 5` 启动。
+- 本次不改 `src/xess_mfg_consumer`：它是协议 v22 旧包，主版本是 `lock_frame`。
+
+逐项对照表与遗留项（UI alpha 标志、手动切倍率的 FG toggle 等）见
+`docs/findings/MFG.md` §7.7。
+
+
 ### feat(codec): 默认 auto + 硬件不支持自动降级 + 性能账 (2026-11-21)
 
 三个游戏（CP2077 4K 双流、PBZ 40x3、Wuchang depth-only）都实测通过后，把 codec 变成默认路径：

@@ -71,6 +71,18 @@ struct Config
     // After this pass the input really is render-sized, so LowResMV is true by construction -
     // OptiScaler's gate passes for a legitimate reason and no size is faked.
     int     mv_resample      = 0;
+    // Streamline's sl::Constants::mvecScale normalizes the MV texels ("scale factors used to
+    // normalize motion vectors", sl_consts.h:197), so the texel -> pixel factor XeFG wants is
+    // mvecScale * (MV width, MV height). OptiScaler does exactly that multiplication in
+    // Sl_Inputs::CaptureConstants (Streamline_Inputs.cpp:231-238). 0 hands the raw value
+    // through for a title whose mvecScale is already in pixels.
+    int     mv_scale_resolution = 1;
+    // OptiScaler [FrameGen] FGDepthValidNow / FGVelocityValidNow / FGHudlessValidNow:
+    // the title's tag lifecycle is wrong on some titles, so force ValidNow (copy while the
+    // Evaluate command list is still open) for that resource. OptiScaler's defaults: off.
+    int     fg_depth_valid_now    = 0;
+    int     fg_velocity_valid_now = 0;
+    int     fg_hudless_valid_now  = 0;
     // 1 = hand the title the swap chain libxess created and detour its vtable, the way
     // OptiScaler does (FGHooks::HookFGSwapchain). 0 = our own facade object.
     int     real_swapchain_object = 0;
@@ -278,6 +290,10 @@ void     xefg_enable(bool on);
 void     xefg_set_count(unsigned n);
 unsigned xefg_max_interp();
 uint32_t xefg_next_frame_id();
+// Record the id whose tags were just accepted, so the present path can dispatch exactly
+// that frame for the lanes that tag inside Evaluate (DLSSG / NVNGX / FSR). Kept separate
+// from xefg_tag() because a tag that failed must not be dispatched.
+void     xefg_note_submit(uint32_t present_id);
 // QueryPerformanceCounter in milliseconds. WGC's SystemRelativeTime is QPC-based,
 // so every producer-side frame timestamp must use this clock, not GetTickCount64.
 uint64_t now_qpc_ms();

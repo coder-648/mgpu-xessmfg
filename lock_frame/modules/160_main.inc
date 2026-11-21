@@ -221,11 +221,15 @@ int main()
         }
     }
     if (g_ui_unblend) {
+        // `--streams=mv,depth` replaces the request mask, so the UI bit has to be added
+        // explicitly - otherwise the producer never copies stream 3 (log: streams -> ...
+        // ui=0) and the unblend pass has nothing to read even with UiStream=1.
+        g_stream_mask |= mgpu::kRequestUi;
         const char* src = (g_ui_source_mode == 1) ? "game"
                         : (g_ui_source_mode == 2) ? "hudless"
                         : (g_ui_source_mode == 3) ? "off" : "auto";
-        logf_("[lock] ui path: unblend=1 source=%s synth_threshold=%.3f\n",
-              src, static_cast<double>(g_ui_synth_threshold));
+        logf_("[lock] ui path: unblend=1 source=%s synth_threshold=%.3f (stream request"
+              " adds ui)\n", src, static_cast<double>(g_ui_synth_threshold));
     }
     if (const wchar_t* sc = wcsstr(GetCommandLineW(), L"--fg-scene ")) {
         const float v = static_cast<float>(_wtof(sc + 11));

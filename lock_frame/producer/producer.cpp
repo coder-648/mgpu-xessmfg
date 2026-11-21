@@ -123,6 +123,9 @@ bool     g_ui_premultiplied_cfg = true;        // fakerFG.ini UiPremultiplied (G
 uint32_t g_ui_source_mode = 0;
 uint32_t g_ui_source = mgpu::kUiSourceOff;     // published in SharedControl::ui_source
 uint32_t g_ui_source_type = mgpu::kUiSourceOff; // stable type once first selected
+// Local A/B override for the closed synthesis gate (`fakerFG.ini UiSynthesis=1`). It is
+// never a release default: UiStream=0/UiSource=Off remain the shipped configuration.
+static bool g_ui_synthesis_override = false;
 // 锁帧版：颜色走消费者侧的 WGC，producer 不再发布 colour 流。默认关闭；
 // 需要 A/B 时在 fakerFG.ini 写 ColourStream=1。
 bool     g_want_colour_session = false;       // ColourStream=0 (lock_frame default)
@@ -2040,10 +2043,10 @@ void ini_string(const wchar_t* key, const wchar_t* def, wchar_t* out, DWORD coun
 // consumer synthesise a zero diff, so it is rejected here.
 const MgpuFgResource* select_ui_source(const MgpuFgFrame& f, uint32_t* out_source)
 {
-    // UI_SYNTHESIS_GATE: CLOSED. Do not enable Game/Hudless synthesis here until
-    // the title always supplies a valid UI source by default. See
-    // docs/UI_SYNTHESIS_GATE.md.
-    if (!mgpu::kUiSynthesisGateOpen) {
+    // UI_SYNTHESIS_GATE: CLOSED by default. `UiSynthesis=1` is the explicit local A/B
+    // override (docs/UI_SYNTHESIS_GATE.md); without it Game/Hudless synthesis stays off even
+    // if UiStream=1 is written by hand.
+    if (!mgpu::kUiSynthesisGateOpen && !g_ui_synthesis_override) {
         if (out_source) { *out_source = mgpu::kUiSourceOff; }
         return nullptr;
     }
@@ -2241,6 +2244,20 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
                     else if (_wcsicmp(src, L"off") == 0)     { g_ui_source_mode = 3; }
                     else                                     { g_ui_source_mode = 0; }
                 }
+                // The gate is closed by default. Two explicit local opt-ins open it for
+                // this session: `UiSynthesis=1`, or `UiStream=1` together with an explicit
+                // `UiSource=Game|Hudless` (Auto stays closed). Never a release default.
+                g_ui_synthesis_override = ini_int(L"UiSynthesis", 0) != 0;
+                if (!g_ui_synthesis_override && g_want_ui_session &&
+                    (g_ui_source_mode == 1 || g_ui_source_mode == 2)) {
+                    g_ui_synthesis_override = true;
+                    logf("producer: UiStream=1 + UiSource=%s opens the synthesis gate for"
+                         " this session (local A/B only; see docs/UI_SYNTHESIS_GATE.md)\n",
+                         g_ui_source_mode == 1 ? "Game" : "Hudless");
+                } else if (g_ui_synthesis_override) {
+                    logf("producer: UiSynthesis=1 - UI synthesis gate overridden for this"
+                         " session (local A/B only; see docs/UI_SYNTHESIS_GATE.md)\n");
+                }
                 if (g_ui_source_mode == 3) {
                     g_want_ui_session = false;
                     logf("producer: UiSource=Off - stream 3 is not published\n");
@@ -2275,14 +2292,26 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
         if (g_ui_source != mgpu::kUiSourceOff) { g_ui_source_type = g_ui_source; }
         g_ui_premultiplied = (g_ui_source == mgpu::kUiSourceGame) && g_ui_premultiplied_cfg;
         if (g_want_ui_session && ui_aux == nullptr) {
-            logf("producer: UiStream=1 but no UI/HUDless resource yet - reserving stream 3"
-                 " at output size / R10; source is re-checked every record\n");
+            static bool told_reserved = false;
+            if (!told_reserved) {
+                told_reserved = true;
+                logf("producer: UiStream=1 but no UI/HUDless resource yet - reserving stream 3"
+                     " at output size / R10; source is re-checked every record\n");
+            }
         }
-        if (g_ui_source == mgpu::kUiSourceGame) {
-            logf("producer: UI source = game UI tag\n");
-        } else if (g_ui_source == mgpu::kUiSourceHudless) {
-            logf("producer: UI source = HUDless (consumer synthesises UI;"
-                 " HUDless must not equal BACKBUFFER)\n");
+        {
+            static uint32_t logged_source = 0xFFFFFFFFu;
+            if (g_ui_source != logged_source) {
+                logged_source = g_ui_source;
+                if (g_ui_source == mgpu::kUiSourceGame) {
+                    logf("producer: UI source = game UI tag\n");
+                } else if (g_ui_source == mgpu::kUiSourceHudless) {
+                    logf("producer: UI source = HUDless (consumer synthesises UI;"
+                         " HUDless must not equal BACKBUFFER)\n");
+                } else {
+                    logf("producer: UI source = Off\n");
+                }
+            }
         }
         uint32_t uw = 0, uh = 0, uf = 0;
         if (ui_aux != nullptr) {

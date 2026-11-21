@@ -1151,8 +1151,20 @@ static bool init_fg()
     // AUTO probes for a UI texture we never provide; NONE says it outright.
     // AUTO only when the UI really travels: XeFG composits a UI texture we tag, and with
     // none tagged "AUTO" is the same as promising something that never arrives.
+    // slot_size alone is NOT evidence: the producer reserves stream 3 at output size even
+    // when its UiStream=1 source is still Off (no UI/HUDless yet). Require a selected
+    // producer source, or an explicit local opt-in (--ui-source + --ui-unblend).
+    const bool ui_source_on = g_ctl != nullptr && g_ctl->ui_source != mgpu::kUiSourceOff;
+    const bool ui_cli_optin = g_ui_unblend && g_ui_source_mode != 0;
     const bool have_ui_stream = g_ctl && g_ctl->streams[3].slot_size != 0 &&
-                                g_ctl->streams[3].width >= 64;
+                                g_ctl->streams[3].width >= 64 &&
+                                (ui_source_on || ui_cli_optin);
+    if (g_ctl && g_ctl->streams[3].slot_size != 0 && g_ctl->streams[3].width >= 64 &&
+        !have_ui_stream) {
+        logf_("[lock] note: stream 3 is reserved but the producer UI source is Off -"
+              " UI composition stays disabled (start lock_frame after the game has presented"
+              " a few frames, or check fakerFG.ini UiStream/UiSource)\n");
+    }
     ip.uiMode = (!g_fg_ui_none && have_ui_stream) ? XEFG_SWAPCHAIN_UI_MODE_AUTO
                                                   : XEFG_SWAPCHAIN_UI_MODE_NONE;
     ip.creationNodeMask = 1;
@@ -1352,8 +1364,11 @@ static bool init_fg()
     // unblend success tags HUDless (mode 4); failure tags UI (mode 2). If the producer has
     // no UI stream there is nothing to compose, so keep the library default (DISABLED).
     {
+        const bool ui_source_on = g_ctl != nullptr && g_ctl->ui_source != mgpu::kUiSourceOff;
+        const bool ui_cli_optin = g_ui_unblend && g_ui_source_mode != 0;
         const bool have_ui_stream = g_ctl && g_ctl->streams[3].slot_size != 0 &&
-                                    g_ctl->streams[3].width >= 64;
+                                    g_ctl->streams[3].width >= 64 &&
+                                    (ui_source_on || ui_cli_optin);
         if (g_api.has_ui_composition()) {
             const auto st = (have_ui_stream && !g_fg_ui_none)
                                 ? XEFG_SWAPCHAIN_UI_COMPOSITION_STATE_ENABLED

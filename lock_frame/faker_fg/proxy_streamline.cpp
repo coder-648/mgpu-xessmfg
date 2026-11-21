@@ -27,6 +27,9 @@
 
 #include <MinHook.h>
 
+#include <cmath>
+#include <cstring>
+
 namespace fakerfg {
 namespace {
 
@@ -47,6 +50,11 @@ struct StageEntry
     ID3D12Resource* resource      = nullptr;
     uint32_t        state         = UINT_MAX;   // sl::Resource::state (UINT_MAX = not declared)
     bool            until_present = false;      // lifecycle == eValidUntilPresent
+    // sl::ResourceTag::extent (zero when the title did not declare one). OptiScaler uses it
+    // before the resource description (Streamline_Inputs.cpp:389-390), which matters when a
+    // bigger texture carries a smaller valid region.
+    uint32_t        ext_w         = 0;
+    uint32_t        ext_h         = 0;
 };
 
 struct Stage
@@ -242,12 +250,39 @@ void remember(StageEntry& slot, const sl::ResourceTag& tag, void* cmd)
     if (tag.resource == nullptr || tag.resource->native == nullptr) { return; }
     if (tag.type == sl::kBufferTypeHUDLessColor &&
         tag.lifecycle != sl::eValidUntilPresent && snapshot_hudless(tag, cmd, slot)) {
+        slot.ext_w = tag.extent.width;
+        slot.ext_h = tag.extent.height;
         if (cmd != nullptr) { g_stage.cmd = cmd; }
         return;
     }
     slot.resource      = reinterpret_cast<ID3D12Resource*>(tag.resource->native);
     slot.state         = tag.resource->state;                       // the title's declaration
-    slot.until_present = (tag.lifecycle == sl::eValidUntilPresent);
+    // Sl_Inputs::reportResource (Streamline_Inputs.cpp:344-359):
+    //   * eValidUntilPresent -> UntilPresent, anything else -> ValidNow;
+    //   * a non-UntilPresent tag with no command buffer cannot be copied later, so it is
+    //     "YOLOed" to UntilPresent;
+    //   * FGDepthValidNow / FGVelocityValidNow / FGHudlessValidNow force ValidNow even when
+    //     the title declared something else (kept on UntilPresent when there is no list,
+    //     because our copy needs one).
+    bool force_now = false;
+    switch (tag.type) {
+    case sl::kBufferTypeDepth:
+    case sl::kBufferTypeHiResDepth:
+    case sl::kBufferTypeLinearDepth:     force_now = cfg().fg_depth_valid_now != 0; break;
+    case sl::kBufferTypeMotionVectors:   force_now = cfg().fg_velocity_valid_now != 0; break;
+    case sl::kBufferTypeHUDLessColor:
+    case sl::kBufferTypeScalingOutputColor:
+                                         force_now = cfg().fg_hudless_valid_now != 0; break;
+    default: break;
+    }
+    const bool until_by_lifecycle = (tag.lifecycle == sl::eValidUntilPresent);
+    if (force_now && cmd != nullptr) {
+        slot.until_present = false;                                  // ValidNow
+    } else {
+        slot.until_present = until_by_lifecycle || (cmd == nullptr); // YOLO without a list
+    }
+    slot.ext_w         = tag.extent.width;
+    slot.ext_h         = tag.extent.height;
     if (cmd != nullptr) { g_stage.cmd = cmd; }
 }
 
@@ -273,7 +308,12 @@ void record_tags(const sl::ResourceTag* tags, uint32_t count, void* cmd)
             }
             break;
         case sl::kBufferTypeMotionVectors:   remember(g_stage.mv, t, cmd); break;
-        case sl::kBufferTypeDepth:           remember(g_stage.depth, t, cmd); break;
+        // Sl_Inputs::GetResourceType maps all three depth flavours onto Depth
+        // (Streamline_Inputs.cpp:287-300). A title that only tags HiResDepth or
+        // LinearDepth used to reach us with no depth at all.
+        case sl::kBufferTypeDepth:
+        case sl::kBufferTypeHiResDepth:
+        case sl::kBufferTypeLinearDepth:     remember(g_stage.depth, t, cmd); break;
         case sl::kBufferTypeUIColorAndAlpha: remember(g_stage.ui, t, cmd); break;
         case sl::kBufferTypeBackbuffer:
             if (t.resource != nullptr && t.resource->native != nullptr) {
@@ -283,6 +323,56 @@ void record_tags(const sl::ResourceTag* tags, uint32_t count, void* cmd)
         default: break;
         }
     }
+}
+
+// ---------------------------------------------------------------- camera from matrix
+// Sl_Inputs::CaptureConstants' loadCameraMatrix (Streamline_Inputs.cpp:153-201): when the
+// title's own camera fields are unusable, near/far/fov are recovered from
+// cameraViewToClip. OptiScaler recomputes for every non-UE title; here the derived values
+// only fill fields that are missing/implausible, so a title that reports a correct camera
+// is never overridden (UE passes a matrix that is not a usable projection, which is why
+// OptiScaler skips the recalculation for UE at all).
+bool projection_camera(const sl::Constants& c, float& out_near, float& out_far, float& out_fov)
+{
+    if (c.orthographicProjection == sl::Boolean::eTrue) { return false; }
+
+    // Row major, exactly the layout Streamline documents (sl_consts.h:177-181).
+    float m[16]{};
+    memcpy(m, &c.cameraViewToClip, sizeof(m));
+    bool any = false;
+    for (int i = 0; i < 16; ++i) { if (m[i] != 0.0f) { any = true; break; } }
+    if (!any) { return false; }
+    static const float kIdentity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+    if (memcmp(m, kIdentity, sizeof(m)) == 0) { return false; }
+
+    const double b  = m[5];       // projMatrix[1][1]
+    const double cc = m[10];      // projMatrix[2][2]
+    const double d  = m[14];      // projMatrix[3][2]
+    const double e  = m[11];      // projMatrix[2][3]
+    if (!(std::fabs(b) > 1e-6)) { return false; }
+
+    double zn = 0.0;
+    double zf = 0.0;
+    if (e < 0.0) {
+        zn = (cc == 0.0) ? 0.0 : (d / cc);
+        zf = (cc + 1.0 == 0.0) ? 0.0 : (d / (cc + 1.0));
+    } else {
+        zn = (cc == 0.0) ? 0.0 : (-d / cc);
+        zf = (cc - 1.0 == 0.0) ? 0.0 : (-d / (cc - 1.0));
+    }
+    if (c.depthInverted == sl::Boolean::eTrue) {
+        const double t = zn;
+        zn = zf;
+        zf = t;
+    }
+    const double fov = 2.0 * std::atan(1.0 / std::fabs(b));
+    if (!std::isfinite(zn) || !std::isfinite(zf) || !std::isfinite(fov)) { return false; }
+    if (!(zn > 0.0) || !(zf > zn) || !(fov > 0.05) || !(fov < 2.5)) { return false; }
+
+    out_near = static_cast<float>(zn);
+    out_far  = static_cast<float>(zf);
+    out_fov  = static_cast<float>(fov);
+    return true;
 }
 
 // ---------------------------------------------------------------- the six answers
@@ -644,7 +734,27 @@ sl::Result hk_set_constants(const sl::Constants& values, const sl::FrameToken& f
 {
     static_assert(sizeof(sl::Constants) <= sizeof(g_stage.constants_raw),
                   "staging buffer too small for sl::Constants");
-    memcpy(g_stage.constants_raw, &values, sizeof(sl::Constants));
+
+    // Sl_Inputs::CaptureConstants (Streamline_Inputs.cpp:63-82): a v1 (or version-0)
+    // struct is promoted into a v2 record. Spider-Man Remastered sends an invalid version;
+    // copying the v1 prefix keeps the v2 tail (minRelativeLinearDepth...) from being read
+    // out of a smaller struct.
+    sl::Constants c{};
+    const size_t v1_size = sizeof(sl::Constants) - sizeof(float);   // - minRelative...
+    if (values.structVersion == c.structVersion) {
+        c = values;
+    } else if ((c.structVersion == sl::kStructVersion2 && values.structVersion == sl::kStructVersion1) ||
+               values.structVersion == 0) {
+        sl::BaseStructure* next = c.next;
+        memcpy(&c, &values, v1_size);
+        c.structVersion = sl::kStructVersion2;
+        c.next = next;
+    } else {
+        // A newer version: our members are a prefix of theirs, so our size is safe to read.
+        memcpy(&c, &values, sizeof(sl::Constants));
+    }
+
+    memcpy(g_stage.constants_raw, &c, sizeof(c));
     g_stage.have_constants = true;
     return (o_set_constants != nullptr) ? o_set_constants(values, frame, viewport)
                                         : sl::Result::eOk;
@@ -726,12 +836,43 @@ sl::Result hk_evaluate(sl::Feature feature, const sl::FrameToken& frame,
         f.jitter_y     = c.jitterOffset.y;
         f.mv_scale_x   = c.mvecScale.x;
         f.mv_scale_y   = c.mvecScale.y;
-        f.camera_near  = c.cameraNear;
-        f.camera_far   = c.cameraFar;
-        f.camera_fov_y = c.cameraFOV;
+        // sl::Constants::mvecScale normalizes the MV texels (sl_consts.h:197-198). The
+        // texel -> pixel factor XeFG multiplies by is mvecScale * (MV width, MV height) -
+        // exactly what Sl_Inputs::CaptureConstants does (Streamline_Inputs.cpp:231-238:
+        // "UE games and Dead Rising expect that multiplication to be done, even if the
+        // scale is 1.0"). MvScaleMultiplyResolution=0 is the escape for a title whose
+        // mvecScale already is in pixels.
+        if (cfg().mv_scale_resolution != 0) {
+            const float mw = static_cast<float>(f.stream[MGPU_FG_STREAM_MV].width);
+            const float mh = static_cast<float>(f.stream[MGPU_FG_STREAM_MV].height);
+            if (mw > 1.0f && mh > 1.0f) {
+                f.mv_scale_x *= mw;
+                f.mv_scale_y *= mh;
+            }
+        }
+        // Camera: keep the title's values when they are plausible; otherwise recover
+        // near/far/fov from cameraViewToClip (OptiScaler's loadCameraMatrix). A far plane
+        // of zero means "infinite"; CameraFar must stay > CameraNear for the consumers.
+        float cam_near = c.cameraNear;
+        float cam_far  = c.cameraFar;
+        float cam_fov  = c.cameraFOV;
+        const bool camera_ok = (cam_near > 0.0f) && (cam_far > cam_near) &&
+                               (cam_fov > 0.05f) && (cam_fov < 2.5f);
+        if (!camera_ok) {
+            float dn = 0.0f, df = 0.0f, dv = 0.0f;
+            if (projection_camera(c, dn, df, dv)) {
+                cam_near = dn;
+                cam_far  = df;
+                cam_fov  = dv;
+            }
+        }
+        if (cam_near > 0.0f && cam_far == 0.0f) { cam_far = cam_near + 1.0f; }
+        f.camera_near  = cam_near;
+        f.camera_far   = cam_far;
+        f.camera_fov_y = cam_fov;
         f.aspect       = c.cameraAspectRatio;
         flags |= MGPU_FG_FRAME_HAS_MATRIX | MGPU_FG_FRAME_HAS_PREV_CLIP;
-        if (c.cameraNear > 0.0f && c.cameraFar > c.cameraNear) {
+        if (cam_near > 0.0f && cam_far > cam_near) {
             flags |= MGPU_FG_FRAME_HAS_CAMERA;
         }
         if (c.depthInverted == sl::Boolean::eTrue)        { flags |= MGPU_FG_FRAME_DEPTH_INVERTED; }
@@ -743,7 +884,21 @@ sl::Result hk_evaluate(sl::Feature feature, const sl::FrameToken& frame,
     }
     f.flags = flags;
 
-    const uint32_t present_id = xefg_next_frame_id();
+    // One id per Streamline frame: a title that evaluates DLSS-G twice for the same token
+    // (multi-view / settings) must not make the id sequence skip, because a skipped id
+    // makes XeFG answer SetPresentId OK and never generate. The second evaluate re-tags
+    // the same frame id (resources only get replaced).
+    static uint32_t s_eval_id_token = 0;
+    static uint32_t s_eval_id = 0;
+    const uint32_t eval_token = static_cast<uint32_t>(frame);
+    uint32_t present_id = 0;
+    if (eval_token != 0 && eval_token == s_eval_id_token && s_eval_id != 0) {
+        present_id = s_eval_id;
+    } else {
+        present_id = xefg_next_frame_id();
+        s_eval_id_token = eval_token;
+        s_eval_id = present_id;
+    }
     f.present_id = present_id;
 
     g_sl_eval_token = static_cast<uint32_t>(frame);
@@ -913,8 +1068,10 @@ int sl_stage_inputs(MgpuFgFrame& f)
         f.stream[stream].state    = e.state;                 // verbatim, may be UINT_MAX
         f.stream[stream].validity = e.until_present ? MGPU_FG_RV_UNTIL_PRESENT
                                                     : MGPU_FG_RV_ONLY_NOW;
-        f.stream[stream].width    = static_cast<uint32_t>(d.Width);
-        f.stream[stream].height   = d.Height;
+        // The tag's declared region wins over the resource description (OptiScaler:
+        // `width = tag.extent ? tag.extent.width : desc.Width`, Streamline_Inputs.cpp:389).
+        f.stream[stream].width    = e.ext_w ? e.ext_w : static_cast<uint32_t>(d.Width);
+        f.stream[stream].height   = e.ext_h ? e.ext_h : d.Height;
         f.stream[stream].format   = static_cast<uint32_t>(d.Format);
         ++provided;
     };
@@ -933,8 +1090,23 @@ int sl_stage_inputs(MgpuFgFrame& f)
 
     put(MGPU_FG_STREAM_MV, g_stage.mv);
     put(MGPU_FG_STREAM_DEPTH, g_stage.depth);
-    // UI synthesis is paused: use only the title's declared sources.
-    if (g_stage.scaling.resource != nullptr) {
+    // HUDless source order. A HUDLESS tag that was a stable snapshot (onlyValidNow ->
+    // copied at tag time, `until_present`) is the real scene-without-UI. SCALING_OUTPUT
+    // is only a fallback: on CP2077 with the game's own FG off it can be an empty target
+    // even though the tag exists (measured: the transported stream 3 was all black and
+    // the unblend mask became all-ones). Prefer the snapshot when we have one.
+    static int logged_hudless_src = 0;
+    if (g_stage.hudless.resource != nullptr && g_stage.hudless.until_present) {
+        if (logged_hudless_src != 1) {
+            logged_hudless_src = 1;
+            logf("sl: HUDless source = HUDLESS snapshot (stable copy)\n");
+        }
+        put(MGPU_FG_STREAM_HUDLESS, g_stage.hudless);
+    } else if (g_stage.scaling.resource != nullptr) {
+        if (logged_hudless_src != 2) {
+            logged_hudless_src = 2;
+            logf("sl: HUDless source = SCALING_OUTPUT (fallback)\n");
+        }
         put(MGPU_FG_STREAM_HUDLESS, g_stage.scaling);
     } else {
         put(MGPU_FG_STREAM_HUDLESS, g_stage.hudless);

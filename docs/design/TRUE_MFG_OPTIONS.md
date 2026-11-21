@@ -322,5 +322,67 @@ jitter/scene 调整都没有改善。因此 **3x/4x 默认回到 keep2x**，true
 `run_3x_true_model.bat` / `run_4x_true_model.bat` 的可选实验入口。
 
 **捕获结论**：2x/3x/4x 的 WGC 捕获都使用 `--overlay-layered --wgc-minint 0`；
-`--wgc-minint -1`（Windows 默认 15–16ms）会卡高帧捕获，不再使用；
-`--capture-monitor` 在 overlay 场景下不可用（捕获 0 帧、画面冻结）。
+`--wgc-minint -1`（Windows 默认 15–16ms）会卡高帧捕获，不再使用；`--capture-monitor` 在 overlay 场景下不可用（捕获 0 帧、画面冻结）。
+### 8.3 审计记录：init 上限 vs 当前倍率，以及 port 路线的倍率策略（2026-11-21）
+
+> 状态：**只记录，不改运行时**。当前发布主版本是 `lock_frame`；动态多帧
+> （`--dyn-mfg` / `--interp-auto`）暂不开放，发布路径只走固定倍率，因此下面第 1 条
+> 与现状等价，等启用动态多帧时再落地。`src/xess_mfg_consumer` 是协议 v22 旧包，
+> 不随主版本同步。
+
+**1. `maxInterpolatedFrames` 是上限，不是当前倍率。**
+
+`xefg_swapchain_d3d12_init_params_t::maxInterpolatedFrames` 的定义是“不会超过这个数”
+（`xefg_swapchain_d3d12.h:41-53`），而 SDK 的默认产出就是该上限
+（`xefg_swapchain.h:462-470`）；`SetNumInterpolatedFrames` 只接受 `1..init 上限`，
+超出返回 `ERROR_INVALID_ARGUMENT`（`xefg_swapchain.h:469-470`）。
+
+`lock_frame` 现在把 `--interp`/起档值直接写进 init
+（`lock_frame/modules/040_cadence.inc:1127-1129`，已建链分支 `:1261`），因此：
+
+```
+init ceiling = 3 (--interp 3)  ->  SetNumInterpolatedFrames(4/5) = ERROR_INVALID_ARGUMENT
+                                 ->  --dyn-mfg / --interp-auto 只能停在启动值
+```
+
+固定倍率下这没有影响（init 上限 = 当前倍率）。启用动态多帧时的落地方式：
+
+```
+can_set_count = g_api.has_mfg();
+init_ceiling  = can_set_count ? g_fg_interp_max : want_interp;
+ip.maxInterpolatedFrames  = init_ceiling;
+ip2.maxInterpolatedFrames = init_ceiling;
+
+// init 成功后、SetEnabled(1) 之后：
+g_fg_interp_actual = init_ceiling;      // SDK 默认产出 = 上限
+fg_apply_interp("after SetEnabled");    // 真正下发当前 count
+```
+
+与上游一致：OptiScaler `intTarget = _maxInterpolationCount` → init，Dispatch 里
+`SetNumInterpolatedFrames(targetCount)`（`XeFG_Dx12.cpp:335-355,729-777`）；
+MFG-Unlocker `params.maxInterpolatedFrames = 5`（失败退
+`USE_MAX_SUPPORTED_INTERPOLATED_FRAMES`），再 `SetNumInterpolatedFrames(frames-1)`
+（`d3d12_host.cpp:674-698`）。
+
+**2. port 路线请固定倍率。**
+
+真多帧按 count 选模型：1 张插值 = 2x 模型（18），2 张及以上 = model 15→16。
+`SetNumInterpolatedFrames` 文档明确可能切换模型并触发着色器编译/资源重分配
+（`xefg_swapchain.h:472-473`）。所以 `--mfg-model=port` 不要配
+`--dyn-mfg` / `--interp-cadence` / `--interp-auto`；A/B 时每次只测一个固定 `--interp`。
+
+```bat
+:: 固定倍率 + 真多帧（每次重启后只测一个倍率）
+lock_frame.exe --mfg-model=port --interp 3 ...
+lock_frame.exe --mfg-model=port --interp 4 ...
+```
+
+**3. 其他。**
+
+- `--interp N` 同时是解锁补丁的容量（`xefg_unlock::Apply(want)`、`ll_generated_gate`）。
+  要摸到 6x 必须 `--interp 5` 启动，否则库上限只有 3。
+- 如果将来把“手动切倍率”做进 UI，照 OptiScaler 在用户改倍率后补一次
+  `SetEnabled(0)` → `SetEnabled(1)`（`WAR_xefgRequestFGToggle`，`XeFG_Dx12.cpp:748-787`）；
+  Dynamic MFG 自己算出的变化不需要 toggle。
+- consumer 还没有传 `UITEXTURE_NOT_PREMUL_ALPHA`；UI 流默认关闭，打开前先确认生产端
+  UI 数据是否预乘。

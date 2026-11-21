@@ -10,9 +10,10 @@
 // filtering at the present pixel's UV. Both images must be in the same colour space
 // (the producer converts scRGB -> PQ in downsample_ui.hlsl when needed).
 //
-// Opaque UI has no recoverable scene behind it. We keep the presented colour for those
-// pixels instead of producing a black halo; XeFG's mode 4 only uses the reconstructed
-// HUDless as the interpolation base, and the opaque UI is extracted from the backbuffer.
+// Opaque UI has no recoverable scene behind it, so the shader writes black there (see the
+// branch below): keeping the presented colour would leave the HUD in the "HUDless" and the
+// generated frames would interpolate it. XeFG's mode 4 takes the opaque UI from the
+// backbuffer, so the scene under it is never shown.
 
 cbuffer Params : register(b0)
 {
@@ -44,13 +45,17 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     if (Premultiplied < 0.5) { ui.rgb *= ui.a; }
 
     const float inv = 1.0 - ui.a;
-    float3 h = present.rgb;
-    if (inv > 0.001) {
-        h = (present.rgb - ui.rgb) / inv;
-    } else if (OpaqueAlpha > 0.5) {
-        // No recoverable scene behind opaque UI. Keep the presented colour so the
-        // interpolated edge does not darken; mode 4's UI extraction supplies the UI.
-        h = present.rgb;
+    float3 h;
+    if (ui.a < OpaqueAlpha) {
+        h = saturate((present.rgb - ui.rgb) / max(inv, 1e-5));
+    } else {
+        // Opaque UI: nothing of the scene is recoverable, and keeping the presented colour
+        // here would bake the HUD into the "HUDless" - mode 4 then interpolates a frame that
+        // still contains the HUD, which is exactly the ghosting this pass is supposed to
+        // remove. OptiScaler's UiUnblend writes black for this branch ("black still differs
+        // from the UI so FG treats it as UI"); mode 4 extracts the opaque UI from the
+        // backbuffer, so the scene under it never reaches the screen.
+        h = 0.0;
     }
 
     Hudless[id.xy] = float4(saturate(h), 1.0);

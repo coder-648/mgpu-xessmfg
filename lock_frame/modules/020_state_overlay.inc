@@ -680,12 +680,38 @@ static bool producer_has_mv_stream()
 
 // v29: what stream 3 means this frame. The producer publishes ui_source; the CLI can
 // override it for an A/B without changing fakerFG.ini on the render side.
+//
+// The synthesis gate is enforced by the PRODUCER (it is the side that owns the HUDless /
+// UI resources). Here an explicit `--ui-source game|hudless` is already an opt-in, so it
+// must not be swallowed by the compile-time gate - that made every local A/B report
+// "producer does not publish a UI stream" even when it did.
 static uint32_t ui_source_now()
 {
-    if (!mgpu::kUiSynthesisGateOpen) { return mgpu::kUiSourceOff; }
-    if (g_ui_source_mode == 1) { return mgpu::kUiSourceGame; }
-    if (g_ui_source_mode == 2) { return mgpu::kUiSourceHudless; }
+    if (g_ui_source_mode == 1) {
+        if (!mgpu::kUiSynthesisGateOpen && g_ui_unblend) {
+            static bool told = false;
+            if (!told) {
+                told = true;
+                logf_("[lock] ui: --ui-source game overrides the closed synthesis gate"
+                      " for this session (local A/B only)\n");
+            }
+        }
+        return mgpu::kUiSourceGame;
+    }
+    if (g_ui_source_mode == 2) {
+        if (!mgpu::kUiSynthesisGateOpen && g_ui_unblend) {
+            static bool told = false;
+            if (!told) {
+                told = true;
+                logf_("[lock] ui: --ui-source hudless overrides the closed synthesis gate"
+                      " for this session (local A/B only)\n");
+            }
+        }
+        return mgpu::kUiSourceHudless;
+    }
     if (g_ui_source_mode == 3) { return mgpu::kUiSourceOff; }
+    // Auto: the producer decides and already enforces its own gate; slot_size alone is not
+    // evidence (a reserved-but-empty stream 3 must stay Off).
     return (g_ctl != nullptr) ? g_ctl->ui_source : mgpu::kUiSourceOff;
 }
 

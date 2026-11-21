@@ -593,24 +593,55 @@ static ID3D12Resource* record_ui_synth(UINT slot, ID3D12Resource* present,
 // Records the unblend pass and returns the HUDless texture to tag for this frame, or
 // nullptr when B cannot run (no UI stream, no local UI, unsupported state). On success
 // `present` is left in RENDER_TARGET and the returned texture is in NON_PIXEL_SRV.
+static void ui_unblend_note(const char* reason)
+{
+    static const char* seen[12]{};
+    static int n = 0;
+    for (int i = 0; i < n; ++i) {
+        if (seen[i] == reason) { return; }
+    }
+    if (n < 12) {
+        seen[n++] = reason;
+        logf_("[lock] ui-unblend: inactive - %s\n", reason);
+    }
+}
+
 static ID3D12Resource* record_ui_unblend(UINT slot, ID3D12Resource* present, UINT w, UINT h)
 {
     g_hudless_current = nullptr;
-    if (!g_ui_unblend || g_ctl == nullptr || present == nullptr || slot >= mgpu::kMaxSlots) {
+    if (!g_ui_unblend) { return nullptr; }
+    if (g_ctl == nullptr || present == nullptr || slot >= mgpu::kMaxSlots) {
+        ui_unblend_note("no shared control / present");
         return nullptr;
     }
-    if (g_ui_local[slot] == nullptr) { return nullptr; }
-    if (!g_ui_fresh[slot]) { return nullptr; }
-    if ((g_ctl->active_mask & mgpu::kRequestUi) == 0) { return nullptr; }
+    if (g_ui_local[slot] == nullptr) {
+        ui_unblend_note("no local UI copy this frame");
+        return nullptr;
+    }
+    if (!g_ui_fresh[slot]) {
+        ui_unblend_note("UI stream is not fresh for this slot");
+        return nullptr;
+    }
+    if ((g_ctl->active_mask & mgpu::kRequestUi) == 0) {
+        ui_unblend_note("producer does not publish a UI stream (active_mask)");
+        return nullptr;
+    }
 
     const uint32_t source = ui_source_now();
     if (source != mgpu::kUiSourceGame && source != mgpu::kUiSourceHudless) {
+        ui_unblend_note("producer UI source is Off/unknown");
         return nullptr;
     }
 
     const mgpu::StreamShared& su = g_ctl->streams[3];
-    if (su.width < 64 || su.height < 64 || su.format == 0) { return nullptr; }
-    if (!ensure_unblend_objects() || !ensure_hudless_ring(w, h)) { return nullptr; }
+    if (su.width < 64 || su.height < 64 || su.format == 0) {
+        ui_unblend_note("stream 3 has no valid size/format");
+        return nullptr;
+    }
+    if (!ensure_unblend_objects() || !ensure_hudless_ring(w, h)) {
+        ui_unblend_note("unblend pipeline/ring init failed");
+        return nullptr;
+    }
 
     // GameUi: stream 3 is the title's UI + alpha. Hudless: stream 3 is a downsampled
     // HUDless image; build the approximate UI first, on this card, and unblend with that.
@@ -618,7 +649,10 @@ static ID3D12Resource* record_ui_unblend(UINT slot, ID3D12Resource* present, UIN
     D3D12_RESOURCE_STATES ui_before = D3D12_RESOURCE_STATE_COMMON;
     if (source == mgpu::kUiSourceHudless) {
         ui_src = record_ui_synth(slot, present, w, h);
-        if (ui_src == nullptr) { return nullptr; }
+        if (ui_src == nullptr) {
+            ui_unblend_note("synth UI pass failed");
+            return nullptr;
+        }
         ui_before = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     }
 

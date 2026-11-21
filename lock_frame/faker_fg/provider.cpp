@@ -323,6 +323,33 @@ unsigned provider_evaluate(ID3D12GraphicsCommandList* list, const void* handle, 
         }
     } else if (cfg().fg_input == static_cast<int>(FgInputSource::DLSSG)) {
         have_inputs = sl_stage_inputs(fg_view) > 0;
+    } else if (cfg().fg_input == static_cast<int>(FgInputSource::NVNGX)) {
+        // NVNGX lane (the game's own DLSS-G parameter block - OptiScaler's NvngxFG input
+        // source; the ini has always advertised it). `harvest()` filled every stream; the
+        // resources carry no declared state, so use the same barrier defaults as the
+        // Upscaler lane. XeFG needs MV and depth on one grid, so a mismatched pair stays 1X.
+        fg_view = f;
+        MgpuFgResource& mv = fg_view.stream[MGPU_FG_STREAM_MV];
+        MgpuFgResource& dp = fg_view.stream[MGPU_FG_STREAM_DEPTH];
+        const bool same_size = (mv.resource != nullptr) && (dp.resource != nullptr) &&
+                               (mv.width == dp.width) && (mv.height == dp.height);
+        if (same_size) {
+            mv.state = (cfg().mv_state != 0)
+                           ? static_cast<uint32_t>(cfg().mv_state)
+                           : static_cast<uint32_t>(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            dp.state = (cfg().depth_state != 0)
+                           ? static_cast<uint32_t>(cfg().depth_state)
+                           : static_cast<uint32_t>(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            have_inputs = true;
+        } else {
+            static bool told = false;
+            if (!told) {
+                told = true;
+                logf("provider: FgInput=NVNGX - mv %ux%u / depth %ux%u are not the same size"
+                     " (XeFG needs one grid); FG stays at 1X\n", mv.width, mv.height, dp.width,
+                     dp.height);
+            }
+        }
     }
 
     const uint32_t present_id = xefg_next_frame_id();
@@ -341,8 +368,12 @@ unsigned provider_evaluate(ID3D12GraphicsCommandList* list, const void* handle, 
 
     // 2) output sink: only XeFG consumes the record here. Capture leaves the title's
     //    own presentation untouched and the producer is already fed above.
-    if (cfg().fg_output == static_cast<int>(FgOutputSink::XeFG) &&
-        cfg().fake_sl_player == 0 && cfg().tag_at_evaluate == 0) {
+    //    The NVNGX lane is driven by this Evaluate itself, so the FakeSlDlssg gate does
+    //    not apply to it.
+    if (cfg().fg_output == static_cast<int>(FgOutputSink::XeFG) && have_inputs &&
+        cfg().tag_at_evaluate == 0 &&
+        (cfg().fg_input == static_cast<int>(FgInputSource::NVNGX) ||
+         cfg().fake_sl_player == 0)) {
         fg_output_submit(f);
     }
     // Remember the buffer the title calls its own backbuffer: with a presenting FG output it

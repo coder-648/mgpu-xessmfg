@@ -48,6 +48,7 @@ bool                     g_generate = false;   // XeFG generation actually on
 bool                     g_want_generate = false; // FgOutput=XeFG and not passthrough
 std::atomic<unsigned>    g_native_pending{ 0 };   // one Present per native publication
 std::atomic<bool>        g_native_seen{ false };  // gate only after the first real record
+std::atomic<uint64_t>    g_native_last_tick{ 0 }; // when the last native record arrived
 uint32_t                 g_frames_presented = 0;   // framesPresented of the last present (logging)
 unsigned                 g_gen_fail_run = 0;
 uint32_t                 g_frame_id = 0;             // StartNewFrame counter (OptiScaler's _frameCount)
@@ -68,6 +69,10 @@ bool                     g_inputs_logged = false;
 bool                     g_lane_logged = false;
 uint32_t                 g_last_tagged_id = 0;       // the frame the tags describe
 uint32_t                 g_last_presented_id = 0;    // the id SetPresentId last used
+// Evaluate-tagged lanes (DLSSG / NVNGX / FSR) hand their accepted tag id to the present
+// path through this; one dispatch per accepted tag.
+uint32_t                 g_submit_frame_id = 0;
+uint32_t                 g_submit_dispatched_id = 0;
 int64_t                  g_last_present_qpc = 0;
 float                    g_frame_ms = 0.0f;
 // State::lastFGFrameTime: the frame time measured while generation is OFF, frozen once it
@@ -224,6 +229,11 @@ unsigned xefg_max_interp() { return g_max_interp; }
 // ids come from a monotonic frame counter, never from the app's present count.
 uint32_t xefg_next_frame_id() { return ++g_frame_id; }
 
+void xefg_note_submit(uint32_t present_id)
+{
+    if (present_id != 0) { g_submit_frame_id = present_id; }
+}
+
 // ---------------------------------------------------------------- XeLL
 // XeFG refuses InitFromSwapChainDesc with LATENCY_REDUCTION_UNSUPPORTED (-15) unless
 // a XeLL (low-latency) context is attached *before* initialization - the same trap our
@@ -351,6 +361,7 @@ void xefg_pause(uint32_t frames)
     // present after it must not reuse it (Dispatch() would pair live output with dead
     // resources - the loading-screen black screen).
     g_eval_tag_fresh = false;
+    g_submit_frame_id = 0;                 // same for the evaluate-tagged lanes
     if (g_generate) { xefg_enable(false); }        // Deactivate()
     logf("xefg: paused for %u frames (UpdateTarget + Deactivate)\n", frames);
 }
@@ -411,6 +422,35 @@ void present_dispatch()
             ++told_eval;
             logf("xefg: present dispatch id=%u SetPresentId -> %s (%d) [tagged at evaluate]\n",
                  id, result_name(r), static_cast<int>(r));
+        }
+        // XeFG_Dx12.cpp:931-940: `SetPresentId error` -> UpdateTarget(); Deactivate();
+        if (r != XEFG_SWAPCHAIN_RESULT_SUCCESS) { xefg_pause(10); }
+        return;
+    }
+
+    // FgInput=DLSSG / NVNGX / FSR: their inputs are tagged inside the title's Evaluate
+    // (proxy_streamline.cpp / provider.cpp / proxy_ffx.cpp) on the command list that was
+    // open there, so present only adds what only present can know - frame constants and
+    // the present id - exactly like XeFG_Dx12::Dispatch(). One dispatch per accepted tag:
+    // a second present without a new tag parks generation instead of interpolating stale
+    // resources.
+    if (cfg().fg_input != static_cast<int>(FgInputSource::Upscaler)) {
+        const bool fresh = (g_submit_frame_id != 0) &&
+                           (g_submit_frame_id == g_last_tagged_id) &&
+                           (g_submit_dispatched_id != g_submit_frame_id);
+        if (!fresh || !xefg_wants_generation() || !g_generate || !xefg_tags_complete()) {
+            xefg_frame_feedback(false);
+            return;
+        }
+        g_submit_dispatched_id = g_submit_frame_id;
+        id = g_submit_frame_id;
+        tag_frame_constants(g_last_frame, id);
+        const xefg_swapchain_result_t r = g_xapi.SetPresentId(g_ctx, id);
+        static int told_lane = 0;
+        if (told_lane < 5) {
+            ++told_lane;
+            logf("xefg: present dispatch id=%u SetPresentId -> %s (%d) [tagged at evaluate,"
+                 " lane=%d]\n", id, result_name(r), static_cast<int>(r), cfg().fg_input);
         }
         // XeFG_Dx12.cpp:931-940: `SetPresentId error` -> UpdateTarget(); Deactivate();
         if (r != XEFG_SWAPCHAIN_RESULT_SUCCESS) { xefg_pause(10); }
@@ -1109,6 +1149,7 @@ void xefg_native_frame()
         cfg().fg_input == static_cast<int>(FgInputSource::NVNGX)) {
         g_native_seen.store(true, std::memory_order_release);
         g_native_pending.store(1, std::memory_order_release);
+        g_native_last_tick.store(GetTickCount64(), std::memory_order_release);
     }
 }
 
@@ -1120,6 +1161,21 @@ bool xefg_should_present()
     }
     // Startup/loading has no published record yet: never gate those presents.
     if (!g_native_seen.load(std::memory_order_acquire)) { return true; }
+    // The gate exists to suppress the title's *generated* presents while the real DLSS-G
+    // plugin runs. If the record stream stops (FG switched off, provider never evaluates,
+    // NVNGX lane used without a DLSS-G Evaluate), gating every present would freeze the
+    // window - measured as "游戏启动卡死". Release it after a short silence and keep
+    // presenting; a later record re-arms the gate.
+    {
+        const uint64_t last = g_native_last_tick.load(std::memory_order_acquire);
+        if (last == 0 || (GetTickCount64() - last) > 500) {
+            if (g_native_seen.exchange(false, std::memory_order_acq_rel)) {
+                logf("xefg: no native record for >500 ms - capture present gate released"
+                     " (presents continue instead of freezing)\n");
+            }
+            return true;
+        }
+    }
     if (g_native_pending.exchange(0, std::memory_order_acq_rel) != 0) { return true; }
     static unsigned dropped = 0;
     if (++dropped <= 5 || (dropped % 600) == 0) {
@@ -1132,6 +1188,7 @@ void xefg_capture_disable()
 {
     g_native_seen.store(false, std::memory_order_release);
     g_native_pending.store(0, std::memory_order_release);
+    g_native_last_tick.store(0, std::memory_order_release);
 }
 
 // Capture output: a native publication is the only frame that may reach the display.
@@ -1709,6 +1766,8 @@ void backend_shutdown()
     g_tags_had_mv = false;
     g_last_tagged_id = 0;
     g_last_presented_id = 0;
+    g_submit_frame_id = 0;
+    g_submit_dispatched_id = 0;
     g_waiting_new_frame_data = false;
     g_eval_frame = MgpuFgFrame{};
     g_eval_frame_id = 0;

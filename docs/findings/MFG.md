@@ -417,3 +417,66 @@ OptiScaler 的 DynamicMFG 目标是"贴着目标帧率选最小倍数"，那套�
 keep2x，true model 只保留为 `run_3x_true_model.bat` / `run_4x_true_model.bat` 实验入口。
 
 详见 `docs/design/TRUE_MFG_OPTIONS.md` §8。
+
+
+### 7.7 调用序列审计记录（2026-11-21，仅记录，不改运行时）
+
+> 范围说明：当前发布主版本是 **`lock_frame`**（`src/xess_mfg_consumer` 是协议 v22
+> 时代的旧包，不随主版本同步）。**动态多帧（`--dyn-mfg` / `--interp-auto`）目前不开放
+> 使用**，发布路径只走固定倍率，所以下面第 1 条是“将来启用时再落地”的记录，不是现在
+> 的行为变更。本节结论来自对 SDK 头文件、OptiScaler
+> （`framegen/xefg/XeFG_Dx12.cpp`）与 MFG-Unlocker
+> （`source/native/xess/d3d12_host.cpp`）的逐条比对。
+
+| 项 | 我们（lock_frame，现状） | 参考实现 | 判定 |
+|---|---|---|---|
+| init 的 `maxInterpolatedFrames` | 用 `--interp`/起档值直接初始化（`040_cadence.inc:1127-1129`，已建链分支 `:1261`） | OptiScaler：`intTarget = _maxInterpolationCount` 先初始化上限，Dispatch 里再落 count；MFG-Unlocker：`params.maxInterpolatedFrames = 5`（失败退 `USE_MAX`），再 `SetNumInterpolatedFrames(frames-1)` | 📝 固定倍率下等价；**启用动态升档前必须改**（见下） |
+| 每帧顺序 | `TagFrameResource(MV/depth)` → `TagFrameConstants` → `SetPresentId` → `Present`（`140_frame.inc:1042-1067,1433-1445`） | MFG-Unlocker `d3d12_host.cpp:1050-1118`；OptiScaler `XeFG_Dx12.cpp:888-934` | ✅ |
+| `TagFrameResource` 的 `pCmdList` | 复制队列/预取时传 `NULL`，`validity = RV_UNTIL_NEXT_PRESENT`（`140_frame.inc:1009-1015`） | SDK：资源能活到下次 Present 时才允许 NULL（`xefg_swapchain_d3d12.h:244-246`） | ✅ |
+| MV / depth 尺寸 | 不同尺寸自动开联合重建，否则拒绝 tag 并 1X（`140_frame.inc:962-1006`） | SDK 指南：depth 必须与 MV 同尺寸；MFG-Unlocker 文档同 | ✅ |
+| `presentId` | 每次 Present 自增一次、不跳号（`140_frame.inc:491`） | 跳号会让 XeFG 静默不出帧（`backend_xefg.cpp:435` 有同一条注释） | ✅ |
+| UI | `uiMode=AUTO`（有 UI 流时）+ `SetUiCompositionState(ENABLED)`，否则 DISABLED（`040_cadence.inc:1156-1157,1351-1369`） | SDK：默认 DISABLED，未 ENABLE 时 init 的 uiMode 无效（`xefg_swapchain.h:494-509`） | ✅ |
+| UI alpha 标志 | 未设置 `UITEXTURE_NOT_PREMUL_ALPHA` | OptiScaler 在默认 `FGUIPremultipliedAlpha=0` 时设置；本地 XeFG 路径也设置（`backend_xefg.cpp:967-969`） | 📝 UI 流默认关闭，打开前需确认数据是否预乘 |
+| 帧常量 | jitter 用生产端原值、mvScale 成对透传、`frameRenderTime`=输入帧间隔、`resetHistory` 来自 DLSSG reset、viewMatrix=单位阵（`140_frame.inc:1276-1375`） | OptiScaler 默认 `FrameTimeSource::Input`；MFG-Unlocker 也传单位 view 矩阵 + `record->frameTimeMs`（`d3d12_host.cpp:1050-1065`） | ✅（相机矩阵是近似，属质量项） |
+| XeLL marker | SIMULATION / RENDERSUBMIT / PRESENT 四段齐全（`140_frame.inc:591-601,1105-1114,1439-1452`） | MFG-Unlocker `d3d12_host.cpp:1119-1124` | ✅ |
+| 倍率运行中变化 | `--interp-cadence` / `--dyn-mfg` / `--interp-auto` 直接调 `SetNumInterpolatedFrames`；失败只有非 quiet 路径打日志 | OptiScaler 对“用户改倍率”额外 toggle FG（`WAR_xefgRequestFGToggle`），Dynamic MFG 自己的变化不 toggle（`XeFG_Dx12.cpp:729-787`） | 📝 动态多帧暂不开放；将来启用时一起补 |
+| 倍率变化的模型代价 | keep2x 模型固定；`port` 路线 1 帧=model 18、2+ 帧=model 15→16 | MFG-Unlocker 真多帧同样按 count 选模型 | 📝 `port` 是实验入口，固定倍率使用 |
+| 生成语义 | keep2x = N 次 2x 模型；port = 真多帧（一次光流 + 每 index 合成） | sm86 3X/4X = model 15 真多帧（自研 D3D12+CUDA 运行器） | ✅ 与 §7 一致，不是调用错误 |
+
+#### 将来启用动态多帧时要做的一件事
+
+`maxInterpolatedFrames` 是上限，不是当前倍率：
+
+- `xefg_swapchain_d3d12.h:41`：“XeSS-FG **won't produce more than** this number of
+  interpolated frames”；
+- 初始化后默认产出的就是该上限（`xefg_swapchain.h:465`）；
+- `SetNumInterpolatedFrames` 只接受 `1..init 上限`，超出返回
+  `ERROR_INVALID_ARGUMENT`（`xefg_swapchain.h:469-470`）。
+
+现在 `lock_frame` 用“当前倍率”初始化，于是 `--dyn-mfg` / `--interp-auto` 之后的升档请求
+会被库拒绝（只在启动值附近有效）。落地方式（两处 init 都要改）：
+
+```
+can_set_count = g_api.has_mfg()
+init_ceiling  = can_set_count ? g_fg_interp_max : want_interp
+ip.maxInterpolatedFrames  = init_ceiling
+ip2.maxInterpolatedFrames = init_ceiling
+
+// init 成功后、SetEnabled(1) 之后：
+g_fg_interp_actual = init_ceiling        // SDK 默认产出=上限
+fg_apply_interp("after SetEnabled")      // 真正下发当前 count
+```
+
+这与 OptiScaler / MFG-Unlocker 的初始化方式一致；固定倍率下它与现状**完全等价**，所以
+没有提前合入的理由。
+
+#### 其他记录
+
+- `port` 路线请固定倍率：真多帧按 count 选模型，1↔2 的每次跨越都是切模型，SDK 明确
+  可能触发着色器编译/资源重分配（`xefg_swapchain.h:472-473`）。
+- `--interp N` 同时是解锁补丁的容量（`xefg_unlock::Apply(want)`、`ll_generated_gate`
+  写入 N）。要用到 6x 必须 `--interp 5` 启动，否则库上限只有 3。
+- 如果将来把“手动切倍率”做进 UI，照 OptiScaler 在用户改倍率后补一次
+  `SetEnabled(0)→SetEnabled(1)`；Dynamic MFG 自己算出的变化不需要 toggle。
+- `src/xess_mfg_consumer`（协议 v22 旧包）与 `lock_frame` 的 cadence 起始策略不同，
+  本次不纳入；后续只以 `lock_frame` 为准。

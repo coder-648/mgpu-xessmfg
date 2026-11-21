@@ -501,6 +501,10 @@ Config& cfg()
     g_cfg.mv_jittered    = ini_int(path, L"MvJittered", 0);
     g_cfg.high_res_mv    = ini_int(path, L"HighResMv", 0);
     g_cfg.mv_resample      = ini_int(path, L"MvResample", 0);
+    g_cfg.mv_scale_resolution = ini_int(path, L"MvScaleMultiplyResolution", 1);
+    g_cfg.fg_depth_valid_now    = ini_int(path, L"FGDepthValidNow", 0);
+    g_cfg.fg_velocity_valid_now = ini_int(path, L"FGVelocityValidNow", 0);
+    g_cfg.fg_hudless_valid_now  = ini_int(path, L"FGHudlessValidNow", 0);
     g_cfg.real_swapchain_object = ini_int(path, L"RealSwapchainObject", 0);
     g_cfg.fake_dlssg_feature = ini_int(path, L"FakeDlssgFeature", 1);
     g_cfg.write_output_real = ini_int(path, L"WriteOutputReal", 0);
@@ -780,6 +784,9 @@ void fg_output_submit(const MgpuFgFrame& f)
     xefg_tag(static_cast<ID3D12GraphicsCommandList*>(f.cmd_list),
              static_cast<uint32_t>(f.present_id), f,
              cfg().fg_input == static_cast<int>(FgInputSource::Upscaler));
+    // Present only adds frame constants + SetPresentId; it must dispatch THE frame whose
+    // tags the library just accepted (not a fresh id, and never a rejected one).
+    if (xefg_tags_complete()) { xefg_note_submit(static_cast<uint32_t>(f.present_id)); }
 }
 
 void clear_record()

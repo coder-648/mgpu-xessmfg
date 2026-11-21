@@ -419,3 +419,94 @@ UI / HUD-less 的处理不同，且都**不做 unblend**：它只消费游戏交
 的“没有 UI 平面”回归锁进测试清单。每一步都以“producer `streams[3]` 有尺寸 +
 consumer `tag ui/hudless` 各一条日志”为通过条件，而不是只看观感。
 
+---
+
+## 11. 2026-11-21 复核：不透明 UI 分支方向错误（已修）
+
+### 11.1 根因
+
+`unblend_ui.hlsl` 原来的不透明分支写的是：
+
+```hlsl
+if (inv > 0.001) h = (present - ui.rgb) / inv;
+else             h = present.rgb;      // a ~ 1：保留带 UI 的画面
+```
+
+而 `synth_ui.hlsl` 把差异 mask 直接当 alpha：不透明 HUD 的 `m → 1`，于是
+`ui.a ≈ 1`。两者相乘的结果是：**最需要去掉 HUD 的区域（不透明准星/血条/文字），
+重建出的 HUDless 里仍然保留着 HUD 本身**。XeFG mode 4 以这张 HUDless 作为插值底图，
+所以 HUD 依旧被插值 → 拖影没有消失（甚至因为 UI 被当成场景而更稳定地重影）。
+这解释了“UI 流/模式 4 代码齐全但验收不过”的现象。
+
+OptiScaler 的 `UiUnblend.hlsl:41` 在同一分支写的是 **0（黑）**，并注释
+“Opaque UI leaves nothing of the scene, black still differs from the UI so FG treats
+it as UI”。mode 4 的不透明 UI 由 XeFG 从全分辨率 backbuffer 提取，黑底不会上屏。
+
+### 11.2 本次改动
+
+- `lock_frame/shaders/unblend_ui.hlsl`：不透明分支改为 `h = 0`，并统一用
+  `ui.a < OpaqueAlpha (0.99)` 判定（与 OptiScaler 一致）。
+- `lock_frame/producer/producer.cpp`：`UiSynthesis=1` 作为**本地 A/B 门控覆盖**
+  （默认仍 `UiStream=0` / `UiSource=Off`；只在显式写 ini 时生效，且日志会写明
+  “local A/B only”）。
+- `lock_frame/modules/085_ui_unblend.inc`：失败路径补一次性原因日志
+  （`ui-unblend: inactive - <reason>`），验收时能区分“没有 UI 平面 / 不 fresh /
+  stream 3 无效 / synth 失败”，不再静默回退。
+- 另外修掉两个让第一次实测“什么都没发生”的门控：
+  - consumer `ui_source_now()` 原来第一行就 `if (!kUiSynthesisGateOpen) return Off;`，
+    连显式 `--ui-source hudless` 也被吞掉；现在显式 CLI 即视为 opt-in，Auto 才看
+    producer 的 `ui_source`。
+  - `--streams=mv,depth` 会清掉请求位，UI 流根本没被请求（日志 `streams -> ... ui=0`）；
+    现在 `--ui-unblend`/`--ui-source` 自动 `|= kRequestUi`。
+  - `SetUiCompositionState(ENABLED)` 的判据从“stream 3 预留了 slot”改为
+    “producer 的 `ui_source != Off`（或显式 CLI opt-in）”，避免“预留但没数据也 ENABLE”。
+- **HUDless 源顺序（第二次实测，2026-11-21）**：链路跑通后发现 stream 3 全黑
+  （`ui_XX_hudless.bmp` 0% 非黑、`ui_XX_alpha.bmp` 100% 白），producer 日志
+  `UI 3840x2160 fmt 10 -> 1920x1080` 表明它选的是 `SCALING_OUTPUT`
+  （`state=0x8 lc=1`）。CP2077 在“游戏自身 FG 关、只跑 DLSS-SR”时这张 target 是空的；
+  `HUDLESS_COLOR` 的 stable snapshot 才是真实的无 UI 场景。`sl_stage_inputs()` 现在
+  **优先用 `until_present` 的 HUDless snapshot**，`SCALING_OUTPUT` 只作 fallback，
+  并打一行 `sl: HUDless source = HUDLESS snapshot (stable copy)` /
+  `= SCALING_OUTPUT (fallback)`。dump 里的 `ui_XX_hudless.bmp` 是**跨卡传过来的
+  stream 3 原始内容**，不是重建后的 HUDless。
+- **NVNGX 启动卡死（2026-11-21）**：切到 `FgInput=NVNGX` 后 `xefg_should_present()` 在
+  没有 native record 时丢弃所有 Present（`capture present dropped (no new native record,
+  total 1200)`），窗口冻死。已加 500 ms 静默看门狗：无 record 就释放门控继续上屏，
+  后续 record 重新挂上。日志还显示该会话只有 DLSS-SR Evaluate（120/120）、没有
+  DLSS-G Evaluate，因此 CP2077 在“游戏 FG 未真正 evaluate”时拿不到 HUDless——
+  需要先让游戏稳定地 evaluate DLSS-G，或改用别的平面来源。
+
+### 11.3 仍然存在的限制（下一步）
+
+1. **R10A2 只有 2-bit alpha**：`synth_ui` 的 mask 写进 UI 流时量化成
+   0 / 0.33 / 0.67 / 1。半透明 UI 边缘（抗锯齿文字、玻璃面板）会出现
+   “0 → 完全不减 / 0.9 → 直接 1（黑边）”的两端跳变。
+2. **Hudless 源的 round-trip**：`synth_ui → unblend` 在数学上等价于
+   `m<1` 时用低分辨率 HUDless 的 bilinear 上采样、`m=1` 时黑；低分辨率场景在
+   半透明 UI 下会偏软。
+3. 因此下一版应针对 `UiSource=Hudless` 做**直接重建**（不再经过 UI 颜色/alpha 流）：
+   - Pass A（低分辨率）：`m = smoothstep(t, 2t, |box(P) - H_low|)`，mask 存本地
+     `R8_UNORM`/`R16_FLOAT` ring（不走跨卡、无量化）；
+   - Pass B（全分辨率）：`m≈0 → P`；`m≈1 → 0`；`0<m<1 → bilinear(H_low)`
+     （可加 1–2 px 膨胀覆盖 AA 边缘）；
+   - 仍然只 tag HUDless（mode 4）。
+   这样去掉了 2-bit alpha 与 UI 颜色重建，代价是两次 compute（预计 +0.5–1.0 ms）。
+
+### 11.4 本地验收步骤（CP2077，Hudless 源）
+
+```text
+1. ui_hudless_on.bat      (写 UiStream=1 / UiSource=Hudless / UiSynthesis=1，备份 .bak_ui)
+2. 启动游戏，进存档；确认 DLSS + 游戏内 Frame Generation 开
+3. run_3x_ui.bat          (consumer: --ui-unblend --ui-source hudless --ui-dump 5)
+4. 日志判据：
+   producer: UiSynthesis=1 - UI synthesis gate overridden
+             producer: UI source = HUDless ...
+   consumer: streams -> mv=1 depth=1 color=0 ui=1
+             SetUiCompositionState(ENABLED)
+             ui-unblend: HUDless rebuilt from ... (source=hudless)
+   没有 ui-unblend: inactive - ...
+5. 画质 A/B：准星/血条/字幕/浮空标记在转视角时是否还拖影；HUD 边缘是否有黑边
+   （黑边 = R10A2 量化，见 §11.3）；半透明菜单是否闪烁。
+6. 还原：ui_hudless_off.bat（下一次启动游戏生效）。
+```
+
