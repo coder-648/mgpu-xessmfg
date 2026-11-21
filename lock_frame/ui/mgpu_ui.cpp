@@ -379,6 +379,10 @@ struct State
     // all-or-nothing switch. Off by default until a real run decides whether it stays
     // (docs/design/UPSAMPLE_QUALITY.md).
     bool upsample = false;
+    // v30 lossless transport (fakerFG.ini MvCodec/DepthCodec): 0 = off, 1 = forced on,
+    // 2 = auto (default: use the codec when this machine can run it, otherwise the old
+    // cross-adapter copy path). Written into the game-side ini by apply_fg_input().
+    int  codec = 2;
     // --stream-auto: the bridge picks the StreamPercent (both streams) from the measured
     // WGC hop. --stream-asym: MV stays 1:1, depth is scaled (implies upsample so the
     // tagged pair is one size). Both are A/B and default off.
@@ -585,7 +589,7 @@ enum Id
 {
     ID_NONE = 0,
     ID_FG_TYPE, ID_FG_MODE, ID_INTERP, ID_OUT, ID_PERF, ID_UPSAMPLE_INFO,
-    ID_FG_INPUT, ID_FG_INI, ID_STREAM_PCT, ID_FG_LOG,
+    ID_FG_INPUT, ID_FG_INI, ID_STREAM_PCT, ID_CODEC, ID_FG_LOG,
     ID_VERSION, ID_CHECK_GPU, ID_CHECK_RUNTIME, ID_CHECK_GAME,
     ID_CAP_API, ID_POOL, ID_LAT, ID_STREAM_INFO,
     ID_JITZ, ID_FOV, ID_NOMARKER, ID_UPSAMPLE, ID_STRAUTO, ID_STRASYM, ID_PREFETCH, ID_UI, ID_RT, ID_UNLOCK, ID_SLACK, ID_IVL,
@@ -623,6 +627,7 @@ static const RowDef kRowsFg[] = {
 static const RowDef kRowsGame[] = {
     { ID_FG_INPUT,   L"fakerFG 输入源",     RK_DD   },
     { ID_STREAM_PCT, L"MV/深度传输比例",    RK_DD   },
+    { ID_CODEC,      L"无损传输（码流）",   RK_DD   },
     { ID_FG_LOG,     L"游戏侧日志 (Log)",   RK_TOG  },
     { ID_FG_INI,     L"fakerFG.ini 路径",   RK_INFO },
 };
@@ -687,6 +692,13 @@ static const wchar_t* kOptStream[] = {
     L"100%（1:1，最清晰）", L"150%（默认，每维 2/3）", L"200%（每维 1/2）", L"400%（每维 1/4，最省）"
 };
 static const int kStreamPct[] = { 100, 150, 200, 400 };
+// 无损传输（Protocol v30 codec）：写进游戏侧 fakerFG.ini 的 MvCodec / DepthCodec。
+static const wchar_t* kOptCodec[] = {
+    L"关闭（老路径：跨卡直接拷贝 + 升降采样）",
+    L"开启（逐位无损，强制 1:1）",
+    L"自动（推荐：能跑就用，跑不了自动退回老路径）"
+};
+static const wchar_t* kCodecIni[] = { L"0", L"1", L"auto" };
 static const wchar_t* kFgInputIni[]  = { L"DLSSG", L"NVNGX", L"Upscaler", L"FSR" };
 static const wchar_t* kOptOut[]    = { L"1:1 原生", L"5K -> 4K (0.75x)", L"半分辨率" };
 static const wchar_t* kOptFov[]    = { L"55.0", L"58.7", L"60.0", L"65.0" };
@@ -714,6 +726,7 @@ static int opt_count(Id id)
     case ID_FG_MODE: return 3;
     case ID_FG_INPUT: return 4;
     case ID_STREAM_PCT: return 4;
+    case ID_CODEC:   return 3;
     case ID_OUT:     return 3;
     case ID_SDR:     return 2;
     case ID_FOV:     return 4;
@@ -751,6 +764,7 @@ static const wchar_t* opt_text(Id id, int i)
     }
     case ID_FG_INPUT: return kOptFgInput[(i < 0 || i > 3) ? 0 : i];
     case ID_STREAM_PCT: return kOptStream[(i < 0 || i > 3) ? 1 : i];
+    case ID_CODEC:   return kOptCodec[(i < 0 || i > 2) ? 2 : i];
     case ID_OUT:     return kOptOut[i % 3];
     case ID_SDR:     return kOptColor[i % 2];
     case ID_FOV:     return kOptFov[i % 4];
@@ -790,6 +804,7 @@ static int opt_get(Id id)
     switch (id) {
     case ID_FG_MODE: return S().fg_mode;
     case ID_FG_INPUT: return S().fg_input;
+    case ID_CODEC:   return (S().codec < 0 || S().codec > 2) ? 2 : S().codec;
     case ID_STREAM_PCT: {
         for (int i = 0; i < 4; ++i) {
             if (kStreamPct[i] == S().stream_pct) { return i; }
@@ -1450,6 +1465,10 @@ static void apply_fg_input()
     ok = ok && WritePrivateProfileStringW(L"fakerFG", L"StreamPercent", pct, ini.c_str()) != 0;
     ok = ok && WritePrivateProfileStringW(L"fakerFG", L"StreamPercentMv", pct, ini.c_str()) != 0;
     ok = ok && WritePrivateProfileStringW(L"fakerFG", L"StreamPercentDepth", pct, ini.c_str()) != 0;
+    // Protocol v30 lossless transport: 0 / 1 / "auto". Producer reads it once per session.
+    const wchar_t* codec_ini = kCodecIni[(S().codec < 0 || S().codec > 2) ? 2 : S().codec];
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"MvCodec", codec_ini, ini.c_str()) != 0;
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"DepthCodec", codec_ini, ini.c_str()) != 0;
     ok = ok && WritePrivateProfileStringW(L"fakerFG", L"Log", S().fg_log ? L"1" : L"0",
                                           ini.c_str()) != 0;
     if (!ok) {
@@ -1459,10 +1478,11 @@ static void apply_fg_input()
         return;
     }
 
-    set_msg(T(L"已写入 fakerFG.ini（输入源 / MV 比例 / Log），重启游戏生效",
-              L"fakerFG.ini written (input / MV ratio / Log); restart the game to apply"));
-    uilog("fakerfg: wrote %ls input=%ls pct=%d log=%d", ini.c_str(),
-          fg_input_ini_value(S().fg_input), S().stream_pct, S().fg_log ? 1 : 0);
+    set_msg(T(L"已写入 fakerFG.ini（输入源 / MV 比例 / 无损传输 / Log），重启游戏生效",
+              L"fakerFG.ini written (input / MV ratio / lossless / Log); restart to apply"));
+    uilog("fakerfg: wrote %ls input=%ls pct=%d codec=%ls log=%d", ini.c_str(),
+          fg_input_ini_value(S().fg_input), S().stream_pct,
+          kCodecIni[(S().codec < 0 || S().codec > 2) ? 2 : S().codec], S().fg_log ? 1 : 0);
 }
 
 // 从指定目录的 fakerFG.ini 读回 FgInput（不依赖游戏是否在跑）。
@@ -1777,6 +1797,7 @@ static void save_state(const std::wstring& sec, const State& s, const wchar_t* f
     ini_w(sec, L"jitter_zero", s.jitter_zero ? 1 : 0);
     ini_w(sec, L"no_marker", s.no_marker ? 1 : 0);
     ini_w(sec, L"upsample", s.upsample ? 1 : 0);
+    ini_w(sec, L"codec", s.codec);
     ini_w(sec, L"stream_auto", s.stream_auto ? 1 : 0);
     ini_w(sec, L"stream_asym", s.stream_asym ? 1 : 0);
     ini_w(sec, L"input_prefetch", s.input_prefetch ? 1 : 0);
@@ -1833,6 +1854,7 @@ static void load_state(const std::wstring& sec, State& s, const wchar_t* file = 
     s.jitter_zero = ini_r(sec, L"jitter_zero", s.jitter_zero ? 1 : 0) != 0;
     s.no_marker   = ini_r(sec, L"no_marker", s.no_marker ? 1 : 0) != 0;
     s.upsample    = ini_r(sec, L"upsample", s.upsample ? 1 : 0) != 0;
+    s.codec       = ini_r(sec, L"codec", s.codec);
     s.stream_auto = ini_r(sec, L"stream_auto", s.stream_auto ? 1 : 0) != 0;
     s.stream_asym = ini_r(sec, L"stream_asym", s.stream_asym ? 1 : 0) != 0;
     s.input_prefetch = ini_r(sec, L"input_prefetch", s.input_prefetch ? 1 : 0) != 0;
@@ -2058,7 +2080,7 @@ static void clear_legacy_game_keys(const wchar_t* sec)
         L"rt", L"tmode", L"gpu_sel", L"hotkey3", L"jitter_zero", L"no_marker",
         L"upsample", L"stream_auto", L"stream_asym", L"input_prefetch", L"ui_none",
         L"unlock", L"slack1", L"tearing", L"sdr", L"overlay_layered", L"relay_input",
-        L"osd", L"perf", L"win_title",
+        L"osd", L"perf", L"win_title", L"codec",
     };
     for (const wchar_t* k : keys) {
         WritePrivateProfileStringW(sec, k, nullptr, ini_path().c_str());
@@ -4896,7 +4918,12 @@ static const wchar_t* tip_for(Id id)
                L"NVNGX / Upscaler / FSR 为实验性。";
     case ID_STREAM_PCT:
         return L"跨卡只传 MV/深度的比例：100%=1:1 最清晰、150%=每维 2/3（默认）、"
-               L"200%=每维 1/2、400%=每维 1/4 最省；改动需重启游戏。";
+               L"200%=每维 1/2、400%=每维 1/4 最省；改动需重启游戏。"
+               L"注意：无损传输开启时该条流强制 1:1，这个比例只对走老路径的流有效。";
+    case ID_CODEC:
+        return L"无损传输（协议 v30）：渲染卡把 MV/深度编码进跨卡槽，副卡解码回逐位一致的"
+               L"原数据，并强制 1:1。自动 = 能跑就用，硬件/格式不支持时自动退回桥接拷贝+"
+               L"升降采样。改动需重启游戏。";
     case ID_FG_LOG:
         return L"游戏侧日志（fakerFG.ini 的 Log）：排查问题打开，稳定后可关闭以减少写盘；"
                L"改动需重启游戏。";
@@ -5813,6 +5840,13 @@ static void set_opt(Id id, int idx)
     case ID_STREAM_PCT:
         S().stream_pct = kStreamPct[(idx < 0 || idx > 3) ? 1 : idx];
         apply_fg_input();
+        break;
+    case ID_CODEC:
+        S().codec = (idx < 0 || idx > 2) ? 2 : idx;
+        apply_fg_input();
+        set_msg(S().codec == 0 ? L"已关闭无损传输：MV/深度走跨卡直接拷贝"
+                : S().codec == 1 ? L"已开启无损传输：MV/深度逐位无损（强制 1:1）"
+                                 : L"无损传输=自动：能跑码流就用，跑不了自动退回老路径");
         break;
     case ID_OUT:     S().out_mode = idx % 3; break;
     case ID_SDR:
