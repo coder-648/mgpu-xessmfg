@@ -3123,10 +3123,17 @@ static std::wstring build_cmdline(HWND target, bool display)
     cmd += kOut[(S().out_mode >= 0 && S().out_mode <= 2) ? S().out_mode : 0];
 
     // 固定倍率：2x / 3x / 4x。--mode 直接决定插帧数；输入锁仍由游戏侧完成。
+    // 这一段与定稿配方 lock_frame/run_3x.bat（2026-11-21 实测）逐项对齐：
+    //   --mode Nx --interp N-1   两个都给，脚本里就是这么写的，日志能一眼对上；
+    //   --streams=mv,depth       默认 mask 还带 ui（020 的 g_stream_mask），
+    //                            producer 会因此多预留 stream 3，显式给出才和脚本一致；
+    //   --wgc-minint 0           显式关掉 WGC 的 ~16 ms 交付节流（默认也是 0，写出来便于核对）。
     const int mul = S().fg_mode + 2;
     wchar_t b[256]{};
-    _snwprintf_s(b, _TRUNCATE, L" --pool %d --latency %d --mode %dx",
-                 S().pool, S().latency, mul);
+    _snwprintf_s(b, _TRUNCATE,
+                 L" --pool %d --latency %d --mode %dx --interp %d"
+                 L" --streams=mv,depth --wgc-minint 0",
+                 S().pool, S().latency, mul, mul - 1);
     cmd += b;
     // v30: no --interp-cadence here. The continuous frameRenderTime feed (--fg-rt-mode auto)
     // keeps slow scenes smooth while the slot gate stays the single pacing owner.
@@ -3166,10 +3173,18 @@ static std::wstring build_cmdline(HWND target, bool display)
     // B mode 4: do NOT force --fg-ui none. UI composition is gated by the producer's
     // UI stream; with no stream XeFG stays on its default (NONE), with one the consumer
     // unblends a HUDless and falls back to UI-only mode 2 if that fails.
-    cmd += L" --fg-rt-mode auto --upsample --report 40";
+    //
+    // --upsample is NOT emitted: consumer 160_main.inc sets g_upsample = !--no-upsample
+    // (ON by default, reconstructed to the input picture size before tagging), and the
+    // verified recipe run_3x.bat does not pass it either. The old hardcoded flag made the
+    // UI command look different from the measured one while changing nothing.
+    cmd += L" --fg-rt-mode auto --report 40";
     // 2x 不需要解锁：原版库就支持 1 张插值帧。3x/4x 继续沿用现有的字节补丁，
     // 保证非 Intel 卡上开箱即用；补丁失败时 consumer 会回退并打日志。
     if (mul > 2) { cmd += L" --unlock-mfg"; }
+    // keep2x is the consumer default (150_probe_mfg.inc: g_mfg_model = 2), but the verified
+    // recipe states it explicitly; keep the UI command identical so logs line up.
+    cmd += L" --mfg-model=keep2x";
     // FOV and 输入间隔 are no longer exposed in the UI (2026-11-08): FOV only feeds the
     // synthetic projection, which the XeFG frame-generation path ignores (5.16), and
     // --input-ms no longer matters for pacing now that frameRenderTime is vblank-snapped.

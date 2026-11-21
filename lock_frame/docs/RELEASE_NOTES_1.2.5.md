@@ -85,6 +85,10 @@ fakerFG 输入车道和 UI 合成的实验结论一次带齐。
   record 会重新挂上。
 - `init_fg()` / `SetUiCompositionState` 不再把“stream 3 已预留”当成 UI 存在的证据：
   生产者 `ui_source` 为 Off 时保持 UI composition DISABLED，并打一条说明日志。
+- **UI 启动命令与定稿脚本对齐**：`lock_frame_ui` 生成的命令行现在与实测配方
+  `run_3x.bat` 逐项一致——`--mode Nx --interp N-1 --streams=mv,depth --wgc-minint 0
+  --mfg-model=keep2x`；去掉多余的 `--upsample`（consumer 本来就默认开）。此前不传
+  `--streams` 会让默认 mask 带上 `ui`，producer 多预留 stream 3，日志和脚本对不上。
 
 ## 5. 多帧 / XeFG 审计（运行时不变）
 

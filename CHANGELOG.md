@@ -20,7 +20,9 @@
   consumer 需 `--ui-unblend`）。见下条与 `docs/UI_SYNTHESIS_GATE.md`。
 - **修复**：`FgInput=NVNGX` + `FgOutput=Capture` 启动后窗口冻死（500 ms 无 native
   record 即释放 present 门控）；stream 3 已预留但 producer `ui_source=Off` 时不再误开
-  UI composition。
+  UI composition；`lock_frame_ui` 生成的启动命令与定稿配方 `run_3x.bat` 对齐
+  （`--interp N-1`、`--streams=mv,depth`、`--wgc-minint 0`、`--mfg-model=keep2x`，
+  去掉多余的 `--upsample`）。
 - **多帧**：XeFG 调用序列审计完毕，运行时不变；动态多帧仍不开放
   （`docs/design/TRUE_MFG_OPTIONS.md` §8.3）。
 
