@@ -105,7 +105,11 @@ inline constexpr uint32_t kSharedMagic   = 0x55475047u;   // 'GPUM'
 // lock_frame v26: kMaxSlots 8 -> 16 (default, user request). 30x4 measured lag
 // up to 6 at 4K (colour + 4x present latency); 16 leaves a wide margin for WGC
 // jitter and long frames. MV/depth only: 4K capacity is ~1.06 GB, 1440p ~472 MB.
-inline constexpr uint32_t kSharedVersion = 28;
+// v29: SharedControl.ui_source. Stream 3 is no longer always a game-supplied UI
+//      texture: when the title has no UI tag we send a downsampled HUDless frame
+//      instead and the consumer synthesises the UI from present - hudless before
+//      the unblend. Both sides must agree on what stream 3 means.
+inline constexpr uint32_t kSharedVersion = 30;
 
 // The mapping is created once, at a size that fits the largest stream we support
 // (see kStreamMaxW/H), so a layout rebuild never has to recreate it - that would
@@ -179,6 +183,19 @@ inline constexpr uint32_t kRequestRawMv    = 1u << 5;
 inline constexpr uint32_t kRequestRawDepth = 1u << 6;
 inline constexpr uint32_t kRequestAll   = 0x1Fu;
 inline constexpr uint32_t kRequestAllV15 = 0x7Fu;
+
+// v29: what stream 3 actually carries. Game = the title's UI-only texture (RGB+alpha);
+// Hudless = a downsampled HUD-less scene, from which the consumer synthesises UI before
+// unblending; Off = no stream 3. The producer writes it, the consumer reads it.
+//
+// ===================== UI_SYNTHESIS_GATE: CLOSED =====================
+// Keep this gate closed until the title ALWAYS supplies a valid UI stream by
+// default (not only on some frames/menus). The current release sends no stream 3
+// and uses UiSource=Off. See docs/UI_SYNTHESIS_GATE.md before reopening.
+inline constexpr bool kUiSynthesisGateOpen = false;
+inline constexpr uint32_t kUiSourceOff     = 0;
+inline constexpr uint32_t kUiSourceGame    = 1;
+inline constexpr uint32_t kUiSourceHudless = 2;
 
 // ---- v11: measured semantics (FrameShared.semantics) --------------------------------
 // Packed so the whole verdict fits in one word. `Measured` tells the consumer whether the
@@ -371,6 +388,11 @@ struct StreamShared
     // changed underneath it, so it can never mix an old width with a new height.
     uint32_t seq;
     uint32_t _pad_v10;
+    // v30: payload kind. 0 = pixels (texture slots, today's path). 1 = fr-codec bytes
+    // (docs/design/LOSSLESS_TRANSPORT.md): slot_size is then the byte buffer size and
+    // slot_w/slot_h stay the *content* capacity, so TileLen[]/tile counts are derivable.
+    uint32_t codec;
+    uint32_t _pad_v30;
 };
 
 // Per-slot frame record, written by the producer just before it signals the
@@ -547,6 +569,13 @@ struct SharedControl
     // A stale ACK from a previous consumer can otherwise be thousands of frames
     // ahead of a new producer/consumer pair and skip every publication forever.
     uint64_t consumer_session;
+    // ---- v29: stream 3 semantics ----
+    // kUiSourceOff / kUiSourceGame / kUiSourceHudless. The producer decides per session
+    // from fakerFG.ini `UiSource` (Auto prefers the title's UI tag, then HUDless). The
+    // consumer uses it to choose between the existing unblend path and the consumer-side
+    // UI synthesis (present - hudless) added in 1.2.3.
+    uint32_t ui_source;
+    uint32_t _pad_v29;
 };
 
 // The textures start after the control block, on a 64 KB boundary.

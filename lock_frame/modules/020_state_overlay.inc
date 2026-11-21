@@ -1,5 +1,6 @@
 // ============================================================================
 //  lock_frame module: 020_state_overlay.inc
+
 //
 //  Shared state, command-line switches, producer hints, overlay
 //  window/placement helpers.
@@ -7,6 +8,13 @@
 //  Included by lock_frame/lock_frame.cpp as part of the single-translation-unit build.
 //  Modules are in dependency order; a module may use only symbols declared above it.
 // ============================================================================
+
+// Windows 10 2004+ display affinity value. With --capture-monitor the overlay is
+// on top of the game; excluding it from capture lets WGC see the game underneath
+// instead of our own output (a feedback loop / black frame).
+#ifndef WDA_EXCLUDEFROMCAPTURE
+#define WDA_EXCLUDEFROMCAPTURE 0x00000011
+#endif
 
 // ------------------------------------------------------------ shared state
 
@@ -18,6 +26,29 @@ static ComPtr<ID3D11Fence>          g_fence11;
 static ComPtr<ID3D12Fence>          g_fence12;
 
 static ComPtr<ID3D12Device>              g_device;
+// --d3d-debug: D3D12 debug layer + InfoQueue for OUR device. The codec transport shares
+// memory between two adapters, and a validation message names the call that the plain
+// "device removed (INVALID_CALL)" only hints at.
+static bool                              g_d3d_debug = false;
+static ComPtr<ID3D12InfoQueue>           g_info_q;
+
+// Logs every validation message the device has stored so far (no-op without --d3d-debug).
+static void d3d_drain_msgs(const char* where)
+{
+    if (!g_info_q) { return; }
+    const UINT64 n = g_info_q->GetNumStoredMessages();
+    for (UINT64 i = 0; i < n; ++i) {
+        SIZE_T len = 0;
+        if (FAILED(g_info_q->GetMessage(i, nullptr, &len)) || len == 0) { continue; }
+        D3D12_MESSAGE* m = static_cast<D3D12_MESSAGE*>(malloc(len));
+        if (m == nullptr) { continue; }
+        if (SUCCEEDED(g_info_q->GetMessage(i, m, &len))) {
+            logf_("[d3d12 %s] %hs\n", where, m->pDescription);
+        }
+        free(m);
+    }
+    g_info_q->ClearStoredMessages();
+}
 static ComPtr<ID3D12CommandQueue>        g_queue;
 static ComPtr<ID3D12CommandAllocator>    g_alloc;
 static ComPtr<ID3D12GraphicsCommandList> g_list;
@@ -430,11 +461,20 @@ float               g_fg_near_z = 10.0f;
 static bool         g_fg_consts_logged = false;
 static bool         g_fg_ui_none = false;
 // B mode 4: UI stream + consumer unblend -> HUDless -> XeFG BACKBUFFER_HUDLESS.
-// NOT accepted yet, so it is OFF by default and has no user-facing switch: the UI stream is
-// not published by default either (producer `UiStream`, default 0), which is the actual gate
-// for XeFG UI composition. `--ui-unblend` exists only for a local A/B.
+// Default OFF (producer `UiStream=0`); v29 adds `UiSource` so stream 3 can carry either
+// UI_SYNTHESIS_GATE: CLOSED. UiStream/UiSource must stay off until the title always
+// provides a valid UI stream by default. See docs/UI_SYNTHESIS_GATE.md.
+// the title's UI tag or a downsampled HUDless frame (consumer synthesises UI). The
+// consumer-side `--ui-unblend` / `--ui-source` switches are the explicit opt-in.
 static bool         g_ui_unblend = false;
 static bool         g_ui_unblend_ready_logged = false;
+// v29: stream-3 semantics. 0 = follow the producer's SharedControl.ui_source,
+// 1 = force GameUi, 2 = force Hudless-derived UI, 3 = force Off. The consumer-side
+// synthesis is only used for Hudless; GameUi keeps the exact-alpha unblend path.
+static int          g_ui_source_mode = 0;
+// Difference threshold for the HUDless-derived UI mask, normalised (0..1). The ini/CLI
+// value is 0..255; 8 is a good first cut for an 8-bit-equivalent HUD overlay.
+static float        g_ui_synth_threshold = 8.0f / 255.0f;
 static bool         g_mv_gate_off = false;   // this frame has no MV -> 1X, no tagging
 static float        g_fg_scene = 0.0f;
 static bool         g_fg_depth_inv = false;
@@ -638,7 +678,32 @@ static bool producer_has_mv_stream()
            g_ctl->streams[mgpu::kStreamMv].slot_size != 0;
 }
 
+// v29: what stream 3 means this frame. The producer publishes ui_source; the CLI can
+// override it for an A/B without changing fakerFG.ini on the render side.
+static uint32_t ui_source_now()
+{
+    if (!mgpu::kUiSynthesisGateOpen) { return mgpu::kUiSourceOff; }
+    if (g_ui_source_mode == 1) { return mgpu::kUiSourceGame; }
+    if (g_ui_source_mode == 2) { return mgpu::kUiSourceHudless; }
+    if (g_ui_source_mode == 3) { return mgpu::kUiSourceOff; }
+    return (g_ctl != nullptr) ? g_ctl->ui_source : mgpu::kUiSourceOff;
+}
+
 static ComPtr<ID3D12Resource> g_mv[mgpu::kMaxSlots];
+// v30: the MV stream can arrive as fr-codec bytes (streams[1].codec == 1) instead of an
+// R16G16_FLOAT texture. Then g_mv[slot] is a raw buffer and the MV input has to be
+// reconstructed with the decode pass (docs/design/LOSSLESS_TRANSPORT.md). Everything else
+// on the consumer side keeps using g_mv_local[slot].
+static bool mv_codec_shared()
+{
+    return g_ctl != nullptr && g_ctl->streams[mgpu::kStreamMv].codec != 0;
+}
+
+// v30: the same codec can carry the R32 depth stream (one 32-bit value per pixel).
+static bool depth_codec_shared()
+{
+    return g_ctl != nullptr && g_ctl->streams[mgpu::kStreamDepth].codec != 0;
+}
 static ComPtr<ID3D12Resource> g_depth[mgpu::kMaxSlots];
 // --fg-colour shared: take the colour from the add-on's stream[0] (a cross-adapter copy of
 // the game's back buffer) instead of WGC. That is the "own the output" half of the FG plan:
@@ -918,6 +983,16 @@ static void make_borderless(HWND hwnd, int x, int y, UINT w, UINT h)
     SetWindowPos(hwnd, HWND_TOPMOST, x, y, static_cast<int>(w), static_cast<int>(h),
                  SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+
+    // Monitor capture sees the whole display, including this topmost overlay. Exclude the
+    // overlay from capture so WGC gets the game underneath; the user still sees the overlay.
+    // Window capture does not need this (it captures the game window directly).
+    if (g_capture_monitor) {
+        SetLastError(ERROR_SUCCESS);
+        const BOOL aff = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+        logf_("[lock] overlay WDA_EXCLUDEFROMCAPTURE=%d err=%lu\n",
+              static_cast<int>(aff), static_cast<unsigned long>(GetLastError()));
+    }
 
     focus_game();
 

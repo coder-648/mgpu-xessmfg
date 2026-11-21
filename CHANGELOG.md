@@ -3,6 +3,550 @@
 只记**用户能感知**的变化与对应实测依据。每条结论的原始数据在
 `docs/findings/PERF_BASELINE.md` / `FINAL_CONFIG.md`。
 
+### feat(codec): 默认 auto + 硬件不支持自动降级 + 性能账 (2026-11-21)
+
+三个游戏（CP2077 4K 双流、PBZ 40x3、Wuchang depth-only）都实测通过后，把 codec 变成默认路径：
+
+- `MvCodec` / `DepthCodec` 三态：`0` 关 / `1` 强制 / **`auto`（缺省）**。`auto` 在布局之前由
+  `fr_resolve_codec()` 探测（PSO + TileLen 能否创建、格式是否被内核支持），任一失败该流退回
+  `copy_stream` 并打 `fr: codec capability: ...` 一行。槽类型是布局的一部分，所以只在启动时决策。
+- 消费端加预算看门狗：codec 开着且 `load` 连续 3 个窗口 ≥85% 时 WARNING，建议改回 0 重启。
+- 真机账（docs §17.10）：Wuchang depth **7.0–7.6 MB/帧（1.86–2.21x）**；CP2077 双流 4K 时
+  103/107 窗口 120/120、load 68%；PBZ 67/69 窗口、load 64–69%。单次成本 NV enc 1.02 /
+  AMD dec 1.98 ms。剩余优化点：AMD 解码的固定块扫描（0.34 ms，2 tiles/group 可省）、
+  NV 编码的按值 LDS 原子（0.17 ms）、槽步长 264→258。
+
+### feat(codec): MvCodec=1 兼容"游戏不提供 MV" (2026-11-21)
+
+Wuchang 只在开头几帧 tag MV，之后 produce 的 `mask` 固定为 `0x2`（只有 depth）。
+`MvCodec=1` 与这种游戏组合时三处都要成立：
+
+- **生产端不编码空 MV**：`on_record` 的 MV 分支要求 `mv.resource != nullptr`，没有 MV 就直接
+  不发布 MV（`mask` 里没有那一位），codec 槽保持未写。
+- **消费端不去解没写过的槽**：`mv_from_producer()` 由 producer 的 `active_mask` 驱动
+  （`producer_has_mv_stream()`），MV 未激活时走 `ensure_dummy_mv` 的老分支——dummy MV 用
+  `streams[1].width/height` 自建，与 depth 同尺寸，不碰那个 buffer 形状的 codec 槽。
+  新增一次性日志：`fr: codec MV slot exists but the game publishes no MV - using dummy
+  vectors (depth still travels through the codec)`。
+- **`--mv-shadow` 旁路**不能再拿 buffer 当纹理源（`ensure_local_copy` 会照抄 desc），已加
+  `!mv_codec_shared()` 守卫。
+
+另：若 MV 中途出现且尺寸大于布局时的 content，编码端的硬钳位会丢掉该帧的 MV 并打日志
+（`fr: MV content ... needs N tiles but the slot holds M - MV dropped`），不会写越界。
+
+### feat(codec): depth 也走码流 + 尺寸不匹配自动归一化 + PBZ 实测通过 (2026-11-21)
+
+- **深度 codec（D32 变体）**：`-DDEPTH32` 编译同一内核（`Texture2D<float>` + `asuint` /
+  `RWTexture2D<float>` + `asfloat`，对全部位型零转换）。生产端按流选 PSO/SRV 格式，深度格式
+  内核读不了（wide/D32_FLOAT）就先走既有的 R32 转换；消费端用独立描述符堆解码（两个 dispatch
+  在同一 list 里，共享堆会互相覆盖描述符），写进 UAV-capable 的 R32_FLOAT sink。
+- **尺寸不匹配**（DLSS 档位不同：MV 在输出分辨率、depth 在渲染分辨率）：codec 各自保持 1:1，
+  尺寸差异原样保留；`refresh_input_geo()` 发现两条流尺寸不同就**自动打开联合重建 pass** 把两者
+  归一到输入画面尺寸（XeFG 的要求），已 1:1 的那条是恒等重采样。`--no-upsample` 仍可显式关闭
+  （会打 WARNING）。
+- **CP2077**：两条流都 4K，`decoded MV/DEPTH -> 3840x2160`，103/107 窗口 120/120，load 68%，
+  升采样 pass 自动跳过。
+- **PBZ（影之刃零，UE5.7.4）**：两条流 2562×1441（wide depth fmt19 走 R32 转换），都解码成功，
+  67 个窗口 120/120、gpu 8.6–9.9 ms、load 64–69%，重建 pass 把两者抬到 3840×2160 后 tag。
+- 顺手修了 `TileLen` 结构化视图（raw view 会丢写）+ 去掉多余的 buffer 状态转换（buffer 实际
+  永远是 COMMON，多声明一次 `UAV->COPY_SOURCE` 会让驱动静默丢弃那次拷贝）。
+
+### verify(codec): 4K MV 逐位无损通过（3/3 BIT-EXACT，2026-11-21）
+
+`run_3x_verify.bat`（`MvCodec=1 --mv-verify`）：
+
+```
+[lock] --mv-verify: sample 1 BIT-EXACT - the re-encoded 34214400 B match the producer's slot byte for byte
+[lock] --mv-verify: sample 2 BIT-EXACT ...   sample 3 BIT-EXACT ...
+```
+
+三次采样、每次 32400 tile × 1056 B = 34,214,400 B 全覆盖比较，逐字节相同。结合
+`encode(source) == bytes` 与编码器单射 ⇒ `decode(bytes) == source`，即 3840x2160 MV
+经「编码 → 跨卡 → 解码」后与渲染卡上的原始 fp16 位型完全一致。同轮 `presents` 27 个窗口
+120/120、0 条校验消息。
+
+带宽那一行首测为 `0.00 MB`：`TileLen` 处于 `UNORDERED_ACCESS` 时不能被 `CopyBufferRegion`
+当源读，驱动静默丢弃拷贝（读回全 0）。已补 `UAV -> COPY_SOURCE -> UAV` 过渡。
+
+### feat(codec): 首跑成功 + `--mv-verify` 逐位对齐 + 真实带宽测量 (2026-11-21)
+
+`MvCodec=1` 第一次完整跑通：44/46 个报告窗口 `presents=120/120`、`xN=3.00`、
+`load 21–67%`（基线 59–76%）、消费者 `fr: decoded MV slot -> 3840x2160 (32400 tiles)`、
+0 条校验消息，生产端 486 次 publish 且 `dropped=0`。
+
+补了两项测量（都不影响默认路径）：
+
+- **真实带宽**：生产端每秒把 `TileLen[]` 回读到 CPU 求和，打印
+  `fr: coded MV x.xx MB/frame (raw 31.62, x.xx) - depth adds 14.1 MB`。消费者那行
+  `bus: 45.7MB/frame` 是按几何算的（`mv_w*mv_h*4`），在 codec 路径上必然虚报。
+- **`--mv-verify` 逐位对齐**：解码后再用同一个 Encode 核把 `g_mv_local` 编一遍，
+  把 34 MB 与槽里的字节各回读一次做逐字节比较。若完全一致，则
+  `encode(decode(bytes)) == bytes`，而生产端是 `encode(source) == bytes` 且编码器是单射
+  （无损，32 帧真机 4K + 65536 个 fp16 位型都对过参考实现）⇒ `decode(bytes) == source`
+  逐位无损。3 个采样点、间隔 2 s，结果打在 `[lock] --mv-verify:` 行。
+  消费者的 Encode 入口为此也内嵌进 `lock_frame.exe`（`kFrEncodeCSO` 22 KB）。
+
+### fix(codec): raw UAV 必须用 R32_TYPELESS —— 这是 INVALID_CALL 的真凶 (2026-11-21)
+
+`MvCodec=1/2/3` 三次都在第一帧编码后 20–30 秒被移除设备。打开 D3D12 校验层（生产者 ini
+`D3dDebug=1`、消费者 `--d3d-debug`）后，调试层直接点名：
+
+```
+ID3D12Device::CreateUnorderedAccessView:
+  When creating a RAW Unordered Access View, the format must be DXGI_FORMAT_R32_TYPELESS.
+ID3D12Device::RemoveDevice: DXGI_ERROR_INVALID_CALL ...
+```
+
+- raw UAV 的正确写法是 `Format = R32_TYPELESS` + `StructureByteStride = 0` +
+  `Flags = D3D12_BUFFER_UAV_FLAG_RAW`；我写的是 `Format = UNKNOWN`（+ RAW），执行期未定义，
+  驱动以 INVALID_CALL 移除设备。离线 harness（`tests/gpu_codec`）用的是 root descriptor（无格式），
+  所以这条路径从未被测到。
+- 同一个调试层还给了两条有用的旁证：buffer 的 `InitialState` 一律被忽略
+  （"Buffers are effectively created in state COMMON"），所以 staging/TileLen 用 UAV 初态无害；
+  消费者侧（`--d3d-debug`）**零**校验消息，说明 buffer 槽的放置与解码路径是干净的。
+- 另外把两侧放置 MV 槽的 `D3D12_RESOURCE_DESC` 对齐（生产者带了 `ALLOW_UNORDERED_ACCESS`、
+  消费者没带），跨卡 placed resource 两侧描述必须完全一致。
+- 注意：`D3dDebug=1` 会让游戏自身的非法状态转换也被调试层判死（日志里 PostFX 列表的
+  CopyResource/ResourceBarrier 状态不匹配），所以它只用于取证，验证时务必关掉。
+
+### fix(codec): 2.3 GB reserve 与 WGC 启动竞态；capture item 改为重试 (2026-11-21)
+
+`MvCodec=1` 第一次真机跑：生产端完全正常（`fr: encode pass ready`、
+`fr: encode mv 3840x2160 -> 32400 tiles`、publish mask=0x3、dropped=0），
+但消费端在 `open_shared()` 之后 `CreateForWindow FAILED` 直接退出 —— 是 WGC 抓取对象
+（游戏还在切呈现模式），**不是码流数据的问题**。两处改动：
+
+- **reserve 2194 MB → ~1.6 GB**：MV 槽的 codec 尺寸原来按「容量 3840x2304」算，
+  而且 100% 的 MV 把共享容量也顶到 3840x2304，把 **depth** 槽从 16 MB 撑到 35.4 MB/槽。
+  现在 codec 槽按自己的 1:1 content（3840x2160）发布 `slot_w/h` 并定尺寸，容量只跟 depth；
+  编码端再加一道「tiles 超过槽容量就丢 MV」的硬钳位（分辨率中途变大时不会写越界）。
+- **capture item 重试 10 s**（每 250 ms 一次，窗口句柄失效就按 pid/exe 重找），
+  启动竞态不再让进程以 code 7 退出。
+
+### feat(codec): 协议 v30 + 生产端编码 / 消费端解码接线，MvCodec 一键开关 (2026-11-21)
+
+把已冻结的码流 v2.2 真正接到链路上（`docs/design/LOSSLESS_TRANSPORT.md` §17.3）：
+
+- 协议 **v29 → v30**：`StreamShared` 尾部加 `uint32_t codec`（0 = 像素纹理，1 = fr 字节流），
+  `lock_frame/include/mgpu_shared.h` 与 `lock_frame/producer/mgpu_shared.h` 同步；
+  legacy `src/mgpu_shared.h`（v23）不动。
+- 生产端：`MvCodec=1` 时 MV 槽改成跨卡 buffer（`ceil(W/32)*ceil(H/8)*264*4`，4K 容量
+  34.8 MB，比原纹理槽小），编码 dispatch 记录在**游戏自己的 list** 上（MV 纹理只在
+  那里有效），由既有的 `f_gpu_frame` → copy queue wait → `Signal(fwd)` 覆盖；
+  MV 强制 `StreamPercent=100`，格式非 R16G16_FLOAT 时打日志并退回老路径。
+- 消费端：按 `codec` 以 buffer 放置槽位；`wait_slot()` 之后在直接队列上跑 decode，
+  结果写进 `g_mv_local[slot]`；codec 模式下自动关闭 MV 的跨卡 copy 与预取，
+  `--input-copy-queue` 也自动关（COPY list 不能 Dispatch）。`record_upsample` 照旧运行：
+  MV 半边成为 1:1 恒等重采样，depth 仍靠它抬到目标尺寸。
+- `MvCodec=0`（默认）走今天的 `copy_stream`，默认路径逐行未改，回退只改 ini。
+- producer `xess_mfg_producer.dll`（md5 be33eefd）与 consumer `lock_frame.exe`
+  （md5 4fc0c693）均已构建并部署到游戏目录与 `C:	emp\mgpu\cp2077_port_run\`
+  （旧文件备份为 `*.bak_20261121_1830/1832`）；`fakerFG.ini` 增加 `MvCodec=0` 及注释。
+
+下一步：4K/3x 实机 A/B（`MvCodec=0` vs `1`），判据 `bus` 28.1 → ≈25.9 MB/帧、
+`presents` 不掉、MV 逐位一致。
+
+### feat(codec): 生产版 shader 改成 texture↔buffer，位型经穷举证明不变 (2026-11-21)
+
+链路上 MV 两端都是 texture，所以 `src/shaders/fr_codec.hlsl` 换成生产形状（同一文件两个 entry）：
+
+```text
+Encode : Texture2D<float2> SrcTex(t0)   -> RWByteAddressBuffer DstBytes(u0) + TileLen(u1)
+Decode : ByteAddressBuffer SrcBytes(t0) -> RWTexture2D<float2> DstTex(u0)
+```
+
+- fxc 允许同一 register 声明两个资源（每个 entry 只用一个）—— 已用最小探针 shader 验证；
+- 像素侧走 `f16→f32→f16`，对**全部 65536 个 fp16 位型穷举**：除 NaN payload（2044 种）
+  规范化为 0x7E00 外，其余（含 ±0 / denormal / ±Inf）**逐位不变** ⇒ 字节流与 buffer 版一致；
+- `lock_frame/build.sh` 的 producer/consumer 都已编译这两个 entry，两个产物构建通过；
+  默认路径（`MvCodec` 未接线）行为与 1.2.2 完全相同。
+
+下一步：协议 v30（每流 `codec` 字段）+ producer 的 buffer 槽位与 encode dispatch + consumer 的
+decode 到 `g_mv_local[]`。设计已定：MV 槽在 codec 模式下改成 buffer（`ceil(W/32)*ceil(H/8)*264*4` 字节）。
+
+### docs+deploy: 4K/3x 实机基线 & 消费端余量修正 (2026-11-21)
+
+第一次真机跑（`run_3x.bat`，4K/3x@40，`--mfg-model=keep2x`）拿到的基线：
+
+```text
+game clock: in 39.9 fps (25.06 ms) -> kept=40 dropped=0
+gpu=6.7-8.3ms  present=7.3-7.7ms  total=14.6-16.7ms  load=56-63%
+bus: mv 14.1MB + depth 14.1MB = 28.1MB/frame (1.1 GB/s at 40 fps)
+show=118  presents=118/120  xN=3.00  drops=0
+```
+
+**修正 §16 的一条结论**：`TIMING_4K40.md` 的 `20.6 + 8.33 > 25.0` 是 keep2x 之前的旧配置；
+现在 4K/3x 的消费端 `load` 只有 56–63%，**还有约 9 ms 余量**。而这台机器的消费卡是
+AMD 6750 GRE ⇒ 要看的是 AMD 解码：**M 1.98 ms（load→71%）、C 4.06 ms（load→79%）**，
+两者都塞得下 3x。所以"4K/3x 收不下解码"不成立，C 现在就能试，代价是吃掉约 44% 余量。
+
+部署：游戏目录 6 个文件已更新（备份 `*.bak_20261121_1808`）；`run_3x.bat` 实际使用的
+`C:\temp\mgpu\cp2077_port_run\lock_frame.exe` 也换成本次构建（备份 `.bak_20261121_1815`）。
+注意本次构建来自**工作树当前状态**（含其他未提交的 1.2.2 改动），不等于 1.2.2 发布版；
+codec 路径仍是死代码，预期行为与基线一致。
+
+### build(codec): 4K 方案 M 第一步落地——生产用 shader 与构建接线 (2026-11-21)
+
+- 新增 `src/shaders/fr_codec.hlsl`：**就是 `tests/gpu_codec` 在两卡上验证过的那份 kernel**
+  （位流 v2.2、tile 32×8、编码/解码两个 entry point）。
+- `scripts/build_producer.sh` 与 `scripts/build_consumer.sh` 现在会编译并内嵌它
+  （`kFrEncodeCSO` / `kFrDecodeCSO`，与 `upsample_joint` 同一套约定，exe 不依赖 d3dcompiler）。
+  本机已跑通 fxc + embed 全链路。
+- 文档 §17 写清了主机侧契约（cbuffer 6×u32、256 像素/tile、SlotWords 按 raw 最坏情况
+  4+256*NW*4 字节预留）与剩下三处接线的**已核对锚点**：
+  协议（`lock_frame/include/mgpu_shared.h` 与 `lock_frame/producer/mgpu_shared.h`，**两份 v29 必须同步改**）、
+  生产端 `producer.cpp:2050` 的 `scale_dispatch(...,1)`、消费端 `frame.cpp:1398` 的
+  `copy_publication_inputs(slot)` 之后。
+
+**未做**：协议字段、生产端/消费端运行时改动 —— 需要 Windows 构建 + 4K 实机 A/B 才能验证
+（`MvCodec=raw` 保持一键回退）。
+
+### docs(design): 4K 整条链路成本对照 —— 今天最便宜（消费端余量见上一条修正）(2026-11-21)
+
+场景固定 4K、颜色走 WGC（链路只承载 MV+depth）。五种配置的整条链账（实测）：
+
+| 配置 | 渲染卡合计 | 消费卡解码 NV/AMD | 画质 |
+|---|---|---|---|
+| **A 今天**（150/150 + 两个 9-tap） | **1.28 ms** | 0 / 0 | 边界 EPE 4.8 px |
+| B 150/150 + 编码 | 1.80 | 0.64 / 2.24 | 同 A |
+| **M MV 100+编码，depth 150 原样** | 1.92 | 0.58 / 1.98 | MV bit-exact |
+| D MV 100+编码，depth 150+编码 | 2.18 | 0.90 / 3.10 | MV bit-exact |
+| C 100/100 + 编码 | 2.61 | **1.30 / 4.06** | 全 bit-exact |
+
+三条结论：
+1. **渲染卡上今天最便宜**：C 贵 +1.33 ms（+5.3 个百分点）；
+2. **消费卡才是 4K 的死穴**：`TIMING_4K40.md` §4.2 里 4K/3x 已经 `20.6+8.33 > 25.0`（超 3.9 ms），
+   再加任何解码都在用"降一档倍率"换精度 ⇒ **4K/3x 收不下，4K/2x 才有余量**；
+3. 所以 C 现在是**画质采购**（+1.33 ms 渲染卡 + 1.3~4.1 ms 消费卡 换 4.8 px → 0），
+   不是省钱手段。
+
+**4K 推荐：M（MV 全分辨率无损，depth 保持 150%）** —— 渲染卡 +0.64 ms、
+消费卡 +0.58(NV)/+1.98(AMD)，质量收益集中在 MV（边界 EPE 的主因）。
+上 C 的前提是**编码器先提速 3×**（1.02 → 0.35，届时 C 的渲染卡成本 ≈ A）或 4K 固定跑 2x。
+
+优化空间（按收益）：① 编码器 3×（需要 profiler）；② depth 走 R16 有损而不是编码（14.75→7.4 MB，
+转换 0.15 ms vs 编码 0.46）；③ 消费卡解码压到 ≤0.3 ms；④ 每行位偏移表（AMD −0.34 ms / +4.6% 字节）。
+
+### perf(codec): 乒乓 barrier + 行内 scan —— NV 解码 0.58 ms 达标 (2026-11-21)
+
+两处结构改动：
+
+1. **块前缀和改乒乓缓冲**（读 A / 写 B，每 step 只要 1 个 barrier，原来 2 个）：编码和解码各少 8 个 barrier；
+2. **行内求和从 O(c) 串行改 5 步 scan**（32 宽一行）：这是 AMD 慢的主因 ——
+   "全零输入"（width=0，一个位都不读）解码在 AMD 上也要 2.04 ms，说明瓶颈是固定阶段而非位解包。
+
+| 流（4K、33 MB、真帧、10 iters） | NV enc | NV dec | AMD enc | AMD dec |
+|---|---|---|---|---|
+| MV（2.97x） | 2.87 → **1.02** | 2.03 → **0.58** | 1.50 → **1.38** | 2.72 → **1.98** |
+| depth（2.44x） | → **1.02** | → **0.72** | → **1.41** | → **2.08** |
+
+**NV 解码已经到 §15.7 的 0.5 ms 目标（0.58）**；AMD 从 4× 缩小到 3.4×，还差一截。
+
+途中修掉 bug：行内 scan 的种子必须从 c=1 开始（列 0 的增量已经包含在 `g_col0` 链里），
+否则 (r,0) 会重复计入一次。
+
+**消融地图**（下一步的依据，都是改一行跑一次再回退）：
+
+| 消融 | 结果 |
+|---|---|
+| AMD 解码跳过块前缀和 | 2.04 → **1.70 ms**（块扫描值 0.34 ms / 17%，可用"每行位偏移表"整块消除，代价 +4.6% 字节）|
+| AMD 解码喂全零（width=0，不读任何位）| 2.04 ms ≈ 真实 1.98 → **位解包不是瓶颈** |
+| NV 编码跳过 e_out 的按值原子 | 1.02 → **0.85 ms**（原子值 0.17 ms / 17%）|
+
+⇒ 瓶颈已从"算法"变成"每 tile 的固定往返"（barrier / LDS / 原子）。
+
+**1080p 已经可用**：单流（8.3 MB）NV 编码 0.23 / 解码 0.15 ms、AMD 0.87 / 0.64 ms
+⇒ MV+depth 两条流 NV 0.47/0.31 ms。4K 下 NV 解码也够（0.58–0.75），短板是 4K 编码。
+
+### perf(codec): 编码端并行化 2.87 → 1.22 ms（每 warp 独立直方图） (2026-11-21)
+
+编码器改成 block-per-tile、**每个线程负责一个值**：LDS 暂存像素 → 每 warp 独立直方图
+（8×33 槽，`InterlockedAdd` 争用降 8×，这是关键一步：单一直方图时 2.30 ms，
+分 warp 后 1.22 ms）→ 合并选 mode/宽度 → `InterlockedOr` 建 mask →
+块前缀和算位偏移 → 每个线程把自己的位 OR 进 LDS 输出缓冲 → 合并刷出。
+
+4K、单流 33 MB：
+
+| 流 | NV enc | NV dec | AMD enc | AMD dec |
+|---|---|---|---|---|
+| MV（2.97x） | 2.87 → **1.22** | **0.65–0.92** | 1.50 | 2.72 |
+| depth（2.44x） | 2.87 → **1.25** | 0.91 | — | — |
+
+（`--iters 10`，无后台负载；带后台负载时能飘到 1.7–3.3 ms，说明这版仍受 SM/显存争用影响。）
+
+途中修掉一个真 bug：mode 0 也预留了 mask 区（`maskWords` 未按 mode 归零），
+表现是"mode/宽度与 CPU 一致、长度多 32 B、解出来差 1"。
+32 帧 CPU 回归不变：MV p50 2.71 / depth 2.56 / colour 1.46，全 bit-exact。
+
+### perf(codec): tile 几何定在 32×8 —— 解码 2.2× 快，比率还更好 (2026-11-21)
+
+性能 pass（A′）第一轮。先做消融定位：4K/33 MB 单流，`pattern 1`（全 raw 逃逸=纯拷贝）
+解码就要 0.63 ms、`pattern 2`（全零）0.85、真实 MV 1.41 —— **瓶颈是拷贝地板**，
+而它离带宽上限 7×，因为 16 px 宽的 tile 每次只写 64 B（半条 cache line）。
+
+于是把 tile 几何参数化（`kTileW`/`kTileH`，每 tile 仍 256 个值，位流只有常数变化）并扫了一遍：
+
+| tile | NV dec | AMD dec |
+|---|---|---|
+| 16×16 | 2.15 | 4.06 |
+| **32×8（采用）** | **0.91** | **3.79** |
+| 64×4 | 1.28 | 4.25 |
+| 128×2 | 1.23 | 5.49 |
+| 256×1 | 1.49 | 6.53 |
+
+**32×8 让每行写满 128 B（一整条 cache line）且保留 8 行垂直预测 → 速度与比率同时最好**：
+MV p50 **2.71**（原 2.59）、depth **2.56**（原 2.46）、colour 1.46；32/32 真帧全 bit-exact，
+两卡编码字节仍逐字节相同。真帧 MV：编码 2.25 ms、NV 解码 1.18 ms、AMD 3.57 ms。
+
+顺带否掉一个"显然的优化"：把行内前缀和从 LDS 改到寄存器（`uint myacc[2]`）反而更慢
+（0.91→1.25）—— 动态下标会掉进 scratch。
+
+还剩三块（已写进 §15.10）：解包未向量化、行内 O(c) 求和未换 scan、AMD 的 LDS/barrier 代价约为 NV 的 4×。
+
+**同一轮里两个失败的尝试（都已回退，记录备查）**：
+- 行内前缀和搬进寄存器（`uint myacc[2]`）：解码 0.91 → 1.25 ms —— 动态下标掉进 scratch，比 LDS 还慢；
+- 编码端 256 线程 block + LDS 暂存像素：编码 2.15 → **15.9 ms** —— 255/256 线程空转 +
+  `hist[33]`/`over[33]` 按 256 线程分配 scratch。
+→ 编码端的并行化必须让每个线程都干活（LDS 原子直方图 + 每线程 OR 进 LDS 输出缓冲 + 合并拷贝）。
+
+### feat(codec): 位流 v2.2（mask 前置）+ block-per-tile 解码 (2026-11-21)
+
+为了让 GPU **并行**算出每个值的位偏移，`exception` 模式的 patch 标志从"逐值内联"改成
+**词对齐的 mask 区放在值区之前**（v2.2）。这换来：
+
+- 解码可以 256 线程一个 tile：block 前缀和算偏移 → 并行解包 → 行内前缀和 + 列 0 链 + 相加；
+- 两卡仍然 **编码字节逐字节相同**、**回环 bit-exact**；比率一字节没变（MV 2.81x / depth 2.37x）；
+- 过程中修掉两个 bug：`g_prev0` 同轮读改写（竞态，改双缓冲）、
+  以及**绝对像素被当成单调整数**（`g_abs` 存的是原始字，必须先 `mono()`）。
+
+**但我没能跑赢串行版**（都是 4K、33 MB 单流）：
+
+| 形状 | NV dec | AMD dec |
+|---|---|---|
+| 一线程一 tile + 按字（3a） | **1.51 ms** | 5.49 ms |
+| block-per-tile + 并行解包（3b） | 2.15 ms | **4.06 ms** |
+
+原因（实测判断）：16 px 宽的 tile 每次只写 64 B 连续 → 合并访问只有一半效率；
+block 形状还多了 LDS 往返；行内 O(c) 求和也没换成 scan。**下一步是把 tile 放宽到 64 px**
+（4 个 tiles 一横排，写 256 B 连续）并把行内求和换成 LDS scan；编码端（3.4 ms）同样要流式化。
+
+1080p 参考值：NV 解码 0.34 ms/流、编码 1.12 ms/流 —— 在 1080p/1440p 渲染尺寸下已经可用。
+
+### perf(codec): 位读写改按 32 位字 + 去掉残差暂存，解码快 26% (2026-11-21)
+
+码流 v2 的第二版（v2.1，**比率一字节没变**）：
+
+- **按 32 位字读写**替代逐字节循环（LSB-first 位布局不变，CPU/GPU 仍逐字节一致）；
+- **每个值前面带自己的 patch 标志**，patch 值与普通值交错存放 ⇒ 解码不再需要
+  2 KB 的 `z[]` 暂存数组，**单趟**解包+重建；
+- 解码 CS 从 11.4 KB 缩到 5.3 KB。
+
+两卡真帧（4K，参考形状）：
+
+| 流 | AMD enc/dec | NV enc/dec | 比率 |
+|---|---|---|---|
+| MV | 3.02 / 5.49 ms（原 4.42 / 6.16） | 2.89 / 1.51 ms（原 3.47 / 2.03） | 2.81x |
+| depth | 2.86 / 5.58 ms | 2.86 / **1.23** ms | 2.37x |
+
+AMD/NV 解码差距 5.3× → 3.6×。32 帧 CPU 回归仍是 124 帧次全 bit-exact。
+
+**顺带量到一个关键自由度**：预测器改成只看**上**邻居（top-only）只损失 **0.1–0.3%**，
+但行内依赖整条消失 —— 这是下一步"每行一个 warp + block-per-tile"把解码压到
+≤0.15 ms 的前提。
+
+### feat(codec): 码流 v2（例外编码）落地，跨厂商逐字节一致 (2026-11-21)
+
+`tests/lossless_bench/fr_codec.h` 升到 v2：每 tile 三选一
+（`plain` / `exception: mask + patch` / `raw 逃逸`），`n_out=0` 时退化成 v1，
+所以老行为随时可回退，最坏情况字节上限不变。
+
+**32 帧 4K 真数据**（`run.sh`，124 帧次全 bit-exact）：
+
+| 流 | v1 | **v2** | p5 | p50 | 输出 |
+|---|---|---|---|---|---|
+| MV | 1.54 | **2.59** | 2.19 | 2.59 | 11.8 MB |
+| depth | 1.89 | **2.46** | 2.41 | 2.46 | 13.9 MB |
+| colour | 1.20 | **1.46** | 1.45 | 1.46 | 45.7 MB |
+
+**HLSL 同步升级并用两张卡验证**（`tests/gpu_codec`）：MV 2.81x / depth 2.37x / colour 1.45x，
+三条流都满足 **编码字节与 CPU 参考逐字节相同 + 跨厂商相同 + 回环 OK**。
+
+过程中修掉一个真 bug：HLSL 位读取对 **32 位 patch** 用了 `>> 32`（UB，GPU 上行为不确定），
+表现为"编码对、解码错"——现在 32 位分支单独处理。
+
+**还没做**（§15.7 的 3–7 步）：解码重建改成每行 inclusive scan（AMD 解码仍慢 3 倍）、
+编码改流式/warp 协作（当前一线程一 tile，7–14 GB/s，目标 500 GB/s）、
+接进 producer/consumer、协议 v24。
+
+### docs(design): 定案——N/A 混搭 + 颜色走 WGC + 无损 4K MV/depth (2026-11-21)
+
+场景收敛为：颜色仍走 WGC（不占链路），**MV + depth 无损、全分辨率**（DLAA，按游戏实际尺寸），
+目标是补掉 FG 在运动边界上的画质短板。定案（`LOSSLESS_TRANSPORT.md` §15）：
+
+- **MV/depth 传 100% + 例外编码**：33.18 MB → MV 12.9(p50)/16.2(p5) MB、
+  depth 13.7/14.1 MB，合计 **26.6–30.3 MB**，对今天 150/150 的 29.4 MB **基本打平**；
+- **生产端删掉两个 9-tap 降采样**（0.60 → 0.13 ms，**−0.47 ms**），消费端删掉升采样 pass；
+- **画质从边界带 EPE p95 4.81 px 变成 bit-exact（0）**；
+- 码流 v2 比 v1 更简单：例外编码的 `n_out=0` 就是 v1 的 max 模式，最坏仍是 raw 逃逸，
+  字节上限 = 原始 + 0.8%，fence/槽位/信用窗口全不动，只换载荷描述；
+- 硬前提：解码必须改成「并行解包 + 每行 inclusive scan」（§13.2 的 AMD 慢 5 倍）。
+
+明确不做：nvComp/hipComp（熵编码 3–8 ms；A 卡无 zstd 压缩）、时间域差分（实测更差）、
+换预测器（实测 +0.6%）、颜色进链路（用户约束 + 只有 1.46）。
+
+### feat(design): 更好的通用压缩路径 = 例外编码（+68%/+31%/+22%，实测） (2026-11-21)
+
+在 32 帧 4K 真数据上把三条候选路径都量了：
+
+- **帧间差分 ❌**：MV 1.16（对帧内 1.53）、depth 1.67（对 1.88）、colour 1.15（对 1.20）；
+  每 tile 自适应 min(帧内,帧间) 只 +0.0~0.6%。原因：相机在动 + TAA jitter，帧内平滑 ≫ 帧间相关。
+- **更好的预测器 ❌**：MED / Paeth / avg 相对 left 只有 +0.0~0.6%。原因见下。
+- **例外编码 ✅**：把“每 tile 取最大位宽”换成「主位宽 + 1 bit/值 mask + 32 bit patch」，
+  **MV 1.54→2.58（+67.6%，p5 2.05）、depth 1.89→2.46（+30.6%，p5 2.36）、
+  colour 1.20→1.46（+22.4%，p5 1.45）**。同一趟、无熵编码、纯整数、slot 尺寸不变。
+
+根因一句话：**位宽被离群像素抬高了** —— 换预测器省不了它，帧间也省不了它，
+只有“谁分离谱谁付 32 位”才省得下来。
+
+**连带结论**：MV 全分辨率例外编码后 12.9 MB(p50)~16.2 MB(p5)，对今天的 150% 档 14.75 MB
+**基本平价** → §12 里“无损压缩替代降采样 ❌”翻成“可行”；S/U 两个变体分别改善到
+≈−3.2 ms / ≈−2.5 ms 名义。顺带解码可以改成「并行解包 + 每行 scan」，
+消掉 §13.2 里 AMD 慢 5 倍的跨像素依赖链。
+
+新增工具：`temporal_test.cpp`、`predictor_test.cpp`、`exception_test.cpp`。
+
+### docs(design): hipCOMP-core 审计——没有 CPU 回退，但 AMD 侧算法不全 (2026-11-21)
+
+查了 `third_party/hipCOMP-core-amd-develop`（v2.3.0，基于 nvCOMP branch-2.2）：
+
+- **不存在 CPU 编解码路径**：`src/`+`include/` 里没有任何 zlib/zstd CPU 调用；
+  `src/CMakeLists.txt` 只链 bitcomp / gdeflate / ans 三个 NVIDIA 专有包，从不链 ZLIB；
+  顶层 `find_package(ZLIB)` 挂在 `if(gdeflate_FOUND)` 下、且只在 `tests/third-party`
+  里用来**造 CPU 压缩输入**喂 GPU 解压。`src/` 里唯一的 zlib 血统是
+  "Derived from zlib's contrib/puff.c" 的 **inflate 设备端代码**。
+- **API 本身就不给压缩**：`include/hipcomp/zstd.h` / `deflate.h` 只有
+  `DecompressGetTempSize` / `DecompressAsync` / `GetDecompressSizeAsync`，
+  **没有 Compress** —— 是链接期就失败，不是运行期悄悄退回 CPU。
+  `lz4.h` 才是完整三件套；`ZstdManager::compress` 直接 `throw "not implemented"`。
+- **四种配对的可用矩阵**：LZ4/Snappy/Cascaded/RLE 双向（但 README 标"✗ Optimized"）；
+  Zstd / Deflate / GZIP 仅 `N编→A解`；Bitcomp / ANS / GDeflate 三方都不可用（NVIDIA 专有）。
+
+结论对本项目不变且更强：自己的 HLSL 码流已经验证**跨厂商逐字节一致**（§13.1），
+不需要赌两个库的位流，也不用把 CUDA/ROCm 运行时塞进游戏进程；而 `A编` 一侧若用第三方库，
+只有未优化的 LZ4/Snappy 可选。
+
+### test(gpu_codec): 厂商矩阵实测——位流跨厂商一致，但 AMD 解码慢 3–5 倍 (2026-11-21)
+
+新增 `tests/gpu_codec/`（HLSL 码流 + D3D12 测试台 + `scripts/build_gpu_codec.sh`），
+在 RX 6750 GRE 与 RTX 3080 Ti 上跑同一份真实 dump 帧：
+
+| 流 | AMD enc / dec | NV enc / dec | 比率 | 字节一致 |
+|---|---|---|---|---|
+| MV 4K | 2.854 / **6.402** ms | 2.286 / 1.203 ms | 1.54x | ✅ |
+| depth 4K | 2.643 / 6.125 ms | 2.202 / 1.211 ms | 1.88x | ✅ |
+| colour 4K | 5.763 / 10.300 ms | 3.343 / 3.110 ms | 1.19x | ✅ |
+
+- **N/N、N/A、A/N、A/A 四种组合不需要各测**：位流逐字节跨厂商一致 + 每卡回环正确 +
+  与 CPU 参考一致，三个事实就覆盖了全部组合。
+- 抓到的问题：**AMD 解码比 NV 慢 3–5 倍**，原因是当前解码"每像素读左邻居"形成 256 长的
+  依赖链。生产实现必须改成「并行解残差 + 每行 inclusive scan」，否则 A 卡当消费端会被拖死。
+- 绝对 ms 是参考形状（一线程一个 tile），比目标形状慢 30–40 倍，**只用于相对比较**。
+
+### docs(design): gate 1 实测完成 —— 无损压缩**不能替代降采样，但可以叠加** (2026-11-21)
+
+数据集 `E:\mgpu_dataset\20261121_155534_full\seg-full`：CP2077 4K、32 帧、96 个 raw、
+4.0 GB、`StreamPercent[Mv|Depth]=100`、`ColourStream=1`、`no_mv 0`；参考实现
+（`tests/lossless_bench/fr_codec`）**96/96 帧 bit-exact**。
+
+| 流 | 原始 | 压缩后 | p5 | p50 |
+|---|---|---|---|---|
+| MV 4K RG16F | 33.2 MB | 21.5 MB | **1.500** | 1.530 |
+| depth 4K R32F | 33.2 MB | 17.6 MB | 1.880 | 1.890 |
+| colour 4K RGBA16F | 66.4 MB | 55.7 MB | 1.190 | 1.200 |
+
+今天的 150% 档压缩后：MV 1.48、depth 1.77（`downsample_test.cpp`）。
+
+**裁决**：
+- **替代 ❌**：MV 1.50 顶不掉 150% 档的 4/9（需要 2.25）；熵编码（nvComp 一类）依旧出局
+  （3–8 ms/帧）。
+- **叠加 ✅（新结论）**：三条流都按今天的尺寸压一遍 → 95.9 → **74.0 MB/帧**，
+  生产端 SM −0.33 ms（编码 0.13 比 9-tap 0.30 便宜），**画质一个像素都不变**。
+- **升级 ✅（意外收获）**：把 MV 升回 100% 全分辨率的 +6.75 MB 被 colour 的 −10.7 MB
+  盖掉，整体仍 −1.1 ms/帧，还消掉两条 `UPSAMPLE_QUALITY.md` 承认的不可恢复误差。
+
+**新增工具**：`tests/lossless_bench/downsample_test.cpp`（同一个 3×3 足迹降采样后量
+“今天的流”压多少）、`ratio_stats.py`（把逐帧比率汇成 p5/p50/p95）；
+`scripts/analyse_dataset.sh` 现在会顺带输出这份分位数汇总。
+
+**gate 2 预演（同一数据集，离线）**：`epe_test` 把全分辨率 MV 按 150%/200% 降采样再
+双线性重建，与真值比：全图 EPE p99 **0.52 px**（150 档），但**边界带**（梯度 > 0.5 px，
+占 3.6%）p95 **4.81 px**、p99 45 px；200 档边界带 p95 7.70 px。即
+“MV 100% + 无损”在构造上把边界带误差清零 —— gate 2 的 ≥30% 判据通过，
+U 变体（多付 0.9 ms/帧名义成本换边界带误差归零）成立。
+
+**下一步**：先给 colour 写编码器（比率 < 1 时自动 raw 回退，等价于现状）。
+
+### docs(design): 无损压缩替代降采样传输的可行性评估 (2026-11-21)
+
+纯离线工具与文档，**不改任何运行时路径**。
+
+- 新增 `docs/design/LOSSLESS_TRANSPORT.md`：把"用 nvComp/hipComp 替代
+  `StreamPercent` 降采样+升采样"拆成两条不等式（字节、渲染卡时间），给出每种流的
+  盈亏平衡压缩率；结论是**只有 MV 值得**（回 100% 全分辨率 + 固定码率块变换，
+  链路打平、画质 bit-exact），colour 该换 R10 格式（0.19 ms 拿到 2:1）而不是压缩，
+  depth 保持降采样。
+- 新增 `tests/lossless_bench/lpbench.cu`：在 3080 Ti（与生产端同型号）上实测
+  固定码率 2:1 编码 **0.13 ms/66 MB**、解码 0.15 ms、4K→150% 的 9-tap 中值降采样
+  **0.30 ms** —— 编码器比它替代的 pass 还便宜，所以问题在压缩率不在算力。
+  需要规约/两趟的 pass（位宽扫描 0.26 ms 只读不写）解释了为什么 GPU 上的
+  LZ/ANS 熵编码不划算。
+- 新增 `tests/lossless_bench/fr_codec.h` + `fr_codec_test.cpp`：§6.1 的**可执行规格**
+  （2D 16×16 tile、左/上预测、per-lane 绝对值、raw 回退），编码/解码 + bit-exact 回环，
+  13 个边界用例 + 300 组 fuzz（越界尺寸、nw=1/2、NaN 位型）全通过；HLSL 直接照抄即可。
+- 新增 `lock_frame/scripts/capture_dataset.bat` + `.ps1`：**一条命令抓一套可复用数据集**
+  （强制 `ColourStream=1` + `StreamPercent[Mv|Depth]=100`、改过 ini 就要求重开游戏、
+  等日志出现 `dump complete` 再收工、写 `manifest.json`/`README.txt`、事后还原 ini）。
+  它针对的正是历史三次 dump 全部 `no_mv 1`、且 `ColourStream=0` 的坑。
+- 新增 `scripts/analyse_dataset.sh`：数据集一键分析（`lossless_ratio.py` 近似 +
+  `fr_codec` 精确 + `analyse_dump.py` 配对），汇总到 `<dataset>\report.txt`。
+- 新增 `scripts/lossless_ratio.py`：在 `--dump` 的真帧上估算三种压缩率
+  （zlib 代理 / 32-bit 字 / fp16 双平面，均含 tile 头），用 **p5** 做决策；
+  对流内近乎全零的缓冲会打印 `degenerate stream` 警告（见下条）。
+
+**gate 1 首轮实测（真实 CP2077 帧，`/mnt/c/temp/dump3`、`dump2077b`）**：
+colour 4K RGBA16F 参考实现 **1.22x**（zlib 1.95）、depth 1440p R32F **1.94x**
+（zlib 1.54，一维近似 1.88）——前者说明 HDR 颜色低位是噪声、预测器无处下手，后者说明
+固定码率在平滑浮点上确实比 zlib 好；两者 `decode(encode(x)) == x` 均 bit-exact。
+
+**MV 没测到**：三个历史 dump 全是 `--no-mv` 的零缓冲
+（`meta.txt` 里 `no_mv 1`，distinct 值只有 0），决定性的那一格仍待一次带 MV 的抓取。
+
+**未做**：协议 v24、编码/解码 HLSL、nvComp/hipComp 的本机吞吐（写作环境拉不下
+wheel，PyPI 只有 ~54 kB/s）。落地顺序是文档 §8 的 gate 0→3，gate 1 的 MV 一格
+（p5 ≥ 2）不过就放弃。**→ 2026-11-21 已跑完，见上一条实测。**
+
+### feat(capture/mfg): 1.2.2 本地版——layered WGC 固定、MFG 真模型只留实验入口 (2026-11-21)
+
+**捕获**：WGC 窗口捕获固定 `--overlay-layered --wgc-minint 0`。CP2077 4K 实测 2x
+`show` 中位 119、`skip 0`；3x/4x 也能到 120。`--wgc-minint -1`（默认 15–16ms）
+会卡高帧捕获；`--capture-monitor` 在 topmost overlay 下 0 帧交付并冻结，DXGI
+Desktop Duplication 同样属于显示器级捕获，默认不采用。
+
+**MFG（可选实验）**：新增 `--mfg-model=keep2x|port`，**默认 keep2x**。`port` 接
+MFG-Unlocker 的 ShaderPort + ModelPort（model 15→16）+ 5 站点解锁，54 个 portable
+DXIL 程序 + 7 个 replacement shader（AMD 保留 2 个 Intel U-Net）。CP2077 4K 实测
+3x `xN=3.00`/`show=120`、4x `xN=4.00`/`show=118–120`，无 XeFG 错误；但 4x 真模型
+屏幕边缘伪影明显比 keep2x 严重，`--fg-use-matrix`、`--no-upsample`、jitter/scene
+调整均无改善。因此 3x/4x 默认保持 keep2x，真模型只在显式 `--mfg-model=port`
+（本地测试脚本）时启用。
+
+**资产**：新增 `scripts/extract_mfgunlocker_assets.py`，从
+`third_party/MFGUnlocker-v1.7.1/MFGUnlocker.dll` 提取 54 程序 + 7 shader 到
+`build/xefg_programs`（gitignored，本地研究资产，不随公开发布包分发）。
+
+**诊断**：`--wgc-minint -1` 现在真正透传 Windows 默认；monitor 捕获的 overlay
+显示亲和度只在 `--capture-monitor` 下设置，不影响默认 WGC 窗口捕获。
+
 ### fix(deploy): Intel 运行时写进游戏目录 + XeFG 加载/传输自愈 (2026-11-20, 1.2.1)
 
 **现场（Cyberpunk 2077，lock_frame 1.2.0）**：UI 每次按热键都报

@@ -349,6 +349,7 @@ void mv_resample_set_device(ID3D12Device* device);
 void pass_set_device(ID3D12Device* device);
 // Swap chain vtable hooks (fg_swapchain_hooks.cpp), OptiScaler's shape.
 bool fg_hook_swapchain(IDXGISwapChain* chain);
+
 // Bridges the detours use, implemented in backend_xefg.cpp.
 void xefg_before_present(bool real_present);
 void xefg_present_result(long hr);

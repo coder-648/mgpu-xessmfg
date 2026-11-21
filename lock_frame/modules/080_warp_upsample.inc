@@ -381,6 +381,10 @@ static void record_upsample(UINT slot)
     if (!g_upsample || g_reuse_frame || !g_ctl) { return; }
     if (g_no_inputs || g_no_depth || g_fg_of || g_depth_lag > 0) { return; }
     if (!mv_from_producer() || !g_mv[slot] || !g_depth[slot]) { return; }
+    // v30: with MvCodec=1 the MV is already at 1:1 (decoded straight into g_mv_local), so
+    // the MV half of this pass is an identity resample; depth still needs the pass, and it
+    // reads only g_mv_local/g_depth_local, never the codec's byte slot. So do NOT skip it
+    // here - skipping would hand XeFG depth at stream size (ERR_INVALID_ARGUMENT).
     if (g_ctl->request_mask & mgpu::kRequestRawMv) { return; }   // prepare_stream path
     if (!g_mv_local[slot]) { return; }
 

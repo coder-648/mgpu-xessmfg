@@ -5,6 +5,12 @@
 > 且**不提供任何开关**（UI 无项、`fakerFG.ini` 无键、发布说明不提及）。
 > 只有本机 A/B 才用内部参数 `--ui-unblend` + 手写 `fakerFG.ini` 的 `UiStream=1`。
 > 这份文档记录的是设计意图与后续验收计划，不代表已发布能力。
+>
+> **v29 更新（2026-11-21）**：stream 3 不再只能是游戏 UI。`fakerFG.ini` 的
+> `UiSource=Auto|Game|Hudless|Off` 允许在没有 UI tag 时发送降采样 HUDless，消费端用
+> `synth_ui.hlsl` 从（present - hudless）合成近似 UI，再走同一条 unblend → mode 4。
+> 生产端仍然只做一次降采样 pass，不传全分辨率 HUDless。开关与门控见
+> `lock_frame/docs/UI_SOURCE_V29.md`。
 
 > 结论：只增加 **一条降采样 UI 流**。UI 流是启用 XeFG UI composition 的唯一门控。
 > 生产端不做 HUDless 传输、不做 HUDless 呈现拷贝；消费端用 OptiScaler 的思路
@@ -336,4 +342,80 @@ if (g_ui_unblend && hudless_valid) {
 - unblend 的 `total p95` / `gpu` 实测；
 - XeFG 是否接受当前 UI 尺寸（我们已升到输出尺寸再 unblend/tag，路径上不依赖它接受低分辨率 UI）；
 - UI 源为 `UIColorAndAlpha` 之外的 lane（UI + UIAlpha 分开）时的 combine pass。
+
+---
+
+## 10. sm86 0.4.2 的处理方式（参考资料，2026-11-21 补）
+
+随包副本：`third_party/dlssg_for_sm86-main/`（0.4.2，2026-11-14）。它的两条引擎对
+UI / HUD-less 的处理不同，且都**不做 unblend**：它只消费游戏交出的平面，或在没有
+平面时把 UI 烘进唯一输入。
+
+### 10.1 它做了什么
+
+| 引擎 | 键 | 行为 | 出处 |
+|---|---|---|---|
+| DLSS-G | `[DLSSG] Preset` | `A`（默认）= UI 烘进颜色历史一起插值；`B` = UI 重组，**只有游戏同时交出 `DLSSG.HUDLess` 和 `DLSSG.UI` 才生效**；缺一张就与 `A` 完全相同，每个特性句柄在第一次 Evaluate 记一条 Level 1 的 `preset_ineffective`（写明缺哪张），不逐帧刷；`C` = FG Lite，UI 重组同时关掉 | `docs/INSTALL.md` 164 / 592–598 / 631、`README.md` 327 |
+| XeSS-FG | `[XeSSFG] UseHudless` | 0.4.2 起 `Auto` **与 `0` 相同**（2026-11-10，C139）：后缓冲做网络输入，整幅画面（含 UI）一起插值，游戏给不给 HUD-less 都一样，不再产生 `xefg_hudless_unused`；`1` = 严格档，每帧都用 HUD-less 做网络源；缺平面或 UI 平面与后缓冲尺寸不同即 `xefg_kernel_fatal{kind:"hudless"}`，进程以 `0xE0D55001` 结束 | `README.md` 24、`dlssg_sm86.ini` 75–82、`docs/INSTALL.md` 133–135 / 166 |
+| 历史 | — | 2026-10-19 之前取值只有 `0/1`、出厂 `1`；10-19 到 11-10 之间 `Auto` 是**逐帧判定**；11-10 起 `Auto` 收敛成 `0` | `docs/INSTALL.md` 232 |
+
+另外两条与其实现相关的约束：
+
+- 运行库**比较指针**来判断“给没给 HUD-less”，所以同一个资源被两个参数共用时只存一份
+  （`docs/CAPTURE.md` 98、`docs/ARCHITECTURE.md` 455）。平面按需抓取时同理（`CAPTURE.md` 105）。
+- 平面交不交由游戏决定：本机 4K 抓取里**黑神话悟空两张都交，赛博朋克 2077 只交
+  `DLSSG.HUDLess`、不交 `DLSSG.UI`**；`Preset=B` 在 2077 上是空操作
+  （`docs/INSTALL.md` 596）。它的诊断工具会打印一行 `HUD 平面:` 直接回答这个问题。
+- 画质归因：HUD / 浮空 UI 抖动走 `Preset` 这条路径；**场景细结构闪烁、遮挡边缘重影
+  不受它影响**，`Preset=B` 也不是这类现象的解法（`docs/INSTALL.md` 598–606）。
+- 成本：`B` 需要两张全分辨率 FP16 平面，1080p ≈ 33 MB、4K ≈ 133 MB（`INSTALL.md` 592）。
+
+### 10.2 对我们（UI 流 + unblend + mode 4）的意义
+
+**可参考的（策略层）**
+
+1. **默认烘 UI、分离是显式 opt-in**：sm86 在 3 周内把“逐帧 Auto”收敛回“默认等于
+   不做”，说明逐帧自适应的行为难以解释、维护成本高。我们的 `UiStream` 默认 0 是对
+   的；恢复发布时也应保持“默认关 + 显式开启”，不要做逐帧自动开关。
+2. **平面可用性必须按游戏探测，并作为开关前置条件**。我们的 UI 源是
+   `sl::kBufferTypeUIColorAndAlpha`（`lock_frame/faker_fg/proxy_streamline.cpp:163`）
+   或 NVNGX 的 `NVSDK_NGX_DLSSG_Parameter_UI` + `_UIAlpha`
+   （`lock_frame/faker_fg/provider.cpp:118–119`）。当游戏只交 HUD-less、不交 UI 时，
+   这条路没有输入：composition 应保持关闭，并明确记一条原因，而不是让 unblend 失败
+   后静默退回 mode 2。
+3. **一次性诊断而不是每帧刷**：`preset_ineffective` 按“每个特性句柄第一次 Evaluate”
+   记一次，字段 `hudless/ui/missing[]` 直接说明缺哪张。我们的 `record_ui_unblend()`
+   现在只在**首次成功**时打一条 `HUDless rebuilt`（`085_ui_unblend.inc:223–227`），
+   失败分支（`140_frame.inc:1080–1085`）没有任何日志——验收时无法区分“没有 UI 平面”
+   与“unblend 坏了”。建议照它的做法补一条带 `reason` 的状态变化日志（首次 + 状态翻转）。
+4. **尺寸/格式是硬条件，不满足就不 tag**：sm86 严格档要求 HUD-less / UI 与后缓冲同
+   尺寸，否则直接失败而不是猜。我们已经在 tag 前校验 `streams[3]` 尺寸与 `g_ui_fresh`，
+   应把同样的规则显式写进日志（UI 尺寸、格式、alpha 位宽、是否 premultiplied）。
+5. **成本论证支持我们的取舍**：它两张全分辨率平面 4K ≈ 133 MB；我们一条 50% 的 R10
+   UI 流 4K ≈ 8.3 MB（本文 §4），代价是消费端一次 unblend dispatch。这个方向值得
+   保留，但验收指标应只针对 **HUD 区块**，不要把场景细结构闪烁算成回归（sm86 明确
+   那属于运行库算法）。
+6. **不要逐帧切 composition**：它文档里同样强调状态切换的代价；我们已有“连续 miss
+   N 帧才关”的滞回（本文 §3.5），与 0.4.2 的收敛方向一致。
+
+**不能照搬的**
+
+- sm86 不做反解：`UseHudless=1` 是“HUD-less 做网络源 + 自己合成 UI”，对应我们的
+  **mode 3**（UI + HUDless 都 tag），不是 mode 4。unblend 的数学、alpha 空间与回退
+  仍以 OptiScaler 的 `UiUnblend` 和我们自己的 `shaders/unblend_ui.hlsl` 为准。
+- DLSS-G 的 UI 重组由 NVIDIA 运行库完成，XeFG 的 composition 由 Intel 运行时完成；
+  两者的“谁合成 UI”不同，不能把 `Preset=B` 的行为当成 XeFG mode 4 的参照。
+
+### 10.3 建议的下一步（按游戏分层验收）
+
+| 游戏 | 已观测的平面 | 用途 |
+|---|---|---|
+| PRAGMATA | FG 开时 `hudless=y ui=y`（`docs/findings/FG_INPUT_V13_PRAGMATA.md:281`） | **主验收题**：UI 流 / mode 2 / mode 4 的 HUD 质量与 unblend 成功率 |
+| Cyberpunk 2077 | 我们自己的抓取 `hudless=n ui=n`（`FG_INPUT_V13_2077.md:298`，FG 关）；sm86 的 4K 抓取也只交 HUDLess | **只做“无 UI 平面”回归**：确认 composition 关闭、画面与 1.2.1 一致、日志给出原因；不要用它验收 mode 4 |
+| Wuchang / Khazan | Khazan 没有 `UI_COLOR_AND_ALPHA` tag（`FG_INPUT_V13_KHAZAN.md:215`） | 验证“缺平面”路径与回退文案 |
+
+顺序建议：先 `UiStream=1` + 只 tag UI（mode 2，不依赖 unblend）确认 UI 不再拖影 →
+再开 `--ui-unblend` 走 mode 4，A/B 看 HUD 区块与 unblend 光晕/暗边 → 最后把 2077
+的“没有 UI 平面”回归锁进测试清单。每一步都以“producer `streams[3]` 有尺寸 +
+consumer `tag ui/hudless` 各一条日志”为通过条件，而不是只看观感。
 

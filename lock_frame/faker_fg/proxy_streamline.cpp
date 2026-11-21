@@ -52,6 +52,7 @@ struct StageEntry
 struct Stage
 {
     StageEntry hudless{};
+    StageEntry scaling{};
     StageEntry mv{};
     StageEntry depth{};
     StageEntry ui{};
@@ -142,9 +143,108 @@ bool    g_sl_tried      = false;
 HMODULE g_interposer = nullptr;
 
 // ---------------------------------------------------------------- helpers
+// CP2077 tags HUDLESS_COLOR as onlyValidNow. At present-staged that resource can
+// already be cleared/reused, which is exactly what produced a black HUDless stream.
+// Snapshot it on the tag's own command list into a stable texture, so the producer
+// reads real pixels later in the same frame.
+struct HudlessSnapshot
+{
+    ID3D12Resource* resource = nullptr;
+    D3D12_RESOURCE_DESC desc{};
+};
+static HudlessSnapshot g_hud_snap[4];
+static UINT g_hud_snap_i = 0;
+
+static bool snapshot_hudless(const sl::ResourceTag& tag, void* cmd, StageEntry& slot)
+{
+    if (tag.resource == nullptr || tag.resource->native == nullptr || cmd == nullptr) {
+        return false;
+    }
+    auto* src = reinterpret_cast<ID3D12Resource*>(tag.resource->native);
+    auto* cl  = reinterpret_cast<ID3D12GraphicsCommandList*>(cmd);
+    ID3D12Device* dev = nullptr;
+    if (FAILED(src->GetDevice(IID_PPV_ARGS(&dev)))) { return false; }
+    const D3D12_RESOURCE_DESC d = src->GetDesc();
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) { dev->Release(); return false; }
+
+    HudlessSnapshot& s = g_hud_snap[g_hud_snap_i];
+    if (s.resource == nullptr || s.desc.Width != d.Width || s.desc.Height != d.Height ||
+        s.desc.Format != d.Format) {
+        if (s.resource != nullptr) { s.resource->Release(); s.resource = nullptr; }
+        D3D12_RESOURCE_DESC rd = d;
+        rd.MipLevels = 1;
+        rd.DepthOrArraySize = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        hp.CreationNodeMask = 1;
+        hp.VisibleNodeMask = 1;
+        if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                IID_PPV_ARGS(&s.resource)))) {
+            dev->Release();
+            s.resource = nullptr;
+            return false;
+        }
+        s.desc = rd;
+    }
+    dev->Release();
+
+    const D3D12_RESOURCE_STATES declared =
+        static_cast<D3D12_RESOURCE_STATES>(tag.resource->state);
+    if (declared == static_cast<D3D12_RESOURCE_STATES>(0xFFFFFFFFu)) {
+        return false;   // no declared state: do not guess with a barrier
+    }
+    // OptiScaler's CyberpunkHudlessState quirk: CP2077 declares HUDLESS as
+    // PIXEL|NON_PIXEL but the resource is actually a UAV. Using the declared state
+    // for the barrier/copy reads undefined data (black). Treat it as UAV.
+    D3D12_RESOURCE_STATES before = declared;
+    if (before == (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)) {
+        before = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = src;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = before;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    if (before != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+        cl->ResourceBarrier(1, &b);
+    }
+    cl->CopyResource(s.resource, src);
+    if (before != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b.Transition.StateAfter = before;
+        cl->ResourceBarrier(1, &b);
+    }
+    b.Transition.pResource = s.resource;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    cl->ResourceBarrier(1, &b);
+
+    slot.resource = s.resource;
+    slot.state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    slot.until_present = true;
+    g_hud_snap_i = (g_hud_snap_i + 1u) % 4u;
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        logf("sl: HUDLESS snapshot (onlyValidNow) %ux%u fmt %u -> stable copy\n",
+             static_cast<unsigned>(d.Width), d.Height, static_cast<unsigned>(d.Format));
+    }
+    return true;
+}
+
 void remember(StageEntry& slot, const sl::ResourceTag& tag, void* cmd)
 {
     if (tag.resource == nullptr || tag.resource->native == nullptr) { return; }
+    if (tag.type == sl::kBufferTypeHUDLessColor &&
+        tag.lifecycle != sl::eValidUntilPresent && snapshot_hudless(tag, cmd, slot)) {
+        if (cmd != nullptr) { g_stage.cmd = cmd; }
+        return;
+    }
     slot.resource      = reinterpret_cast<ID3D12Resource*>(tag.resource->native);
     slot.state         = tag.resource->state;                       // the title's declaration
     slot.until_present = (tag.lifecycle == sl::eValidUntilPresent);
@@ -158,6 +258,20 @@ void record_tags(const sl::ResourceTag* tags, uint32_t count, void* cmd)
         const sl::ResourceTag& t = tags[i];
         switch (t.type) {
         case sl::kBufferTypeHUDLessColor:    remember(g_stage.hudless, t, cmd); break;
+        case sl::kBufferTypeScalingOutputColor:
+            // CP2077 tags HUDLESS_COLOR onlyValidNow (its content can already be
+            // cleared at present). SCALING_OUTPUT is the upscaled scene image and is
+            // tagged validUntilPresent; use it as the HUDless plane when available.
+            remember(g_stage.scaling, t, cmd);
+            {
+                static bool told = false;
+                if (!told && t.resource != nullptr) {
+                    told = true;
+                    logf("sl: SCALING_OUTPUT used as HUDless fallback (state=0x%X lc=%d)\n",
+                         t.resource->state, static_cast<int>(t.lifecycle));
+                }
+            }
+            break;
         case sl::kBufferTypeMotionVectors:   remember(g_stage.mv, t, cmd); break;
         case sl::kBufferTypeDepth:           remember(g_stage.depth, t, cmd); break;
         case sl::kBufferTypeUIColorAndAlpha: remember(g_stage.ui, t, cmd); break;
@@ -819,7 +933,12 @@ int sl_stage_inputs(MgpuFgFrame& f)
 
     put(MGPU_FG_STREAM_MV, g_stage.mv);
     put(MGPU_FG_STREAM_DEPTH, g_stage.depth);
-    put(MGPU_FG_STREAM_HUDLESS, g_stage.hudless);
+    // UI synthesis is paused: use only the title's declared sources.
+    if (g_stage.scaling.resource != nullptr) {
+        put(MGPU_FG_STREAM_HUDLESS, g_stage.scaling);
+    } else {
+        put(MGPU_FG_STREAM_HUDLESS, g_stage.hudless);
+    }
     put(MGPU_FG_STREAM_UI_COLOR, g_stage.ui);
 
     if (g_stage.backbuffer != nullptr) {
@@ -940,5 +1059,5 @@ void sl_publish_staged()
     }
 }
 
-} // namespace fakerfg
+}
 

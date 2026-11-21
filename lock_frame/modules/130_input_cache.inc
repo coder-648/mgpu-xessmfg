@@ -501,6 +501,9 @@ static bool copy_slot_streams(UINT s)
 static void prefetch_publications()
 {
     if (!g_pf_pub || !g_ctl || g_reuse_frame) { return; }
+    // v30: the codec path decodes on the direct queue (a COPY list cannot Dispatch), and its
+    // slot is a byte buffer, so the prefetch cache is not used for it.
+    if (mv_codec_shared()) { return; }
     UINT     ss[mgpu::kMaxSlots] = {};
     uint64_t pp[mgpu::kMaxSlots] = {};
     UINT n = 0;

@@ -51,6 +51,17 @@ python3 "$REPO_WSL/scripts/embed_cso.py" "$BUILD_LNX/upsample_joint.cso" \
     "$BUILD_LNX/upsample_joint_cso.h" "UpsampleJoint" \
     || { echo "[build] embed failed for upsample_joint"; exit 1; }
 
+# Lossless MV decode (docs/design/LOSSLESS_TRANSPORT.md sections 6.1/14.3). The
+# encoder lives in the producer; the consumer only needs Decode. Embedded so the exe
+# needs no d3dcompiler at runtime, same as upsample_joint.
+"$FXC_WIN" -nologo -T cs_5_0 -E Decode \
+    -Fo "$(wslpath -w "$BUILD_LNX/fr_decode.cso")" \
+    "$(wslpath -w "$REPO_WSL/src/shaders/fr_codec.hlsl")" \
+    || { echo "[build] fxc failed for fr_codec Decode"; exit 1; }
+python3 "$REPO_WSL/scripts/embed_cso.py" "$BUILD_LNX/fr_decode.cso" \
+    "$BUILD_LNX/fr_decode_cso.h" "FrDecode" \
+    || { echo "[build] embed failed for fr_decode"; exit 1; }
+
 # The convert/prepare shaders are compiled at RUNTIME from a string in
 # modules/shaders.cpp, so cl cannot catch a broken one - a bad ps_main made the
 # consumer fail to start with only a log line. Validate every entry point here.

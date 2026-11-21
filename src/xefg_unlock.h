@@ -39,9 +39,12 @@
 // the library builds that many frames - which is also the check this code makes
 // before it says it succeeded.
 //
-// Consequence worth knowing: because the MFG model is absent, every interpolated
-// frame comes from the 2x model. That is exactly what the unlocker does too
-// ("fg_keep_2x_model"), and it is why quality at 4x is not 2x quality.
+// Consequence worth knowing: the stock build keeps the 2x model for every
+// generated frame. MFG-Unlocker's recommended route instead relabels the model
+// 15 record already present in this DLL as model 16 (ModelPort) and swaps the
+// 54 portable programs (ShaderPort); frame generation is then real multi-frame.
+// Our default `--mfg-model=auto` tries that port and falls back to the 2x-model
+// route when the payload or layout does not match.
 // ============================================================================
 #pragma once
 
@@ -78,9 +81,14 @@ inline Bytes with(const uint8_t* p, size_t n)
     return out;
 }
 
-// The six sites. `interp` is the number of interpolated frames per real frame,
-// i.e. what xefg_swapchain_d3d12_init_params_t::maxInterpolatedFrames means.
-inline void build_table(unsigned interp, Patch out[6])
+// The unlock sites. `interp` is the number of interpolated frames per real
+// frame, i.e. what xefg_swapchain_d3d12_init_params_t::maxInterpolatedFrames
+// means. `keep2xModel` selects the two routes MFG-Unlocker exposes:
+//   true  -> force fg_keep_2x_model (the 2x model is reused for every
+//            generated frame; our old behaviour)
+//   false -> leave that predicate alone and let the provider's MFG path pick
+//            the ported model (ModelPort must have relabelled model 15 as 16)
+inline int build_table(unsigned interp, bool keep2xModel, Patch out[6])
 {
     static const uint8_t override_clamp[] = { 0xC7, 0x87, 0x6C, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00 };
     static const uint8_t default_ceiling[] = { 0xBB, 0x03, 0x00, 0x00, 0x00 };
@@ -106,26 +114,34 @@ inline void build_table(unsigned interp, Patch out[6])
     Bytes ll_after = with(ll_gate, sizeof(ll_gate));
     ll_after.b[2] = n;
 
-    out[0] = { "fg_override_clamp",   true,  0x1A45C2, with(override_clamp, sizeof(override_clamp)), oc_after };
-    out[1] = { "fg_default_ceiling",  true,  0x1A517D, with(default_ceiling, sizeof(default_ceiling)), dc_after };
-    out[2] = { "fg_reported_maximum", true,  0x20973B, with(reported_max,   sizeof(reported_max)),   rm_after };
-    out[3] = { "fg_keep_2x_model",    true,  0x1A5DE4, with(keep_2x_model,  sizeof(keep_2x_model)),  with(k2m_after, sizeof(k2m_after)) };
-    out[4] = { "fg_live_count",       true,  0x21B86B, with(live_count,     sizeof(live_count)),     lc_after };
-    out[5] = { "ll_generated_gate",   false, 0x00D1C9, with(ll_gate,        sizeof(ll_gate)),        ll_after };
+    int count = 0;
+    out[count++] = { "fg_override_clamp",   true,  0x1A45C2, with(override_clamp, sizeof(override_clamp)), oc_after };
+    out[count++] = { "fg_default_ceiling",  true,  0x1A517D, with(default_ceiling, sizeof(default_ceiling)), dc_after };
+    out[count++] = { "fg_reported_maximum", true,  0x20973B, with(reported_max,   sizeof(reported_max)),   rm_after };
+    if (keep2xModel) {
+        out[count++] = { "fg_keep_2x_model", true, 0x1A5DE4, with(keep_2x_model, sizeof(keep_2x_model)),
+                         with(k2m_after, sizeof(k2m_after)) };
+    }
+    out[count++] = { "fg_live_count",     true,  0x21B86B, with(live_count,     sizeof(live_count)),     lc_after };
+    out[count++] = { "ll_generated_gate", false, 0x00D1C9, with(ll_gate,        sizeof(ll_gate)),        ll_after };
+    return count;
 }
 
 
-// Applies all six sites or none at all.
+// Applies all selected sites or none at all.
 //
-//   fg / ll  - the loaded libxess_fg.dll and libxell.dll (the one that DLL uses).
-//   interp   - requested interpolated frames per real frame (2..5 -> 3x..6x).
-//   err      - which site failed and why.
+//   fg / ll        - the loaded libxess_fg.dll and libxell.dll (the one that DLL uses).
+//   interp         - requested interpolated frames per real frame (2..5 -> 3x..6x).
+//   err            - which site failed and why.
+//   keep2xModel    - true: reuse the 2x model (legacy route); false: leave the
+//                    model predicate alone so the ported model can be selected.
 //
 // Every site is checked (module ownership, committed image page, exact bytes)
 // before anything is written, each write is flushed and read back, and the old
 // page protection is restored. The caller still has to confirm the effect with
 // xefgSwapChainGetProperties - that is the only proof the right byte moved.
-inline bool Apply(HMODULE fg, HMODULE ll, unsigned interp, std::string* err)
+inline bool Apply(HMODULE fg, HMODULE ll, unsigned interp, std::string* err,
+                  bool keep2xModel = true)
 {
     if (interp < 2 || interp > 5) {
         if (err) { *err = "interp out of range (2..5)"; }
@@ -137,13 +153,13 @@ inline bool Apply(HMODULE fg, HMODULE ll, unsigned interp, std::string* err)
     }
 
     Patch table[6];
-    build_table(interp, table);
+    const int site_count = build_table(interp, keep2xModel, table);
 
     struct Target { const Patch* p; uint8_t* addr; DWORD prot; bool already; };
     Target targets[6]{};
 
     // ---- phase 1: verify every site before touching memory ------------------
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < site_count; ++i) {
         const Patch& p = table[i];
         HMODULE mod = p.in_fg ? fg : ll;
         auto* addr = reinterpret_cast<uint8_t*>(mod) + p.rva;
@@ -167,7 +183,7 @@ inline bool Apply(HMODULE fg, HMODULE ll, unsigned interp, std::string* err)
 
     // ---- phase 2: write, verifying as we go --------------------------------
     int done = 0;
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < site_count; ++i) {
         Target& t = targets[i];
         if (t.already) { ++done; continue; }
 
@@ -188,10 +204,10 @@ inline bool Apply(HMODULE fg, HMODULE ll, unsigned interp, std::string* err)
         ++done;
     }
 
-    if (done == 6) { return true; }
+    if (done == site_count) { return true; }
 
     // ---- phase 3: roll back what we changed --------------------------------
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < site_count; ++i) {
         Target& t = targets[i];
         if (t.already || !t.addr) { continue; }
         if (std::memcmp(t.addr, t.p->after.b, t.p->after.n) != 0) { continue; }

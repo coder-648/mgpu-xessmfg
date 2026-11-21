@@ -1399,6 +1399,37 @@ static bool place_shared_views()
             const UINT pw = st.slot_w ? st.slot_w : st.width;
             const UINT ph = st.slot_h ? st.slot_h : st.height;
             D3D12_RESOURCE_DESC rd{};
+            if (st.codec != 0) {
+                // v30: the stream carries fr-codec bytes in a raw buffer. slot_size is the
+                // byte size; slot_w/slot_h stay the content capacity, so tile counts and the
+                // TileLen[] layout are derivable on both sides.
+                rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+                rd.Width            = st.slot_size;
+                rd.Height           = 1;
+                rd.DepthOrArraySize = 1;
+                rd.MipLevels        = 1;
+                rd.Format           = DXGI_FORMAT_UNKNOWN;
+                rd.SampleDesc.Count = 1;
+                rd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                // The two adapters place the SAME memory: the resource description (size,
+                // format and flags) must be identical on both sides, otherwise the driver
+                // treats the view as mismatched and removes the device. The producer needs
+                // ALLOW_UNORDERED_ACCESS for the encode pass, so this side carries it too
+                // (measured 2026-11-21: producer had it, this side did not).
+                rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER |
+                                      D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                const UINT64 boff = st.offset + st.slot_size * s;
+                // A buffer cannot be created in COMMON (E_INVALIDARG, measured in
+                // tests/gpu_codec); the decode pass transitions it back afterwards.
+                if (FAILED(g_device->CreatePlacedResource(
+                        g_shared_heap.Get(), boff, &rd, D3D12_RESOURCE_STATE_COPY_DEST,
+                        nullptr, IID_PPV_ARGS(&dst)))) {
+                    logf_("[lock] placed BUFFER FAILED (stream %d slot %u, %llu B)\n", k, s,
+                          static_cast<unsigned long long>(st.slot_size));
+                    return false;
+                }
+                continue;
+            }
             rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
             rd.Width            = pw;
             rd.Height           = ph;

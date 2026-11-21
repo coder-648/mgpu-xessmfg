@@ -477,6 +477,12 @@ static bool read_stream_geo(const mgpu::StreamShared& st, UINT* w, UINT* h)
 static void refresh_input_geo()
 {
     if (!g_ctl) { return; }
+    // --no-upsample is the explicit opt-out from the reconstruction pass (an A/B for the
+    // ported MFG model). Read once: the CLI does not change while we run.
+    static int s_no_upsample = -1;
+    if (s_no_upsample < 0) {
+        s_no_upsample = (wcsstr(GetCommandLineW(), L"--no-upsample") != nullptr) ? 1 : 0;
+    }
     // Clamp to the slot capacity: a stale/foreign header must never make us copy out of
     // bounds of the placed view (belt and braces on top of the seqlock).
     auto clamp = [](UINT v, UINT cap) { return (cap && v > cap) ? cap : v; };
@@ -500,21 +506,52 @@ static void refresh_input_geo()
         g_geo.depth_w = dw;
         g_geo.depth_h = dh;
     }
+
+    // XeFG requires MV and depth at the SAME size. The two streams can legitimately differ
+    // (a DLSS preset can hand the producer MV at output resolution and depth at render
+    // resolution), and the codec keeps each stream at its own 1:1 size instead of forcing
+    // both through one StreamPercent. The joint reconstruction pass is what normalises
+    // them, so a mismatch has to switch it on - otherwise the tags would carry two
+    // different sizes and XeFG refuses the frame.
+    if (mw >= 256 && dw >= 256 && (mw != dw || mh != dh)) {
+        static bool told = false;
+        if (!told) {
+            told = true;
+            logf_("[lock] MV %ux%u and depth %ux%u differ - the reconstruction pass is"
+                  " forced ON so both reach one size before tagging (XeFG requires it)\n",
+                  mw, mh, dw, dh);
+        }
+        if (!g_upsample && s_no_upsample == 0) {
+            g_upsample = true;
+            logf_("[lock] --upsample: switched ON automatically (the two streams differ)\n");
+        } else if (!g_upsample) {
+            static bool told_off = false;
+            if (!told_off) {
+                told_off = true;
+                logf_("[lock] WARNING: --no-upsample with mismatched MV/depth sizes - XeFG"
+                      " will refuse the frame; drop it from the command line\n");
+            }
+        }
+    }
 }
 
 static bool ensure_local_copy(ComPtr<ID3D12Resource>& dst, ID3D12Resource* src,
-                              UINT w, UINT h)
+                              UINT w, UINT h, bool uav = false)
 {
     if (w == 0 || h == 0) { return false; }
     if (dst) {
         const D3D12_RESOURCE_DESC have = dst->GetDesc();
-        if (have.Width == w && have.Height == h) { return true; }
+        if (have.Width == w && have.Height == h &&
+            ((have.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0) == uav) {
+            return true;
+        }
         dst.Reset();
     }
     D3D12_RESOURCE_DESC d = src->GetDesc();
     d.Width  = w;
     d.Height = h;
-    d.Flags  = D3D12_RESOURCE_FLAG_NONE;
+    d.Flags  = uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+                   : D3D12_RESOURCE_FLAG_NONE;
     // The producer's textures are row-major because they live on a cross-adapter
     // heap; committed local resources must use the usual (unknown/swizzled) layout.
     d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
@@ -570,6 +607,605 @@ static void copy_content(ID3D12Resource* dst, ID3D12Resource* src, UINT w, UINT 
     ++g_copy_count;
 }
 
+// --------------------------------------------------- --mv-verify (bit-exact round trip)
+// The producer encoded `source` into the bytes sitting in the slot. This re-encodes the
+// freshly decoded MV and compares the two byte streams: if they are identical then
+// decode(bytes) == source bit for bit, because the encoder is injective (lossless - 32
+// real 4K frames bit-exact against the CPU reference plus all 65536 fp16 bit patterns).
+// A few samples are enough; each one reads back ~34 MB twice, so this is opt-in only.
+static bool                          g_mv_verify = false;
+static ComPtr<ID3D12RootSignature>   g_ver_rs;
+static ComPtr<ID3D12DescriptorHeap>  g_ver_heap;      // t0 texture, u0 out, u1 TileLen
+static ComPtr<ID3D12PipelineState>   g_ver_pso;
+static ComPtr<ID3D12Resource>        g_ver_tl, g_ver_out, g_ver_rb_enc, g_ver_rb_slot;
+static uint64_t                      g_ver_bytes = 0;
+static uint32_t                      g_ver_tiles = 0;
+static ULONGLONG                     g_ver_ms = 0;
+static int                           g_ver_samples = 0;
+static uint64_t                      g_ver_slot_bytes = 0;
+static D3D12_RESOURCE_STATES         g_ver_out_state = D3D12_RESOURCE_STATE_COPY_DEST;
+
+static bool init_mv_verify()
+{
+    static int state = 0;
+    if (state != 0) { return state > 0; }
+    state = -1;
+    D3D12_DESCRIPTOR_RANGE rg[3]{};
+    for (int i = 0; i < 3; ++i) {
+        rg[i].NumDescriptors     = 1;
+        rg[i].BaseShaderRegister = static_cast<UINT>(i == 0 ? 0 : (i - 1));
+        rg[i].RangeType          = (i == 0) ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+                                            : D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    }
+    D3D12_ROOT_PARAMETER rp[4]{};
+    rp[0].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[0].Constants.ShaderRegister = 0;
+    rp[0].Constants.Num32BitValues = 6;
+    rp[0].ShaderVisibility         = D3D12_SHADER_VISIBILITY_ALL;
+    for (int i = 0; i < 3; ++i) {
+        rp[i + 1].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[i + 1].DescriptorTable.NumDescriptorRanges = 1;
+        rp[i + 1].DescriptorTable.pDescriptorRanges   = &rg[i];
+        rp[i + 1].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
+    }
+    D3D12_ROOT_SIGNATURE_DESC rsd{};
+    rsd.NumParameters = 4;
+    rsd.pParameters   = rp;
+    ComPtr<ID3DBlob> blob, err;
+    if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err)) ||
+        FAILED(g_device->CreateRootSignature(0, blob->GetBufferPointer(),
+                                             blob->GetBufferSize(), IID_PPV_ARGS(&g_ver_rs)))) {
+        logf_("[lock] --mv-verify: root signature FAILED\n");
+        return false;
+    }
+    D3D12_DESCRIPTOR_HEAP_DESC hd{};
+    hd.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 3;
+    hd.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_ver_heap)))) { return false; }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature     = g_ver_rs.Get();
+    pd.CS.pShaderBytecode = kFrEncodeCSO;
+    pd.CS.BytecodeLength  = sizeof(kFrEncodeCSO);
+    if (FAILED(g_device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_ver_pso)))) {
+        logf_("[lock] --mv-verify: encode PSO FAILED\n");
+        return false;
+    }
+    state = 1;
+    logf_("[lock] --mv-verify: round-trip check ready (%zu B encode blob)\n",
+          sizeof(kFrEncodeCSO));
+    return true;
+}
+
+static ID3D12Resource* ver_buffer(ComPtr<ID3D12Resource>& r, uint64_t bytes, bool readback)
+{
+    if (r && r->GetDesc().Width >= bytes) { return r.Get(); }
+    r.Reset();
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = readback ? D3D12_HEAP_TYPE_READBACK : D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width            = bytes;
+    rd.Height           = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels        = 1;
+    rd.Format           = DXGI_FORMAT_UNKNOWN;
+    rd.SampleDesc.Count = 1;
+    rd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    rd.Flags            = readback ? D3D12_RESOURCE_FLAG_NONE
+                                  : D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                 IID_PPV_ARGS(&r)))) {
+        return nullptr;
+    }
+    return r.Get();
+}
+
+// Records one sample (re-encode + two readbacks) and, on the next call, compares the two
+// byte streams from the *previous* sample - two seconds later, so nothing has to wait.
+static void mv_verify_tick(UINT slot, UINT w, UINT h)
+{
+    if (!g_mv_verify || slot >= mgpu::kMaxSlots || !g_mv_local[slot] || !g_mv[slot]) { return; }
+    const ULONGLONG now = GetTickCount64();
+
+    if (g_ver_bytes != 0 && g_ver_rb_enc && g_ver_rb_slot) {
+        void* a = nullptr;
+        void* b = nullptr;
+        const D3D12_RANGE rr{ 0, static_cast<SIZE_T>(g_ver_bytes) };
+        if (SUCCEEDED(g_ver_rb_enc->Map(0, &rr, &a)) && a != nullptr &&
+            SUCCEEDED(g_ver_rb_slot->Map(0, &rr, &b)) && b != nullptr) {
+            const uint8_t* pa = static_cast<const uint8_t*>(a);
+            const uint8_t* pb = static_cast<const uint8_t*>(b);
+            uint64_t diff = 0, first = 0;
+            for (uint64_t i = 0; i < g_ver_bytes; ++i) {
+                if (pa[i] != pb[i]) { if (diff == 0) { first = i; } ++diff; }
+            }
+            if (diff == 0) {
+                logf_("[lock] --mv-verify: sample %d BIT-EXACT - the re-encoded %llu B match"
+                      " the producer's slot byte for byte\n",
+                      g_ver_samples, static_cast<unsigned long long>(g_ver_bytes));
+            } else {
+                logf_("[lock] --mv-verify: sample %d MISMATCH - %llu of %llu bytes differ,"
+                      " first at +%llu\n",
+                      g_ver_samples, static_cast<unsigned long long>(diff),
+                      static_cast<unsigned long long>(g_ver_bytes),
+                      static_cast<unsigned long long>(first));
+            }
+            const D3D12_RANGE none{ 0, 0 };
+            g_ver_rb_enc->Unmap(0, &none);
+            g_ver_rb_slot->Unmap(0, &none);
+        }
+        g_ver_bytes = 0;
+    }
+    if (g_ver_samples >= 3) { return; }
+    if (g_ver_ms != 0 && (now - g_ver_ms) < 2000) { return; }
+    if (!init_mv_verify()) { g_mv_verify = false; return; }
+
+    // Only the written part of the slot is comparable: the encoder fills every tile's full
+    // 264-word stride, so the tail beyond the last tile is untouched in both buffers.
+    const uint32_t tx = (w + 31u) / 32u;
+    const uint32_t ty = (h + 7u) / 8u;
+    const uint32_t tiles = tx * ty;
+    const uint64_t bytes = static_cast<uint64_t>(tiles) * 1056ull;
+    if (bytes == 0 || g_mv[slot]->GetDesc().Width < bytes) { return; }
+    const int next_sample = g_ver_samples + 1;
+
+    ID3D12GraphicsCommandList* list = g_list.Get();
+    ID3D12Resource* out = ver_buffer(g_ver_out, bytes, false);
+    ID3D12Resource* rbe = ver_buffer(g_ver_rb_enc, bytes, true);
+    ID3D12Resource* rbs = ver_buffer(g_ver_rb_slot, bytes, true);
+    ID3D12Resource* tl  = ver_buffer(g_ver_tl, 65536ull * 4ull, false);
+    if (list == nullptr || !out || !rbe || !rbs || !tl) {
+        logf_("[lock] --mv-verify: resources FAILED - check disabled\n");
+        g_mv_verify = false;
+        return;
+    }
+    ID3D12Resource* mv = g_mv_local[slot].Get();
+    ID3D12Resource* slot_buf = g_mv[slot].Get();
+
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.pResource   = mv;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    list->ResourceBarrier(1, &b);
+    b.Transition.pResource   = out;
+    b.Transition.StateBefore = g_ver_out_state;
+    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    list->ResourceBarrier(1, &b);
+    g_ver_out_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+
+    const UINT inc = g_device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_ver_heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = g_ver_heap->GetGPUDescriptorHandleForHeapStart();
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format                  = DXGI_FORMAT_R16G16_FLOAT;
+    srv.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels     = 1;
+    g_device->CreateShaderResourceView(mv, &srv, cpu);
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format                     = DXGI_FORMAT_R32_TYPELESS;   // raw buffer view
+    uav.ViewDimension              = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Buffer.StructureByteStride = 0;
+    uav.Buffer.Flags               = D3D12_BUFFER_UAV_FLAG_RAW;
+    uav.Buffer.NumElements         = static_cast<UINT>(out->GetDesc().Width / 4ull);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu_uav = cpu;
+    cpu_uav.ptr += inc;
+    g_device->CreateUnorderedAccessView(out, nullptr, &uav, cpu_uav);
+    // TileLen is RWStructuredBuffer<uint> in the shader: the view MUST be structured
+    // (stride 4); a raw view silently drops every write.
+    uav.Format                     = DXGI_FORMAT_UNKNOWN;
+    uav.Buffer.StructureByteStride = 4;
+    uav.Buffer.Flags               = D3D12_BUFFER_UAV_FLAG_NONE;
+    uav.Buffer.NumElements = static_cast<UINT>(tl->GetDesc().Width / 4ull);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu_tl = cpu_uav;
+    cpu_tl.ptr += inc;
+    g_device->CreateUnorderedAccessView(tl, nullptr, &uav, cpu_tl);
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu_uav = gpu;
+    gpu_uav.ptr += inc;
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu_tl = gpu_uav;
+    gpu_tl.ptr += inc;
+
+    uint32_t params[6] = { w, h, 1u, tx, ty, 264u };
+    list->SetComputeRootSignature(g_ver_rs.Get());
+    list->SetPipelineState(g_ver_pso.Get());
+    ID3D12DescriptorHeap* heaps[1] = { g_ver_heap.Get() };
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetComputeRoot32BitConstants(0, 6, params, 0);
+    list->SetComputeRootDescriptorTable(1, gpu);
+    list->SetComputeRootDescriptorTable(2, gpu_uav);
+    list->SetComputeRootDescriptorTable(3, gpu_tl);
+    list->Dispatch(tiles, 1, 1);
+
+    D3D12_RESOURCE_BARRIER ub{};
+    ub.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    ub.UAV.pResource = out;
+    list->ResourceBarrier(1, &ub);
+    b.Transition.pResource   = out;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    list->ResourceBarrier(1, &b);
+    list->CopyBufferRegion(rbe, 0, out, 0, bytes);
+
+    // The producer's bytes, exactly as they arrived (the decode left the slot in COPY_DEST).
+    b.Transition.pResource   = slot_buf;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    list->ResourceBarrier(1, &b);
+    list->CopyBufferRegion(rbs, 0, slot_buf, 0, bytes);
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+    list->ResourceBarrier(1, &b);
+
+    b.Transition.pResource   = mv;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
+    list->ResourceBarrier(1, &b);
+    b.Transition.pResource   = out;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+    list->ResourceBarrier(1, &b);
+    g_ver_out_state = D3D12_RESOURCE_STATE_COPY_DEST;
+
+    g_ver_bytes = bytes;
+    g_ver_ms = now;
+    ++g_ver_samples;
+    logf_("[lock] --mv-verify: sample %d recorded (%u tiles, %llu B, MV %ux%u)\n",
+          next_sample, tiles, static_cast<unsigned long long>(bytes), w, h);
+}
+
+// The producer's encode pass wrote the MV bytes into the slot buffer (streams[1].codec=1);
+// this pass turns them back into the exact fp16 bit patterns XeFG expects, straight into
+// g_mv_local[slot]. Same tiling as the encoder: 32x8 pixels per tile, one 256-thread group
+// per tile.
+static ComPtr<ID3D12RootSignature>  g_fr_rs;
+static ComPtr<ID3D12DescriptorHeap> g_fr_heap;    // 0 = slot SRV (bytes), 1 = MV UAV
+static ComPtr<ID3D12PipelineState>  g_fr_pso;
+
+static bool init_fr_decode()
+{
+    static int state = 0;                        // 0 = untried, 1 = ready, -1 = failed
+    if (state != 0) { return state > 0; }
+    state = -1;
+    D3D12_DESCRIPTOR_RANGE rg[2]{};
+    rg[0].RangeType          = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    rg[0].NumDescriptors     = 1;
+    rg[0].BaseShaderRegister = 0;
+    rg[1].RangeType          = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    rg[1].NumDescriptors     = 1;
+    rg[1].BaseShaderRegister = 0;
+
+    D3D12_ROOT_PARAMETER rp[3]{};
+    rp[0].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[0].Constants.ShaderRegister = 0;
+    rp[0].Constants.Num32BitValues = 6;
+    rp[0].ShaderVisibility         = D3D12_SHADER_VISIBILITY_ALL;
+    for (int i = 0; i < 2; ++i) {
+        rp[i + 1].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[i + 1].DescriptorTable.NumDescriptorRanges = 1;
+        rp[i + 1].DescriptorTable.pDescriptorRanges   = &rg[i];
+        rp[i + 1].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
+    }
+    D3D12_ROOT_SIGNATURE_DESC rsd{};
+    rsd.NumParameters = 3;
+    rsd.pParameters   = rp;
+    ComPtr<ID3DBlob> blob, err;
+    if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err)) ||
+        FAILED(g_device->CreateRootSignature(0, blob->GetBufferPointer(),
+                                             blob->GetBufferSize(), IID_PPV_ARGS(&g_fr_rs)))) {
+        logf_("[lock] fr: root signature FAILED\n");
+        return false;
+    }
+    D3D12_DESCRIPTOR_HEAP_DESC hd{};
+    hd.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 2;
+    hd.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_fr_heap)))) {
+        logf_("[lock] fr: descriptor heap FAILED\n");
+        return false;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature     = g_fr_rs.Get();
+    pd.CS.pShaderBytecode = kFrDecodeCSO;
+    pd.CS.BytecodeLength  = sizeof(kFrDecodeCSO);
+    if (FAILED(g_device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_fr_pso)))) {
+        logf_("[lock] fr: decode PSO FAILED (%zu bytes)\n", sizeof(kFrDecodeCSO));
+        return false;
+    }
+    state = 1;
+    logf_("[lock] fr: MV decode pass ready (tile 32x8, 264 words per slot tile)\n");
+    return true;
+}
+
+// Local MV sink for the codec path: R16G16_FLOAT with UAV access, because the decode
+// pass writes it. Same lifecycle as ensure_local_copy (recreated on geometry change).
+static bool ensure_mv_local_codec(ComPtr<ID3D12Resource>& dst, UINT w, UINT h)
+{
+    if (w < 16 || h < 16) { return false; }
+    if (dst) {
+        const D3D12_RESOURCE_DESC have = dst->GetDesc();
+        if (have.Width == w && have.Height == h &&
+            have.Format == DXGI_FORMAT_R16G16_FLOAT &&
+            (have.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0) {
+            return true;
+        }
+        dst.Reset();
+    }
+    D3D12_RESOURCE_DESC d{};
+    d.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    d.Width            = w;
+    d.Height           = h;
+    d.DepthOrArraySize = 1;
+    d.MipLevels        = 1;
+    d.Format           = DXGI_FORMAT_R16G16_FLOAT;
+    d.SampleDesc.Count = 1;
+    d.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    d.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d,
+                                                 D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                 IID_PPV_ARGS(&dst)))) {
+        logf_("[lock] fr: MV local %ux%u FAILED\n", w, h);
+        return false;
+    }
+    return true;
+}
+
+// Decodes this slot's MV bytes into g_mv_local[slot]. wait_slot() has already blocked on
+// the slot's forward fence, so the producer's writes are complete; the barriers below are
+// only state bookkeeping (the slot is our own view of the shared memory).
+static bool decode_mv_slot(UINT slot, UINT w, UINT h)
+{
+    if (slot >= mgpu::kMaxSlots || !g_mv[slot]) { return false; }
+    ID3D12Resource* src = g_mv[slot].Get();
+    if (src->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) { return false; }
+    ID3D12GraphicsCommandList* list = g_list.Get();
+    if (!list || !init_fr_decode()) { return false; }
+    if (!ensure_mv_local_codec(g_mv_local[slot], w, h)) { return false; }
+    ID3D12Resource* dst = g_mv_local[slot].Get();
+
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.pResource   = src;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    list->ResourceBarrier(1, &b);
+    b.Transition.pResource   = dst;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    list->ResourceBarrier(1, &b);
+
+    const UINT inc = g_device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_fr_heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = g_fr_heap->GetGPUDescriptorHandleForHeapStart();
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format                     = DXGI_FORMAT_R32_TYPELESS;   // raw ByteAddressBuffer
+    srv.ViewDimension              = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Shader4ComponentMapping    = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Buffer.FirstElement        = 0;
+    srv.Buffer.NumElements         = static_cast<UINT>(src->GetDesc().Width / 4ull);
+    srv.Buffer.StructureByteStride = 0;
+    srv.Buffer.Flags               = D3D12_BUFFER_SRV_FLAG_RAW;
+    g_device->CreateShaderResourceView(src, &srv, cpu);
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format             = DXGI_FORMAT_R16G16_FLOAT;
+    uav.ViewDimension      = D3D12_UAV_DIMENSION_TEXTURE2D;
+    uav.Texture2D.MipSlice = 0;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu_uav = cpu;
+    cpu_uav.ptr += inc;
+    g_device->CreateUnorderedAccessView(dst, nullptr, &uav, cpu_uav);
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu_uav = gpu;
+    gpu_uav.ptr += inc;
+
+    const UINT tx = (w + 31u) / 32u;
+    const UINT ty = (h + 7u) / 8u;
+    uint32_t params[6] = { w, h, 1u, tx, ty, 264u };
+    list->SetComputeRootSignature(g_fr_rs.Get());
+    list->SetPipelineState(g_fr_pso.Get());
+    ID3D12DescriptorHeap* heaps[1] = { g_fr_heap.Get() };
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetComputeRoot32BitConstants(0, 6, params, 0);
+    list->SetComputeRootDescriptorTable(1, gpu);
+    list->SetComputeRootDescriptorTable(2, gpu_uav);
+    list->Dispatch(tx * ty, 1, 1);
+
+    D3D12_RESOURCE_BARRIER ub{};
+    ub.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    ub.UAV.pResource = dst;
+    list->ResourceBarrier(1, &ub);
+    b.Transition.pResource   = dst;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
+    list->ResourceBarrier(1, &b);
+    b.Transition.pResource   = src;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+    list->ResourceBarrier(1, &b);
+
+    d3d_drain_msgs("fr-decode");
+    mv_verify_tick(slot, w, h);
+    static bool told = false;
+    if (!told) {
+        told = true;
+        logf_("[lock] fr: decoded MV slot %u -> %ux%u (%u tiles, %llu B slot)\n",
+              slot, w, h, tx * ty, static_cast<unsigned long long>(src->GetDesc().Width));
+        // The two streams are independent, so spell out the plan the producer chose.
+        logf_("[lock] fr: transport plan: mv=codec %ux%u, depth=%s %ux%u, upsample %s\n",
+              g_geo.mv_w, g_geo.mv_h,
+              depth_codec_shared() ? "codec" : "texture",
+              g_geo.depth_w, g_geo.depth_h,
+              (g_geo.mv_w >= g_full_w && g_geo.depth_w >= g_full_w) ? "not needed"
+                                                                  : "runs (depth)");
+    }
+    return true;
+}
+
+// Depth sink for the codec path. ensure_local_copy() copies the source's DESCRIPTION, which
+// on the codec path is a byte buffer - so this builds a proper R32_FLOAT texture instead
+// (UAV-capable: the decode pass writes it).
+static bool ensure_depth_sink_codec(ComPtr<ID3D12Resource>& dst, UINT w, UINT h)
+{
+    if (w < 16 || h < 16) { return false; }
+    if (dst) {
+        const D3D12_RESOURCE_DESC have = dst->GetDesc();
+        if (have.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            have.Width == w && have.Height == h &&
+            have.Format == DXGI_FORMAT_R32_FLOAT &&
+            (have.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0) {
+            return true;
+        }
+        dst.Reset();
+    }
+    D3D12_RESOURCE_DESC d{};
+    d.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    d.Width            = w;
+    d.Height           = h;
+    d.DepthOrArraySize = 1;
+    d.MipLevels        = 1;
+    d.Format           = DXGI_FORMAT_R32_FLOAT;
+    d.SampleDesc.Count = 1;
+    d.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    d.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d,
+                                                 D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                 IID_PPV_ARGS(&dst)))) {
+        logf_("[lock] fr: depth sink %ux%u FAILED\n", w, h);
+        return false;
+    }
+    return true;
+}
+
+// ------------------------------------------------- v30: depth decode (fr codec, D32)
+// Same kernel, R32 variant: one 32-bit value per pixel, so the depth stream can run at
+// 1:1 through the same codec instead of being downsampled to 150% and resampled here.
+// A SEPARATE descriptor heap from the MV pass: both dispatches are recorded into the same
+// command list, so sharing one heap would make the second descriptor write win at
+// execution time for both.
+static ComPtr<ID3D12DescriptorHeap> g_fr_d_heap;
+static ComPtr<ID3D12PipelineState>  g_fr_d_pso;
+
+static bool init_fr_decode_depth()
+{
+    static int state = 0;
+    if (state != 0) { return state > 0; }
+    state = -1;
+    if (!init_fr_decode()) { return false; }        // root signature is shared
+    D3D12_DESCRIPTOR_HEAP_DESC hd{};
+    hd.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 2;                          // slot SRV (bytes) | depth UAV
+    hd.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_fr_d_heap)))) {
+        logf_("[lock] fr: depth descriptor heap FAILED\n");
+        return false;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature     = g_fr_rs.Get();
+    pd.CS.pShaderBytecode = kFrDecodeD32CSO;
+    pd.CS.BytecodeLength  = sizeof(kFrDecodeD32CSO);
+    if (FAILED(g_device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_fr_d_pso)))) {
+        logf_("[lock] fr: depth decode PSO FAILED (%zu bytes)\n", sizeof(kFrDecodeD32CSO));
+        return false;
+    }
+    state = 1;
+    logf_("[lock] fr: depth decode pass ready (D32 variant, %zu B blob)\n",
+          sizeof(kFrDecodeD32CSO));
+    return true;
+}
+
+static bool decode_depth_slot(UINT slot, ID3D12Resource* dst, UINT w, UINT h)
+{
+    if (dst == nullptr || slot >= mgpu::kMaxSlots || !g_depth[slot]) { return false; }
+    ID3D12Resource* src = g_depth[slot].Get();
+    if (src == nullptr || src->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        return false;
+    }
+    ID3D12GraphicsCommandList* list = g_list.Get();
+    if (list == nullptr || !init_fr_decode_depth()) { return false; }
+
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.pResource   = src;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    list->ResourceBarrier(1, &b);
+    b.Transition.pResource   = dst;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    list->ResourceBarrier(1, &b);
+
+    const UINT inc = g_device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_fr_d_heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = g_fr_d_heap->GetGPUDescriptorHandleForHeapStart();
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format                     = DXGI_FORMAT_R32_TYPELESS;   // raw ByteAddressBuffer
+    srv.ViewDimension              = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Shader4ComponentMapping    = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Buffer.FirstElement        = 0;
+    srv.Buffer.NumElements         = static_cast<UINT>(src->GetDesc().Width / 4ull);
+    srv.Buffer.StructureByteStride = 0;
+    srv.Buffer.Flags               = D3D12_BUFFER_SRV_FLAG_RAW;
+    g_device->CreateShaderResourceView(src, &srv, cpu);
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format             = DXGI_FORMAT_R32_FLOAT;
+    uav.ViewDimension      = D3D12_UAV_DIMENSION_TEXTURE2D;
+    uav.Texture2D.MipSlice = 0;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu_uav = cpu;
+    cpu_uav.ptr += inc;
+    g_device->CreateUnorderedAccessView(dst, nullptr, &uav, cpu_uav);
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu_uav = gpu;
+    gpu_uav.ptr += inc;
+
+    const UINT tx = (w + 31u) / 32u;
+    const UINT ty = (h + 7u) / 8u;
+    uint32_t params[6] = { w, h, 1u, tx, ty, 264u };
+    list->SetComputeRootSignature(g_fr_rs.Get());
+    list->SetPipelineState(g_fr_d_pso.Get());
+    ID3D12DescriptorHeap* heaps[1] = { g_fr_d_heap.Get() };
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetComputeRoot32BitConstants(0, 6, params, 0);
+    list->SetComputeRootDescriptorTable(1, gpu);
+    list->SetComputeRootDescriptorTable(2, gpu_uav);
+    list->Dispatch(tx * ty, 1, 1);
+
+    D3D12_RESOURCE_BARRIER ub{};
+    ub.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    ub.UAV.pResource = dst;
+    list->ResourceBarrier(1, &ub);
+    b.Transition.pResource   = dst;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
+    list->ResourceBarrier(1, &b);
+    b.Transition.pResource   = src;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+    list->ResourceBarrier(1, &b);
+
+    static bool told = false;
+    if (!told) {
+        told = true;
+        logf_("[lock] fr: decoded DEPTH -> %ux%u (%u tiles, %llu B slot, codec 1:1)\n",
+              w, h, tx * ty, static_cast<unsigned long long>(src->GetDesc().Width));
+    }
+    return true;
+}
+
 static void ensure_dummy_mv(UINT slot);      // declared below (used by --no-mv)
 static void ensure_dummy_depth(UINT slot);   // declared below (used by --no-depth)
 
@@ -608,6 +1244,14 @@ static void copy_inputs_local(UINT slot)
     if (mv_from_flow()) {
         // Vectors come from our own flow pass; the producer's MV stream is neither copied
         // nor trusted (and its cross-adapter request is dropped, see g_stream_mask).
+    } else if (mv_from_producer() && g_mv[slot] && mv_codec_shared()) {
+        // v30: the slot holds fr-codec bytes, not pixels - reconstruct the exact fp16 MV
+        // input on this GPU. No copy and no upsample: the codec runs at 1:1.
+        static bool told_fail = false;
+        if (!decode_mv_slot(slot, g_geo.mv_w, g_geo.mv_h) && !told_fail) {
+            told_fail = true;
+            logf_("[lock] fr: decode failed - MV keeps its previous contents\n");
+        }
     } else if (mv_from_producer() && g_mv[slot]) {
         // Dumb producer: with kRequestRawMv the slot holds the source's own resolution, so
         // the resample happens here (see prepare_stream). The target size is the producer's
@@ -637,7 +1281,19 @@ static void copy_inputs_local(UINT slot)
         // No producer vectors and no flow pass: real depth, zeroed motion vectors.
         // --mv-shadow still copies the producer's stream into a sink texture for A/B.
         ensure_dummy_mv(slot);
-        if (g_mv_shadow && g_mv[slot]) {
+        if (mv_codec_shared()) {
+            // MvCodec=1 with a title that does not publish MV (measured on Wuchang: it tags
+            // MV for the first few frames, then the record's mask drops to depth-only). The
+            // codec slot exists but is never written, so it must NOT be decoded - this branch
+            // is what keeps that case working. Nothing else changes: dummy vectors, real depth.
+            static bool told_nomv = false;
+            if (!told_nomv) {
+                told_nomv = true;
+                logf_("[lock] fr: codec MV slot exists but the game publishes no MV - using"
+                      " dummy vectors (depth still travels through the codec)\n");
+            }
+        } else if (g_mv_shadow && g_mv[slot]) {
+            // The shadow sink needs a TEXTURE source; a codec slot is a byte buffer.
             if (ensure_local_copy(g_mv_shadow_tex[slot], g_mv[slot].Get(),
                                   g_geo.mv_w, g_geo.mv_h)) {
                 copy_content(g_mv_shadow_tex[slot].Get(), g_mv[slot].Get(),
@@ -670,9 +1326,15 @@ static void copy_inputs_local(UINT slot)
         // halved both the game and our loop), then hand XeFG a depth from `--depth-lag`
         // frames ago out of our own textures.
         const UINT need = 1u + static_cast<UINT>((g_depth_lag > 0) ? g_depth_lag : 0);
+        const bool dec_depth = depth_codec_shared();
         bool ok = true;
         for (UINT i = 0; i < need; ++i) {
-            if (!ensure_local_copy(g_depth_ring[i], g_depth[slot].Get(), g_geo.depth_w, g_geo.depth_h)) {
+            // The codec slot is a byte BUFFER, so its desc cannot be copied into a texture.
+            const bool ring_ok = dec_depth
+                ? ensure_depth_sink_codec(g_depth_ring[i], g_geo.depth_w, g_geo.depth_h)
+                : ensure_local_copy(g_depth_ring[i], g_depth[slot].Get(),
+                                    g_geo.depth_w, g_geo.depth_h);
+            if (!ring_ok) {
                 ok = false;
                 break;
             }
@@ -687,11 +1349,24 @@ static void copy_inputs_local(UINT slot)
                 g_of_depth_bound[g_ring_write] = true;
             }
 #endif
-            copy_content(g_depth_ring[g_ring_write].Get(), g_depth[slot].Get(),
-                         g_geo.depth_w, g_geo.depth_h);
+            if (dec_depth) {
+                if (!decode_depth_slot(slot, g_depth_ring[g_ring_write].Get(),
+                                       g_geo.depth_w, g_geo.depth_h)) {
+                    static bool told_dd = false;
+                    if (!told_dd) {
+                        told_dd = true;
+                        logf_("[lock] fr: depth decode failed - depth keeps its previous"
+                              " contents\n");
+                    }
+                }
+            } else {
+                copy_content(g_depth_ring[g_ring_write].Get(), g_depth[slot].Get(),
+                             g_geo.depth_w, g_geo.depth_h);
+            }
             if (g_ring_count < need) { ++g_ring_count; }
             g_ring_need = need;
-        } else if (ensure_local_copy(g_depth_local[slot], g_depth[slot].Get(),
+        } else if (!depth_codec_shared() &&
+                   ensure_local_copy(g_depth_local[slot], g_depth[slot].Get(),
                                      g_geo.depth_w, g_geo.depth_h)) {
             // A 8-byte depth slot means the producer sent the field raw; convert it here
             // instead of asking the game's GPU to do it.
@@ -706,7 +1381,8 @@ static void copy_inputs_local(UINT slot)
             }
         }
     }
-    // stream 3: the UI, on its own (the colour above is the HUDless picture).
+    // stream 3: GameUi (UI colour+alpha) or, with UiSource=Hudless, a downsampled
+    // HUDless image from which the consumer synthesises UI before unblending.
     if (g_ui[slot]) {
         const mgpu::StreamShared& su = g_ctl->streams[3];
         if (su.width >= 64 && su.height >= 64 &&
@@ -714,8 +1390,8 @@ static void copy_inputs_local(UINT slot)
             static bool logged = false;
             if (!logged) {
                 logged = true;
-                logf_("[lock] UI stream: copying %ux%u from the producer's slot 3\n",
-                      su.width, su.height);
+                logf_("[lock] stream 3: copying %ux%u (fmt %u) from the producer's slot 3\n",
+                      su.width, su.height, su.format);
             }
             copy_content(g_ui_local[slot].Get(), g_ui[slot].Get(), su.width, su.height);
             g_ui_fresh[slot] = true;

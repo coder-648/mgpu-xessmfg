@@ -45,3 +45,25 @@ proxy_nvngx.cpp       (Upscaler)                        `-> fg_output_submit()
 
 New outputs (DLSSG / FSRFG) belong behind the same `fg_output_submit()` route; they
 must not be added as conditions inside the input lanes.
+
+## Stream 3 (UI) in v29
+
+`producer.cpp` publishes one optional auxiliary stream (`kStreamUi`, index 3). Its
+payload is selected by `fakerFG.ini`:
+
+```ini
+UiStream=1
+UiSource=Auto      ; Auto | Game | Hudless | Off
+```
+
+- `Game`: the title's `UI_COLOR` / `UI_COLOR_AND_ALPHA` tag, downsampled on the render
+  card; the consumer unblends it with the WGC present.
+- `Hudless`: a downsampled `HUDLESS` image; the consumer synthesises an approximate UI
+  (`d = present - hudless`, `m = smoothstep(t, 2t, max|d|)`, `U = P - (1-m)H`, `a = m`)
+  and then unblends. Used when the title has no UI tag.
+- `Off`: no stream 3.
+
+The producer only runs the existing single `downsample_ui` pass; it never adds a second
+full-screen pass and never transports full-resolution HUDless. The consumer tags the
+rebuilt HUDless and XeFG uses `BACKBUFFER_HUDLESS` (mode 4). See
+[`UI_SOURCE_V29.md`](UI_SOURCE_V29.md).

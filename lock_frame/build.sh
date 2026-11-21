@@ -28,6 +28,8 @@ build_consumer() {
     cp "$HERE/version.h" "$stage/"
     cp "$HERE/include/mgpu_shared.h" "$stage/"     # v28: kMaxSlots=32
     cp -r "$HERE/modules" "$stage/"
+    cp -r "$HERE/xefg_mfg" "$stage/"
+    [ -d "$REPO/build/xefg_programs" ] && cp -r "$REPO/build/xefg_programs" "$stage/"
     for dll in libxess_fg.dll libxell.dll; do
         cp "$REPO/third_party/xess/bin/$dll" "$stage/" 2>/dev/null || true
     done
@@ -40,6 +42,41 @@ build_consumer() {
     python3 "$REPO/scripts/embed_cso.py" "$stage/upsample_joint.cso" \
         "$stage/upsample_joint_cso.h" "UpsampleJoint" \
         || { echo "[build] embed failed"; return 1; }
+
+    # Lossless MV decode (docs/design/LOSSLESS_TRANSPORT.md sections 6.1/14.3/17).
+    # Encoder lives in the producer; the consumer only needs Decode - except for
+    # --mv-verify, which re-encodes the decoded MV to prove the round trip is exact
+    # (encode(decode(bytes)) == bytes  =>  decode(bytes) == source, the encoder being
+    # injective), so the Encode entry is embedded here too.
+    "$FXC_WIN" -nologo -T cs_5_0 -E Decode \
+        -Fo "$(wslpath -w "$stage/fr_decode.cso")" \
+        "$(wslpath -w "$HERE/shaders/fr_codec.hlsl")" \
+        || { echo "[build] fxc failed for fr_codec Decode"; return 1; }
+    python3 "$REPO/scripts/embed_cso.py" "$stage/fr_decode.cso" \
+        "$stage/fr_decode_cso.h" "FrDecode" \
+        || { echo "[build] embed failed for fr_decode"; return 1; }
+    "$FXC_WIN" -nologo -T cs_5_0 -E Encode \
+        -Fo "$(wslpath -w "$stage/fr_encode.cso")" \
+        "$(wslpath -w "$HERE/shaders/fr_codec.hlsl")" \
+        || { echo "[build] fxc failed for fr_codec Encode"; return 1; }
+    python3 "$REPO/scripts/embed_cso.py" "$stage/fr_encode.cso" \
+        "$stage/fr_encode_cso.h" "FrEncode" \
+        || { echo "[build] embed failed for fr_encode"; return 1; }
+    # D32 variants (depth: one 32-bit value per pixel) - same body, -DDEPTH32.
+    "$FXC_WIN" -nologo -T cs_5_0 -E Decode -D DEPTH32 \
+        -Fo "$(wslpath -w "$stage/fr_decode32.cso")" \
+        "$(wslpath -w "$HERE/shaders/fr_codec.hlsl")" \
+        || { echo "[build] fxc failed for fr_codec Decode (D32)"; return 1; }
+    python3 "$REPO/scripts/embed_cso.py" "$stage/fr_decode32.cso" \
+        "$stage/fr_decode32_cso.h" "FrDecodeD32" \
+        || { echo "[build] embed failed for fr_decode32"; return 1; }
+    "$FXC_WIN" -nologo -T cs_5_0 -E Encode -D DEPTH32 \
+        -Fo "$(wslpath -w "$stage/fr_encode32.cso")" \
+        "$(wslpath -w "$HERE/shaders/fr_codec.hlsl")" \
+        || { echo "[build] fxc failed for fr_codec Encode (D32)"; return 1; }
+    python3 "$REPO/scripts/embed_cso.py" "$stage/fr_encode32.cso" \
+        "$stage/fr_encode32_cso.h" "FrEncodeD32" \
+        || { echo "[build] embed failed for fr_encode32"; return 1; }
 
     python3 "$REPO/scripts/extract_hlsl.py" "$HERE/modules/050_shaders.inc" \
         "$stage/conv_check.hlsl" || { echo "[build] could not extract k_conv_hlsl"; return 1; }
@@ -58,6 +95,15 @@ build_consumer() {
     python3 "$REPO/scripts/embed_cso.py" "$stage/unblend_ui.cso" \
         "$stage/unblend_ui_cso.h" "UnblendUI" \
         || { echo "[build] embed failed for unblend_ui"; return 1; }
+
+    # v29: HUDless-derived UI synthesis (present - hudless) before the unblend pass.
+    "$FXC_WIN" -nologo -T cs_5_0 -E CSMain \
+        -Fo "$(wslpath -w "$stage/synth_ui.cso")" \
+        "$(wslpath -w "$HERE/shaders/synth_ui.hlsl")" \
+        || { echo "[build] fxc failed for synth_ui"; return 1; }
+    python3 "$REPO/scripts/embed_cso.py" "$stage/synth_ui.cso" \
+        "$stage/synth_ui_cso.h" "SynthUI" \
+        || { echo "[build] embed failed for synth_ui"; return 1; }
 
     ( cd "$stage" && cmd.exe /c build.bat "$REPO_WIN" > build.log 2>&1 )
     local rc=$?
@@ -79,11 +125,18 @@ build_producer() {
     [ -x "$FXC_WIN" ] || { echo "[build] fxc.exe not found"; return 1; }
     for spec in "downsample_mv:cs_5_0:CSMain:DownsampleMV:downsample_mv" \
                 "downsample_depth:cs_5_0:CSMain:DownsampleDepth:downsample_depth" \
-                "downsample_ui:cs_5_0:CSMain:DownsampleUI:downsample_ui"; do
-        IFS=: read -r base prof entry sym out <<< "$spec"
-        "$FXC_WIN" -nologo -T "$prof" -E "$entry" \
+                "downsample_ui:cs_5_0:CSMain:DownsampleUI:downsample_ui" \
+                "fr_codec:cs_5_0:Encode:FrEncode:fr_encode" \
+                "fr_codec:cs_5_0:Decode:FrDecode:fr_decode" \
+                "fr_codec:cs_5_0:Encode:FrEncodeD32:fr_encode32:-D DEPTH32" \
+                "fr_codec:cs_5_0:Decode:FrDecodeD32:fr_decode32:-D DEPTH32"; do
+        IFS=: read -r base prof entry sym out extra <<< "$spec"
+        # fr_codec is shared with the consumer, so it lives in lock_frame/shaders/
+        local hlsl="$HERE/producer/shaders/$base.hlsl"
+        [ "$base" = "fr_codec" ] && hlsl="$HERE/shaders/fr_codec.hlsl"
+        "$FXC_WIN" -nologo -T "$prof" -E "$entry" $extra \
             -Fo "$(wslpath -w "$stage/$out.cso")" \
-            "$(wslpath -w "$HERE/producer/shaders/$base.hlsl")" || return 1
+            "$(wslpath -w "$hlsl")" || return 1
         python3 "$REPO/scripts/embed_cso.py" "$stage/$out.cso" "$stage/${out}_cso.h" "$sym" || return 1
     done
     cat > "$stage/build.bat" <<'BAT'
@@ -140,6 +193,7 @@ call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
 if not exist obj mkdir obj
 cl /nologo /std:c++17 /EHsc /O2 /MD /W3 /utf-8 /permissive- ^
   /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX /I"%~dp0." /I"%REPO%\src" /I"%REPO%\src\faker_fg" ^
+
   /I"%REPO%\third_party\xess\inc" /I"%REPO%\third_party\streamline\include" ^
   /I"%REPO%\\third_party\\ffx\\api\\include" ^
   /I"%REPO%\\third_party\\ffx\\include" ^
@@ -148,7 +202,7 @@ cl /nologo /std:c++17 /EHsc /O2 /MD /W3 /utf-8 /permissive- ^
   /I"%REPO%\lock_frame\third_party" ^
   unity.cpp "%REPO%\third_party\minhook\src\buffer.c" "%REPO%\third_party\minhook\src\hook.c" ^
   "%REPO%\third_party\minhook\src\trampoline.c" "%REPO%\third_party\minhook\src\hde\hde64.c" ^
-  /Fe:fakerFG.dll /Fo:obj\ /link /DLL /DEF:fakerFG.def /MAP:fakerFG.map d3d12.lib dxgi.lib user32.lib psapi.lib
+  /Fe:fakerFG.dll /Fo:obj\ /link /DLL /DEF:fakerFG.def /MAP:fakerFG.map d3d12.lib dxgi.lib user32.lib psapi.lib ole32.lib
 if errorlevel 1 exit /b 1
 exit /b 0
 BAT

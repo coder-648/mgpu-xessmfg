@@ -14,7 +14,8 @@ cbuffer Params : register(b0)
     uint  SrcH;
     uint  DstW;
     uint  DstH;
-    uint  Mode;           // 0 = pass-through, 1 = scRGB -> PQ
+    uint  Mode;           // 0 = pass-through UI, 1 = UI scRGB -> PQ,
+                          // 2 = opaque HUDless pass-through, 3 = opaque HUDless scRGB -> PQ
     uint  Premultiplied;  // 1 = source UI.rgb is already premultiplied
 };
 
@@ -43,26 +44,41 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     const float2 c = (float2(id.xy) + 0.5) * scale - 0.5;
     const int2   b = (int2)floor(c);
 
+    const bool opaque = (Mode >= 2);          // HUDless: scene colour, alpha is meaningless
+    const bool pq     = (Mode == 1) || (Mode == 3);
+
     float3 acc = 0.0;
     float  asum = 0.0;
     [unroll] for (int y = 0; y <= 1; ++y) {
         [unroll] for (int x = 0; x <= 1; ++x) {
             float4 v = Src.Load(int3(clamp_src(b + int2(x, y)), 0));
-            // Average straight colour weighted by alpha. Premultiplying before the
-            // average would darken transparent edges; the output is premultiplied again
-            // after the optional PQ encode.
-            const float a = v.a;
-            const float3 straight = (Premultiplied != 0) ? v.rgb / max(a, 1e-5) : v.rgb;
-            acc += straight * a;
-            asum += a;
+            if (opaque) {
+                acc += v.rgb;
+                asum += 1.0;
+            } else {
+                // Average straight colour weighted by alpha. Premultiplying before the
+                // average would darken transparent edges; the output is premultiplied again
+                // after the optional PQ encode.
+                const float a = v.a;
+                const float3 straight = (Premultiplied != 0) ? v.rgb / max(a, 1e-5) : v.rgb;
+                acc += straight * a;
+                asum += a;
+            }
         }
     }
-    const float alpha = saturate(asum * 0.25);
-    float3 straight = acc / max(asum, 1e-5);
+    const float alpha = opaque ? 1.0 : saturate(asum * 0.25);
+    float3 straight = opaque ? (acc * 0.25) : (acc / max(asum, 1e-5));
 
-    if (Mode != 0) {
-        // scRGB: 1.0 = 80 nits. The consumer's convert pass uses the same SDR white.
-        straight = pq_encode(straight * 80.0);
+    if (pq) {
+        // scRGB: 1.0 = 80 nits. The consumer's convert pass encodes the WGC scRGB
+        // present as BT.2020 PQ; apply the same BT.709 -> BT.2020 matrix here. Without
+        // it, HUDless and present differ in saturated colours across the whole scene,
+        // the difference mask becomes all-ones, and the "UI" dump is just the present.
+        const float3x3 k709to2020 = float3x3(
+            0.6274, 0.3293, 0.0433,
+            0.0691, 0.9195, 0.0114,
+            0.0164, 0.0880, 0.8956);
+        straight = pq_encode(mul(k709to2020, straight * 80.0));
     }
 
     Dst[id.xy] = saturate(float4(straight * alpha, alpha));

@@ -32,6 +32,8 @@
 #include "downsample_mv_cso.h"
 #include "downsample_depth_cso.h"
 #include "downsample_ui_cso.h"
+#include "fr_encode_cso.h"
+#include "fr_encode32_cso.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -112,6 +114,15 @@ uint32_t g_ui_format = 0;                     // transport format (R10 or RGBA8)
 uint32_t g_ui_slot_w = 0, g_ui_slot_h = 0;     // placed capacity (downsampled)
 bool     g_want_ui_session = false;            // UI stream is OFF by default (unverified, see below)
 bool     g_ui_premultiplied = true;            // source UI.rgb already premultiplied (Streamline default)
+bool     g_ui_premultiplied_cfg = true;        // fakerFG.ini UiPremultiplied (GameUi only)
+// v29: which resource feeds stream 3.
+//   mode 0 Auto    - title UI tag first, then HUDless
+//   mode 1 Game    - title UI tag only
+//   mode 2 Hudless - downsampled HUDless only (consumer synthesises UI)
+//   mode 3 Off     - no stream 3
+uint32_t g_ui_source_mode = 0;
+uint32_t g_ui_source = mgpu::kUiSourceOff;     // published in SharedControl::ui_source
+uint32_t g_ui_source_type = mgpu::kUiSourceOff; // stable type once first selected
 // 锁帧版：颜色走消费者侧的 WGC，producer 不再发布 colour 流。默认关闭；
 // 需要 A/B 时在 fakerFG.ini 写 ColourStream=1。
 bool     g_want_colour_session = false;       // ColourStream=0 (lock_frame default)
@@ -202,6 +213,158 @@ D3D12_RESOURCE_STATES       g_ds_state[mgpu::kMaxStreams] = { D3D12_RESOURCE_STA
                                               D3D12_RESOURCE_STATE_COMMON,
                                               D3D12_RESOURCE_STATE_COMMON };
 
+// ------------------------------------------------------- fr codec (protocol v30)
+// Lossless MV transport (docs/design/LOSSLESS_TRANSPORT.md sections 6.1/14.3/17).
+// Off unless fakerFG.ini says MvCodec=1; with 0 everything below is unused and the
+// texture slot + copy_stream path stays bit-identical to 1.2.2.
+uint32_t mv_codec();      // MvCodec= from fakerFG.ini, read once per session (defined below)
+uint32_t depth_codec();   // DepthCodec= (the same codec on the R32 depth stream)
+uint32_t stream_codec(int stream);   // 1 = MV, 2 = depth, 0 = texture path
+void fr_resolve_codec(ID3D12Device* device);   // resolves "auto" before the layout
+constexpr uint32_t kFrTileW = 32, kFrTileH = 8;
+constexpr uint32_t kFrSlotWords = 264;          // (4 + 256*4) bytes / 4, rounded up
+ComPtr<ID3D12RootSignature>  g_fr_rs;
+ComPtr<ID3D12DescriptorHeap> g_fr_heap;         // srv(texture) | uav(slot) | uav(TileLen)
+ComPtr<ID3D12PipelineState>  g_fr_pso;     // MV: fp16 pairs
+ComPtr<ID3D12PipelineState>  g_fr_pso_d32; // depth: one R32 value per pixel
+ComPtr<ID3D12Resource>       g_fr_tilelen[2];   // [0] = MV, [1] = depth
+// MvCodec=2: private encode target (bisect: is a UAV write to the cross-adapter slot the
+// invalid call?). Never read - it exists only so the kernel has a legal destination.
+ComPtr<ID3D12Resource>       g_fr_stage;
+uint64_t                     g_fr_stage_bytes = 0;
+
+// ----------------------------------------------------------- d3d12 validation (D3dDebug)
+// A cross-adapter resource that one side treats as illegal only surfaces as "device
+// removed (INVALID_CALL)". D3dDebug=1 turns the debug layer on for this process (before the
+// title creates its device - that is why it hangs off MgpuProducerStart) and mirrors the
+// validation messages into this log. Expect a much slower session; diagnosis only.
+uint32_t ini_int(const wchar_t* key, uint32_t def);   // defined with the other ini readers
+
+bool                     g_d3d_debug = false;
+ComPtr<ID3D12InfoQueue>  g_info_q;
+
+void fr_debug_enable()
+{
+    g_d3d_debug = ini_int(L"D3dDebug", 0) != 0;
+    if (!g_d3d_debug) { return; }
+    ComPtr<ID3D12Debug> dbg;
+    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) {
+        dbg->EnableDebugLayer();
+        logf("d3d12: debug layer ENABLED (D3dDebug=1) - this session runs much slower,"
+             " validation messages go to this log\n");
+    } else {
+        g_d3d_debug = false;
+        logf("d3d12: D3D12GetDebugInterface FAILED (Graphics Tools not installed?) -"
+             " no validation\n");
+    }
+}
+
+void fr_drain_msgs(const char* where)
+{
+    if (!g_d3d_debug) { return; }
+    if (!g_info_q) {
+        if (!g_device) { return; }
+        if (FAILED(g_device->QueryInterface(IID_PPV_ARGS(&g_info_q)))) {
+            g_d3d_debug = false;
+            return;
+        }
+        logf("d3d12: InfoQueue attached (%s)\n", where);
+    }
+    const UINT64 n = g_info_q->GetNumStoredMessages();
+    for (UINT64 i = 0; i < n; ++i) {
+        SIZE_T len = 0;
+        if (FAILED(g_info_q->GetMessage(i, nullptr, &len)) || len == 0) { continue; }
+        D3D12_MESSAGE* m = static_cast<D3D12_MESSAGE*>(malloc(len));
+        if (m == nullptr) { continue; }
+        if (SUCCEEDED(g_info_q->GetMessage(i, m, &len))) {
+            logf("[d3d12 %s] %hs\n", where, m->pDescription);
+        }
+        free(m);
+    }
+    g_info_q->ClearStoredMessages();
+}
+
+// ------------------------------------------------------- coded-size measurement (1 Hz)
+// The consumer's `bus:` line is derived from the stream geometry, so on the codec path it
+// reports the RAW size (3840x2160x4 B). The real cross-adapter traffic is what the encoder
+// wrote per tile, which only TileLen[] knows. Sample it once a second: copy TileLen into a
+// readback buffer and sum it while the NEXT sample is being recorded (a second later, so
+// the previous copy has long retired - no fence, no stall).
+ComPtr<ID3D12Resource> g_fr_rb[2];              // [0] = MV, [1] = depth
+uint32_t               g_fr_rb_tiles[2] = { 0, 0 };
+ULONGLONG              g_fr_rb_ms[2] = { 0, 0 };
+
+void fr_bytes_tick(ID3D12GraphicsCommandList* list, uint32_t tiles, int stream)
+{
+    if (list == nullptr || tiles == 0 || stream < 0 || stream > 1) { return; }
+    const ULONGLONG now = GetTickCount64();
+    if (g_fr_rb_ms[stream] != 0 && (now - g_fr_rb_ms[stream]) < 1000) { return; }
+
+    if (g_fr_rb[stream] && g_fr_rb_tiles[stream] != 0) {
+        void* p = nullptr;
+        const D3D12_RANGE rr{ 0, static_cast<SIZE_T>(g_fr_rb_tiles[stream]) * 4u };
+        if (SUCCEEDED(g_fr_rb[stream]->Map(0, &rr, &p)) && p != nullptr) {
+            const uint32_t* v = static_cast<const uint32_t*>(p);
+            uint64_t sum = 0;
+            for (uint32_t i = 0; i < g_fr_rb_tiles[stream]; ++i) { sum += v[i]; }
+            const double coded = static_cast<double>(sum) / 1048576.0;
+            const double raw = static_cast<double>(g_fr_rb_tiles[stream]) * 1024.0 / 1048576.0;
+            logf("fr: coded %s %.2f MB/frame (raw %.2f, %.2fx)\n",
+                 stream == 0 ? "mv   " : "depth", coded, raw,
+                 coded > 0.001 ? raw / coded : 0.0);
+            const D3D12_RANGE none{ 0, 0 };
+            g_fr_rb[stream]->Unmap(0, &none);
+        }
+    }
+
+    if (!g_fr_rb[stream]) {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width            = 65536ull * 4ull;   // TileLen upper bound (see ensure_fr_objects)
+        rd.Height           = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels        = 1;
+        rd.Format           = DXGI_FORMAT_UNKNOWN;
+        rd.SampleDesc.Count = 1;
+        rd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                     IID_PPV_ARGS(&g_fr_rb[stream])))) {
+            g_fr_rb_ms[stream] = now;                    // try again in a second
+            return;
+        }
+    }
+
+    // TileLen is a UAV the dispatch just wrote: one UAV barrier for visibility, then the
+    // actual state change - a copy SOURCE may not be in UNORDERED_ACCESS, and the driver
+    // drops the copy silently when it is (measured: readback came back all zeros).
+    ID3D12Resource* tl = g_fr_tilelen[stream].Get();
+    D3D12_RESOURCE_BARRIER ub{};
+    ub.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    ub.UAV.pResource = tl;
+    list->ResourceBarrier(1, &ub);
+    // No transition: TileLen lives in COMMON (buffers always do) and D3D12 promotes it for
+    // both the UAV write and this copy. Adding a UAV->COPY_SOURCE barrier here was what made
+    // the driver drop the copy silently (the readback kept reading zeros).
+    list->CopyBufferRegion(g_fr_rb[stream].Get(), 0, tl, 0,
+                           static_cast<UINT64>(tiles) * 4ull);
+    g_fr_rb_tiles[stream] = tiles;
+    g_fr_rb_ms[stream] = now;
+}
+
+
+uint32_t fr_tiles(uint32_t w, uint32_t h)
+{
+    return ((w + kFrTileW - 1u) / kFrTileW) * ((h + kFrTileH - 1u) / kFrTileH);
+}
+uint64_t fr_slot_bytes(uint32_t slot_w, uint32_t slot_h)
+{
+    return mgpu::align64k(static_cast<uint64_t>(fr_tiles(slot_w, slot_h)) *
+                          kFrSlotWords * 4u);
+}
+
 // credit window (v10): never overwrite a slot the consumer is still reading.
 // Start "off": with no consumer yet, every slot must be usable (the old add-on
 // started ON and dropped its first ~30 publications).
@@ -260,7 +423,7 @@ bool layout_streams(ID3D12Device* device, mgpu::SharedControl* c,
                     uint32_t ui_format)
 {
     struct Spec { DXGI_FORMAT format; uint32_t w, h, sw, sh; };
-    const Spec specs[mgpu::kMaxStreams] = {
+    Spec specs[mgpu::kMaxStreams] = {
         // v22: colour is the frame's OUTPUT image. w/h is the live content (the consumer
         // builds its sink/swap chain at this) and sw/sh is the placed capacity (cap_dim
         // rounds 2160 up to 2304 - never confuse the two).
@@ -274,6 +437,20 @@ bool layout_streams(ID3D12Device* device, mgpu::SharedControl* c,
         // v22: the scar/marker stream is retired with WGC; kept as an empty slot.
         { DXGI_FORMAT_UNKNOWN,      0, 0, 0, 0 },
     };
+    // v30: the codec MV slot holds bytes for exactly this content size, so it is sized and
+    // published from (w,h) - not from the shared texture capacity, which now follows the
+    // depth stream. The consumer clamps the live MV size against slot_w/h, so publishing a
+    // smaller capacity here would silently cut a 4K MV stream down to the depth size.
+    if (mv_codec() != 0 && specs[mgpu::kStreamMv].format == DXGI_FORMAT_R16G16_FLOAT) {
+        specs[mgpu::kStreamMv].sw = specs[mgpu::kStreamMv].w;
+        specs[mgpu::kStreamMv].sh = specs[mgpu::kStreamMv].h;
+    }
+    if (depth_codec() != 0 &&
+        (specs[mgpu::kStreamDepth].format == DXGI_FORMAT_R32_TYPELESS ||
+         specs[mgpu::kStreamDepth].format == DXGI_FORMAT_R32_FLOAT)) {
+        specs[mgpu::kStreamDepth].sw = specs[mgpu::kStreamDepth].w;
+        specs[mgpu::kStreamDepth].sh = specs[mgpu::kStreamDepth].h;
+    }
     uint64_t cursor = mgpu::kDataStart;
     for (int i = 0; i < static_cast<int>(mgpu::kMaxStreams); ++i) {
         const bool needed = (i == static_cast<int>(mgpu::kStreamColour) ||
@@ -281,7 +458,22 @@ bool layout_streams(ID3D12Device* device, mgpu::SharedControl* c,
                              i == static_cast<int>(mgpu::kStreamDepth) ||
                              i == static_cast<int>(mgpu::kStreamUi));
         uint64_t slot_size = 0;
-        if (needed && specs[i].sw >= 16 && specs[i].sh >= 16 &&
+        const bool want_fr = (stream_codec(i) != 0);
+        const bool fr_fmt_ok = (i == static_cast<int>(mgpu::kStreamMv))
+            ? (specs[i].format == DXGI_FORMAT_R16G16_FLOAT)
+            : (specs[i].format == DXGI_FORMAT_R32_TYPELESS ||
+               specs[i].format == DXGI_FORMAT_R32_FLOAT);
+        const bool fr = want_fr && fr_fmt_ok;
+        if (want_fr && !fr) {
+            logf("fr: codec needs %s, source is fmt %u - keeping the texture slot\n",
+                 i == static_cast<int>(mgpu::kStreamMv) ? "R16G16_FLOAT"
+                                                       : "R32_TYPELESS/R32_FLOAT",
+                 specs[i].format);
+        }
+        if (fr) {
+            // v30: the MV slot carries fr-codec bytes, not pixels.
+            slot_size = fr_slot_bytes(specs[i].sw, specs[i].sh);
+        } else if (needed && specs[i].sw >= 16 && specs[i].sh >= 16 &&
             specs[i].format != DXGI_FORMAT_UNKNOWN) {
             D3D12_RESOURCE_DESC rd{};
             rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -305,6 +497,7 @@ bool layout_streams(ID3D12Device* device, mgpu::SharedControl* c,
         c->streams[i].slot_w    = needed ? specs[i].sw : 0;
         c->streams[i].slot_h    = needed ? specs[i].sh : 0;
         c->streams[i].seq       = 0;
+        c->streams[i].codec     = fr ? 1u : 0u;
         cursor += slot_size * mgpu::kMaxSlots;
     }
     return true;
@@ -313,8 +506,29 @@ bool layout_streams(ID3D12Device* device, mgpu::SharedControl* c,
 bool place_slots(ID3D12Device* device, uint32_t stream, uint32_t format,
                  uint32_t w, uint32_t h, uint64_t offset, uint64_t slot_size)
 {
+    // Must match layout_streams(): the byte slot exists only for the format the kernel
+    // implements, otherwise the size laid out is a texture's allocation size.
+    const bool as_buffer = (stream_codec(static_cast<int>(stream)) != 0 &&
+                            (stream != mgpu::kStreamMv ||
+                             format == static_cast<uint32_t>(DXGI_FORMAT_R16G16_FLOAT)) &&
+                            (stream != mgpu::kStreamDepth ||
+                             format == static_cast<uint32_t>(DXGI_FORMAT_R32_TYPELESS) ||
+                             format == static_cast<uint32_t>(DXGI_FORMAT_R32_FLOAT)));
     for (uint32_t s = 0; s < mgpu::kMaxSlots; ++s) {
         D3D12_RESOURCE_DESC rd{};
+        if (as_buffer) {
+            // v30: raw byte buffer, sized from the slot capacity (see layout_streams).
+            rd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rd.Width            = slot_size;
+            rd.Height           = 1;
+            rd.DepthOrArraySize = 1;
+            rd.MipLevels        = 1;
+            rd.Format           = DXGI_FORMAT_UNKNOWN;
+            rd.SampleDesc.Count = 1;
+            rd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER |
+                                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        } else {
         rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         rd.Width            = w;
         rd.Height           = h;
@@ -324,8 +538,11 @@ bool place_slots(ID3D12Device* device, uint32_t stream, uint32_t format,
         rd.SampleDesc.Count = 1;
         rd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+        }
+        const D3D12_RESOURCE_STATES init_state =
+            as_buffer ? D3D12_RESOURCE_STATE_COPY_DEST : D3D12_RESOURCE_STATE_COMMON;
         const HRESULT hr = device->CreatePlacedResource(
-            g_heap.Get(), offset + slot_size * s, &rd, D3D12_RESOURCE_STATE_COMMON,
+            g_heap.Get(), offset + slot_size * s, &rd, init_state,
             nullptr, IID_PPV_ARGS(&g_slot[stream][s]));
         if (FAILED(hr)) {
             logf("shared: CreatePlacedResource FAILED (stream %u %ux%u fmt %u slot %u) hr=0x%08lX\n",
@@ -342,6 +559,9 @@ bool place_slots(ID3D12Device* device, uint32_t stream, uint32_t format,
 // access); the bridge's dynamic request arrives through shared memory, not the file.
 uint32_t read_percent(int stream)
 {
+    // v30: the fr codec is lossless at 1:1, so a codec stream always runs at 100%.
+    if (stream == 1 && mv_codec() != 0) { return 100; }
+    if (stream == 2 && depth_codec() != 0) { return 100; }
     wchar_t path[MAX_PATH]{};
     GetModuleFileNameW(nullptr, path, MAX_PATH);
     if (wchar_t* slash = wcsrchr(path, L'\\')) { *slash = L'\0'; }
@@ -616,14 +836,22 @@ bool scale_dispatch(ID3D12GraphicsCommandList* list, ID3D12Resource* src,
         g_ds_state[stream] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     }
 
+    uint32_t mode = 0;
+    if (is_ui && g_ui_source == mgpu::kUiSourceHudless) {
+        // 2 = opaque HUDless pass-through, 3 = opaque HUDless scRGB -> PQ. The source
+        // alpha of a HUDless target is not meaningful, so the shader forces alpha = 1.
+        mode = 2u + ((sd.Format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+                      g_ui_format == DXGI_FORMAT_R10G10B10A2_UNORM) ? 1u : 0u);
+    } else if (is_ui && sd.Format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
+               g_ui_format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+        mode = 1u;
+    }
     uint32_t params[6] = {
         static_cast<uint32_t>(sd.Width), static_cast<uint32_t>(sd.Height),
         g_stream_w[stream], g_stream_h[stream],
-        (is_ui && sd.Format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
-         g_ui_format == DXGI_FORMAT_R10G10B10A2_UNORM) ? 1u : 0u,
-        1u   // ignore for MV/depth
+        mode,
+        g_ui_premultiplied ? 1u : 0u
     };
-    params[5] = g_ui_premultiplied ? 1u : 0u;
 
     // Descriptors: textures need a table (root SRV/UAV would only accept raw buffers).
     ID3D12Resource* dst = g_ds_tex[stream].Get();
@@ -688,6 +916,269 @@ bool scale_dispatch(ID3D12GraphicsCommandList* list, ID3D12Resource* src,
              static_cast<unsigned long long>(sd.Height),
              g_stream_w[stream], g_stream_h[stream], static_cast<unsigned>(target_fmt),
              g_percent[stream]);
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------- fr codec encode
+// One compute pass per frame: read the game's MV texture, write the compressed bytes into
+// the slot. Recorded on the *game's* list (like scale_dispatch) because the MV texture is
+// only valid there; the copy queue waits on the game's fence before publishing, so the
+// forward fence still covers this write.
+bool ensure_fr_objects(ID3D12Device* device)
+{
+    if (g_fr_rs && g_fr_pso && g_fr_pso_d32 && g_fr_tilelen[0] && g_fr_tilelen[1]) { return true; }
+
+    D3D12_DESCRIPTOR_RANGE ranges[3]{};
+    for (int i = 0; i < 3; ++i) {
+        ranges[i].NumDescriptors     = 1;
+        ranges[i].BaseShaderRegister = static_cast<UINT>(i == 0 ? 0 : (i - 1));
+        ranges[i].RangeType          = (i == 0) ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+                                                : D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    }
+    D3D12_ROOT_PARAMETER rp[4]{};
+    rp[0].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[0].Constants.ShaderRegister = 0;
+    rp[0].Constants.Num32BitValues = 6;
+    rp[0].ShaderVisibility         = D3D12_SHADER_VISIBILITY_ALL;
+    for (int i = 0; i < 3; ++i) {
+        rp[i + 1].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[i + 1].DescriptorTable.NumDescriptorRanges = 1;
+        rp[i + 1].DescriptorTable.pDescriptorRanges   = &ranges[i];
+        rp[i + 1].ShaderVisibility                    = D3D12_SHADER_VISIBILITY_ALL;
+    }
+    D3D12_ROOT_SIGNATURE_DESC rsd{};
+    rsd.NumParameters = 4;
+    rsd.pParameters   = rp;
+    ComPtr<ID3DBlob> blob, err;
+    if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &err)) ||
+        FAILED(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
+                                           IID_PPV_ARGS(&g_fr_rs)))) {
+        logf("fr: root signature FAILED\n");
+        return false;
+    }
+
+    D3D12_DESCRIPTOR_HEAP_DESC hd{};
+    hd.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 3;                 // srv(texture) | uav(slot) | uav(TileLen)
+    hd.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_fr_heap)))) {
+        logf("fr: descriptor heap FAILED\n");
+        return false;
+    }
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature     = g_fr_rs.Get();
+    pd.CS.pShaderBytecode = kFrEncodeCSO;
+    pd.CS.BytecodeLength  = sizeof(kFrEncodeCSO);
+    if (FAILED(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_fr_pso)))) {
+        logf("fr: CreateComputePipelineState FAILED (%zu bytes)\n", sizeof(kFrEncodeCSO));
+        return false;
+    }
+    pd.CS.pShaderBytecode = kFrEncodeD32CSO;
+    pd.CS.BytecodeLength  = sizeof(kFrEncodeD32CSO);
+    if (FAILED(device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_fr_pso_d32)))) {
+        logf("fr: CreateComputePipelineState(D32) FAILED (%zu bytes)\n",
+             sizeof(kFrEncodeD32CSO));
+        return false;
+    }
+
+    // TileLen[] is bookkeeping the shader always writes; give it a real buffer. Sized for
+    // a generous upper bound (4096x4096 / 32x8 = 65536 entries = 256 KB).
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width            = fr_tiles(4096, 4096) * 4ull;
+    bd.Height           = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels        = 1;
+    bd.Format           = DXGI_FORMAT_UNKNOWN;
+    bd.SampleDesc.Count = 1;
+    bd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    bd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    // Buffers cannot be created in COMMON: the shader writes this as a UAV every frame, so
+    // it is born in UNORDERED_ACCESS (a UAV write from COMMON was the prime suspect for
+    // the INVALID_CALL device removal, 2026-11-21).
+    for (int i = 0; i < 2; ++i) {
+        // A buffer is effectively COMMON whatever the initial state says (the D3D12 debug
+        // layer reports that explicitly), and COMMON is implicitly promoted for both a UAV
+        // write and a copy read - so no transition is needed anywhere.
+        if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
+                                                   D3D12_RESOURCE_STATE_COMMON,
+                                                   nullptr,
+                                                   IID_PPV_ARGS(&g_fr_tilelen[i])))) {
+            logf("fr: TileLen buffer FAILED (%d)\n", i);
+            return false;
+        }
+    }
+    logf("fr: encode pass ready (mode %u, tile %ux%u, %u words per slot tile)\n",
+         mv_codec(), kFrTileW, kFrTileH, kFrSlotWords);
+    return true;
+}
+
+bool fr_encode_dispatch(ID3D12GraphicsCommandList* list, ID3D12Resource* src,
+                        uint32_t declared_state, int stream, uint32_t slot)
+{
+    if (list == nullptr || src == nullptr) { return false; }
+    ID3D12Device* device = g_device.Get();
+    if (!ensure_fr_objects(device)) { return false; }
+    ID3D12Resource* dst = (slot < mgpu::kMaxSlots) ? g_slot[stream][slot].Get() : nullptr;
+    if (dst == nullptr || dst->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        return false;
+    }
+    const D3D12_RESOURCE_DESC sd = src->GetDesc();
+    // stream 1 = MV (fp16 pairs), stream 2 = depth (one R32 value per pixel, read through
+    // an R32_FLOAT view; R32_TYPELESS is the usual source format).
+    const bool d32 = (stream == 2);
+    const DXGI_FORMAT codec_srv_fmt = d32 ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R16G16_FLOAT;
+    if (d32 ? (sd.Format != DXGI_FORMAT_R32_TYPELESS && sd.Format != DXGI_FORMAT_R32_FLOAT)
+            : (sd.Format != DXGI_FORMAT_R16G16_FLOAT)) {
+        return false;
+    }
+
+    const uint32_t w = g_stream_w[stream] ? g_stream_w[stream] : static_cast<uint32_t>(sd.Width);
+    const uint32_t h = g_stream_h[stream] ? g_stream_h[stream] : static_cast<uint32_t>(sd.Height);
+    const uint32_t tiles = fr_tiles(w, h);
+    // The slot is sized for the content that was current at layout time. A later preset
+    // change that grows the render size must not write past it - drop MV instead.
+    const uint64_t cap_tiles = dst->GetDesc().Width / (kFrSlotWords * 4u);
+    if (tiles > cap_tiles) {
+        static bool told_overflow = false;
+        if (!told_overflow) {
+            told_overflow = true;
+            logf("fr: MV content %ux%u needs %u tiles but the slot holds %llu - MV dropped"
+                 " (raise StreamPercentMv to 100 at the largest render size, or restart)\n",
+                 w, h, tiles, static_cast<unsigned long long>(cap_tiles));
+        }
+        return false;
+    }
+
+    // MvCodec 1 = UAV straight into the shared slot (the real path); 2 = same but into a
+    // private buffer (bisect: is a UAV write to a cross-adapter buffer the invalid call?);
+    // 3 = everything except the Dispatch. See docs/design/LOSSLESS_TRANSPORT.md 17.6.
+    const uint32_t fr_mode = mv_codec();
+    ID3D12Resource* uav_target = dst;
+    if (fr_mode == 2) {
+        const uint64_t need = dst->GetDesc().Width;
+        if (!g_fr_stage || g_fr_stage_bytes < need) {
+            g_fr_stage.Reset();
+            D3D12_HEAP_PROPERTIES shp{};
+            shp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC sbd{};
+            sbd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+            sbd.Width            = need;
+            sbd.Height           = 1;
+            sbd.DepthOrArraySize = 1;
+            sbd.MipLevels        = 1;
+            sbd.Format           = DXGI_FORMAT_UNKNOWN;
+            sbd.SampleDesc.Count = 1;
+            sbd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            sbd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            if (FAILED(device->CreateCommittedResource(
+                    &shp, D3D12_HEAP_FLAG_NONE, &sbd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    nullptr, IID_PPV_ARGS(&g_fr_stage)))) {
+                logf("fr: staging buffer FAILED (%llu B)\n",
+                     static_cast<unsigned long long>(need));
+                return false;
+            }
+            g_fr_stage_bytes = need;
+            logf("fr: MvCodec=2 bisect - the encode target is a private %llu B buffer\n",
+                 static_cast<unsigned long long>(need));
+        }
+        uav_target = g_fr_stage.Get();
+    }
+
+    const D3D12_RESOURCE_STATES read_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    const bool state_unknown = (declared_state == 0xFFFFFFFFu);
+    const D3D12_RESOURCE_STATES before =
+        (declared_state != 0 && !state_unknown)
+            ? static_cast<D3D12_RESOURCE_STATES>(declared_state)
+            : read_state;
+    if (before != read_state) { barrier(list, src, before, read_state); }
+    if (fr_mode == 1) {
+        barrier(list, dst, D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+
+    const UINT inc = device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_fr_heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = g_fr_heap->GetGPUDescriptorHandleForHeapStart();
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format                  = codec_srv_fmt;          // R16G16_FLOAT / R32_FLOAT
+    srv.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels     = 1;
+    device->CreateShaderResourceView(src, &srv, cpu);
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    // A raw (ByteAddressBuffer) UAV is Format R32_TYPELESS + stride 0 + FLAG_RAW. UNKNOWN
+    // is rejected by the debug layer ("When creating a RAW Unordered Access View, the
+    // format must be DXGI_FORMAT_R32_TYPELESS") and undefined at execution time - that was
+    // the DXGI_ERROR_INVALID_CALL device removal measured on 2026-11-21.
+    uav.Format                     = DXGI_FORMAT_R32_TYPELESS;
+    uav.ViewDimension              = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Buffer.StructureByteStride = 0;
+    uav.Buffer.Flags               = D3D12_BUFFER_UAV_FLAG_RAW;
+    uav.Buffer.NumElements = static_cast<UINT>(uav_target->GetDesc().Width / 4ull);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu_uav = cpu;
+    cpu_uav.ptr += inc;
+    device->CreateUnorderedAccessView(uav_target, nullptr, &uav, cpu_uav);
+
+    // TileLen is an RWStructuredBuffer<uint> in the shader, so the view must be STRUCTURED
+    // (stride 4). A raw view silently drops every write - that is why this readback used to
+    // report 0.00 MB while the transport itself was fine.
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uavtl{};
+    uavtl.Format                     = DXGI_FORMAT_UNKNOWN;
+    uavtl.ViewDimension              = D3D12_UAV_DIMENSION_BUFFER;
+    uavtl.Buffer.StructureByteStride = 4;
+    uavtl.Buffer.Flags               = D3D12_BUFFER_UAV_FLAG_NONE;
+    uavtl.Buffer.NumElements = static_cast<UINT>(g_fr_tilelen[d32 ? 1 : 0]->GetDesc().Width / 4ull);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu_tl = cpu_uav;
+    cpu_tl.ptr += inc;
+    device->CreateUnorderedAccessView(g_fr_tilelen[d32 ? 1 : 0].Get(), nullptr, &uavtl, cpu_tl);
+
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu_uav = gpu;
+    gpu_uav.ptr += inc;
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu_tl = gpu_uav;
+    gpu_tl.ptr += inc;
+
+    uint32_t params[6] = { w, h, 1u,
+                           (w + kFrTileW - 1u) / kFrTileW,
+                           (h + kFrTileH - 1u) / kFrTileH,
+                           kFrSlotWords };
+    list->SetComputeRootSignature(g_fr_rs.Get());
+    list->SetPipelineState(d32 ? g_fr_pso_d32.Get() : g_fr_pso.Get());
+    ID3D12DescriptorHeap* heaps[1] = { g_fr_heap.Get() };
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetComputeRoot32BitConstants(0, 6, params, 0);
+    list->SetComputeRootDescriptorTable(1, gpu);
+    list->SetComputeRootDescriptorTable(2, gpu_uav);
+    list->SetComputeRootDescriptorTable(3, gpu_tl);
+    if (fr_mode != 3) { list->Dispatch(tiles, 1, 1); }
+
+    if (fr_mode != 3) { fr_bytes_tick(list, tiles, d32 ? 1 : 0); }
+    if (fr_mode == 1 || fr_mode == 2) {
+        D3D12_RESOURCE_BARRIER ub{};
+        ub.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        ub.UAV.pResource = uav_target;
+        list->ResourceBarrier(1, &ub);
+    }
+    if (fr_mode == 1) {
+        barrier(list, dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_DEST);
+    }
+    if (before != read_state) { barrier(list, src, read_state, before); }
+
+    static bool told[2] = { false, false };
+    const int si = d32 ? 1 : 0;
+    if (!told[si]) {
+        told[si] = true;
+        logf("fr: encode %s %ux%u -> %u tiles, slot %llu B\n",
+             d32 ? "depth" : "mv", w, h, tiles,
+             static_cast<unsigned long long>(dst->GetDesc().Width));
     }
     return true;
 }
@@ -812,13 +1303,22 @@ bool ensure_shared(ID3D12Device* device, uint32_t render_w, uint32_t render_h,
         g_stream_w[3] = g_stream_h[3] = 0;
     }
 
+    // "auto" codec: decide BEFORE the layout, because the layout picks buffer vs texture
+    // slots and the stream sizes (a codec stream runs at 100%).
+    fr_resolve_codec(device);
     compute_target(render_w, render_h);
     // Capacity follows the actual stream size, not the render size. lock_frame fixes
     // StreamPercent (150), so there is no runtime request that can grow the streams; sizing
     // at render resolution instead reserved ~1.1 GB for 16 slots at 4K and the mapping/heap
     // creation stalled the device on PBZ. Use the largest stream we place.
-    uint32_t capw = g_stream_w[mgpu::kStreamMv];
-    uint32_t caph = g_stream_h[mgpu::kStreamMv];
+    // v30: with MvCodec=1 the MV slot is a byte buffer sized from its own 1:1 content (see
+    // layout_streams), so it must not drive the texture capacity. Letting it do so reserved
+    // 3840x2304 x 32 slots = 2.3 GB and the transport creation then starved the WGC
+    // capture-item creation at startup (measured: CreateForWindow FAILED, 2026-11-21).
+    const bool codec_mv = (mv_codec() != 0 &&
+                           g_mv_format == DXGI_FORMAT_R16G16_FLOAT);
+    uint32_t capw = codec_mv ? 0u : g_stream_w[mgpu::kStreamMv];
+    uint32_t caph = codec_mv ? 0u : g_stream_h[mgpu::kStreamMv];
     if (g_stream_w[mgpu::kStreamDepth] > capw) { capw = g_stream_w[mgpu::kStreamDepth]; }
     if (g_stream_h[mgpu::kStreamDepth] > caph) { caph = g_stream_h[mgpu::kStreamDepth]; }
     if (g_want_colour_session) {
@@ -843,7 +1343,8 @@ bool ensure_shared(ID3D12Device* device, uint32_t render_w, uint32_t render_h,
                    g_want_colour_session ? g_colour_slot_w : 0,
                    g_want_colour_session ? g_colour_slot_h : 0,
                    g_want_colour_session ? g_colour_format : 0,
-                   g_ui_w, g_ui_h, g_ui_slot_w, g_ui_slot_h, g_ui_format);
+                   g_stream_w[3], g_stream_h[3], g_ui_slot_w, g_ui_slot_h,
+                   g_ui_format);
 
     uint64_t reserve = mgpu::kDataStart;
     for (int i = 0; i < static_cast<int>(mgpu::kMaxStreams); ++i) {
@@ -1018,6 +1519,15 @@ bool ensure_shared(ID3D12Device* device, uint32_t render_w, uint32_t render_h,
     g_device = device;
     g_ready  = true;
     g_ready_ms = GetTickCount64();
+    // What each stream actually does this session (the four combinations are all legal).
+    const bool codec_plan_mv = (probe.streams[mgpu::kStreamMv].codec != 0);
+    const bool codec_plan_dp = (probe.streams[mgpu::kStreamDepth].codec != 0);
+    logf("fr: transport plan: mv=%s%ux%u depth=%s%ux%u colour=%s"
+         " (MvCodec=%u DepthCodec=%u StreamPercent mv/depth=%u/%u)\n",
+         codec_plan_mv ? "codec " : "texture ", g_stream_w[1], g_stream_h[1],
+         codec_plan_dp ? "codec " : "texture ", g_stream_w[2], g_stream_h[2],
+         g_want_colour_session ? "on" : "off",
+         mv_codec(), depth_codec(), g_percent[1], g_percent[2]);
     logf("shared ready: name=%hs pid=%lu used=%.1f MB slots=%u mv %ux%u fmt %u"
          " depth %ux%u fmt %u\n",
          mgpu::kMappingName, GetCurrentProcessId(),
@@ -1240,17 +1750,6 @@ bool copy_stream(ID3D12GraphicsCommandList* list, ID3D12Resource* src, int strea
 
     const D3D12_COMMAND_LIST_TYPE type = list->GetType();
     const bool can_barrier = (type != D3D12_COMMAND_LIST_TYPE_COPY);
-    // v22: colour always needs a transition out of the game's declared state. If the only
-    // list available is a COPY list (some UE5 tag lanes), skip the colour instead of
-    // issuing an invalid copy; MV/depth may still be copied.
-    if ((stream == 0 || stream == 3) && !can_barrier) {
-        static bool told = false;
-        if (!told) {
-            told = true;
-            logf("[%s] COPY list has no barriers - stream skipped\n", sname);
-        }
-        return false;
-    }
     const bool state_unknown = (declared_state == 0xFFFFFFFFu);
     // DLSSG parameter-block resources do not carry a declared state. The previous guesses
     // (COMMON / NON_PIXEL_SRV) still crashed in nvwgf2umx, so for this lane copy from the
@@ -1270,6 +1769,20 @@ bool copy_stream(ID3D12GraphicsCommandList* list, ID3D12Resource* src, int strea
                                                                      : (stream == 3
                                                                             ? D3D12_RESOURCE_STATE_COMMON
                                                                             : D3D12_RESOURCE_STATE_DEPTH_READ)))));
+    // v22/v29: colour and UI may need a transition out of the game's declared state. A
+    // COPY list cannot express a barrier, so skip only when a barrier is actually needed.
+    // The scaled UI/HUDless target is already COPY_SOURCE, and v29's CP2077 path is
+    // exactly that: the source is g_ds_tex[3], not the title's tagged resource.
+    if ((stream == 0 || stream == 3) && !can_barrier &&
+        before != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+        static bool told = false;
+        if (!told) {
+            told = true;
+            logf("[%s] COPY list has no barriers - stream skipped (declared 0x%X)\n",
+                 sname, declared_state);
+        }
+        return false;
+    }
 
     if (can_barrier && before != D3D12_RESOURCE_STATE_COPY_SOURCE) {
         barrier(list, src, before, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1421,6 +1934,85 @@ void reset_consumer_session(mgpu::SharedControl* c, uint64_t session)
          static_cast<unsigned long long>(session), c->generation);
 }
 
+uint32_t ini_int(const wchar_t* key, uint32_t def);
+
+// 0 = off, 1 = on, 2 = auto (the default): the codec is used whenever this session can
+// actually run it, and that stream silently keeps the copy path otherwise. This is what
+// makes "codec by default, degrade when the hardware cannot" work without a rebuild.
+int ini_codec_mode(const wchar_t* key)
+{
+    wchar_t path[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (wchar_t* slash = wcsrchr(path, L'\\')) { *slash = L'\0'; }
+    wcscat_s(path, MAX_PATH, L"\\fakerFG.ini");
+    wchar_t buf[32]{};
+    GetPrivateProfileStringW(L"fakerFG", key, L"auto", buf, 32, path);
+    if (buf[0] == L'0') { return 0; }
+    if (buf[0] == L'1') { return 1; }
+    return 2;                                    // "auto", empty or anything else
+}
+
+int  g_codec_mode[3] = { 0, -1, -1 };            // [1] = mv, [2] = depth; -1 = unread
+bool g_codec_resolved = false;
+
+
+uint32_t depth_codec()
+{
+    if (g_codec_mode[2] < 0) { g_codec_mode[2] = ini_codec_mode(L"DepthCodec"); }
+    return static_cast<uint32_t>(g_codec_mode[2] >= 2 ? 1 : g_codec_mode[2]);
+}
+
+// Called once, BEFORE the layout decides the slot types: resolves "auto" against what this
+// session can actually do, so a machine that cannot run the codec ends up with the old
+// copy path instead of a codec that does not work.
+void fr_resolve_codec(ID3D12Device* device)
+{
+    if (g_codec_resolved) { return; }
+    for (int i = 1; i <= 2; ++i) {
+        if (g_codec_mode[i] < 0) {
+            g_codec_mode[i] = ini_codec_mode(i == 1 ? L"MvCodec" : L"DepthCodec");
+        }
+    }
+    const bool want_any = (g_codec_mode[1] != 0 || g_codec_mode[2] != 0);
+    const bool objs = !want_any || ensure_fr_objects(device);
+    const bool fmt_mv = (g_mv_format == DXGI_FORMAT_R16G16_FLOAT);
+    const bool fmt_dp = (g_depth_format == DXGI_FORMAT_R32_TYPELESS ||
+                         g_depth_format == DXGI_FORMAT_R32_FLOAT ||
+                         wide_depth_format(static_cast<DXGI_FORMAT>(g_depth_format)));
+    if (!objs) {
+        g_codec_mode[1] = 0;
+        g_codec_mode[2] = 0;
+    } else {
+        if (!fmt_mv) { g_codec_mode[1] = 0; }
+        if (!fmt_dp) { g_codec_mode[2] = 0; }
+    }
+    g_codec_resolved = true;
+    logf("fr: codec capability: pass=%s, mv fmt %u %s, depth fmt %u %s -> MV %s, depth %s\n",
+         objs ? "ok" : "FAILED", g_mv_format, fmt_mv ? "ok" : "unsupported",
+         g_depth_format, fmt_dp ? "ok" : "unsupported",
+         g_codec_mode[1] ? "CODEC(1:1)" : "copy",
+         g_codec_mode[2] ? "CODEC(1:1)" : "copy");
+}
+
+bool ensure_fr_objects(ID3D12Device* device);   // defined with the encode pass below
+
+// 1 = MV, 2 = depth; everything else is not a codec stream.
+uint32_t stream_codec(int stream)
+{
+    if (stream == 1) { return mv_codec(); }
+    if (stream == 2) { return depth_codec(); }
+    return 0;
+}
+
+uint32_t mv_codec()
+{
+    if (g_codec_mode[1] < 0) { g_codec_mode[1] = ini_codec_mode(L"MvCodec"); }
+    // 2 = auto: optimistic here, fr_resolve_codec() turns it off before the layout when
+    // this session cannot actually run the codec. 3 = the "no Dispatch" bisect mode.
+    const int m = g_codec_mode[1];
+    return static_cast<uint32_t>(m == 2 ? 1 : (m > 3 ? 3 : m));
+}
+
 uint32_t ini_int(const wchar_t* key, uint32_t def)
 {
     wchar_t path[MAX_PATH]{};
@@ -1429,6 +2021,69 @@ uint32_t ini_int(const wchar_t* key, uint32_t def)
     wcscat_s(path, MAX_PATH, L"\\fakerFG.ini");
     const int v = GetPrivateProfileIntW(L"fakerFG", key, static_cast<int>(def), path);
     return v < 0 ? 0u : static_cast<uint32_t>(v);
+}
+
+void ini_string(const wchar_t* key, const wchar_t* def, wchar_t* out, DWORD count)
+{
+    if (out == nullptr || count == 0) { return; }
+    out[0] = L'\0';
+    wchar_t path[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (wchar_t* slash = wcsrchr(path, L'\\')) { *slash = L'\0'; }
+    wcscat_s(path, MAX_PATH, L"\\fakerFG.ini");
+    GetPrivateProfileStringW(L"fakerFG", key, def, out, count, path);
+}
+
+// v29: pick the stream-3 source once, when the transport is created. Auto prefers the
+// title's own UI (exact alpha, best unblend), then HUDless (consumer synthesises UI).
+// `hudless == backbuffer` means the title never separated UI; sending that would make the
+// consumer synthesise a zero diff, so it is rejected here.
+const MgpuFgResource* select_ui_source(const MgpuFgFrame& f, uint32_t* out_source)
+{
+    // UI_SYNTHESIS_GATE: CLOSED. Do not enable Game/Hudless synthesis here until
+    // the title always supplies a valid UI source by default. See
+    // docs/UI_SYNTHESIS_GATE.md.
+    if (!mgpu::kUiSynthesisGateOpen) {
+        if (out_source) { *out_source = mgpu::kUiSourceOff; }
+        return nullptr;
+    }
+    const MgpuFgResource& ui  = f.stream[MGPU_FG_STREAM_UI_COLOR];
+    const MgpuFgResource& hud = f.stream[MGPU_FG_STREAM_HUDLESS];
+    const MgpuFgResource& bb  = f.stream[MGPU_FG_STREAM_BACKBUFFER];
+    auto usable = [](const MgpuFgResource& r) {
+        // width/height can be 0 on an older provider; the descriptor fallback below
+        // fills them in. A non-null resource with a format is enough to select it.
+        return r.resource != nullptr && r.format != 0 &&
+               (r.width == 0 || r.width >= 64) &&
+               (r.height == 0 || r.height >= 64);
+    };
+    auto hud_usable = [&]() {
+        return usable(hud) && hud.resource != bb.resource;
+    };
+
+    // Once a type was selected, keep it: stream 3's slot format was laid out for it.
+    const uint32_t mode = (g_ui_source_type == mgpu::kUiSourceGame) ? 1
+                        : (g_ui_source_type == mgpu::kUiSourceHudless) ? 2
+                        : g_ui_source_mode;
+    if (mode == 3) {
+        if (out_source) { *out_source = mgpu::kUiSourceOff; }
+        return nullptr;
+    }
+    if (mode == 1) {
+        if (usable(ui)) { if (out_source) { *out_source = mgpu::kUiSourceGame; } return &ui; }
+        if (out_source) { *out_source = mgpu::kUiSourceOff; }
+        return nullptr;
+    }
+    if (mode == 2) {
+        if (hud_usable()) { if (out_source) { *out_source = mgpu::kUiSourceHudless; } return &hud; }
+        if (out_source) { *out_source = mgpu::kUiSourceOff; }
+        return nullptr;
+    }
+    // Auto.
+    if (usable(ui)) { if (out_source) { *out_source = mgpu::kUiSourceGame; } return &ui; }
+    if (hud_usable()) { if (out_source) { *out_source = mgpu::kUiSourceHudless; } return &hud; }
+    if (out_source) { *out_source = mgpu::kUiSourceOff; }
+    return nullptr;
 }
 
 // v22: which record resource is the colour we interpolate. The DLSS-G Backbuffer is the
@@ -1509,6 +2164,7 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
     const MgpuFgResource& dp = f->stream[MGPU_FG_STREAM_DEPTH];
     const MgpuFgResource& col = colour_source(*f);
     const MgpuFgResource& ui = f->stream[MGPU_FG_STREAM_UI_COLOR];
+    const MgpuFgResource& hud = f->stream[MGPU_FG_STREAM_HUDLESS];
     if (mv.resource == nullptr && dp.resource == nullptr && col.resource == nullptr) {
         return;
     }
@@ -1569,12 +2225,26 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
             if (!s_colour_ini) {
                 s_colour_ini = true;
                 g_want_colour_session = ini_int(L"ColourStream", 0) != 0;
-                // UI stream is an unverified experiment: default OFF and not exposed anywhere
-                // (no UI toggle, no key in the shipped fakerFG.ini). Set UiStream=1 by hand
-                // only for a local A/B. With it off, stream 3 has no slot size and the
-                // consumer keeps XeFG's default UI composition (DISABLED).
+                // UI stream is an unverified experiment: default OFF. Set UiStream=1 by hand
+                // for a local A/B. UiSource selects the stream-3 payload:
+                //   Auto (default) = title UI tag, else downsampled HUDless
+                //   Game           = title UI tag only
+                //   Hudless        = downsampled HUDless only (consumer synthesises UI)
+                //   Off            = never publish stream 3
                 g_want_ui_session = ini_int(L"UiStream", 0) != 0;
-                g_ui_premultiplied = ini_int(L"UiPremultiplied", 1) != 0;
+                g_ui_premultiplied_cfg = ini_int(L"UiPremultiplied", 1) != 0;
+                {
+                    wchar_t src[32]{};
+                    ini_string(L"UiSource", L"Auto", src, 32);
+                    if (_wcsicmp(src, L"game") == 0)         { g_ui_source_mode = 1; }
+                    else if (_wcsicmp(src, L"hudless") == 0) { g_ui_source_mode = 2; }
+                    else if (_wcsicmp(src, L"off") == 0)     { g_ui_source_mode = 3; }
+                    else                                     { g_ui_source_mode = 0; }
+                }
+                if (g_ui_source_mode == 3) {
+                    g_want_ui_session = false;
+                    logf("producer: UiSource=Off - stream 3 is not published\n");
+                }
                 g_force_inline = ini_int(L"CopyInline", 0) != 0;
                 if (!g_want_colour_session) {
                     logf("producer: ColourStream=0 - colour is not published"
@@ -1594,15 +2264,46 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
             if (cf == 0) { cf = static_cast<uint32_t>(cd.Format); }
         }
         if (cw < 256 || ch < 256) { cw = f->output_w; ch = f->output_h; }
-        uint32_t uw = ui.width, uh = ui.height, uf = ui.format;
-        if ((uw == 0 || uh == 0) && ui.resource != nullptr) {
-            const D3D12_RESOURCE_DESC ud =
-                static_cast<ID3D12Resource*>(ui.resource)->GetDesc();
-            uw = static_cast<uint32_t>(ud.Width);
-            uh = ud.Height;
-            if (uf == 0) { uf = static_cast<uint32_t>(ud.Format); }
+        // v29: choose what stream 3 carries before the layout is placed. If the source
+        // is not available yet (the title creates its FG tag after the first record),
+        // reserve stream 3 at output size / R10 and let the per-frame selection pick the
+        // real source later. Disabling here would leave UI off for the whole session.
+        const MgpuFgResource* ui_aux = g_want_ui_session
+                                           ? select_ui_source(*f, &g_ui_source)
+                                           : nullptr;
+        if (!g_want_ui_session) { g_ui_source = mgpu::kUiSourceOff; }
+        if (g_ui_source != mgpu::kUiSourceOff) { g_ui_source_type = g_ui_source; }
+        g_ui_premultiplied = (g_ui_source == mgpu::kUiSourceGame) && g_ui_premultiplied_cfg;
+        if (g_want_ui_session && ui_aux == nullptr) {
+            logf("producer: UiStream=1 but no UI/HUDless resource yet - reserving stream 3"
+                 " at output size / R10; source is re-checked every record\n");
         }
-        if (uw < 64 || uh < 64 || uf == 0) { uw = uh = uf = 0; }
+        if (g_ui_source == mgpu::kUiSourceGame) {
+            logf("producer: UI source = game UI tag\n");
+        } else if (g_ui_source == mgpu::kUiSourceHudless) {
+            logf("producer: UI source = HUDless (consumer synthesises UI;"
+                 " HUDless must not equal BACKBUFFER)\n");
+        }
+        uint32_t uw = 0, uh = 0, uf = 0;
+        if (ui_aux != nullptr) {
+            uw = ui_aux->width;
+            uh = ui_aux->height;
+            uf = ui_aux->format;
+            if ((uw == 0 || uh == 0) && ui_aux->resource != nullptr) {
+                const D3D12_RESOURCE_DESC ud =
+                    static_cast<ID3D12Resource*>(ui_aux->resource)->GetDesc();
+                uw = static_cast<uint32_t>(ud.Width);
+                uh = ud.Height;
+                if (uf == 0) { uf = static_cast<uint32_t>(ud.Format); }
+            }
+            if (uw < 64 || uh < 64 || uf == 0) { uw = uh = uf = 0; }
+        } else if (g_want_ui_session) {
+            // Reserved placeholder: the real source is selected after the FG tag appears.
+            uw = f->output_w ? f->output_w : f->render_w;
+            uh = f->output_h ? f->output_h : f->render_h;
+            uf = static_cast<uint32_t>(DXGI_FORMAT_R10G10B10A2_UNORM);
+            if (uw < 64 || uh < 64) { uw = uh = 0; uf = 0; }
+        }
         // A depth-only record (no motion vectors) still has to size the transport.
         // f.render_w/h used to come only from the MV stream; fakerFG now falls back to
         // depth there, and this second fallback keeps an older fakerFG working too.
@@ -1656,16 +2357,49 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
     const bool want_colour = g_want_colour_session &&
                              (want & mgpu::kRequestColor) != 0 &&
                              col.resource != nullptr;
-    const bool want_ui = g_want_ui_session &&
-                         (want & mgpu::kRequestUi) != 0 &&
-                         ui.resource != nullptr && g_ui_format != 0 &&
-                         g_stream_w[3] >= 64 && g_stream_h[3] >= 64;
-    if ((want & mgpu::kRequestUi) && ui.resource == nullptr) {
+    // v29: stream 3 follows the source chosen at init, but the source can appear after
+    // the first record (FG tag creation is often late). Re-check every record; a source
+    // that disappears simply idles the stream. The slot layout is never re-placed.
+    const MgpuFgResource* ui_aux = nullptr;
+    if (g_want_ui_session) {
+        uint32_t new_source = mgpu::kUiSourceOff;
+        const MgpuFgResource* sel = select_ui_source(*f, &new_source);
+        // Once stream 3 has a type, do not switch UI->HUDless mid-session: the slot
+        // format was chosen for the first type. A temporary disappearance goes Off and
+        // recovers when the same type returns.
+        if (sel != nullptr && g_ui_source != mgpu::kUiSourceOff &&
+            new_source != g_ui_source) {
+            sel = nullptr;
+            new_source = mgpu::kUiSourceOff;
+        }
+        if (sel != nullptr) {
+            if (new_source != g_ui_source) {
+                logf("producer: UI source %u -> %u%s\n", g_ui_source, new_source,
+                     new_source == mgpu::kUiSourceHudless
+                         ? " (consumer synthesises UI)"
+                         : (new_source == mgpu::kUiSourceGame ? " (game UI tag)" : ""));
+            }
+            g_ui_source = new_source;
+            g_ui_source_type = new_source;
+            ui_aux = sel;
+        } else if (g_ui_source != mgpu::kUiSourceOff) {
+            logf("producer: UI source %u unavailable this record - stream 3 idles\n",
+                 g_ui_source);
+            g_ui_source = mgpu::kUiSourceOff;
+        }
+    }
+    g_ui_premultiplied = (g_ui_source == mgpu::kUiSourceGame) && g_ui_premultiplied_cfg;
+    bool want_ui = g_want_ui_session &&
+                   (want & mgpu::kRequestUi) != 0 &&
+                   ui_aux != nullptr && g_ui_format != 0 &&
+                   g_stream_w[3] >= 64 && g_stream_h[3] >= 64;
+    if ((want & mgpu::kRequestUi) && ui_aux == nullptr && g_want_ui_session) {
         static bool told_no_ui = false;
         if (!told_no_ui) {
             told_no_ui = true;
-            logf("producer: consumer requested UI but this record has no UI resource"
-                 " - stream 3 cannot be published\n");
+            logf("producer: consumer requested UI but the selected source"
+                 " (ui_source=%u) has no resource this record - stream 3 idles\n",
+                 g_ui_source);
         }
     }
     if (!want_mv && !want_depth && !want_colour && !want_ui) {
@@ -1823,7 +2557,7 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
         const bool dp_ok = !want_depth || g_scaled[2] ||
             static_cast<D3D12_RESOURCE_STATES>(dp.state) == D3D12_RESOURCE_STATE_COPY_SOURCE;
         const bool ui_ok = !want_ui || g_scaled[3] ||
-            static_cast<D3D12_RESOURCE_STATES>(ui.state) == D3D12_RESOURCE_STATE_COPY_SOURCE;
+            static_cast<D3D12_RESOURCE_STATES>(ui_aux->state) == D3D12_RESOURCE_STATE_COPY_SOURCE;
         use_dma = mv_ok && dp_ok && ui_ok;
     }
     auto* copy_list = g_force_inline
@@ -1847,8 +2581,15 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
     // Wide depth additionally needs the pass at any percent, including 100: the source
     // is R32G8X24 (8 B/px) and the slot is R32 (4 B/px).
     bool scaled_mv = false, scaled_depth = false, scaled_ui = false;
+    // Depth codec: the kernel reads an R32_FLOAT view, so a source it cannot read directly
+    // (wide depth, D32_FLOAT, ...) is converted once by the existing scale pass.
+    const bool depth_codec_on = (depth_codec() != 0 && dp.resource != nullptr);
+    const bool depth_fmt_direct =
+        dp.resource != nullptr &&
+        (dp.format == DXGI_FORMAT_R32_TYPELESS || dp.format == DXGI_FORMAT_R32_FLOAT);
     const bool need_depth_convert = want_depth && dp.resource != nullptr &&
-                                    wide_depth_format(static_cast<DXGI_FORMAT>(dp.format));
+                                    (wide_depth_format(static_cast<DXGI_FORMAT>(dp.format)) ||
+                                     (depth_codec_on && !depth_fmt_direct));
     // Only pass a stream through the downscale when its source actually exists. A
     // depth-only record (no MV tagged) must NOT fail just because StreamPercent>100
     // also covers the missing MV stream: that made scale_dispatch(null) return false,
@@ -1857,7 +2598,7 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
     const bool need_scaled_mv = want_mv && mv.resource != nullptr && g_scaled[1];
     const bool need_scaled_depth = want_depth && dp.resource != nullptr &&
                                    (g_scaled[2] || need_depth_convert);
-    const bool need_scaled_ui = want_ui && ui.resource != nullptr && g_scaled[3];
+    bool need_scaled_ui = want_ui && ui_aux != nullptr && g_scaled[3];
     if (need_scaled_mv || need_scaled_depth || need_scaled_ui) {
         const bool can_dispatch =
             list != nullptr && (list->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT ||
@@ -1869,7 +2610,18 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
                 logf("downscale: list type %d cannot take a Dispatch - set StreamPercent=100\n",
                      list != nullptr ? static_cast<int>(list->GetType()) : -1);
             }
-            return;
+            // UI is optional: drop it for this frame instead of losing MV/depth too.
+            if (need_scaled_ui) {
+                static bool told_ui = false;
+                if (!told_ui) {
+                    told_ui = true;
+                    logf("downscale: UI/HUDless needs a Dispatch but the list is COPY-only"
+                         " - stream 3 idles (MV/depth continue at their own sizes)\n");
+                }
+                want_ui = false;
+                need_scaled_ui = false;
+            }
+            if (need_scaled_mv || need_scaled_depth) { return; }
         }
         bool ok = true;
         if (ok && need_scaled_mv) {
@@ -1879,7 +2631,8 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
             ok = scale_dispatch(list, static_cast<ID3D12Resource*>(dp.resource), dp.state, 2);
         }
         if (ok && need_scaled_ui) {
-            ok = scale_dispatch(list, static_cast<ID3D12Resource*>(ui.resource), ui.state, 3);
+            ok = scale_dispatch(list, static_cast<ID3D12Resource*>(ui_aux->resource),
+                                ui_aux->state, 3);
         }
         if (!ok) {
             static bool told = false;
@@ -1900,24 +2653,54 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
     }
 
     if (want_mv && (g_copied_mask & mgpu::kRequestMv) == 0) {
-        ID3D12Resource* src = scaled_mv ? g_ds_tex[1].Get()
-                                        : static_cast<ID3D12Resource*>(mv.resource);
-        const uint32_t state = scaled_mv ? static_cast<uint32_t>(D3D12_RESOURCE_STATE_COPY_SOURCE)
-                                         : mv.state;
-        if (copy_stream(copy_list, src, 1, state)) { g_copied_mask |= mgpu::kRequestMv; }
+        if (mv_codec() != 0 && !scaled_mv && mv.resource != nullptr) {
+            // v30: lossless - encode straight from the title's MV into the slot buffer.
+            // Recorded on the game's list because the MV texture is only valid there; the
+            // copy queue waits on the frame fence, so the forward fence covers this write.
+            if (fr_encode_dispatch(list, static_cast<ID3D12Resource*>(mv.resource), mv.state,
+                                   1, g_cur_slot)) {
+                g_copied_mask |= mgpu::kRequestMv;
+            } else {
+                static bool told = false;
+                if (!told) {
+                    told = true;
+                    logf("fr: encode failed - MV dropped this frame (MvCodec=0 reverts)\n");
+                }
+            }
+        } else {
+            ID3D12Resource* src = scaled_mv ? g_ds_tex[1].Get()
+                                            : static_cast<ID3D12Resource*>(mv.resource);
+            const uint32_t state = scaled_mv
+                ? static_cast<uint32_t>(D3D12_RESOURCE_STATE_COPY_SOURCE) : mv.state;
+            if (copy_stream(copy_list, src, 1, state)) { g_copied_mask |= mgpu::kRequestMv; }
+        }
     }
     if (want_depth && (g_copied_mask & mgpu::kRequestDepth) == 0) {
         ID3D12Resource* src = scaled_depth ? g_ds_tex[2].Get()
                                            : static_cast<ID3D12Resource*>(dp.resource);
         const uint32_t state = scaled_depth ? static_cast<uint32_t>(D3D12_RESOURCE_STATE_COPY_SOURCE)
                                             : dp.state;
-        if (copy_stream(copy_list, src, 2, state)) { g_copied_mask |= mgpu::kRequestDepth; }
+        if (depth_codec_on) {
+            // v30: lossless depth - encode on the render card, decode on the consumer.
+            if (fr_encode_dispatch(list, src, state, 2, g_cur_slot)) {
+                g_copied_mask |= mgpu::kRequestDepth;
+            } else {
+                static bool told_dep = false;
+                if (!told_dep) {
+                    told_dep = true;
+                    logf("fr: depth encode failed - depth dropped this frame"
+                         " (DepthCodec=0 reverts)\n");
+                }
+            }
+        } else if (copy_stream(copy_list, src, 2, state)) {
+            g_copied_mask |= mgpu::kRequestDepth;
+        }
     }
     if (want_ui && (g_copied_mask & mgpu::kRequestUi) == 0) {
         ID3D12Resource* src = scaled_ui ? g_ds_tex[3].Get()
-                                        : static_cast<ID3D12Resource*>(ui.resource);
+                                        : static_cast<ID3D12Resource*>(ui_aux->resource);
         const uint32_t state = scaled_ui ? static_cast<uint32_t>(D3D12_RESOURCE_STATE_COPY_SOURCE)
-                                         : ui.state;
+                                         : ui_aux->state;
         if (copy_stream(copy_list, src, 3, state)) { g_copied_mask |= mgpu::kRequestUi; }
     }
     // v22: colour, verbatim, into the same publication slot. Its declared state is used
@@ -1957,6 +2740,7 @@ struct PublishSpinGuard
 
 void publish_frame(void* queue_ptr)
 {
+    fr_drain_msgs("publish");
     // Wuchang presents ~2x per rendered frame; if two presents ever land on different
     // threads, g_frame/g_copied_mask/g_cur_slot would be corrupted. Serialize with a
     // plain Win32 interlocked flag: std::mutex pulled MSVCP140 into the first Present and
@@ -2131,6 +2915,9 @@ void publish_frame(void* queue_ptr)
                                                : (g_render_h ? g_render_h : g_stream_h[1]);
         c->producer.declared_frames = f.declared_frames;
         c->producer.harvest_flags   = 0;
+        c->ui_source = (g_ui_source != mgpu::kUiSourceOff && (g_copied_mask & mgpu::kRequestUi))
+                           ? g_ui_source
+                           : mgpu::kUiSourceOff;
         MemoryBarrier();
     }
 
@@ -2203,6 +2990,7 @@ extern "C" __declspec(dllexport) int __cdecl MgpuProducerStart(const void* fg_ap
         logf("producer: no usable MgpuFgApi (need a v2 table with subscribe)\n");
         return 1;
     }
+    fr_debug_enable();
     g_fg = api;
     if (api->subscribe(&on_record, nullptr) != 0) {
         logf("producer: subscribe FAILED\n");

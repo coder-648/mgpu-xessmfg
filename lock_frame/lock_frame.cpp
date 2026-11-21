@@ -75,6 +75,19 @@
 // B mode 4: consumer-side UI unblend (HUDless = present - UI). The CSO is compiled from
 // lock_frame/shaders/unblend_ui.hlsl by lock_frame/build.sh and embedded like the others.
 #include "unblend_ui_cso.h"
+// v29: when stream 3 carries HUDless instead of a title UI, this pass synthesises an
+// approximate UI (present - hudless) before the unblend. Same bindings as unblend_ui.
+#include "synth_ui_cso.h"
+// v30: consumer side of the lossless MV transport (docs/design/LOSSLESS_TRANSPORT.md).
+// The producer runs the encode pass and writes fr-codec bytes into the MV slot; this
+// blob turns them back into the exact fp16 bit patterns into g_mv_local[slot].
+#include "fr_decode_cso.h"
+// v30 --mv-verify: the same codec's Encode entry, used to prove the round trip is exact
+// (re-encode the decoded MV and compare the bytes with what the producer sent).
+#include "fr_encode_cso.h"
+// D32 (depth) variants: one 32-bit value per pixel, same kernel with -DDEPTH32.
+#include "fr_decode32_cso.h"
+#include "fr_encode32_cso.h"
 
 // AMD FidelityFX optical flow: compute the motion vectors locally on the AMD card
 // instead of trusting the producer's MV stream (that stream measured as garbage on
@@ -85,6 +98,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <cstdlib>
 #include <cwctype>
 #include <deque>
 #include <string>

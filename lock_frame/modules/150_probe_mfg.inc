@@ -7,6 +7,29 @@
 //  Modules are in dependency order; a module may use only symbols declared above it.
 // ============================================================================
 
+// MFG-Unlocker's ported-model route (ShaderPort + ModelPort + unlock without
+// fg_keep_2x_model). Header-only; uses logf_ from 010_platform.inc.
+#include "xefg_mfg/xefg_mfg_port.h"
+
+// --mfg-model=port|keep2x. Default is keep2x: the ported model 15/16 is an
+// explicit experiment, because on CP2077 4x its edge artifacts were worse than
+// the 2x-model route (2x stayed clean, 4x_keep2x was visibly better). `port`
+// still selects the full ShaderPort + ModelPort + keep2x=false path.
+static int g_mfg_model = 2;   // 0 auto (legacy), 1 port, 2 keep2x (default)
+
+static std::wstring mfg_program_dir()
+{
+    wchar_t path[MAX_PATH]{};
+    const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) { return {}; }
+    std::wstring p(path, n);
+    const size_t slash = p.find_last_of(L"\\/");
+    if (slash == std::wstring::npos) { p.clear(); }
+    else { p.resize(slash + 1); }
+    p += L"xefg_programs";
+    return p;
+}
+
 // Answers "which libxess_fg.dll is loaded, what version is it, and can it do MFG
 // here?" without touching the game, the shared memory or a swap chain. It is the
 // only way to tell a real MFG build from a file that merely has a different name.
@@ -155,12 +178,17 @@ static bool apply_unlock_mfg()
         return true;
     }
 
-    if (g_fg_probe) {
+    if (g_fg_probe && g_mfg_model == 2) {
+        // Only on the explicit keep2x route: creating a context here would make
+        // ModelPort's "install before the first context" precondition false.
         const UINT stock = read_max_interp();
         if (stock > 0) {
             logf_("[lock] probe: maxSupportedInterpolations (stock) %u -> %ux\n",
                   stock, stock + 1);
         }
+    } else if (g_fg_probe) {
+        logf_("[lock] probe: stock maxSupportedInterpolations skipped (ported-model"
+              " route needs no prior context)\n");
     }
 
     // libxell.dll is imported by this exe, so it is already loaded here; libxess_fg
@@ -172,12 +200,40 @@ static bool apply_unlock_mfg()
           want + 1, want, ll ? narrow_utf8(ll_path).c_str() : "(not loaded)");
 
     std::string uerr;
-    if (xefg_unlock::Apply(g_api.dll, ll, want, &uerr)) {
+    // Recommended route: MFG-Unlocker's ported model (ShaderPort + ModelPort +
+    // frame-count unlock WITHOUT fg_keep_2x_model). The model 15 that already
+    // lives in libxess_fg is relabelled as model 16, so XeFG's MFG path runs the
+    // real multi-frame model instead of reusing the 2x model.
+    if (g_mfg_model != 2) {
+        const std::wstring dir = mfg_program_dir();
+        xefg_mfg::SetDataRoot(std::filesystem::path(dir));
+        std::string perr;
+        if (xefg_mfg::Install(g_api.dll, g_consumer_vendor, &perr)) {
+            if (xefg_unlock::Apply(g_api.dll, ll, want, &uerr, false)) {
+                g_fg_interp = static_cast<int>(want);
+                g_fg_interp_max = want;
+                logf_("[lock] --unlock-mfg: ported MFG model route active"
+                      " (model 15 -> 16, 5 sites, no fg_keep_2x_model)\n");
+                logf_("[lock]   programs: %ls\n", dir.c_str());
+                return true;
+            }
+            logf_("[lock] --unlock-mfg: port installed but the unlock failed: %s\n",
+                  uerr.c_str());
+            xefg_mfg::Restore();
+        } else {
+            logf_("[lock] --unlock-mfg: ported MFG model not used: %s"
+                  " -> falling back to the 2x-model route\n", perr.c_str());
+        }
+    }
+
+    // Legacy route: keep fg_keep_2x_model. Every generated frame reuses the 2x
+    // model; this is the behaviour shipped before the port existed.
+    if (xefg_unlock::Apply(g_api.dll, ll, want, &uerr, true)) {
         g_fg_interp = static_cast<int>(want);
         g_fg_interp_max = want;
-        logf_("[lock] --unlock-mfg: all 6 sites patched and read back OK\n");
-        logf_("[lock]   every generated frame uses the 2x model (the MFG model is"
-              " not in this build), so quality is not 2x quality\n");
+        logf_("[lock] --unlock-mfg: 2x-model route active (fg_keep_2x_model kept)\n");
+        logf_("[lock]   every generated frame uses the 2x model, so quality is not"
+              " true-MFG quality\n");
         return true;
     }
 

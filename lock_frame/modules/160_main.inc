@@ -82,6 +82,10 @@ int main()
     if (wcsstr(GetCommandLineW(), L"--no-depth")) { g_no_depth = true; }
     if (wcsstr(GetCommandLineW(), L"--no-mv")) { g_no_mv = true; }
     if (wcsstr(GetCommandLineW(), L"--mv-shadow")) { g_mv_shadow = true; }
+    // --d3d-debug: D3D12 debug layer + validation messages in this log (diagnosis only).
+    if (wcsstr(GetCommandLineW(), L"--d3d-debug")) { g_d3d_debug = true; }
+    // --mv-verify: prove the codec round trip is bit-exact (3 samples, ~2 s apart).
+    if (wcsstr(GetCommandLineW(), L"--mv-verify")) { g_mv_verify = true; }
     // --log-flush: fflush after every line (pre-change behaviour). Useful when watching
     // for a crash, where the last lines before the process dies are the interesting ones.
     if (wcsstr(GetCommandLineW(), L"--log-flush")) { g_log_flush_each = 1; }
@@ -185,6 +189,10 @@ int main()
     }
     if (wcsstr(GetCommandLineW(), L"--fg-probe")) { g_fg_probe = true; }
     if (wcsstr(GetCommandLineW(), L"--unlock-mfg")) { g_unlock_mfg = true; }
+    // MFG model route: auto (default) tries the ported model and falls back to
+    // the 2x-model unlock, exactly like MFG-Unlocker's PreparePort().
+    if (wcsstr(GetCommandLineW(), L"--mfg-model=port")) { g_mfg_model = 1; }
+    else if (wcsstr(GetCommandLineW(), L"--mfg-model=keep2x")) { g_mfg_model = 2; }
     // XeFG tuning (see the globals above).
     if (const wchar_t* rt = wcsstr(GetCommandLineW(), L"--fg-rt ")) {
         if (wcsncmp(rt + 8, L"0", 1) == 0) { g_fg_rt_zero = true; }
@@ -195,6 +203,30 @@ int main()
     // (not in the UI, not in fakerFG.ini, not in the release notes).
     if (wcsstr(GetCommandLineW(), L"--ui-unblend")) { g_ui_unblend = true; }
     if (wcsstr(GetCommandLineW(), L"--no-ui-unblend")) { g_ui_unblend = false; }
+    // v29: stream-3 source. `--ui-source` also enables the unblend path (there is no
+    // reason to select a source and then leave the pass off).
+    if (wcsstr(GetCommandLineW(), L"--ui-source game")) {
+        g_ui_source_mode = 1; g_ui_unblend = true;
+    } else if (wcsstr(GetCommandLineW(), L"--ui-source hudless")) {
+        g_ui_source_mode = 2; g_ui_unblend = true;
+    } else if (wcsstr(GetCommandLineW(), L"--ui-source off")) {
+        g_ui_source_mode = 3; g_ui_unblend = false;
+    } else if (wcsstr(GetCommandLineW(), L"--ui-source auto")) {
+        g_ui_source_mode = 0; g_ui_unblend = true;
+    }
+    if (const wchar_t* ust = wcsstr(GetCommandLineW(), L"--ui-synth-threshold ")) {
+        const long v = wcstol(ust + 21, nullptr, 10);
+        if (v >= 0 && v <= 255) {
+            g_ui_synth_threshold = static_cast<float>(v) / 255.0f;
+        }
+    }
+    if (g_ui_unblend) {
+        const char* src = (g_ui_source_mode == 1) ? "game"
+                        : (g_ui_source_mode == 2) ? "hudless"
+                        : (g_ui_source_mode == 3) ? "off" : "auto";
+        logf_("[lock] ui path: unblend=1 source=%s synth_threshold=%.3f\n",
+              src, static_cast<double>(g_ui_synth_threshold));
+    }
     if (const wchar_t* sc = wcsstr(GetCommandLineW(), L"--fg-scene ")) {
         const float v = static_cast<float>(_wtof(sc + 11));
         if (v > 0.0f && v <= 10.0f) { g_fg_scene = v; }
@@ -483,7 +515,9 @@ int main()
     if (wcsstr(GetCommandLineW(), L"--cad-batch-rt")) { g_cad_batch_rt = true; }
     if (const wchar_t* mi = wcsstr(GetCommandLineW(), L"--wgc-minint ")) {
         g_wgc_minint_ms = _wtoi(mi + 13);
-        if (g_wgc_minint_ms < 0) { g_wgc_minint_ms = 0; }   // 0 = no throttle
+        // -1 = leave Windows' default (the start_wgc() branch logs it); 0 = no
+        // throttle; N = N ms. Anything below -1 is a typo and means 0.
+        if (g_wgc_minint_ms < -1) { g_wgc_minint_ms = 0; }
         if (g_wgc_minint_ms > 100) { g_wgc_minint_ms = 100; }
         logf_("[lock] --wgc-minint %d ms\n", g_wgc_minint_ms);
     }
@@ -572,6 +606,32 @@ int main()
               g_dump_frames, g_dump_dir);
         logf_("[lock]   run with real inputs (no --no-mv/--no-depth) or the dump"
               " cannot answer the pairing question\n");
+    }
+    // --ui-dump: visual reference for the HUDless-derived UI.
+    if (const wchar_t* ud = wcsstr(GetCommandLineW(), L"--ui-dump ")) {
+        const int n = _wtoi(ud + 10);
+        if (n > 0 && n <= 64) { g_ui_dump_frames = n; }
+    }
+    if (const wchar_t* uda = wcsstr(GetCommandLineW(), L"--ui-dump-after ")) {
+        const int n = _wtoi(uda + 16);
+        if (n >= 0 && n <= 100000) { g_ui_dump_after = n; }
+    }
+    if (const wchar_t* udd = wcsstr(GetCommandLineW(), L"--ui-dump-dir ")) {
+        const wchar_t* p = udd + 14;
+        while (*p == L' ' || *p == L'"') { ++p; }
+        const wchar_t* end = p;
+        const bool quoted = (*(udd + 14) == L'"');
+        while (*end && ((quoted && *end != L'"') || (!quoted && *end != L' '))) { ++end; }
+        if (end > p) {
+            const int len = WideCharToMultiByte(CP_ACP, 0, p, static_cast<int>(end - p),
+                                                g_ui_dump_dir, MAX_PATH - 1, nullptr, nullptr);
+            if (len > 0) { g_ui_dump_dir[len] = '\0'; }
+        }
+    }
+    if (g_ui_dump_frames > 0) {
+        CreateDirectoryA(g_ui_dump_dir, nullptr);
+        logf_("[lock] --ui-dump %d frame(s) after %d -> %s (BMP: rgb/alpha/over)\n",
+              g_ui_dump_frames, g_ui_dump_after, g_ui_dump_dir);
     }
     if (wcsstr(GetCommandLineW(), L"--no-throttle")) { g_no_throttle = true; }
     // --input-copy-queue: MV/depth copies on their own COPY queue so they run on the copy
@@ -764,7 +824,11 @@ int main()
     //   之前预先拷贝一个"猜的"槽，锁帧版不需要也不允许这种猜测。
     // StreamPercent 由 producer 的 fakerFG.ini 固定（默认 150），消费者不再自动调。
     // 以上都是强制项：这一版只为固定倍率 2x/3x/4x 服务，A/B 入口在命令行保留但不再生效。
-    g_fg_colour_shared = false;
+    // 2026-11-21: --fg-colour shared is an explicit A/B now. It was forced off in
+    // the locked build because the shipping default is WGC; when the producer
+    // publishes ColourStream=1, taking stream[0] avoids WGC's DWM arrival jitter
+    // (the 60 Hz input reading that wanders 51..60 on a 4K overlay).
+    // g_fg_colour_shared stays false unless the command line asked for it.
     g_pair_frame_key   = false;
     g_prefetch_inputs  = false;
     g_pf_pub           = false;
@@ -773,12 +837,22 @@ int main()
     g_stream_asym      = false;
     // 锁帧版固定开启：MV/depth 跨卡按 StreamPercent 传输（默认 150），到消费卡后
     // 用 080 模块的联合重建 pass 还原到 frames[].render_w/h（输入画面尺寸）再 tag。
-    g_upsample         = true;
+    // 2026-11-21: --no-upsample is an explicit A/B for the ported MFG model. It tags the
+    // producer's low-res MV/depth pair directly and lets XeFG do the resampling; model 15/16
+    // is much more sensitive to reconstructed motion than the 2x model at screen edges.
+    const bool no_upsample = wcsstr(GetCommandLineW(), L"--no-upsample") != nullptr;
+    g_upsample         = !no_upsample;
     if (!g_stream_mask_explicit) {
         g_stream_mask = mgpu::kRequestMv | mgpu::kRequestDepth | mgpu::kRequestUi;
+        if (g_fg_colour_shared) { g_stream_mask |= mgpu::kRequestColor; }
     }
-    logf_("[lock] --upsample: ON by default - MV/depth 150%% transfer, reconstructed to the"
-          " input picture size before tagging\n");
+    if (g_upsample) {
+        logf_("[lock] --upsample: ON by default - MV/depth 150%% transfer, reconstructed to the"
+              " input picture size before tagging\n");
+    } else {
+        logf_("[lock] --no-upsample: tagging the producer's MV/depth at their stream size"
+              " (XeFG resamples internally)\n");
+    }
     logf_("[lock] locked cadence: interp=%d (%dx per input), report every %d frames;"
           " slot gate: %s%s\n",
           g_fg_interp, g_fg_interp + 1, 40,
@@ -1011,7 +1085,36 @@ int main()
     if (!open_shared()) { return 5; }
     // The capture item comes first: its size is the only trustworthy one, and the colour
     // sink / frame pool / FG swap chain all have to be built at that size.
-    if (!create_capture_item(game_wnd)) { return 7; }
+    //
+    // WGC refuses a window that is not capturable *yet* - the game is usually still
+    // switching to its present mode when the transport appears, and CreateForWindow then
+    // answers E_ILLEGAL_METHOD_CALL ("exclusive fullscreen?"). That is a startup race, not
+    // a fatal error: retry for up to 10 s and re-resolve the window if the game recreated
+    // it, instead of exiting with code 7 (measured 2026-11-21 with protocol v30).
+    {
+        bool item_ok = create_capture_item(game_wnd);
+        for (int attempt = 1; !item_ok && attempt <= 40; ++attempt) {
+            Sleep(250);
+            if (!IsWindow(game_wnd)) {
+                HWND again = (g_game_pid != 0) ? find_window_of_pid(g_game_pid)
+                           : (g_game_exe_set ? find_game_window(g_game_exe.c_str()) : nullptr);
+                if (again != nullptr && again != game_wnd) {
+                    game_wnd = again;
+                    logf_("[lock] capture: the game window moved -> %p, retrying\n",
+                          (void*)game_wnd);
+                }
+            }
+            item_ok = create_capture_item(game_wnd);
+            if (item_ok) {
+                logf_("[lock] capture item ready after %d retries\n", attempt);
+            }
+        }
+        if (!item_ok) {
+            logf_("[lock] capture item could not be created in 10 s - is the game window"
+                  " capturable (not exclusive fullscreen)?\n");
+            return 7;
+        }
+    }
     adopt_capture_size();
     if (!create_colour_sink(g_width, g_height)) { return 6; }
     if (!init_convert()) { return 9; }

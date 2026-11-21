@@ -6,6 +6,7 @@
 #    BUILD=1 ./lock_frame/release.sh         # 先构建 consumer/producer/fakerFG/ui
 #    VERSION=1.0.0 ./lock_frame/release.sh   # 覆盖 version.h 里的版本号
 #    WITH_XESS=1 ./lock_frame/release.sh     # 把 Intel 运行时一起放进包里
+#    WITH_MFG_ASSETS=1 ./lock_frame/release.sh # 本地包带上 MFG 实验资产（不公开分发）
 #    WITH_THIRD_PARTY=1 ./lock_frame/release.sh  # 源码包也放入本地 third_party 副本
 #
 #  产物：
@@ -119,6 +120,16 @@ cat > "$OUT/docs/TROUBLESHOOTING.md" <<'EOF'
    运行 `collect_diagnostics.bat`，把生成的 zip 发给支持者；它只收集日志、
    版本、系统/显卡/显示模式信息，不联网、不上传。
 EOF
+
+# --- optional MFG experiment assets (local research only) -------------------
+# The 54 portable programs + 7 replacement shaders are derived from Intel's
+# XeSS SDK. They are a local research asset, not part of the public package.
+if [ "${WITH_MFG_ASSETS:-0}" = "1" ]; then
+    [ -d "$REPO/build/xefg_programs" ] || die "missing build/xefg_programs (run scripts/extract_mfgunlocker_assets.py)"
+    say "including local MFG experiment assets (do not redistribute)"
+    cp -a "$REPO/build/xefg_programs" "$OUT/"
+    cp -f "$HERE/xefg_mfg/NOTICE.md" "$OUT/docs/MFG-PORT-NOTICE.md"
+fi
 
 # --- manifest + checksums ----------------------------------------------------
 python3 "$HERE/scripts/write_manifest.py" \

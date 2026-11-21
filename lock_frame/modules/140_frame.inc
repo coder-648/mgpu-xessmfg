@@ -915,7 +915,10 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     //    frame's Present, so this frame only queues the wait.
     // The lookup itself happened before the OF/colour list (see above): a prefetch hit
     // needs no copy, and a miss now uses the flow instead of a fallback copy.
-    const bool cq = (pf_hit || g_of_miss || g_upsample || !pair_ok) ? false : input_copy_begin();
+    // v30: the MV decode is a Dispatch, which a COPY list cannot record, so the codec keeps
+    // the inputs on this list (same reason as --upsample).
+    const bool cq = (pf_hit || g_of_miss || g_upsample || !pair_ok || mv_codec_shared())
+                        ? false : input_copy_begin();
     if (pair_ok && !pf_hit && !g_of_miss) {
         const double m0 = qpc_ms();
         if (g_no_inputs) { ensure_dummy_inputs(slot); } else { copy_inputs_local(slot); }
@@ -1077,12 +1080,21 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
         rd.incomingState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         rd.type = XEFG_SWAPCHAIN_RES_HUDLESS_COLOR;
         if (!g_mv_gate_off) { g_api.D3D12TagFrameResource(g_fg, tag_list, present_id, &rd); }
-    } else if (ui_active) {
+    } else if (ui_active && ui_source_now() == mgpu::kUiSourceGame) {
         rd.resourceSize = { g_ctl->streams[3].width, g_ctl->streams[3].height };
         rd.pResource = g_ui_local[slot].Get();
         rd.incomingState = D3D12_RESOURCE_STATE_COMMON;
         rd.type = XEFG_SWAPCHAIN_RES_UI;
         if (!g_mv_gate_off) { g_api.D3D12TagFrameResource(g_fg, tag_list, present_id, &rd); }
+    } else if (ui_active) {
+        // Hudless-derived UI is only a means to rebuild HUDless; it must never be tagged
+        // as a UI texture (that would freeze scene colour into the overlay).
+        static bool told_derived = false;
+        if (!told_derived) {
+            told_derived = true;
+            logf_("[lock] ui-unblend: source=hudless has no HUDless this frame -"
+                  " UI composition stays off (no UI tag fallback)\n");
+        }
     }
 
     // --dump: record the readback copies in this list, i.e. after everything that
@@ -1443,6 +1455,7 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     // offline. Placed after Present so the resources a dump reads are the exact
     // ones XeSS-FG was tagged with for this present id.
     if (g_dump_frames > 0) { dump_flush(); }
+    if (g_ui_dump_frames > 0) { ui_dump_flush(); }
 
     // Did this frame's GPU work fit inside the interval the game gives us? When the sum
     // exceeds it we cannot consume frames as fast as they arrive, the WGC pool backs up
@@ -1972,6 +1985,20 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
               drops, budget, slow, g_pace_ms, pace_rep, pace_sk,
               mx_gpu, mx_pres, mx_wait, mx_cw, mx_col, mx_in, mx_cq, g_max_of, mx_age, mx_xe,
               mx_fg, mx_tot, mx_gap, x2m);
+        // Codec budget watchdog: the decode runs on THIS GPU, so a machine that is already
+        // saturated pays for it. Switching streams mid-session is impossible (the slot type
+        // is part of the layout), so this only reports and recommends the ini change.
+        if (mv_codec_shared() || depth_codec_shared()) {
+            static int hot_windows = 0;
+            static bool told_hot = false;
+            hot_windows = (budget >= 85.0) ? hot_windows + 1 : 0;
+            if (hot_windows >= 3 && !told_hot) {
+                told_hot = true;
+                logf_("[lock] WARNING: load stayed >=85%% with the fr codec on - this GPU is"
+                      " paying for the decode. Set MvCodec=0 / DepthCodec=0 in fakerFG.ini"
+                      " and restart to fall back to the cross-adapter copy path\n");
+            }
+        }
         // --prefetch-inputs hit/miss for this window (only worth a line when it is on).
         if (g_pf_pub) {
             static UINT s_pf_h = 0, s_pf_m = 0, s_pf_d = 0;

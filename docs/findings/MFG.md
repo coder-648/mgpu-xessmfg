@@ -314,3 +314,106 @@ OptiScaler 的 DynamicMFG 目标是"贴着目标帧率选最小倍数"，那套�
 | `run_mgpu_5k_mfg.bat` | 5K + 4x（含 `--unlock-mfg`） |
 | `temp/check_sites.py` → **`scripts/check_sites.py`** | 逐点比对 DLL 字节的小工具（换版本时先用它） |
 | `docs/findings/FINAL_CONFIG.md` | 运维总文档（开关全集、日志判据） |
+
+---
+
+## 7. x3/x4 实现对照：sm86 的真多帧 vs 我们的 2x 模型复用（2026-11-21）
+
+> **结论**：你的判断基本正确，但更准确的说法不是“把 2x 接口调两次”，而是
+> **解锁补丁让库的多帧循环对每一张生成帧都复用 2x 模型**。sm86 的 3X/4X 走的是
+> model 15 的真多帧（一次光流 + 每个 index 一次合成），两者不是同一条路径。
+
+### 7.1 机制对照
+
+| 维度 | sm86（0.4.2，自研 XeSS-FG 引擎） | 我们（lock_frame / xess_mfg_consumer） |
+|---|---|---|
+| 谁执行生成 | 自己的 D3D12 + CUDA 运行器，在游戏 Evaluate 的命令列表上跑 Intel 模型的移植 | Intel `libxess_fg.dll` 的 swapchain 代理，在它自己的 Present 路径里生成 |
+| 2X 模型 | model 18 | 同一份库里的 2x 模型（model 18 族） |
+| 3X/4X 模型 | **model 15（真多帧）**：每个真实帧跑一次光流（D01–D28），再按 index i 在 `t = i/(N+1)` 各跑一次合成（D29–D44） | **仍然是 2x 模型**：解锁表第 4 点 `fg_keep_2x_model`（`libxess_fg 0x1A5DE4`，`je +9 → jmp +6`）恒跳。**但模型其实就在库里**：MFG-Unlocker 把 model 15 重标记成 16 后，provider 的 MFG 路径就能跑它（`docs/design/TRUE_MFG_OPTIONS.md` §7） |
+| 光流复用 | 一次/真实帧，多个生成帧共享 | 没有“共享光流”这层语义；每张生成帧是一次 2x 模型执行 |
+| 历史 | 自管两组槽：上一帧深度（开 HUD-less 时还有后缓冲），句柄/尺寸/格式/网络源不符都 reset | XeFG 内部历史，我们只能通过 `framesPresented` 观察结果 |
+| 控制面 | 自己的 `MultiFrameIndex`、`Reset`、逐帧 jitter | `SetNumInterpolatedFrames(N)` + 每真实帧 tag MV/depth/constants；动态 MFG 只是改 N |
+| 抖动 MV | 把 `D = (jp − jc)·(1 − t)` 移植进 model 15 的 D31（每个 index 用自己的 t） | 生成仍由 2x 模型做，`JITTERED_MV` 是初始化标志；model 18 支持 jittered，但多帧下 t≠0.5 的修正是否正确未验证 |
+| UI/HUD-less | model 15 会读上一帧后缓冲（开 HUD-less 时），历史按自己的规则；UI 由它合成 | 交给 XeFG 的 composition；UI 流实验与这条路径独立 |
+| 代价 | 3070 离线：4X 1440p 4.5–5.0 ms / 4K 10.3–10.8 ms（每真实帧含生成帧） | 每多一帧就是一次 2x 模型的 GPU 时间；1440p 4x 实测 `gpu` p50 ≈ 17.3 ms（6750 GRE，含拷贝/桥接开销） |
+
+### 7.2 证据链（我们这边）
+
+- `src/xefg_unlock.h:27-44`：第 4 点是“切到 MFG 模型”的谓词；我们的解锁表选择把它强制成恒跳，
+  **每个插值帧复用 2x 模型**。文件里直接写了“quality at 4x is not 2x quality”。
+  注意这不是“模型不存在”：MFG-Unlocker 走的是相反方向——把 donor model 15 重标记成 16，
+  让 provider 的 MFG 路径找到它（见 §7.5）。
+- `docs/findings/MFG.md:33, 50-54`：站点表与代价（模型不存在 → 每帧 2x 模型）。
+- `lock_frame/modules/150_probe_mfg.inc:175-181`（`src/xess_mfg_consumer/modules/probe_mfg.cpp`
+  同一份逻辑）：成功日志明确打
+  `every generated frame uses the 2x model (the MFG model is not in this build)`。
+- 站点 1/2/3/5/6 只是抬上限（`maxSupportedInterpolations 1 → N`、默认 ceiling、
+  live count 不重建）；**没有任何一处引入 model 15**。
+- 副卡是 Intel 时 `apply_unlock_mfg()` 会跳过补丁（`150_probe_mfg.inc:142-147`）：
+  原生 MFG 模型存在，打了反而会把真多帧换成重复 2x——这条注释本身就说明了差别。
+- lock_frame UI 默认 `unlock_mfg = true`（`lock_frame/ui/mgpu_ui.cpp:396`），
+  倍率 > 2 时命令行自动加 `--unlock-mfg`（同文件 `:3150`），所以 3x/4x 发布路径
+  就是这条“2x 模型复用”。
+- 游戏内本地 XeFG（`FgOutput=XeFG`，`faker_fg/backend_xefg.cpp`）**不打这个补丁**：
+  `g_max_interp` 直接取 `GetProperties`，非 Intel 适配器上就是 1 → 本地路径实际只有 2x。
+  3x/4x 只在 consumer 路径成立。
+
+### 7.3 sm86 的 3X/4X 为什么不是同一条路
+
+它的 3X/4X 是**真多帧**：`model 15` 一次光流、每个 index 一次合成，历史与 reset 都是
+自己管；2X 才用 model 18。它甚至为了抖动 MV 单独给 D31 编了 4 个 `jt_` 内核。
+这带来两个直接差异：
+
+1. **画质**：model 15 的多帧合成在遮挡/转视角处比“2x 模型连跑 N 次”更连贯；我们的
+   4x 观感会比原生 2x “稀”（`MFG.md:246`），这是模型复用本身的代价，不是调参能修的。
+2. **算力曲线**：真多帧把光流摊到 N 张上；我们的路径近似“N 次 2x”，所以 3x/4x 的
+   `gpu` 应该更接近线性增长。可以用同一题、同一站位量 2x / 3x / 4x 的 `gpu` 验证：
+   线性 = 我们现在的路径；明显次线性 = 有共享光流。
+3. **抖动 MV**：sm86 的“提供者 3X/4X 拒绝 jittered”说的是 model 15 路径；我们这条
+   被强制成 model 18，**未必会拒绝**，但也不能假设它按每个 index 的 t 正确修正。
+   这条要单独实测（见 `docs/design/MV_JITTERED.md`）。
+
+### 7.4 实际取舍
+
+- 面板 120 Hz、输入能稳 60 fps 时：**2x@60 的画质优于 4x@30**（后者每张生成帧都是
+  2x 模型在非 0.5 相位上的输出）。锁定帧率时优先用 2x，把 4x 留给“输入上不去、
+  又要贴满刷新率”的场景。
+- 要真 MFG 只有三条路：① 消费端用 Intel 卡（原生模型，不补丁）；② 找到一份
+  非 Intel 也能切到真多帧模型的 build（当前 1.3.1.78 没有）；③ 自己移植 model 15
+  ——那是 sm86 那个量级的项目（完整 D3D12+CUDA 运行器），不是参数级改动。
+- 如果继续用当前路径，能做的只有**把代价说清楚**：启动日志已经有“every generated
+  frame uses the 2x model”，建议在 UI 选择 3x/4x 时也显示同一句话（现在只在日志里），
+  避免用户把 4x 的稀疏感当成 bug。
+
+### 7.6 代码对齐（2026-11-21）
+
+已把 `lock_frame` 的 MFG 路径按 MFG-Unlocker 的推荐方式（`PreparePort`）对齐：
+
+- `src/xefg_unlock.h` 的 `Apply()` 新增 `keep2xModel`；`false` 时不再打
+  `fg_keep_2x_model`（5 个站点），与 MFG-Unlocker 的 `Sites(..., keep2xModel=false)` 一致。
+- `lock_frame/xefg_mfg/` 引入 `ModelPort` / `ShaderPort` 的 vendored shim；安装顺序是
+  ShaderPort → ModelPort → 解锁，且必须在第一个 XeFG context 之前。
+- `--mfg-model=port|keep2x`：**默认 keep2x**（3x/4x 复用 2x 模型，CP2077 画质更好）；
+  `port` 是显式实验入口，缺 54 个程序资产/布局不符/vendor 不符时回退 keep2x 并打
+  `model_port_rejected`。
+- 54 个 `programs/<key>.dxil` + `programs.tsv` 与 7 个 `shaders/<name>.dxil` 放在
+  `<exe>\xefg_programs\`；`scripts/extract_mfgunlocker_assets.py` 可从
+  `third_party/MFGUnlocker-v1.7.1/MFGUnlocker.dll` 提取（输出 `build/xefg_programs`，
+  `.gitignore` 已忽略该目录）。
+
+实机 probe（RX 6750 GRE / libxess_fg 1.3.1.78）已通过：`programs=54`、
+`replacements=5`（AMD 保留两个 Intel U-Net）、`ModelPort edits=167`、5 站点解锁、
+`maxSupportedInterpolations 3 -> 4x`，退出时正常 restore。
+
+实机游戏（CP2077，RTX 3080 Ti 渲染 + RX 6750 GRE 消费，4K 无边框，
+`--overlay-layered --wgc-minint 0`）：
+- **3x**：`maxSupportedInterpolations=2`、`xN=3.00`、`show=120`、`skip=0`、load 30%；
+- **4x**：`maxSupportedInterpolations=3`、`xN=4.00`、`show=118–120`、`skip=0–3`、load 77–87%，
+  `total 26ms / 33.3ms`；
+- 两档都没有 `xefg error`/HITCH，日志有 `shader_native_lookup`/`shader_supplied`。
+真多帧（model 15→16）已在游戏中成立；但 CP2077 的观感 A/B 显示 2x 干净、
+4x_keep2x 仅有 UI 拖影和少量边缘伪影，而 4x true model 的边缘伪影明显更严重。
+`--fg-use-matrix`、`--no-upsample`、jitter/scene 调整都没有改善，因此默认回到
+keep2x，true model 只保留为 `run_3x_true_model.bat` / `run_4x_true_model.bat` 实验入口。
+
+详见 `docs/design/TRUE_MFG_OPTIONS.md` §8。

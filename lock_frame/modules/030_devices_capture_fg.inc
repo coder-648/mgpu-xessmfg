@@ -198,9 +198,27 @@ static bool init_devices(IDXGIAdapter1* adapter)
         logf_("[lock] ID3D11Device5/Context4 unavailable\n");
         return false;
     }
+    // --d3d-debug: turn on the D3D12 debug layer for OUR device and keep an InfoQueue, so an
+    // invalid call on the shared (cross-adapter) resources prints its real message instead
+    // of only "device removed". Needs the Graphics Tools feature; a failure is not fatal.
+    if (g_d3d_debug) {
+        ComPtr<ID3D12Debug> dbg;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) {
+            dbg->EnableDebugLayer();
+            logf_("[lock] --d3d-debug: D3D12 debug layer enabled\n");
+        } else {
+            logf_("[lock] --d3d-debug: D3D12GetDebugInterface FAILED (Graphics Tools not"
+                  " installed?) - continuing without validation\n");
+        }
+    }
     if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_device)))) {
         logf_("[lock] D3D12CreateDevice FAILED\n");
         return false;
+    }
+    if (g_d3d_debug) {
+        if (SUCCEEDED(g_device->QueryInterface(IID_PPV_ARGS(&g_info_q)))) {
+            logf_("[lock] --d3d-debug: InfoQueue attached (messages go to this log)\n");
+        }
     }
 
     D3D12_COMMAND_QUEUE_DESC qd{};

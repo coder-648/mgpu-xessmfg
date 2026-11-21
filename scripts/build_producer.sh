@@ -37,16 +37,25 @@ if [ -d "$SRC_DIR/shaders" ]; then
     shader_specs=(
         "downsample_mv:cs_5_0:CSMain:DownsampleMV"
         "downsample_depth:cs_5_0:CSMain:DownsampleDepth"
+        # lossless MV/depth codec (docs/design/LOSSLESS_TRANSPORT.md sections 6.1/14.3).
+        # Both entry points come from one file; the host sizes slots from the raw
+        # worst case (4 + 256*NW*4 bytes per tile) and reads TileLen[] for the rest.
+        "fr_codec:cs_5_0:Encode:FrEncode"
+        "fr_codec:cs_5_0:Decode:FrDecode"
     )
     for spec in "${shader_specs[@]}"; do
         base="${spec%%:*}"; rest="${spec#*:}"
         profile="${rest%%:*}"; rest="${rest#*:}"
         entry="${rest%%:*}"; symbol="${rest##*:}"
         hlsl="$SRC_DIR/shaders/${base}.hlsl"
+        # the codec is shared with the consumer, so it lives outside this component
+        [ "$base" = "fr_codec" ] && hlsl="$REPO_WSL/src/shaders/fr_codec.hlsl"
         out="${base}_${entry}"
         case "$symbol" in
             DownsampleMV)    out="downsample_mv" ;;
             DownsampleDepth) out="downsample_depth" ;;
+            FrEncode)        out="fr_encode" ;;
+            FrDecode)        out="fr_decode" ;;
         esac
         [ -f "$hlsl" ] || { echo "[build] missing shader $hlsl"; exit 1; }
         "$FXC_WIN" -nologo -T "$profile" -E "$entry" \
