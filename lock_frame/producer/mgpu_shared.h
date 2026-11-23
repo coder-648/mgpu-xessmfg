@@ -109,7 +109,10 @@ inline constexpr uint32_t kSharedMagic   = 0x55475047u;   // 'GPUM'
 //      texture: when the title has no UI tag we send a downsampled HUDless frame
 //      instead and the consumer synthesises the UI from present - hudless before
 //      the unblend. Both sides must agree on what stream 3 means.
-inline constexpr uint32_t kSharedVersion = 30;
+// v31: stream 3 can also carry a **full-resolution UI synthesised on the render card**
+//      (kUiSourceSynth), and the colour stream is retired (WGC is the only colour path).
+//      Layout is unchanged; the version bump rejects mixed binaries.
+inline constexpr uint32_t kSharedVersion = 32;
 
 // The mapping is created once, at a size that fits the largest stream we support
 // (see kStreamMaxW/H), so a layout rebuild never has to recreate it - that would
@@ -181,21 +184,22 @@ inline constexpr uint32_t kRequestMeta  = 1u << 4;  // camera/matrix/jitter meta
 // trades main-GPU time for cross-adapter bytes: MV +51 MB/frame, depth +14.8 MB/frame.
 inline constexpr uint32_t kRequestRawMv    = 1u << 5;
 inline constexpr uint32_t kRequestRawDepth = 1u << 6;
+inline constexpr uint32_t kRequestHudless = 1u << 7; // clean HUDless colour (stream 4)
 inline constexpr uint32_t kRequestAll   = 0x1Fu;
 inline constexpr uint32_t kRequestAllV15 = 0x7Fu;
 
 // v29: what stream 3 actually carries. Game = the title's UI-only texture (RGB+alpha);
 // Hudless = a downsampled HUD-less scene, from which the consumer synthesises UI before
-// unblending; Off = no stream 3. The producer writes it, the consumer reads it.
-//
-// ===================== UI_SYNTHESIS_GATE: CLOSED =====================
-// Keep this gate closed until the title ALWAYS supplies a valid UI stream by
-// default (not only on some frames/menus). The current release sends no stream 3
-// and uses UiSource=Off. See docs/UI_SYNTHESIS_GATE.md before reopening.
+// unblending; **Synth (v31) = UI synthesised on the render card from (backbuffer, HUDless)
+// at full resolution**, so the consumer treats stream 3 exactly like Game (unblend only);
+// Off = no stream 3. The producer writes it, the consumer reads it.
+// UI_SYNTHESIS_GATE: CLOSED. Do not enable stream 3 until the title always
+// supplies a valid UI stream by default. See docs/UI_SYNTHESIS_GATE.md.
 inline constexpr bool kUiSynthesisGateOpen = false;
 inline constexpr uint32_t kUiSourceOff     = 0;
 inline constexpr uint32_t kUiSourceGame    = 1;
 inline constexpr uint32_t kUiSourceHudless = 2;
+inline constexpr uint32_t kUiSourceSynth   = 3;   // v31: render-card full-res synth
 
 // ---- v11: measured semantics (FrameShared.semantics) --------------------------------
 // Packed so the whole verdict fits in one word. `Measured` tells the consumer whether the
@@ -257,11 +261,10 @@ inline constexpr uint32_t kStreamMv     = 1;
 inline constexpr uint32_t kStreamDepth  = 2;
 inline constexpr uint32_t kStreamUi     = 3;
 
-// v17 reserved a 16x16 R10 tile per publication for the pre-marker patch. From v22 the
-// marker mechanism is gone with WGC (slot identity replaces it), so this stream is no
-// longer laid out or published. The constant stays so the StreamShared array keeps its
-// historical indices.
-inline constexpr uint32_t kStreamScar = 4;
+// v32: stream 4 carries a clean full-resolution HUDless (R10 PQ). It reuses the slot that
+// was reserved for the retired marker/scar stream.
+inline constexpr uint32_t kStreamHudless = 4;
+inline constexpr uint32_t kStreamScar    = kStreamHudless;   // legacy alias
 inline constexpr uint32_t kScarSide   = 16u;
 
 // Marker geometry: a 32-bit SHORT SNOWFLAKE code is SPLIT over FOUR 6x6 blocks, one
@@ -375,7 +378,10 @@ struct StreamShared
     uint32_t width;
     uint32_t height;
     uint32_t format;        // DXGI_FORMAT
-    uint32_t _pad;
+    // v31: stream 3 only. bit0 = UI was synthesised on the render card (derived),
+    // bit1 = UI RGB is premultiplied, bits 2.. = reserved. The consumer uses this to
+    // decide between mode 5 and mode 4 for a derived UI.
+    uint32_t ui_flags;
     uint64_t offset;        // byte offset of slot 0 inside the mapping
     uint64_t slot_size;     // bytes per slot (64 KB aligned)
     // v9: the placed resource is always this big; the live content sits in its top-left
@@ -387,12 +393,18 @@ struct StreamShared
     // back to even when the pair is consistent; the consumer retries while it is odd or
     // changed underneath it, so it can never mix an old width with a new height.
     uint32_t seq;
-    uint32_t _pad_v10;
+    // v31: number of shared slots placed for THIS stream (0 = kMaxSlots). MV/depth keep 32;
+    // UI can use a shorter ring (UiSlots, default 8) because only its content is large.
+    // The publication slot is global; a stream with fewer slots uses `pub_slot % slots`.
+    uint32_t slots;
     // v30: payload kind. 0 = pixels (texture slots, today's path). 1 = fr-codec bytes
     // (docs/design/LOSSLESS_TRANSPORT.md): slot_size is then the byte buffer size and
     // slot_w/slot_h stay the *content* capacity, so TileLen[]/tile counts are derivable.
     uint32_t codec;
-    uint32_t _pad_v30;
+    // v31: stream 3 only. Coverage of the render-card synth mask, in basis points
+    // (1/10000 of the frame), updated at most once per second. 0xFFFFFFFF = not sampled
+    // yet (mode 5 is then allowed for a forced derived UI).
+    uint32_t ui_quality;
 };
 
 // Per-slot frame record, written by the producer just before it signals the

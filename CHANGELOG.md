@@ -3,6 +3,70 @@
 只记**用户能感知**的变化与对应实测依据。每条结论的原始数据在
 `docs/findings/PERF_BASELINE.md` / `FINAL_CONFIG.md`。
 
+### release: lock_frame 1.2.9（2026-11-23）—— 1.2.7 之后的性能批 + UI 合成实验性关闭 + fakerFG.ini 两版
+
+发布说明见 `lock_frame/docs/RELEASE_NOTES_1.2.9.md`。协议仍 **v32**，默认 `keep2x` 不变。
+
+- **UI 合成改回实验性、发布默认关闭**：发布 `fakerFG.ini` 为 `UiStream=0` / `UiSource=Off`，
+  UI 的「UI 合成（HUDless，实验性）」默认「关闭」，`check_release.py` 也要求发布 ini
+  必须是关的。需要 A/B 时手动打开（打开后仍走 mode 5；`--no-ui-mode5` 回 mode 4）。
+- **无论 UI 来源（游戏 tag / render-card 派生），只要 HUDless 与全分辨率 UI 同时可用就
+  一起 tag**，XeFG AUTO 选 `BACKBUFFER_HUDLESS_UITEXTURE`（mode 5）。CP2077 4K/3x 的
+  A/B：派生 UI 在 mode 5 下 UI 周边拖影消失——mode 5 把我们的 UI 合成回 HUDless
+  （`U + (1−a)H' = P`），抵消了 mode 4 里 `(P−U)/(1−a)` 在边缘的放大。
+- **移除派生 UI 的旧覆盖率门（50..6000 bp）**：空 UI 在 mode 5 里合成回 HUDless，无害。
+- `ui_full_res` 仍是硬条件（XeFG 要求 HUDless/UI/backbuffer 同 `resourceSize`）；
+  半分辨率 UI（`UiFullRes=0`）自动退回 mode 4。
+- `--no-ui-mode5` 保留为回退；`--ui-mode5` / `--ui-mode5-auto` 语义不变（0/1 都表示允许）。
+- 日志：`ui: mode 5 (HUDless + UI), source=... coverage=... bp`；unblend pass 的启动行不再写
+  “B mode 4”，改为 “feeds mode 5, mode 4 with --no-ui-mode5”。
+- **fakerFG.ini 拆成两版**：`fakerFG.ini` 为发布精简版（只保留常用键）；
+  `fakerFG.full.ini` 为测试全参数版（含 `UiAlpha8` / `UiDilate` / `HudlessStream` /
+  `UiSynthDump` / 诊断与内部键）。UI「高级设置 → 游戏侧配置 → 配置版本」可切换：
+  切换会先备份、再覆盖游戏目录的 `fakerFG.ini`（producer 每会话只读一次，重启生效）；
+  首次部署按所选版本放入模板。`scripts/check_release.py` 现在要求两版都在包里。
+- **FgInput 固定 DLSSG**：本版只实现 Streamline tag 车道。ini 写 `NVNGX` / `Upscaler` /
+  `FSR` 会被代码强制回 `DLSSG`（`FgInput=NoFG` 仍是显式禁用）；UI 不再暴露输入源下拉，
+  固定写 `FgInput=DLSSG`，游戏配置检查会提示非 DLSSG 的旧文件。
+
+### local: lock_frame 1.2.9 初版 —— 把 1.2.8 的性能配置接到 UI（2026-11-23，已被上面的重打包取代）
+
+发布说明见 `lock_frame/docs/RELEASE_NOTES_1.2.9.md`。协议仍 **v30**、默认值不变
+（`DepthCodecPercent=150`、`UiStream=1`）。
+
+- **UI 现在会写这一轮的键**：「高级设置 → 游戏侧配置」新增 **深度码流（无损）** 100/150/200
+  与 **UI 合成（HUDless）** 关/自动；点「安装 / 应用配置」时写进游戏目录
+  `DepthCodecPercent`、`MvCodecPercent=100`、`CodecStreamPercent=100`、`UiStream`、
+  `UiSource`、`UiFullRes=1`、`UiSparseCodec=1`。两项按游戏持久化（`depth_pct` / `ui_compose`），
+  并从游戏 ini 读回显示。
+- **修复：UI 启动命令从不打开 UI 合成**。消费端的 `g_ui_unblend` 只由命令行打开，而 UI 生成的
+  命令一直是 `--streams=mv,depth` 且不带 `--ui-source` ⇒ producer 白发布 stream 3
+  （白付 0.8 ms/帧）、消费端从不 unblend、HUD 照旧残影。现在 UI 合成开时命令为
+  `--streams=mv,depth,ui --ui-source auto`，关时两者都不给（也不白占 UI 槽）。
+- 其余同 1.2.8：depth 150% 省 1.26 ms/帧与 5.3 MB/帧（MV 仍比特精确）、sparse unblend、
+  UI 本地纹理 1.06 GB → 265 MB、`ProfGpu`/`FrCodecAblate`/`--run-sec` 测量工具（默认关）。
+
+### local: lock_frame 1.2.8 —— 性能收尾 + UI 合成转默认（2026-11-23，未单独发布，已并入 1.2.9）
+
+发布说明见 `lock_frame/docs/RELEASE_NOTES_1.2.8.md`。协议仍 **v30**、`MgpuFgFrame` 布局不变、
+模型仍是 **keep2x**。两处默认值改变：`DepthCodecPercent=150`、`UiStream=1`。
+
+- **depth 走 150%（MV 仍比特精确）**：新增 `MvCodecPercent`/`DepthCodecPercent` 按流覆盖。
+  实测 CP2077 4K/3x@40：depth 编码 2.05 → **0.79 ms（−61%）**、码流 10.8 → **5.56 MB（−49%）**、
+  链路 16.8 → **11.6 MB/帧**，MV 一字未改，`presents 961/962`、`HITCH=0`。
+  依据：`docs/design/PERF_OPT_2026-11-23.md` §7.3。
+- **UI 合成（HUDless / mode 4）转默认开启**：插值帧的 HUD 不再残影；代价 ≈0.8 ms/帧
+  （synth 0.20 + UI encode 0.61）。没有 HUDless/UI 平面的标题自动退化。
+- **sparse unblend**：按 UI codec 的 tile 头派生占用表（`shaders/ui_occ.hlsl`，130 KB/帧，
+  协议不变），空 32×8 tile 直接写 `present`，不再采样 UI / 跑两次 PQ。
+  帧率无可测差异（消费端余量 ~88%），消费端 `--no-sparse-unblend` 可 A/B。
+- **UI 本地纹理按 UI 槽位建**：4K 全分辨率 32 张 → 8 张，≈**1.06 GB → 265 MB**。
+- **新测量工具（默认关）**：`ProfGpu=1` 每 pass GPU 时间戳（`prof:` 行）、
+  `FrCodecAblate=1|2|3` 编码器消融、`--run-sec N` 定时退出、`DepthFp16=1`（有损，默认关）。
+  三者每秒重读 ini，改完不用重启。
+- **修正**：marker 探测由每帧 2–3 次系统调用改为 1 s 缓存；`capture=`/`g_frame_ms_ema`
+  改 QPC（原来被 15.6 ms 量化）；Dispatch 合法性加发 list 类型判断。
+
 ### release: lock_frame 1.2.7 —— 输入侧正确性 + OptiScaler 逐游戏适配（2026-11-22）
 
 发布说明见 `lock_frame/docs/RELEASE_NOTES_1.2.7.md`。协议仍 **v30**、`MgpuFgFrame` 布局与

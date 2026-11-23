@@ -77,6 +77,18 @@ build_consumer() {
     python3 "$REPO/scripts/embed_cso.py" "$stage/fr_encode32.cso" \
         "$stage/fr_encode32_cso.h" "FrEncodeD32" \
         || { echo "[build] embed failed for fr_encode32"; return 1; }
+    # UI variants (P2): typed R10G10B10A2 / RGBA8 pixels packed to one u32 per pixel.
+    for spec in "UIFMT_R10:fr_decode_ui_r10:FrDecodeUiR10" \
+                "UIFMT_RGBA8:fr_decode_ui_rgba8:FrDecodeUiRgba8"; do
+        IFS=: read -r def out sym <<< "$spec"
+        "$FXC_WIN" -nologo -T cs_5_0 -E Decode -D "$def" \
+            -Fo "$(wslpath -w "$stage/$out.cso")" \
+            "$(wslpath -w "$HERE/shaders/fr_codec.hlsl")" \
+            || { echo "[build] fxc failed for $out"; return 1; }
+        python3 "$REPO/scripts/embed_cso.py" "$stage/$out.cso" \
+            "$stage/${out}_cso.h" "$sym" \
+            || { echo "[build] embed failed for $out"; return 1; }
+    done
 
     python3 "$REPO/scripts/extract_hlsl.py" "$HERE/modules/050_shaders.inc" \
         "$stage/conv_check.hlsl" || { echo "[build] could not extract k_conv_hlsl"; return 1; }
@@ -105,6 +117,17 @@ build_consumer() {
         "$stage/synth_ui_cso.h" "SynthUI" \
         || { echo "[build] embed failed for synth_ui"; return 1; }
 
+    # Sparse unblend: per-tile UI occupancy derived from the codec headers (no protocol
+    # change). One 4-byte word per 32x8 tile; the unblend writes `present` for empty tiles
+    # instead of sampling UI and running the PQ math.
+    "$FXC_WIN" -nologo -T cs_5_0 -E CSMain \
+        -Fo "$(wslpath -w "$stage/ui_occ.cso")" \
+        "$(wslpath -w "$HERE/shaders/ui_occ.hlsl")" \
+        || { echo "[build] fxc failed for ui_occ"; return 1; }
+    python3 "$REPO/scripts/embed_cso.py" "$stage/ui_occ.cso" \
+        "$stage/ui_occ_cso.h" "UiOcc" \
+        || { echo "[build] embed failed for ui_occ"; return 1; }
+
     ( cd "$stage" && cmd.exe /c build.bat "$REPO_WIN" > build.log 2>&1 )
     local rc=$?
     echo "[build] cl exit code: $rc"
@@ -126,10 +149,19 @@ build_producer() {
     for spec in "downsample_mv:cs_5_0:CSMain:DownsampleMV:downsample_mv" \
                 "downsample_depth:cs_5_0:CSMain:DownsampleDepth:downsample_depth" \
                 "downsample_ui:cs_5_0:CSMain:DownsampleUI:downsample_ui" \
+                "synth_ui_full:cs_5_0:CSMain:SynthUiFull:synth_ui_full" \
                 "fr_codec:cs_5_0:Encode:FrEncode:fr_encode" \
                 "fr_codec:cs_5_0:Decode:FrDecode:fr_decode" \
                 "fr_codec:cs_5_0:Encode:FrEncodeD32:fr_encode32:-D DEPTH32" \
-                "fr_codec:cs_5_0:Decode:FrDecodeD32:fr_decode32:-D DEPTH32"; do
+                "fr_codec:cs_5_0:Encode:FrEncodeD32Fp16:fr_encode32_fp16:-D DEPTH32 -D DEPTH_FP16" \
+                "fr_codec:cs_5_0:Decode:FrDecodeD32:fr_decode32:-D DEPTH32" \
+                "fr_codec:cs_5_0:Encode:FrEncodeUiR10:fr_encode_ui_r10:-D UIFMT_R10" \
+                "fr_codec:cs_5_0:Encode:FrEncodeUiRgba8:fr_encode_ui_rgba8:-D UIFMT_RGBA8" \
+                "fr_codec:cs_5_0:Encode:FrEncodeUiR10Sparse:fr_encode_ui_r10_sparse:-D UIFMT_R10 -D UI_SPARSE" \
+                "fr_codec:cs_5_0:Encode:FrEncodeUiRgba8Sparse:fr_encode_ui_rgba8_sparse:-D UIFMT_RGBA8 -D UI_SPARSE" \
+                "fr_codec:cs_5_0:Encode:FrEncodeAblateScan:fr_encode_ablate_scan:-D ABLATE_SCAN" \
+                "fr_codec:cs_5_0:Encode:FrEncodeAblateAtomics:fr_encode_ablate_atomics:-D ABLATE_ATOMICS" \
+                "fr_codec:cs_5_0:Encode:FrEncodeAblateLoads:fr_encode_ablate_loads:-D ABLATE_LOADS"; do
         IFS=: read -r base prof entry sym out extra <<< "$spec"
         # fr_codec is shared with the consumer, so it lives in lock_frame/shaders/
         local hlsl="$HERE/producer/shaders/$base.hlsl"
@@ -151,7 +183,7 @@ if not exist obj mkdir obj
 cl /nologo /std:c++17 /EHsc /O2 /MD /W3 /utf-8 /permissive- ^
   /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX /I"%~dp0." /I"%REPO%\src" /I"%REPO%\src\faker_fg" ^
   "%~dp0producer.cpp" /Fe:xess_mfg_producer.dll /Fo:obj\ ^
-  /link /DLL d3d12.lib dxgi.lib
+  /link /DLL /MAP:xess_mfg_producer.map d3d12.lib dxgi.lib
 if errorlevel 1 exit /b 1
 exit /b 0
 BAT
@@ -174,6 +206,7 @@ build_faker() {
                 "render_ui_pm:ps_5_0:PSMain:RenderUiPmPS" \
                 "hudless_compare:ps_5_0:PSMain:HudlessComparePS" \
                 "hud_copy:cs_5_0:CSMain:HudCopy" \
+                "hudless_to_pq:cs_5_0:CSMain:HudlessToPQ" \
                 "marker:ps_5_0:PSMain:MarkerPS"; do
         IFS=: read -r base prof entry sym <<< "$spec"
         local out="${base}_${entry}"

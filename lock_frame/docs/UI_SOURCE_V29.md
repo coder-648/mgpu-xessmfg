@@ -1,5 +1,9 @@
 # UI 流 v29：有 UI 用 UI，没有 UI 用 HUDless 自造
 
+> **2026-11-23 更新**：UI 合成是**实验性**，发布默认关闭（`UiStream=0` / `UiSource=Off`）。
+> 手动打开时，消费端把 HUDless 和 UI 一起 tag，XeFG 选 **mode 5**（`--no-ui-mode5` 才回退
+> mode 4）。下面描述的数据流不变，只是最后的 tag 组合变了。
+
 > 状态：代码已落地，默认关闭；需要显式打开 `UiStream=1` + `--ui-unblend`。
 > 目的只有一个：**消除 XeFG 插值时的 UI 拖影**（插值在 HUDless 上做，UI 从全分辨率
 > backbuffer 提取）。

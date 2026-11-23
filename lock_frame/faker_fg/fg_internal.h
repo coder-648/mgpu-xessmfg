@@ -108,6 +108,14 @@ struct Config
     int     fg_hud_cutoff      = 0;      // /10 -> DiffThreshold, like OptiScaler
     int     fg_hudless_compare = 0;
     int     ui_premultiplied = 0;           // 1 = the UI texture is already premultiplied
+    // v4 experiment: run the UI synth on the HUDless tag's command list and skip the
+    // full-resolution HUDless snapshot. Default off: inserting the dispatch/barriers into
+    // the title's list perturbs its render queue, and the tag-time P is not always the
+    // final composed frame.
+    int     ui_tag_synth = 0;
+    // 1 = convert the FP16 HUDless snapshot to R10 PQ (halves the snapshot + later H
+    // reads). 0 = the old exact FP16 copy, for A/B.
+    int     ui_snapshot_pq = 0;
     int     tag_hudless     = 0;            // tag DLSSG.HUDLess as the colour source
     // Send the backbuffer tag (which is also the only carrier of the interpolation rect in
     // this API version) in the Upscaler lane too. 1 = send, 0 = OptiScaler's
@@ -225,6 +233,10 @@ void install_crash_log();
 // the FG chain.
 void producer_link_start();
 void producer_present(void* queue);
+// v4: tag-time UI synth. Records the producer's synth on `cmd` while the HUDless tag is
+// still valid; returns true when the next record can reuse it (no snapshot copy).
+bool producer_ui_tag(void* cmd, void* backbuffer, uint32_t backbuffer_state,
+                     void* hudless, uint32_t hudless_state);
 
 // ---------------------------------------------------------------- lifecycle
 // Loader work starts on our own thread: DllMain must not LoadLibrary anything
@@ -378,6 +390,11 @@ bool pass_marker(ID3D12CommandList* list, ID3D12Resource* sc_buffer,
 // (pass_norm_tile is gone with the scar tile transport)
 bool pass_hud_copy(ID3D12CommandList* list, ID3D12Resource* hudless, ID3D12Resource* present,
                    uint32_t hudless_state, uint32_t present_state, float threshold);
+// v4: convert an FP16 scRGB HUDless snapshot to R10 PQ on the tag list. Used by
+// snapshot_hudless so the UI synth reads 33 MB instead of 66 MB of H per frame.
+bool pass_hudless_to_pq(ID3D12CommandList* list, ID3D12Resource* hudless,
+                        uint32_t hudless_state, ID3D12Resource* out_r10,
+                        UINT w, UINT h);
 // The UI resource the title declared (FGDrawUIOverFG).
 void xefg_set_dlssg_ui(void* resource, uint32_t state);
 // The upscaler lane's real colour resource (g_sr.color), used for the marker

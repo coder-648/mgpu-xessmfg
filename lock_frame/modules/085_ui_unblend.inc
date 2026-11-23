@@ -1,7 +1,7 @@
 // ============================================================================
 //  lock_frame module: 085_ui_unblend.inc
 //
-//  B mode 4: consumer-side UI unblend.
+//  UI unblend: consumer-side reconstruction of the HUDless base.
 //
 //  The colour that arrives through WGC is the presented backbuffer (UI included). The
 //  producer transports one downsampled stream 3:
@@ -22,9 +22,9 @@
 //  Included by lock_frame/lock_frame.cpp after 080 (make_srv/make_uav/up_transition).
 // ============================================================================
 
-static ComPtr<ID3D12RootSignature> g_unblend_rs;
-static ComPtr<ID3D12PipelineState> g_unblend_pso;
-static ComPtr<ID3D12PipelineState> g_synth_pso;
+static ComPtr<ID3D12RootSignature> g_unblend_rs;   // 3 SRVs (present, UI, occupancy) + 1 UAV
+static ComPtr<ID3D12PipelineState>  g_unblend_pso;
+static ComPtr<ID3D12PipelineState>  g_synth_pso;
 static ComPtr<ID3D12DescriptorHeap> g_unblend_heap;
 
 // A small ring, not one texture per publication slot: 32 x 4K R10 would be ~1 GB. Four
@@ -46,6 +46,10 @@ static D3D12_RESOURCE_STATES  g_synth_state[kUnblendRing] = {
     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON };
 static UINT g_synth_w = 0, g_synth_h = 0;
 static UINT g_synth_ring_i = 0;
+// The UI resource the unblend actually consumed this frame (game UI / decoded synth UI /
+// legacy synth ring). --tag-dump reads this instead of assuming g_ui_local[slot].
+static ID3D12Resource*        g_ui_used_current = nullptr;
+static D3D12_RESOURCE_STATES  g_ui_used_state = D3D12_RESOURCE_STATE_COMMON;
 
 // v29 visual reference dump: --ui-dump N writes the synthesized UI (RGB / alpha /
 // composited over a checker) as BMP files. This is a debugging aid only; it records a
@@ -71,58 +75,71 @@ static bool ensure_unblend_objects()
 {
     if (g_unblend_rs && g_unblend_pso && g_synth_pso && g_unblend_heap) { return true; }
 
-    D3D12_DESCRIPTOR_RANGE ranges[2]{};
-    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    ranges[0].NumDescriptors = 2;                 // present, UI
-    ranges[0].BaseShaderRegister = 0;
-    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    ranges[1].NumDescriptors = 1;                 // HUDless
-    ranges[1].BaseShaderRegister = 0;
+    // ONE root signature for both passes. The SRV table always carries three entries
+    // (t0 present, t1 UI, t2 occupancy) because the unblend shader declares all three - a
+    // shader may not reference a register the root signature does not describe, or
+    // CreateComputePipelineState fails. That is exactly what happened when the sparse pass
+    // was bolted onto the old 2-SRV signature: the whole UI path stopped initialising
+    // ("unblend pipeline/ring init failed" every frame) and nobody noticed until the
+    // consumer was run with --ui-source auto. The synth shader uses only t0/t1 and the
+    // plain unblend runs with Sparse=0, so t2 just carries a valid 1-word buffer there.
+    auto make_rs = [](UINT srv_count, ComPtr<ID3D12RootSignature>& out) -> bool {
+        D3D12_DESCRIPTOR_RANGE ranges[2]{};
+        ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[0].NumDescriptors = srv_count;         // present, UI[, Occ]
+        ranges[0].BaseShaderRegister = 0;
+        ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        ranges[1].NumDescriptors = 1;                 // HUDless
+        ranges[1].BaseShaderRegister = 0;
 
-    D3D12_ROOT_PARAMETER p[3]{};
-    p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    p[0].Constants.ShaderRegister = 0;
-    p[0].Constants.Num32BitValues = 8;            // DstW/DstH/UiW/UiH + 4 floats
-    p[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    p[1].DescriptorTable.NumDescriptorRanges = 1;
-    p[1].DescriptorTable.pDescriptorRanges = &ranges[0];
-    p[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    p[2].DescriptorTable.NumDescriptorRanges = 1;
-    p[2].DescriptorTable.pDescriptorRanges = &ranges[1];
-    p[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_PARAMETER p[3]{};
+        p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        p[0].Constants.ShaderRegister = 0;
+        p[0].Constants.Num32BitValues = 8;            // DstW/DstH/UiW/UiH + 4 floats
+        p[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[1].DescriptorTable.NumDescriptorRanges = 1;
+        p[1].DescriptorTable.pDescriptorRanges = &ranges[0];
+        p[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        p[2].DescriptorTable.NumDescriptorRanges = 1;
+        p[2].DescriptorTable.pDescriptorRanges = &ranges[1];
+        p[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
-    D3D12_STATIC_SAMPLER_DESC smp{};
-    smp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-    smp.AddressU = smp.AddressV = smp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    smp.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
-    smp.MaxLOD = D3D12_FLOAT32_MAX;
-    smp.ShaderRegister = 0;
-    smp.RegisterSpace = 0;
-    smp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_STATIC_SAMPLER_DESC smp{};
+        smp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        smp.AddressU = smp.AddressV = smp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        smp.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+        smp.MaxLOD = D3D12_FLOAT32_MAX;
+        smp.ShaderRegister = 0;
+        smp.RegisterSpace = 0;
+        smp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
-    D3D12_ROOT_SIGNATURE_DESC rs{};
-    rs.NumParameters = 3;
-    rs.pParameters = p;
-    rs.NumStaticSamplers = 1;
-    rs.pStaticSamplers = &smp;
-    rs.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+        D3D12_ROOT_SIGNATURE_DESC rs{};
+        rs.NumParameters = 3;
+        rs.pParameters = p;
+        rs.NumStaticSamplers = 1;
+        rs.pStaticSamplers = &smp;
+        rs.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
 
-    ComPtr<ID3DBlob> sig, err;
-    const HRESULT shr = D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1,
-                                                    &sig, &err);
-    if (FAILED(shr) || !sig) {
-        logf_("[lock] ui-unblend: root signature FAILED hr=0x%08lX\n",
-              static_cast<unsigned long>(shr));
-        return false;
-    }
-    if (FAILED(g_device->CreateRootSignature(0, sig->GetBufferPointer(),
-                                             sig->GetBufferSize(),
-                                             IID_PPV_ARGS(&g_unblend_rs)))) {
-        logf_("[lock] ui-unblend: CreateRootSignature FAILED\n");
-        return false;
-    }
+        ComPtr<ID3DBlob> sig, err;
+        const HRESULT shr = D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1,
+                                                        &sig, &err);
+        if (FAILED(shr) || !sig) {
+            logf_("[lock] ui-unblend: root signature FAILED hr=0x%08lX\n",
+                  static_cast<unsigned long>(shr));
+            return false;
+        }
+        if (FAILED(g_device->CreateRootSignature(0, sig->GetBufferPointer(),
+                                                 sig->GetBufferSize(),
+                                                 IID_PPV_ARGS(&out)))) {
+            logf_("[lock] ui-unblend: CreateRootSignature FAILED\n");
+            return false;
+        }
+        return true;
+    };
+
+    if (!g_unblend_rs && !make_rs(3, g_unblend_rs)) { return false; }
 
     D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = g_unblend_rs.Get();
@@ -143,17 +160,18 @@ static bool ensure_unblend_objects()
 
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    // 0..2 = synth (present, HUDless, UI), 3..5 = unblend (present, UI, HUDless).
-    // Separate regions are required: descriptors are read at execution time, so reusing
-    // the same three slots in one command list would let the second dispatch overwrite
-    // what the first one sees.
-    hd.NumDescriptors = 6;
+    // 0..3 = synth (present, HUDless, occupancy, UI UAV)
+    // 4..7 = unblend (present, UI, occupancy, HUDless UAV)
+    // Separate regions are required: descriptors are read at execution time, so reusing the
+    // same slots in one command list would let a later dispatch overwrite what an earlier
+    // one sees.
+    hd.NumDescriptors = 8;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_unblend_heap)))) {
         logf_("[lock] ui-unblend: descriptor heap FAILED\n");
         return false;
     }
-    logf_("[lock] ui-unblend: UI -> HUDless pass ready (B mode 4)\n");
+    logf_("[lock] ui-unblend: UI -> HUDless pass ready (feeds mode 5, mode 4 with --no-ui-mode5)\n");
     return true;
 }
 
@@ -468,12 +486,207 @@ static void ui_dump_flush()
     logf_("[lock] ui-dump complete (%d frame(s)) -> %s\n", g_ui_dump_frames, g_ui_dump_dir);
 }
 
+// ---- sparse unblend: per-32x8-tile UI occupancy ------------------------------
+// The sparse UI codec writes a 4-word header per tile and mode 3 means "empty". The
+// consumer derives one flag per tile from those headers (shaders/ui_occ.hlsl) and the
+// unblend then writes `present` for empty tiles instead of sampling UI and running two PQ
+// pow chains. Measured UI coverage on CP2077 is 6.4-6.8%, so most tiles are empty.
+//
+// Deriving it here instead of transporting it keeps the protocol at v30: no new field, no
+// extra PCIe traffic, and an old producer (sparse codec off) simply never writes mode 3,
+// which makes this a no-op rather than a wrong answer.
+static const UINT kUiOccTileWords = 264;    // kFrSlotWords in the codec (32x8 tile slot)
+static ComPtr<ID3D12Resource>       g_ui_occ;
+static D3D12_RESOURCE_STATES        g_ui_occ_state = D3D12_RESOURCE_STATE_COMMON;
+static ComPtr<ID3D12RootSignature>  g_occ_rs;
+static ComPtr<ID3D12PipelineState>  g_occ_pso;
+static ComPtr<ID3D12DescriptorHeap> g_occ_heap;      // t0 codec bytes, u0 occupancy
+static UINT                         g_ui_occ_tiles = 0;
+static bool                         g_ui_occ_failed = false;
+// --no-sparse-unblend: A/B the sparse pass off without touching the producer's ini (the
+// consumer alone decides whether its unblend takes the occupancy shortcut).
+static bool                         g_ui_sparse_unblend_on = true;
+
+static bool ensure_occ_objects()
+{
+    if (g_occ_rs && g_occ_pso && g_occ_heap) { return true; }
+    if (g_ui_occ_failed) { return false; }
+
+    D3D12_DESCRIPTOR_RANGE rg[2]{};
+    rg[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    rg[0].NumDescriptors = 1;
+    rg[0].BaseShaderRegister = 0;
+    rg[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    rg[1].NumDescriptors = 1;
+    rg[1].BaseShaderRegister = 0;
+
+    D3D12_ROOT_PARAMETER p[3]{};
+    p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    p[0].Constants.ShaderRegister = 0;
+    p[0].Constants.Num32BitValues = 2;              // Tiles, SlotWords
+    p[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    p[1].DescriptorTable.NumDescriptorRanges = 1;
+    p[1].DescriptorTable.pDescriptorRanges = &rg[0];
+    p[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    p[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    p[2].DescriptorTable.NumDescriptorRanges = 1;
+    p[2].DescriptorTable.pDescriptorRanges = &rg[1];
+    p[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC rsd{};
+    rsd.NumParameters = 3;
+    rsd.pParameters = p;
+    rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+    ComPtr<ID3DBlob> sig, err;
+    if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
+        !sig) {
+        logf_("[lock] ui-occ: root signature FAILED\n");
+        g_ui_occ_failed = true;
+        return false;
+    }
+    if (FAILED(g_device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
+                                             IID_PPV_ARGS(&g_occ_rs)))) {
+        logf_("[lock] ui-occ: CreateRootSignature FAILED\n");
+        g_ui_occ_failed = true;
+        return false;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = g_occ_rs.Get();
+    pd.CS.pShaderBytecode = kUiOccCSO;
+    pd.CS.BytecodeLength = sizeof(kUiOccCSO);
+    if (FAILED(g_device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_occ_pso)))) {
+        logf_("[lock] ui-occ: CreateComputePipelineState FAILED\n");
+        g_ui_occ_failed = true;
+        return false;
+    }
+    D3D12_DESCRIPTOR_HEAP_DESC hd{};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 2;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_occ_heap)))) {
+        logf_("[lock] ui-occ: descriptor heap FAILED\n");
+        g_ui_occ_failed = true;
+        return false;
+    }
+    logf_("[lock] ui-occ: per-tile UI occupancy pass ready\n");
+    return true;
+}
+
+static bool ensure_occ_buffer(UINT tiles)
+{
+    if (tiles == 0) { return false; }
+    if (g_ui_occ && g_ui_occ_tiles >= tiles) { return true; }
+    g_ui_occ.Reset();
+    g_ui_occ_tiles = 0;
+    g_ui_occ_state = D3D12_RESOURCE_STATE_COMMON;
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = static_cast<UINT64>(tiles) * 4ull;
+    bd.Height = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels = 1;
+    bd.Format = DXGI_FORMAT_UNKNOWN;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
+                                                 D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                 IID_PPV_ARGS(&g_ui_occ)))) {
+        logf_("[lock] ui-occ: buffer FAILED (%u tiles)\n", tiles);
+        return false;
+    }
+    g_ui_occ_tiles = tiles;
+    return true;
+}
+
+// Structured SRV for the occupancy buffer (1 element when the slot is unused, so the
+// descriptor is always valid - the shader only reads it when Sparse=1).
+static void make_occ_srv(D3D12_CPU_DESCRIPTOR_HANDLE where)
+{
+    if (!g_ui_occ) { return; }
+    D3D12_SHADER_RESOURCE_VIEW_DESC os{};
+    os.Format = DXGI_FORMAT_UNKNOWN;
+    os.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    os.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    os.Buffer.StructureByteStride = 4;
+    os.Buffer.NumElements = g_ui_occ_tiles ? g_ui_occ_tiles : 1u;
+    g_device->CreateShaderResourceView(g_ui_occ.Get(), &os, where);
+}
+
+// Fills g_ui_occ from the codec slot's tile headers and leaves it in NON_PIXEL_SRV.
+static bool record_ui_occ(ID3D12Resource* codec, UINT w, UINT h, UINT& tiles_out)
+{
+    tiles_out = 0;
+    if (codec == nullptr || w < 32 || h < 8) { return false; }
+    if (codec->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) { return false; }
+    if (!ensure_occ_objects()) { return false; }
+    const UINT tiles = ((w + 31u) / 32u) * ((h + 7u) / 8u);
+    if (!ensure_occ_buffer(tiles)) { return false; }
+
+    const UINT inc = g_device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_occ_heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = g_occ_heap->GetGPUDescriptorHandleForHeapStart();
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R32_TYPELESS;          // raw ByteAddressBuffer
+    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Buffer.NumElements = static_cast<UINT>(codec->GetDesc().Width / 4ull);
+    srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    g_device->CreateShaderResourceView(codec, &srv, cpu);
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format = DXGI_FORMAT_UNKNOWN;               // structured (stride 4)
+    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uav.Buffer.StructureByteStride = 4;
+    uav.Buffer.NumElements = tiles;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu_uav = cpu;
+    cpu_uav.ptr += inc;
+    g_device->CreateUnorderedAccessView(g_ui_occ.Get(), nullptr, &uav, cpu_uav);
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu_uav = gpu;
+    gpu_uav.ptr += inc;
+
+    // decode_ui_slot() leaves the codec slot in COPY_DEST; restore that on the way out.
+    up_transition(codec, D3D12_RESOURCE_STATE_COPY_DEST,
+                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    up_transition(g_ui_occ.Get(), g_ui_occ_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    g_ui_occ_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+
+    g_list->SetComputeRootSignature(g_occ_rs.Get());
+    g_list->SetPipelineState(g_occ_pso.Get());
+    ID3D12DescriptorHeap* heaps[1] = { g_occ_heap.Get() };
+    g_list->SetDescriptorHeaps(1, heaps);
+    uint32_t params[2] = { tiles, kUiOccTileWords };
+    g_list->SetComputeRoot32BitConstants(0, 2, params, 0);
+    g_list->SetComputeRootDescriptorTable(1, gpu);
+    g_list->SetComputeRootDescriptorTable(2, gpu_uav);
+    g_list->Dispatch((tiles + 63u) / 64u, 1, 1);
+
+    D3D12_RESOURCE_BARRIER ub{};
+    ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    ub.UAV.pResource = g_ui_occ.Get();
+    g_list->ResourceBarrier(1, &ub);
+    up_transition(g_ui_occ.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    g_ui_occ_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    up_transition(codec, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                  D3D12_RESOURCE_STATE_COPY_DEST);
+    tiles_out = tiles;
+    return true;
+}
+
 static ID3D12Resource* record_ui_synth(UINT slot, ID3D12Resource* present,
                                        UINT w, UINT h)
 {
     if (!g_ui_unblend || ui_source_now() != mgpu::kUiSourceHudless) { return nullptr; }
     if (g_ctl == nullptr || present == nullptr || slot >= mgpu::kMaxSlots) { return nullptr; }
-    if (g_ui_local[slot] == nullptr || !g_ui_fresh[slot]) { return nullptr; }
+    // Local UI state lives per UI publication slot (see ui_slot_index in 060).
+    const UINT uil = ui_slot_index(slot);
+    if (g_ui_local[uil] == nullptr || !g_ui_fresh[uil]) { return nullptr; }
     if ((g_ctl->active_mask & mgpu::kRequestUi) == 0) { return nullptr; }
 
     const mgpu::StreamShared& su = g_ctl->streams[3];
@@ -489,19 +702,24 @@ static ID3D12Resource* record_ui_synth(UINT slot, ID3D12Resource* present,
 
     const UINT inc = g_device->GetDescriptorHandleIncrementSize(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    // The SRV table is always 3 entries (see ensure_unblend_objects), so the synth binds a
+    // valid (unused) occupancy buffer at t2 and puts its UAV at 3.
+    (void)ensure_occ_buffer(1);
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_unblend_heap->GetCPUDescriptorHandleForHeapStart();
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = g_unblend_heap->GetGPUDescriptorHandleForHeapStart();
     const D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu = gpu;
     make_srv(present, cpu, DXGI_FORMAT_R10G10B10A2_UNORM);
     cpu.ptr += inc; gpu.ptr += inc;
-    make_srv(g_ui_local[slot].Get(), cpu, ui_fmt);
+    make_srv(g_ui_local[uil].Get(), cpu, ui_fmt);
+    cpu.ptr += inc; gpu.ptr += inc;
+    make_occ_srv(cpu);
     cpu.ptr += inc; gpu.ptr += inc;
     const D3D12_GPU_DESCRIPTOR_HANDLE uav_gpu = gpu;
     make_uav(ui, cpu, ui_fmt);
 
     up_transition(present, D3D12_RESOURCE_STATE_RENDER_TARGET,
                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    up_transition(g_ui_local[slot].Get(), D3D12_RESOURCE_STATE_COMMON,
+    up_transition(g_ui_local[uil].Get(), D3D12_RESOURCE_STATE_COMMON,
                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     up_transition(ui, g_synth_state[ri], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
@@ -551,12 +769,12 @@ static ID3D12Resource* record_ui_synth(UINT slot, ID3D12Resource* present,
         }
         // Also dump the HUDless input (same frame) so a bad mask can be diagnosed by
         // comparing it with the present.
-        if (ui_dump_prepare(hs, g_ui_local[slot].Get())) {
-            up_transition(g_ui_local[slot].Get(),
+        if (ui_dump_prepare(hs, g_ui_local[uil].Get())) {
+            up_transition(g_ui_local[uil].Get(),
                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                           D3D12_RESOURCE_STATE_COPY_SOURCE);
             D3D12_TEXTURE_COPY_LOCATION src{};
-            src.pResource = g_ui_local[slot].Get();
+            src.pResource = g_ui_local[uil].Get();
             src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
             src.SubresourceIndex = 0;
             D3D12_TEXTURE_COPY_LOCATION dst{};
@@ -564,7 +782,7 @@ static ID3D12Resource* record_ui_synth(UINT slot, ID3D12Resource* present,
             dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
             dst.PlacedFootprint = hs.fp;
             g_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-            up_transition(g_ui_local[slot].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+            up_transition(g_ui_local[uil].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         }
         if (ui_dumped) { ++g_ui_dump_index; }
@@ -576,7 +794,7 @@ static ID3D12Resource* record_ui_synth(UINT slot, ID3D12Resource* present,
 
     up_transition(present, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                   D3D12_RESOURCE_STATE_RENDER_TARGET);
-    up_transition(g_ui_local[slot].Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+    up_transition(g_ui_local[uil].Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                   D3D12_RESOURCE_STATE_COMMON);
     g_synth_state[ri] = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
@@ -606,19 +824,43 @@ static void ui_unblend_note(const char* reason)
     }
 }
 
+static void ui_enable_composition_when_ready()
+{
+    if (!g_ui_unblend || g_fg == nullptr || !g_api.has_ui_composition()) { return; }
+    if (g_ctl == nullptr) { return; }
+    // The producer selects stream 3 only after the first P/H records, so at consumer
+    // init `ui_source` can still be Off and the one-shot init call leaves composition
+    // DISABLED. Enable it when the stream actually appears (once per session; XeFG
+    // keeps the state).
+    static bool applied = false;
+    if (applied) { return; }
+    const bool ready = g_ctl->streams[3].slot_size != 0 &&
+                       g_ctl->streams[3].width >= 64 && g_ctl->streams[3].height >= 64 &&
+                       g_ctl->ui_source != mgpu::kUiSourceOff;
+    if (!ready) { return; }
+    const xefg_swapchain_result_t r = g_api.SetUiCompositionState(
+        g_fg, XEFG_SWAPCHAIN_UI_COMPOSITION_STATE_ENABLED);
+    logf_("[lock] ui: SetUiCompositionState(ENABLED) after the stream appeared: %s (%d)\n",
+          xefg_str(r), static_cast<int>(r));
+    if (r == XEFG_SWAPCHAIN_RESULT_SUCCESS) { applied = true; }
+}
+
 static ID3D12Resource* record_ui_unblend(UINT slot, ID3D12Resource* present, UINT w, UINT h)
 {
     g_hudless_current = nullptr;
+    g_ui_used_current = nullptr;
     if (!g_ui_unblend) { return nullptr; }
     if (g_ctl == nullptr || present == nullptr || slot >= mgpu::kMaxSlots) {
         ui_unblend_note("no shared control / present");
         return nullptr;
     }
-    if (g_ui_local[slot] == nullptr) {
+    // Local UI state lives per UI publication slot (see ui_slot_index in 060).
+    const UINT uil = ui_slot_index(slot);
+    if (g_ui_local[uil] == nullptr) {
         ui_unblend_note("no local UI copy this frame");
         return nullptr;
     }
-    if (!g_ui_fresh[slot]) {
+    if (!g_ui_fresh[uil]) {
         ui_unblend_note("UI stream is not fresh for this slot");
         return nullptr;
     }
@@ -628,7 +870,8 @@ static ID3D12Resource* record_ui_unblend(UINT slot, ID3D12Resource* present, UIN
     }
 
     const uint32_t source = ui_source_now();
-    if (source != mgpu::kUiSourceGame && source != mgpu::kUiSourceHudless) {
+    if (source != mgpu::kUiSourceGame && source != mgpu::kUiSourceHudless &&
+        source != mgpu::kUiSourceSynth) {
         ui_unblend_note("producer UI source is Off/unknown");
         return nullptr;
     }
@@ -638,14 +881,16 @@ static ID3D12Resource* record_ui_unblend(UINT slot, ID3D12Resource* present, UIN
         ui_unblend_note("stream 3 has no valid size/format");
         return nullptr;
     }
+    ui_enable_composition_when_ready();
     if (!ensure_unblend_objects() || !ensure_hudless_ring(w, h)) {
         ui_unblend_note("unblend pipeline/ring init failed");
         return nullptr;
     }
 
-    // GameUi: stream 3 is the title's UI + alpha. Hudless: stream 3 is a downsampled
-    // HUDless image; build the approximate UI first, on this card, and unblend with that.
-    ID3D12Resource* ui_src = g_ui_local[slot].Get();
+    // GameUi / Synth: stream 3 is already a UI texture (Synth = full-res UI built on the
+    // render card). Hudless: stream 3 is a downsampled HUDless image; build the
+    // approximate UI first, on this card, and unblend with that.
+    ID3D12Resource* ui_src = g_ui_local[uil].Get();
     D3D12_RESOURCE_STATES ui_before = D3D12_RESOURCE_STATE_COMMON;
     if (source == mgpu::kUiSourceHudless) {
         ui_src = record_ui_synth(slot, present, w, h);
@@ -664,13 +909,39 @@ static ID3D12Resource* record_ui_unblend(UINT slot, ID3D12Resource* present, UIN
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_unblend_heap->GetCPUDescriptorHandleForHeapStart();
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = g_unblend_heap->GetGPUDescriptorHandleForHeapStart();
-    // Unblend uses the second half of the heap; synth (if any) owns 0..2.
-    cpu.ptr += static_cast<SIZE_T>(inc) * 3;
-    gpu.ptr += static_cast<UINT64>(inc) * 3;
+
+    // Sparse path: derive per-tile occupancy from the sparse codec's headers so the pass
+    // can write `present` for empty tiles. Needs a codec stream (only it has headers), a
+    // full-resolution UI texture (an 8x8 dest group must map 1:1 to UI texels, otherwise a
+    // bilinear sample could pull a neighbour into an "empty" tile), and a stream that
+    // really carries UI (the HUDless source synthesises UI on this card, so its tiles are
+    // never empty).
+    const UINT uislot_occ = uil;
+    UINT occ_tiles = 0;
+    // t2 always needs a valid descriptor, so the buffer exists even when the sparse path is
+    // off (record_ui_occ grows it when the mask is actually built).
+    (void)ensure_occ_buffer(1);
+    const bool sparse_ok =
+        g_ui_sparse_unblend_on && su.codec != 0 &&
+        su.width == w && su.height == h && source != mgpu::kUiSourceHudless &&
+        uislot_occ < mgpu::kMaxSlots &&
+        record_ui_occ(g_ui[uislot_occ].Get(), su.width, su.height, occ_tiles);
+    static bool told_sparse = false;
+    if (sparse_ok && !told_sparse) {
+        told_sparse = true;
+        logf_("[lock] ui-unblend: sparse dispatch ON (%u tiles; an empty tile writes"
+              " present directly)\n", occ_tiles);
+    }
+
+    // Unblend owns heap region 4..7 (synth owns 0..3).
+    cpu.ptr += static_cast<SIZE_T>(inc) * 4;
+    gpu.ptr += static_cast<UINT64>(inc) * 4;
     const D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu = gpu;
     make_srv(present, cpu, DXGI_FORMAT_R10G10B10A2_UNORM);
     cpu.ptr += inc; gpu.ptr += inc;
     make_srv(ui_src, cpu, static_cast<DXGI_FORMAT>(su.format));
+    cpu.ptr += inc; gpu.ptr += inc;
+    make_occ_srv(cpu);          // t2: the per-tile UI occupancy
     cpu.ptr += inc; gpu.ptr += inc;
     const D3D12_GPU_DESCRIPTOR_HANDLE uav_gpu = gpu;
     make_uav(hudless, cpu, DXGI_FORMAT_R10G10B10A2_UNORM);
@@ -684,8 +955,12 @@ static ID3D12Resource* record_ui_unblend(UINT slot, ID3D12Resource* present, UIN
     }
     up_transition(hudless, g_hudless_state[ri], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
-    struct UnblendConsts { UINT dst_w, dst_h, ui_w, ui_h; float premul, opaque, pad0, pad1; }
-        c{ w, h, su.width, su.height, 1.0f, 0.99f, 0.0f, 0.0f };
+    // v31/P4b: the producer writes ui_flags bit3 when the UI stream was built for linear
+    // subtraction (HDR/R10 PQ). The SDR path stays in code space.
+    const float linear = (g_ctl->streams[3].ui_flags & 8u) ? 1.0f : 0.0f;
+    struct UnblendConsts { UINT dst_w, dst_h, ui_w, ui_h; float premul, opaque, linear;
+                           UINT sparse; }
+        c{ w, h, su.width, su.height, 1.0f, 0.99f, linear, sparse_ok ? 1u : 0u };
 
     g_list->SetComputeRootSignature(g_unblend_rs.Get());
     g_list->SetPipelineState(g_unblend_pso.Get());
@@ -712,12 +987,18 @@ static ID3D12Resource* record_ui_unblend(UINT slot, ID3D12Resource* present, UIN
     g_hudless_state[ri] = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
     g_hudless_current = hudless;
+    g_ui_used_current = ui_src;
+    g_ui_used_state = (source == mgpu::kUiSourceHudless)
+                          ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                          : D3D12_RESOURCE_STATE_COMMON;
     if (!g_ui_unblend_ready_logged) {
         g_ui_unblend_ready_logged = true;
         logf_("[lock] ui-unblend: HUDless rebuilt from %ux%u present + %ux%u %s"
               " (source=%s)\n", w, h, su.width, su.height,
-              source == mgpu::kUiSourceHudless ? "synth UI" : "UI",
-              source == mgpu::kUiSourceHudless ? "hudless" : "game");
+              source == mgpu::kUiSourceHudless ? "synth UI"
+              : source == mgpu::kUiSourceSynth ? "full-res synth UI" : "UI",
+              source == mgpu::kUiSourceHudless ? "hudless"
+              : source == mgpu::kUiSourceSynth ? "render-synth" : "game");
     }
     return hudless;
 }

@@ -476,7 +476,8 @@ float               g_fg_fov_y = 60.0f;
 float               g_fg_near_z = 10.0f;
 static bool         g_fg_consts_logged = false;
 static bool         g_fg_ui_none = false;
-// B mode 4: UI stream + consumer unblend -> HUDless -> XeFG BACKBUFFER_HUDLESS.
+// UI stream + consumer unblend -> HUDless (+ UI) -> XeFG mode 5
+// (mode 4 when --no-ui-mode5).
 // Default OFF (producer `UiStream=0`); v29 adds `UiSource` so stream 3 can carry either
 // UI_SYNTHESIS_GATE: CLOSED. UiStream/UiSource must stay off until the title always
 // provides a valid UI stream by default. See docs/UI_SYNTHESIS_GATE.md.
@@ -488,6 +489,11 @@ static bool         g_ui_unblend_ready_logged = false;
 // 1 = force GameUi, 2 = force Hudless-derived UI, 3 = force Off. The consumer-side
 // synthesis is only used for Hudless; GameUi keeps the exact-alpha unblend path.
 static int          g_ui_source_mode = 0;
+// P3: XeFG composition mode when both HUDless and UI are available.
+//   0 = auto (mode 5 whenever the UI stream is full-res, for BOTH game and render-synth UI)
+//   1 = force mode 5 (same as 0 today; kept so old scripts keep working)
+//   2 = force mode 4 (--no-ui-mode5: HUDless only, never tag UI)
+static int          g_ui_mode5 = 0;
 // Difference threshold for the HUDless-derived UI mask, normalised (0..1). The ini/CLI
 // value is 0..255; 8 is a good first cut for an 8-bit-equivalent HUD overlay.
 static float        g_ui_synth_threshold = 8.0f / 255.0f;
@@ -715,6 +721,21 @@ static bool producer_has_mv_stream()
 // "producer does not publish a UI stream" even when it did.
 static uint32_t ui_source_now()
 {
+    // The producer is authoritative about what stream 3 carries: a render-card synth
+    // (kUiSourceSynth) must be unblended as UI even if an explicit --ui-source asks for
+    // the legacy Hudless path. Otherwise we would run synth_ui on an already-synth UI.
+    if (g_ctl != nullptr && g_ctl->ui_source == mgpu::kUiSourceSynth &&
+        g_ui_source_mode != 3) {
+        if (g_ui_source_mode != 0) {
+            static bool told = false;
+            if (!told) {
+                told = true;
+                logf_("[lock] ui: producer publishes a full-res synth UI;"
+                      " ignoring --ui-source override for stream 3\n");
+            }
+        }
+        return mgpu::kUiSourceSynth;
+    }
     if (g_ui_source_mode == 1) {
         if (!mgpu::kUiSynthesisGateOpen && g_ui_unblend) {
             static bool told = false;
@@ -767,6 +788,12 @@ static ComPtr<ID3D12Resource> g_depth[mgpu::kMaxSlots];
 // stream[0] is how they get here (docs/design/FG_CLAIM.md §16).
 static ComPtr<ID3D12Resource> g_colour[mgpu::kMaxSlots];   // stream 0: HUDless colour
 static ComPtr<ID3D12Resource> g_ui[mgpu::kMaxSlots];       // stream 3: UI colour+alpha
+static ComPtr<ID3D12Resource> g_hudless[mgpu::kMaxSlots];   // stream 4: clean HUDless (R10 PQ)
+static ComPtr<ID3D12Resource> g_hudless_local[mgpu::kMaxSlots];
+static bool                   g_hudless_fresh[mgpu::kMaxSlots] = {};
+static UINT                   g_hudless_slots = mgpu::kMaxSlots;
+static bool                   g_hudless_stream = false;     // --hudless-stream
+static UINT g_ui_slots = mgpu::kMaxSlots;                   // v31: shared UI ring size (8 default)
 static bool                   g_fg_colour_shared = false;      // --fg-colour shared
 // v8: the mapping-backed heap is kept so the views can be re-placed when the add-on
 // rebuilds its slot layout (upscaler preset/mode switch).

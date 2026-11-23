@@ -677,11 +677,46 @@ static bool marker_file_exists(const wchar_t* name)
 // marker_norm_debug_mode() removed with the norm pass.
 
 
+static bool consumer_present_event()
+{
+    // Runs once per Present (40-120x/s) on the GAME's thread: OpenEventW + CloseHandle are
+    // two syscalls. The answer only changes at session boundaries, so a positive result is
+    // cached for 1 s. A negative result is still re-probed every frame, so the marker
+    // starts as soon as the consumer window appears (a 1 s hole there would be ~40
+    // unpaired frames).
+    static ULONGLONG cached_ms = 0;
+    static bool cached = false;
+    if (cached) {
+        const ULONGLONG now = GetTickCount64();
+        if (cached_ms != 0 && now - cached_ms < 1000) { return true; }
+    }
+    HANDLE ev = OpenEventW(SYNCHRONIZE, FALSE, L"Local\\mgpu_consumer_present_v1");
+    cached = (ev != nullptr);
+    if (ev != nullptr) { CloseHandle(ev); }
+    cached_ms = GetTickCount64();
+    return cached;
+}
+
+// marker_disable.on is an A/B switch the user drops next to the exe before launching.
+// GetFileAttributesW goes through the filesystem (and any AV filter) - tens of
+// microseconds - so it is read once per second, not once per Present.
+static bool marker_opt_out()
+{
+    static ULONGLONG checked_ms = 0;
+    static bool off = false;
+    const ULONGLONG now = GetTickCount64();
+    if (checked_ms != 0 && now - checked_ms < 1000) { return off; }
+    checked_ms = now;
+    off = marker_file_exists(L"marker_disable.on");
+    return off;
+}
+
 static void marker_probe_present()
 {
     if (!marker_probe_enabled() || g_chain_api == nullptr || g_queue == nullptr) { return; }
     if (g_pending_seq == 0) { return; }
-    if (marker_file_exists(L"marker_disable.on")) { return; }
+    if (!consumer_present_event()) { return; }   // no consumer: no pairing marker cost
+    if (marker_opt_out()) { return; }
     const UINT idx = chain_current_index();
     ID3D12Resource* dst = nullptr;
     if (FAILED(g_chain_api->GetBuffer(idx, IID_PPV_ARGS(&dst))) || dst == nullptr) { return; }

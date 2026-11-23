@@ -75,6 +75,14 @@ void producer_present(void* queue)
     fg_present_done();
 }
 
+bool producer_ui_tag(void* cmd, void* backbuffer, uint32_t backbuffer_state,
+                     void* hudless, uint32_t hudless_state)
+{
+    if (g_producer_api == nullptr || g_producer_api->ui_tag == nullptr) { return false; }
+    return g_producer_api->ui_tag(cmd, backbuffer, backbuffer_state,
+                                  hudless, hudless_state) != 0;
+}
+
 // producer_record_scar() removed: the marker no longer transports a 16x16 tile.
 
 } // namespace fakerfg

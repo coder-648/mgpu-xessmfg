@@ -167,6 +167,16 @@ inline void plan_tile(const uint32_t* src, size_t w, size_t h, size_t nw,
 
 inline void write_tile(const TilePlan& p, const uint32_t* src, size_t w, size_t nw,
                        size_t tx0, size_t ty0, size_t pw, size_t ph, Writer& wr) {
+    // Constant tile (mode 0, width 0): every residual is zero, so the generic code below
+    // would emit only the header and the absolute pixel(s). This fast path must stay
+    // byte-identical to it - it mirrors the early-out in lock_frame/shaders/fr_codec.hlsl
+    // (fr_codec_test re-running on the same dumps is the check: the sizes must not move).
+    if (p.mode == kModePlain && p.w == 0) {
+        wr.word(0);
+        for (size_t l = 0; l < nw; ++l) wr.word(src[(ty0 * w + tx0) * nw + l]);
+        wr.align();
+        return;
+    }
     wr.word((uint32_t)p.w | ((uint32_t)p.mode << 6));
     if (p.mode == kModeRaw) {
         for (size_t y = ty0; y < ty0 + ph; ++y)

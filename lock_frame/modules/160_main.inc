@@ -256,6 +256,11 @@ int main()
             g_ui_synth_threshold = static_cast<float>(v) / 255.0f;
         }
     }
+    // P3: composition mode. 0/1 = mode 5 whenever the UI is full-res (all sources);
+    // 2 = force mode 4. Default is 0.
+    if (wcsstr(GetCommandLineW(), L"--ui-mode5-auto")) { g_ui_mode5 = 0; }
+    else if (wcsstr(GetCommandLineW(), L"--no-ui-mode5")) { g_ui_mode5 = 2; }
+    else if (wcsstr(GetCommandLineW(), L"--ui-mode5 ")) { g_ui_mode5 = 1; }
     if (g_ui_unblend) {
         // `--streams=mv,depth` replaces the request mask, so the UI bit has to be added
         // explicitly - otherwise the producer never copies stream 3 (log: streams -> ...
@@ -266,6 +271,13 @@ int main()
                         : (g_ui_source_mode == 3) ? "off" : "auto";
         logf_("[lock] ui path: unblend=1 source=%s synth_threshold=%.3f (stream request"
               " adds ui)\n", src, static_cast<double>(g_ui_synth_threshold));
+    }
+    // v32: clean HUDless stream (stream 4). This is independent of the UI stream: with UI
+    // off it tags HUDless only (mode 4); with UI on it tags both (mode 5).
+    if (wcsstr(GetCommandLineW(), L"--hudless-stream")) {
+        g_hudless_stream = true;
+        g_stream_mask |= mgpu::kRequestHudless;
+        logf_("[lock] hudless path: clean stream 4 requested\n");
     }
     if (const wchar_t* sc = wcsstr(GetCommandLineW(), L"--fg-scene ")) {
         const float v = static_cast<float>(_wtof(sc + 11));
@@ -674,7 +686,48 @@ int main()
         logf_("[lock] --ui-dump %d frame(s) after %d -> %s (BMP: rgb/alpha/over)\n",
               g_ui_dump_frames, g_ui_dump_after, g_ui_dump_dir);
     }
+    // --tag-dump: the exact three colour inputs XeFG is about to receive.
+    if (const wchar_t* td = wcsstr(GetCommandLineW(), L"--tag-dump ")) {
+        const int n = _wtoi(td + 11);
+        // Full-res colour readbacks are ~33 MB each; 16 frames x 3 streams is already
+        // ~1.6 GB, so keep the visual-check window small (5 is the recommended value).
+        if (n > 0 && n <= 16) { g_tag_dump_frames = n; }
+    }
+    if (const wchar_t* tda = wcsstr(GetCommandLineW(), L"--tag-dump-after ")) {
+        const int n = _wtoi(tda + 17);
+        if (n >= 0 && n <= 100000) { g_tag_dump_after = n; }
+    }
+    if (const wchar_t* tdd = wcsstr(GetCommandLineW(), L"--tag-dump-dir ")) {
+        const wchar_t* p = tdd + 15;
+        while (*p == L' ' || *p == L'"') { ++p; }
+        const wchar_t* end = p;
+        const bool quoted = (*(tdd + 15) == L'"');
+        while (*end && ((quoted && *end != L'"') || (!quoted && *end != L' '))) { ++end; }
+        if (end > p) {
+            const int len = WideCharToMultiByte(CP_ACP, 0, p, static_cast<int>(end - p),
+                                                g_tag_dump_dir, MAX_PATH - 1, nullptr, nullptr);
+            if (len > 0) { g_tag_dump_dir[len] = '\0'; }
+        }
+    }
+    if (g_tag_dump_frames > 0) {
+        CreateDirectoryA(g_tag_dump_dir, nullptr);
+        logf_("[lock] --tag-dump %d frame(s) after %d -> %s"
+              " (BMP: backbuffer/hudless/ui + meta)\n",
+              g_tag_dump_frames, g_tag_dump_after, g_tag_dump_dir);
+    }
     if (wcsstr(GetCommandLineW(), L"--no-throttle")) { g_no_throttle = true; }
+    if (wcsstr(GetCommandLineW(), L"--no-sparse-unblend")) {
+        g_ui_sparse_unblend_on = false;
+        logf_("[lock] --no-sparse-unblend: the occupancy shortcut is off - the unblend runs"
+              " the plain pass over the whole frame\n");
+    }
+    if (const wchar_t* rs = wcsstr(GetCommandLineW(), L"--run-sec ")) {
+        const int n = _wtoi(rs + 10);
+        if (n > 0 && n <= 3600) {
+            g_run_sec = static_cast<UINT>(n);
+            logf_("[lock] --run-sec %d: the consumer exits by itself after %d s\n", n, n);
+        }
+    }
     // --input-copy-queue: MV/depth copies on their own COPY queue so they run on the copy
     // engine at the same time as the colour convert draw (see the block next to
     // run_frame_ex()). Off by default: it is the first structural change to the submit
@@ -1275,7 +1328,8 @@ int main()
             g_arr_slow_i = (g_arr_slow_i + 1) % kArrSlowRing;
             if (g_arr_slow_n < kArrSlowRing) { ++g_arr_slow_n; }
             g_rt_ema_fast = arr_median_ms();          // short median (16 samples)
-            g_rt_ema_slow = (g_arr_slow_n >= 32) ? arr_slow_median_ms() : g_rt_ema_fast;
+            // g_rt_ema_slow is only read by the --fg-rt-mode auto decision, which runs once
+            // per report window; computing a 64-sample median per frame here was waste.
         }
     };
 
@@ -1420,7 +1474,7 @@ int main()
             // Paced path: keep the newest frame that has arrived, present on a fixed
             // cadence. Frames arriving early simply wait; if none arrived by the tick
             // the previous frame is presented again, so the output rate never wobbles.
-            const ULONGLONG t_poll = GetTickCount64();
+            const double t_poll = qpc_ms();
             for (;;) {
                 ComPtr<IDirect3D11CaptureFrame> f;
                 if (FAILED(g_pool->TryGetNextFrame(&f)) || !f) { break; }
@@ -1431,8 +1485,10 @@ int main()
                 pending = f;
                 pending_tex = tex;
             }
-            g_ms_capture = g_ms_capture * 0.9 +
-                           static_cast<double>(GetTickCount64() - t_poll) * 0.1;
+            // QPC, not GetTickCount64: the latter ticks in 15.6 ms steps, so this field used
+            // to read 0 / 16 / 31 ms no matter what actually happened (the same defect that
+            // was fixed for work/gpu/present/colour in PERF_BASELINE 3.1).
+            g_ms_capture = g_ms_capture * 0.9 + (qpc_ms() - t_poll) * 0.1;
 
             if (g_pace_auto) {
                 const double target = (g_arrival_ms_ema > 2.0) ? g_arrival_ms_ema : 25.0;
@@ -1466,7 +1522,7 @@ int main()
             continue;
         }
 
-        const ULONGLONG t_poll = GetTickCount64();
+        const double t_poll = qpc_ms();
         // Keep a bounded queue of captured frames.
         //
         // --slack 0 (default) drains the pool and keeps only the NEWEST frame: an
@@ -1548,8 +1604,7 @@ int main()
             continue;
         }
 
-        g_ms_capture = g_ms_capture * 0.9 +
-                       static_cast<double>(GetTickCount64() - t_poll) * 0.1;
+        g_ms_capture = g_ms_capture * 0.9 + (qpc_ms() - t_poll) * 0.1;
         // Take the oldest frame in the queue. With --slack 0 the queue only ever
         // holds one frame, so this is the same "process the newest" behaviour.
         ComPtr<IDirect3D11CaptureFrame> frame = slack_q.front().first;

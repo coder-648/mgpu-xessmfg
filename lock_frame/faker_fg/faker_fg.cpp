@@ -514,6 +514,8 @@ Config& cfg()
     g_cfg.fg_hud_cutoff    = ini_int(path, L"FGHudCutoff", 0);
     g_cfg.fg_hudless_compare = ini_int(path, L"FGHudlessCompare", 0);
     g_cfg.ui_premultiplied = ini_int(path, L"UiPremultiplied", 0);
+    g_cfg.ui_tag_synth = ini_int(path, L"UiTagSynth", 0);
+    g_cfg.ui_snapshot_pq = ini_int(path, L"UiSnapshotPQ", 0);
     g_cfg.tag_hudless    = ini_int(path, L"TagHudless", 0);
     g_cfg.tag_backbuffer = ini_int(path, L"TagBackbuffer", 1);
     g_cfg.tag_at_evaluate = ini_int(path, L"TagAtEvaluate", 1);
@@ -577,7 +579,17 @@ Config& cfg()
     // Only FgInput is a public choice for the input source. Everything else below is
     // derived, so an old ini cannot leave a lane half-configured.
     const bool input_explicit = fgi_a[0] != '\0';
-    if (input_explicit && g_cfg.fg_input != 0) {
+    const bool input_no_fg = _stricmp(fgi_a, "NoFG") == 0;
+    // This build implements the DLSSG lane only (Streamline tags). Keep the key readable
+    // for old configs but pin the lane: a missing value or any other source falls back to
+    // DLSSG (an explicit NoFG still disables the pipeline).
+    if (!input_no_fg && g_cfg.fg_input != static_cast<int>(FgInputSource::DLSSG)) {
+        if (input_explicit) {
+            logf("config: FgInput=%s is not implemented in this build - using DLSSG\n", fgi_a);
+        }
+        g_cfg.fg_input = static_cast<int>(FgInputSource::DLSSG);
+    }
+    if (g_cfg.fg_input != 0) {
         if (g_cfg.fg_output == 0 && !output_explicit) {
             g_cfg.fg_output = static_cast<int>(FgOutputSink::Capture);
         }
@@ -638,6 +650,12 @@ Config& cfg()
             g_cfg.strip_dlssg        = 0;
             g_cfg.write_output_real   = 1;
             g_cfg.write_output_interp = 0;
+        }
+        // A/B: CP2077 may not need the provider to copy Backbuffer into OutputReal when
+        // faker owns the presenting path. NoOutputReal=1 disables this full 4K copy.
+        if (ini_int(path, L"NoOutputReal", 0) != 0) {
+            g_cfg.write_output_real = 0;
+            logf("config: NoOutputReal=1 - skipping Backbuffer -> OutputReal copy\n");
         }
         logf("config: FgInput profile: %s -> fake_dlssg=%d fake_sl=%d strip_sl=%d"
              " tag_at_eval=%d mv_resample=%d write_real=%d write_interp=%d\n",

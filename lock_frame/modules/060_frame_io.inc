@@ -142,7 +142,7 @@ static bool   g_present_cap_warned = false;
 static bool   g_diag_dumped = false;    // producer state printed once (wait_slot)
 static UINT   g_report_every = 40; // --report N: frames per statistics window
 static UINT   g_arr_count = 0;
-static ULONGLONG g_last_frame_tick = 0;
+static double  g_last_frame_tick = 0.0;   // qpc_ms() of the previous run_frame_ex (QPC, not GetTickCount64)
 
 // Bucketed arrival histogram, in vblanks, reset every report window. This is the direct
 // answer to "are we losing input frames, or is the game simply not delivering them?":
@@ -277,6 +277,9 @@ static int g_depth_lag = 0;
 // for N seconds (default 5, 0 = never). Without this the topmost overlay survives a
 // crashed/closed game and just sits on the desktop forever.
 static UINT g_exit_after_s = 5;
+// --run-sec N: quit after N seconds of running. Measurement runs need a reproducible
+// length (30 s per segment) and an automatic exit, so the next segment can start.
+static UINT g_run_sec = 0;
 static ULONGLONG g_fg_lost_ms = 0;
 
 static void wait_slot(UINT slot)
@@ -328,6 +331,20 @@ static void wait_slot(UINT slot)
 static ComPtr<ID3D12Resource> g_mv_local[mgpu::kMaxSlots];
 static ComPtr<ID3D12Resource> g_ui_local[mgpu::kMaxSlots];
 static bool                   g_ui_fresh[mgpu::kMaxSlots] = {};
+
+// Local UI decode targets are indexed by UI PUBLICATION slot, not by MV/depth slot.
+// The producer's UI ring is smaller (UiSlots, 8 by default: the 4K full-res UI is ~34 MB
+// per slot) and `decode_ui_slot()` always reads codec slot `slot % UiSlots`, so one local
+// texture per UI slot is enough. At 4K that is 8 x 33 MB instead of 32 x 33 MB
+// (1.06 GB -> 265 MB). The decode -> unblend -> tag window is a single frame and
+// gpu_throttle() keeps the queue at depth 1, so two MV slots that map to the same UI slot
+// can never be in flight at the same time. With an older producer (slots == 32) this is
+// the identity, i.e. exactly the old behaviour.
+static UINT ui_slot_index(UINT slot)
+{
+    const UINT n = (g_ui_slots != 0) ? g_ui_slots : mgpu::kMaxSlots;
+    return (n != 0) ? (slot % n) : slot;
+}
 static ComPtr<ID3D12Resource> g_depth_local[mgpu::kMaxSlots];
 // --depth-lag N: our own ring of local depth copies. The shared ring must always be read
 // at its newest completed slot (reading an older one collides with the producer's write),
@@ -1206,18 +1223,191 @@ static bool decode_depth_slot(UINT slot, ID3D12Resource* dst, UINT w, UINT h)
     return true;
 }
 
-static void ensure_dummy_mv(UINT slot);      // declared below (used by --no-mv)
-static void ensure_dummy_depth(UINT slot);   // declared below (used by --no-depth)
+static ComPtr<ID3D12DescriptorHeap> g_fr_u_heap;
+static ComPtr<ID3D12PipelineState>  g_fr_u_pso_r10;
+static ComPtr<ID3D12PipelineState>  g_fr_u_pso_rgba8;
+
+static bool init_fr_decode_ui();
+static bool ensure_ui_sink_codec(ComPtr<ID3D12Resource>& dst, UINT w, UINT h,
+                                 DXGI_FORMAT fmt);
+
+static bool decode_ui_slot(UINT slot, ID3D12Resource* dst, UINT w, UINT h,
+                           DXGI_FORMAT fmt)
+{
+    if (dst == nullptr || slot >= mgpu::kMaxSlots || !g_ui[slot]) { return false; }
+    ID3D12Resource* src = g_ui[slot].Get();
+    if (src == nullptr || src->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        return false;
+    }
+    ID3D12GraphicsCommandList* list = g_list.Get();
+    if (list == nullptr || !init_fr_decode_ui()) { return false; }
+
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.pResource   = src;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    list->ResourceBarrier(1, &b);
+    b.Transition.pResource   = dst;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    list->ResourceBarrier(1, &b);
+
+    const UINT inc = g_device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_fr_u_heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = g_fr_u_heap->GetGPUDescriptorHandleForHeapStart();
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format                     = DXGI_FORMAT_R32_TYPELESS;   // raw ByteAddressBuffer
+    srv.ViewDimension              = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Shader4ComponentMapping    = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Buffer.FirstElement        = 0;
+    srv.Buffer.NumElements         = static_cast<UINT>(src->GetDesc().Width / 4ull);
+    srv.Buffer.StructureByteStride = 0;
+    srv.Buffer.Flags               = D3D12_BUFFER_SRV_FLAG_RAW;
+    g_device->CreateShaderResourceView(src, &srv, cpu);
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format             = fmt;
+    uav.ViewDimension      = D3D12_UAV_DIMENSION_TEXTURE2D;
+    uav.Texture2D.MipSlice = 0;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu_uav = cpu;
+    cpu_uav.ptr += inc;
+    g_device->CreateUnorderedAccessView(dst, nullptr, &uav, cpu_uav);
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu_uav = gpu;
+    gpu_uav.ptr += inc;
+
+    const UINT tx = (w + 31u) / 32u;
+    const UINT ty = (h + 7u) / 8u;
+    uint32_t params[6] = { w, h, 1u, tx, ty, 264u };
+    list->SetComputeRootSignature(g_fr_rs.Get());
+    list->SetPipelineState(fmt == DXGI_FORMAT_R10G10B10A2_UNORM
+                               ? g_fr_u_pso_r10.Get() : g_fr_u_pso_rgba8.Get());
+    ID3D12DescriptorHeap* heaps[1] = { g_fr_u_heap.Get() };
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetComputeRoot32BitConstants(0, 6, params, 0);
+    list->SetComputeRootDescriptorTable(1, gpu);
+    list->SetComputeRootDescriptorTable(2, gpu_uav);
+    list->Dispatch(tx * ty, 1, 1);
+
+    D3D12_RESOURCE_BARRIER ub{};
+    ub.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    ub.UAV.pResource = dst;
+    list->ResourceBarrier(1, &ub);
+    b.Transition.pResource   = dst;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
+    list->ResourceBarrier(1, &b);
+    b.Transition.pResource   = src;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+    list->ResourceBarrier(1, &b);
+
+    static bool told = false;
+    if (!told) {
+        told = true;
+        logf_("[lock] fr: decoded UI -> %ux%u fmt %u (%u tiles, %llu B slot, codec 1:1)\n",
+              w, h, static_cast<unsigned>(fmt), tx * ty,
+              static_cast<unsigned long long>(src->GetDesc().Width));
+    }
+    return true;
+}
+
+
+// ------------------------------------------------- v31/P2: UI decode (fr codec, packed)
+// Same kernel, UI variants: R10G10B10A2 / R8G8B8A8 packed to one u32 per pixel on the
+// producer, unpacked into the local UI texture here. SEPARATE heap from MV/depth: all
+// decodes are recorded into the same list, so a shared descriptor write would make the
+// last one win at execution time.
+
+static bool init_fr_decode_ui()
+{
+    static int state = 0;
+    if (state != 0) { return state > 0; }
+    state = -1;
+    if (!init_fr_decode()) { return false; }        // root signature is shared
+    D3D12_DESCRIPTOR_HEAP_DESC hd{};
+    hd.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 2;                          // slot SRV (bytes) | UI UAV
+    hd.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_fr_u_heap)))) {
+        logf_("[lock] fr: UI descriptor heap FAILED\n");
+        return false;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature     = g_fr_rs.Get();
+    pd.CS.pShaderBytecode = kFrDecodeUiR10CSO;
+    pd.CS.BytecodeLength  = sizeof(kFrDecodeUiR10CSO);
+    if (FAILED(g_device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_fr_u_pso_r10)))) {
+        logf_("[lock] fr: UI R10 decode PSO FAILED (%zu bytes)\n", sizeof(kFrDecodeUiR10CSO));
+        return false;
+    }
+    pd.CS.pShaderBytecode = kFrDecodeUiRgba8CSO;
+    pd.CS.BytecodeLength  = sizeof(kFrDecodeUiRgba8CSO);
+    if (FAILED(g_device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_fr_u_pso_rgba8)))) {
+        logf_("[lock] fr: UI RGBA8 decode PSO FAILED (%zu bytes)\n",
+              sizeof(kFrDecodeUiRgba8CSO));
+        return false;
+    }
+    state = 1;
+    logf_("[lock] fr: UI decode pass ready (R10 %zu B, RGBA8 %zu B)\n",
+          sizeof(kFrDecodeUiR10CSO), sizeof(kFrDecodeUiRgba8CSO));
+    return true;
+}
+
+static bool ensure_ui_sink_codec(ComPtr<ID3D12Resource>& dst, UINT w, UINT h,
+                                 DXGI_FORMAT fmt)
+{
+    if (w < 16 || h < 16) { return false; }
+    if (dst) {
+        const D3D12_RESOURCE_DESC have = dst->GetDesc();
+        if (have.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            have.Width == w && have.Height == h && have.Format == fmt &&
+            (have.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0) {
+            return true;
+        }
+        dst.Reset();
+    }
+    D3D12_RESOURCE_DESC d{};
+    d.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    d.Width            = w;
+    d.Height           = h;
+    d.DepthOrArraySize = 1;
+    d.MipLevels        = 1;
+    d.Format           = fmt;
+    d.SampleDesc.Count = 1;
+    d.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    d.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d,
+                                                 D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                 IID_PPV_ARGS(&dst)))) {
+        logf_("[lock] fr: UI sink %ux%u fmt %u FAILED\n", w, h,
+              static_cast<unsigned>(fmt));
+        return false;
+    }
+    return true;
+}
 
 #if MGPU_FG_OF
 static void of_bind_depth(UINT i, ID3D12Resource* res);   // defined with the OF state below
 static void of_bind_hist();                              // ditto (history colours)
 #endif
 
+static void ensure_dummy_mv(UINT slot);      // defined below (used by --no-mv)
+static void ensure_dummy_depth(UINT slot);   // defined below (used by --no-depth)
+
 static void copy_inputs_local(UINT slot)
 {
     if (slot >= mgpu::kMaxSlots) { return; }
-    g_ui_fresh[slot] = false;
+    // UI state is tracked per UI publication slot (see ui_slot_index), so a slot reuses the
+    // local texture of the UI slot it maps to.
+    const UINT uislot = ui_slot_index(slot);
+    g_ui_fresh[uislot] = false;
+    g_hudless_fresh[slot] = false;
     // --fg-colour shared: the colour rides the same path as MV/depth - one cross-adapter
     // CopyTextureRegion of the live rectangle into the sink the convert draw reads.
     if (g_fg_colour_shared && g_colour[slot] && g_shared12) {
@@ -1381,26 +1571,64 @@ static void copy_inputs_local(UINT slot)
             }
         }
     }
-    // stream 3: GameUi (UI colour+alpha) or, with UiSource=Hudless, a downsampled
-    // HUDless image from which the consumer synthesises UI before unblending.
-    if (g_ui[slot]) {
+    // stream 3: UI (colour+alpha). With UiFullRes it is a full-resolution UI (game or
+    // render-card synth); with UiCodec it travels as packed bytes and is decoded here.
+    // `uislot` comes from the top of the function: it is both the shared slot index and the
+    // index of this slot's local decode target.
+    if (g_ui[uislot]) {
         const mgpu::StreamShared& su = g_ctl->streams[3];
-        if (su.width >= 64 && su.height >= 64 &&
-            ensure_local_copy(g_ui_local[slot], g_ui[slot].Get(), su.width, su.height)) {
-            static bool logged = false;
-            if (!logged) {
-                logged = true;
-                logf_("[lock] stream 3: copying %ux%u (fmt %u) from the producer's slot 3\n",
-                      su.width, su.height, su.format);
+        if (su.width >= 64 && su.height >= 64) {
+            if (su.codec != 0) {
+                const DXGI_FORMAT fmt =
+                    (su.format == static_cast<uint32_t>(DXGI_FORMAT_R10G10B10A2_UNORM))
+                        ? DXGI_FORMAT_R10G10B10A2_UNORM
+                        : DXGI_FORMAT_R8G8B8A8_UNORM;
+                if (ensure_ui_sink_codec(g_ui_local[uislot], su.width, su.height, fmt) &&
+                    decode_ui_slot(uislot, g_ui_local[uislot].Get(), su.width, su.height, fmt)) {
+                    g_ui_fresh[uislot] = true;
+                } else {
+                    static bool told_dec = false;
+                    if (!told_dec) {
+                        told_dec = true;
+                        logf_("[lock] fr: UI decode failed - stream 3 not fresh this frame\n");
+                    }
+                }
+            } else if (ensure_local_copy(g_ui_local[uislot], g_ui[uislot].Get(),
+                                         su.width, su.height)) {
+                static bool logged = false;
+                if (!logged) {
+                    logged = true;
+                    logf_("[lock] stream 3: copying %ux%u (fmt %u) from the producer's"
+                          " slot 3\n", su.width, su.height, su.format);
+                }
+                copy_content(g_ui_local[uislot].Get(), g_ui[uislot].Get(),
+                             su.width, su.height);
+                g_ui_fresh[uislot] = true;
             }
-            copy_content(g_ui_local[slot].Get(), g_ui[slot].Get(), su.width, su.height);
-            g_ui_fresh[slot] = true;
+        }
+    }
+
+    // stream 4: clean HUDless (v32). R10 PQ texture; consumer tags it directly.
+    if (g_hudless_stream && g_ctl->streams[4].slot_size != 0) {
+        const UINT hslot = g_hudless_slots ? (slot % g_hudless_slots) : slot;
+        const mgpu::StreamShared& sh = g_ctl->streams[4];
+        if (g_hudless[hslot] && sh.width >= 64 && sh.height >= 64 &&
+            sh.codec == 0 &&
+            ensure_local_copy(g_hudless_local[slot], g_hudless[hslot].Get(),
+                              sh.width, sh.height)) {
+            copy_content(g_hudless_local[slot].Get(), g_hudless[hslot].Get(),
+                         sh.width, sh.height);
+            g_hudless_fresh[slot] = true;
+            static bool told_h = false;
+            if (!told_h) {
+                told_h = true;
+                logf_("[lock] stream 4: clean HUDless %ux%u fmt %u\n",
+                      sh.width, sh.height, sh.format);
+            }
         }
     }
 
 }
-
-// --no-inputs: still hand XeSS-FG valid resources so the pipeline keeps running,
 // but with zero motion vectors and cleared depth, so the peer-access code path is
 // completely absent. Interpolation then looks wrong, which is expected.
 static void ensure_dummy_mv(UINT slot)

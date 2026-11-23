@@ -383,6 +383,20 @@ struct State
     // 2 = auto (default: use the codec when this machine can run it, otherwise the old
     // cross-adapter copy path). Written into the game-side ini by apply_fg_input().
     int  codec = 2;
+    // 1.2.9: depth codec resolution. MV stays 1:1 unconditionally (it drives the warp and
+    // must stay bit-exact); depth only feeds the disocclusion clamp, so it can travel at
+    // 150% (2560x1440) - measured on CP2077 4K: depth encode 2.05 -> 0.79 ms (-61%) and
+    // 10.8 -> 5.56 MB per frame with MV untouched (docs/design/PERF_OPT_2026-11-23.md 7.3).
+    // 100 = per-pixel lossless, 150 = default, 200 = smaller still (higher edge risk).
+    int  depth_pct = 150;
+    // 1.2.9: UI composition (HUDless / XeFG mode 5) — EXPERIMENTAL, default OFF.
+    // ON = interpolated frames no longer smear the HUD, at ~0.8 ms/frame, but the
+    // render-card synth / unblend chain still shows edge artefacts on some titles.
+    // Release default is OFF; enable only for A/B.
+    bool ui_compose = false;
+    // 游戏侧配置版本：false = fakerFG.ini（发布精简版），true = fakerFG.full.ini
+    // （测试全参数版）。切换时会备份并覆盖游戏目录的 fakerFG.ini，重启游戏生效。
+    bool ini_full = false;
     // --stream-auto: the bridge picks the StreamPercent (both streams) from the measured
     // WGC hop. --stream-asym: MV stays 1:1, depth is scaled (implies upsample so the
     // tagged pair is one size). Both are A/B and default off.
@@ -591,7 +605,7 @@ enum Id
 {
     ID_NONE = 0,
     ID_FG_TYPE, ID_FG_MODE, ID_INTERP, ID_OUT, ID_PERF, ID_UPSAMPLE_INFO,
-    ID_FG_INPUT, ID_FG_INI, ID_STREAM_PCT, ID_CODEC, ID_FG_LOG,
+    ID_FG_INPUT, ID_FG_INI, ID_STREAM_PCT, ID_CODEC, ID_DEPTH_PCT, ID_UI_COMPOSE, ID_INI_PROFILE, ID_FG_LOG,
     ID_VERSION, ID_CHECK_GPU, ID_CHECK_RUNTIME, ID_CHECK_GAME,
     ID_CAP_API, ID_POOL, ID_LAT, ID_STREAM_INFO,
     ID_JITZ, ID_FOV, ID_NOMARKER, ID_UPSAMPLE, ID_STRAUTO, ID_STRASYM, ID_PREFETCH, ID_UI, ID_RT, ID_UNLOCK, ID_GAME_QUIRKS, ID_SLACK, ID_IVL,
@@ -627,9 +641,12 @@ static const RowDef kRowsFg[] = {
     // 消费端把收到的 MV/depth 联合重建到输入画面尺寸。
 };
 static const RowDef kRowsGame[] = {
-    { ID_FG_INPUT,   L"fakerFG 输入源",     RK_DD   },
+    { ID_FG_INPUT,   L"fakerFG 输入源",     RK_INFO },
     { ID_STREAM_PCT, L"MV/深度传输比例",    RK_DD   },
     { ID_CODEC,      L"无损传输（码流）",   RK_DD   },
+    { ID_DEPTH_PCT,  L"深度码流（无损）",   RK_DD   },
+    { ID_UI_COMPOSE, L"UI 合成（HUDless，实验性）", RK_DD   },
+    { ID_INI_PROFILE, L"配置版本（游戏侧）", RK_DD   },
     { ID_GAME_QUIRKS, L"游戏适配（OptiScaler 表）", RK_TOG },
     { ID_FG_LOG,     L"游戏侧日志 (Log)",   RK_TOG  },
     { ID_FG_INI,     L"fakerFG.ini 路径",   RK_INFO },
@@ -689,7 +706,8 @@ static const int kCardCount = (int)(sizeof(kCards) / sizeof(kCards[0]));
 
 // ------------------------------------------------------------------ options
 // 固定倍率：2x / 3x / 4x。显示文本按当前面板刷新率动态计算输入帧率。
-static const wchar_t* kOptFgInput[] = { L"DLSSG（推荐）", L"NVNGX", L"Upscaler", L"FSR" };
+// 本版只实现 DLSSG 输入（Streamline tag）。UI 不再暴露输入源选择。
+static const wchar_t* kOptIniProfile[] = { L"精简（发布）", L"完整（测试）" };
 // StreamPercent：100 = 1:1，150 = 每维 2/3，200 = 每维 1/2，400 = 每维 1/4
 static const wchar_t* kOptStream[] = {
     L"100%（1:1，最清晰）", L"150%（默认，每维 2/3）", L"200%（每维 1/2）", L"400%（每维 1/4，最省）"
@@ -702,6 +720,18 @@ static const wchar_t* kOptCodec[] = {
     L"自动（推荐：能跑就用，跑不了自动退回老路径）"
 };
 static const wchar_t* kCodecIni[] = { L"0", L"1", L"auto" };
+// 1.2.9: depth 码流分辨率（MV 永远是 100%）。
+static const wchar_t* kOptDepthPct[] = {
+    L"100%（逐像素无损，depth 编码 +1.3 ms）",
+    L"150%（默认，每维 2/3；depth 编码 -61%）",
+    L"200%（每维 1/2，更省）"
+};
+static const int kDepthPct[] = { 100, 150, 200 };
+// 1.2.9: UI 合成（HUDless / XeFG mode 5）——实验性，发布默认关闭。
+static const wchar_t* kOptUiCompose[] = {
+    L"关闭（默认；最大帧率，HUD 会在插值帧里残影）",
+    L"开启（实验性；HUD 不残影，但边缘/半透明 UI 仍可能出伪影）"
+};
 static const wchar_t* kFgInputIni[]  = { L"DLSSG", L"NVNGX", L"Upscaler", L"FSR" };
 static const wchar_t* kOptOut[]    = { L"1:1 原生", L"5K -> 4K (0.75x)", L"半分辨率" };
 static const wchar_t* kOptFov[]    = { L"55.0", L"58.7", L"60.0", L"65.0" };
@@ -727,9 +757,12 @@ static int opt_count(Id id)
 {
     switch (id) {
     case ID_FG_MODE: return 3;
-    case ID_FG_INPUT: return 4;
+    case ID_FG_INPUT: return 1;
+    case ID_INI_PROFILE: return 2;
     case ID_STREAM_PCT: return 4;
     case ID_CODEC:   return 3;
+    case ID_DEPTH_PCT: return 3;
+    case ID_UI_COMPOSE: return 2;
     case ID_OUT:     return 3;
     case ID_SDR:     return 2;
     case ID_FOV:     return 4;
@@ -765,9 +798,12 @@ static const wchar_t* opt_text(Id id, int i)
         s = b;
         return s.c_str();
     }
-    case ID_FG_INPUT: return kOptFgInput[(i < 0 || i > 3) ? 0 : i];
+    case ID_FG_INPUT: return L"DLSSG（固定）";
+    case ID_INI_PROFILE: return kOptIniProfile[(i % 2) == 0 ? 0 : 1];
     case ID_STREAM_PCT: return kOptStream[(i < 0 || i > 3) ? 1 : i];
     case ID_CODEC:   return kOptCodec[(i < 0 || i > 2) ? 2 : i];
+    case ID_DEPTH_PCT:  return kOptDepthPct[(i < 0 || i > 2) ? 1 : i];
+    case ID_UI_COMPOSE: return kOptUiCompose[(i % 2) == 0 ? 0 : 1];
     case ID_OUT:     return kOptOut[i % 3];
     case ID_SDR:     return kOptColor[i % 2];
     case ID_FOV:     return kOptFov[i % 4];
@@ -806,8 +842,16 @@ static int opt_get(Id id)
 {
     switch (id) {
     case ID_FG_MODE: return S().fg_mode;
-    case ID_FG_INPUT: return S().fg_input;
+    case ID_FG_INPUT: return 0;
+    case ID_INI_PROFILE: return S().ini_full ? 1 : 0;
     case ID_CODEC:   return (S().codec < 0 || S().codec > 2) ? 2 : S().codec;
+    case ID_DEPTH_PCT: {
+        for (int i = 0; i < 3; ++i) {
+            if (kDepthPct[i] == S().depth_pct) { return i; }
+        }
+        return 1;
+    }
+    case ID_UI_COMPOSE: return S().ui_compose ? 1 : 0;
     case ID_STREAM_PCT: {
         for (int i = 0; i < 4; ++i) {
             if (kStreamPct[i] == S().stream_pct) { return i; }
@@ -916,6 +960,7 @@ static std::wstring row_value(Id id)
         wchar_t in[32]{};
         GetPrivateProfileStringW(L"fakerFG", L"FgInput", L"", in, 32, ini.c_str());
         if (in[0] == 0) { return L"FgInput 为空"; }
+        if (_wcsicmp(in, L"DLSSG") != 0) { return L"FgInput 不是 DLSSG（本版只支持 DLSSG）"; }
         return L"fakerFG.ini OK";
     }
     case ID_CHECK_SHA: return g_sha_text;
@@ -1305,6 +1350,8 @@ static void read_game_ini_state(const std::wstring& ini)
     for (int i = 0; i < 4; ++i) {
         if (_wcsicmp(v, fg_input_ini_value(i)) == 0) { S().fg_input = i; break; }
     }
+    // This build only implements the DLSSG lane; the UI never offers another source.
+    S().fg_input = 0;
 
     int pct = (int)GetPrivateProfileIntW(L"fakerFG", L"StreamPercent", 150, ini.c_str());
     wchar_t mv[16]{};
@@ -1320,6 +1367,22 @@ static void read_game_ini_state(const std::wstring& ini)
     }
     S().stream_pct = best;
     S().fg_log = (GetPrivateProfileIntW(L"fakerFG", L"Log", 1, ini.c_str()) != 0);
+    // 1.2.9: reflect the file's codec resolution / UI composition so the dropdowns show what
+    // the game will actually load. Missing keys mean "not configured yet": depth defaults to
+    // 150 (the 1.2.8+ default) and UI composition to OFF, which is what an old ini does.
+    {
+        const int dpct = (int)GetPrivateProfileIntW(L"fakerFG", L"DepthCodecPercent", 150,
+                                                    ini.c_str());
+        S().depth_pct = (dpct == 100 || dpct == 200) ? dpct : 150;
+        S().ui_compose = GetPrivateProfileIntW(L"fakerFG", L"UiStream", 0, ini.c_str()) != 0;
+    }
+    // The full test template carries keys the release one does not; use one of them to
+    // show the right "配置版本" entry instead of trusting the remembered state.
+    {
+        wchar_t probe[16]{};
+        GetPrivateProfileStringW(L"fakerFG", L"UiSynthDump", L"", probe, 16, ini.c_str());
+        S().ini_full = probe[0] != 0;
+    }
 }
 
 // 目录里是否有进程正在运行（覆盖最小化到托盘、窗口被隐藏的游戏）。
@@ -1461,7 +1524,7 @@ static void apply_fg_input()
     _snwprintf_s(pct, _TRUNCATE, L"%d", S().stream_pct);
     bool ok = true;
     ok = ok && WritePrivateProfileStringW(L"fakerFG", L"FgInput",
-                                          fg_input_ini_value(S().fg_input), ini.c_str()) != 0;
+                                          L"DLSSG", ini.c_str()) != 0;
     ok = ok && WritePrivateProfileStringW(L"fakerFG", L"FgOutput", L"Capture", ini.c_str()) != 0;
     ok = ok && WritePrivateProfileStringW(L"fakerFG", L"Passthrough", L"0", ini.c_str()) != 0;
     ok = ok && WritePrivateProfileStringW(L"fakerFG", L"RealSwapchainObject", L"1", ini.c_str()) != 0;
@@ -1472,6 +1535,23 @@ static void apply_fg_input()
     const wchar_t* codec_ini = kCodecIni[(S().codec < 0 || S().codec > 2) ? 2 : S().codec];
     ok = ok && WritePrivateProfileStringW(L"fakerFG", L"MvCodec", codec_ini, ini.c_str()) != 0;
     ok = ok && WritePrivateProfileStringW(L"fakerFG", L"DepthCodec", codec_ini, ini.c_str()) != 0;
+    // 1.2.9: per-stream codec resolution + UI composition. MV stays 1:1 (bit-exact); only
+    // depth is allowed to travel smaller, because it is the stream that costs the most
+    // (2.05 of the 3.5 ms render-card codec time at 4K) and depth resolution is documented
+    // as insensitive (FINAL_CONFIG 2.1.2).
+    wchar_t dpct[16]{};
+    _snwprintf_s(dpct, _TRUNCATE, L"%d", S().depth_pct);
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"CodecStreamPercent", L"100", ini.c_str()) != 0;
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"MvCodecPercent", L"100", ini.c_str()) != 0;
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"DepthCodecPercent", dpct, ini.c_str()) != 0;
+    // UI composition (HUDless / XeFG mode 4). The producer reads these once per session;
+    // the consumer needs `--ui-source auto` (build_cmdline) for its unblend half.
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"UiStream",
+                                          S().ui_compose ? L"1" : L"0", ini.c_str()) != 0;
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"UiSource",
+                                          S().ui_compose ? L"Auto" : L"Off", ini.c_str()) != 0;
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"UiFullRes", L"1", ini.c_str()) != 0;
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"UiSparseCodec", L"1", ini.c_str()) != 0;
     ok = ok && WritePrivateProfileStringW(L"fakerFG", L"Log", S().fg_log ? L"1" : L"0",
                                           ini.c_str()) != 0;
     if (!ok) {
@@ -1481,11 +1561,61 @@ static void apply_fg_input()
         return;
     }
 
-    set_msg(T(L"已写入 fakerFG.ini（输入源 / MV 比例 / 无损传输 / Log），重启游戏生效",
-              L"fakerFG.ini written (input / MV ratio / lossless / Log); restart to apply"));
-    uilog("fakerfg: wrote %ls input=%ls pct=%d codec=%ls log=%d", ini.c_str(),
-          fg_input_ini_value(S().fg_input), S().stream_pct,
-          kCodecIni[(S().codec < 0 || S().codec > 2) ? 2 : S().codec], S().fg_log ? 1 : 0);
+    set_msg(T(L"已写入 fakerFG.ini（DLSSG / 码流分辨率 / UI 合成 / Log），重启游戏生效",
+              L"fakerFG.ini written (DLSSG / codec resolution / UI composition / Log); restart to apply"));
+    uilog("fakerfg: wrote %ls input=DLSSG pct=%d codec=%ls depthpct=%d ui=%d log=%d", ini.c_str(),
+          S().stream_pct,
+          kCodecIni[(S().codec < 0 || S().codec > 2) ? 2 : S().codec],
+          S().depth_pct, S().ui_compose ? 1 : 0, S().fg_log ? 1 : 0);
+}
+
+// 切换游戏侧配置版本：备份现有 fakerFG.ini，再写入精简发布模板或完整测试模板。
+// producer 每个会话只读一次 ini，所以写完必须重启游戏才生效。
+static void apply_ini_profile()
+{
+    const std::wstring ini = game_ini_path();
+    if (ini.empty()) {
+        set_msg(T(L"先选择游戏窗口或游戏库条目，才能写入 fakerFG.ini",
+                  L"Select a game window or library entry first"));
+        return;
+    }
+    if (GetFileAttributesW(ini.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        set_msg(T(L"游戏目录没有 fakerFG.ini：请先部署游戏侧文件",
+                  L"No fakerFG.ini in the game folder: deploy the game-side files first"));
+        uilog("ini: %ls missing", ini.c_str());
+        return;
+    }
+    const wchar_t* tmpl = S().ini_full ? L"fakerFG.full.ini" : L"fakerFG.ini";
+    if (!exe_file_exists(tmpl)) {
+        set_msg(T(L"发布包缺少 fakerFG.full.ini（完整测试模板）",
+                  L"fakerFG.full.ini is missing from the package"));
+        uilog("ini: %ls missing in the package", tmpl);
+        return;
+    }
+
+    wchar_t bak[512]{};
+    _snwprintf_s(bak, _TRUNCATE, L"%s.bak_%lu", ini.c_str(),
+                 (unsigned long)GetTickCount());
+    if (!CopyFileW(ini.c_str(), bak, FALSE)) {
+        uilog("ini: backup failed err=%lu", (unsigned long)GetLastError());
+    } else {
+        prune_ini_backups(ini);
+    }
+
+    const std::wstring src = exe_dir() + L"\\" + tmpl;
+    if (!CopyFileW(src.c_str(), ini.c_str(), FALSE)) {
+        set_msg(T(L"写入 fakerFG.ini 失败（游戏是否在运行？目录是否只读？）",
+                  L"Failed to write fakerFG.ini (game running? read-only?)"));
+        uilog("ini: copy %ls failed err=%lu", tmpl, (unsigned long)GetLastError());
+        return;
+    }
+    read_game_ini_state(ini);
+    set_msg(S().ini_full
+                ? T(L"已写入完整测试配置（fakerFG.full.ini）；重启游戏生效",
+                    L"Full test config written (fakerFG.full.ini); restart the game")
+                : T(L"已写入精简发布配置（fakerFG.ini）；重启游戏生效",
+                    L"Simple release config written (fakerFG.ini); restart the game"));
+    uilog("ini: profile=%ls -> %ls", tmpl, ini.c_str());
 }
 
 // 从指定目录的 fakerFG.ini 读回 FgInput（不依赖游戏是否在跑）。
@@ -1502,6 +1632,24 @@ static void sync_fg_input_from_target()
     if (target_game_ini(&ini)) { read_game_ini_state(ini); }
 }
 
+
+// 部署是“权威覆盖”：先删目标再复制。这样一次失败的复制不会留下旧版本的 DLL，
+// 也就不会出现 producer / consumer / fakerFG 协议版本混用（“协议不同”）。
+static bool force_delete_file(const std::wstring& path)
+{
+    const DWORD attr = GetFileAttributesW(path.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES) { return true; }
+    if (attr & FILE_ATTRIBUTE_READONLY) {
+        SetFileAttributesW(path.c_str(), attr & ~FILE_ATTRIBUTE_READONLY);
+    }
+    return DeleteFileW(path.c_str()) != 0;
+}
+
+static bool force_copy_file(const std::wstring& src, const std::wstring& dst)
+{
+    if (!force_delete_file(dst)) { return false; }
+    return CopyFileW(src.c_str(), dst.c_str(), FALSE) != 0;
+}
 
 // 安装到 <dir>：与 deploy_game.bat 等价，但把每一步结果返回给 UI。
 static bool deploy_game_dir(const std::wstring& dir, std::wstring* out)
@@ -1537,26 +1685,41 @@ static bool deploy_game_dir(const std::wstring& dir, std::wstring* out)
         }
         line(L"已备份游戏原 dxgi.dll -> dxgi.dll.bak");
     }
-    if (file_in_dir(dir, L"nvngx_dlssg.dll") && !file_in_dir(dir, L"nvngx_dlssg_real.dll")) {
+    // 第一次安装才移动游戏自己的 nvngx_dlssg.dll；重装时 nvngx_dlssg.dll 已经是我们的
+    // 别名，不能再把它当成“游戏原文件”存成 _real（那会在还原时换回旧组件）。
+    if (!file_in_dir(dir, L"fakerFG.dll") && file_in_dir(dir, L"nvngx_dlssg.dll") &&
+        !file_in_dir(dir, L"nvngx_dlssg_real.dll")) {
         if (MoveFileW(dlssg.c_str(), dlssg_real.c_str())) {
             line(L"已保留游戏原 DLSS-G -> nvngx_dlssg_real.dll");
         }
     }
 
-    const wchar_t* aliases[] = { L"dxgi.dll", L"nvngx_dlssg.dll", L"fakerFG.dll" };
-    for (const wchar_t* name : aliases) {
-        if (!CopyFileW(dll.c_str(), (dir + L"\\" + name).c_str(), FALSE)) {
-            return fail(L"复制 fakerFG.dll 失败（游戏是否正在运行？目录是否只读？）");
+    // dlssg_sm86 用 version.dll 抢 nvngx_dlssg.dll；它和我们的别名/协议不兼容。
+    // 禁用一次（改名），还原时再换回去。
+    if (file_in_dir(dir, L"version.dll") && !file_in_dir(dir, L"version.dll.bak_mgpu")) {
+        if (MoveFileW((dir + L"\\version.dll").c_str(),
+                      (dir + L"\\version.dll.bak_mgpu").c_str())) {
+            line(L"已禁用 version.dll（dlssg_sm86）-> version.dll.bak_mgpu");
+        } else {
+            line(L"[注意] version.dll 禁用失败（游戏是否在运行？）");
         }
     }
-    line(L"已写入 fakerFG.dll（dxgi.dll / nvngx_dlssg.dll 两个别名）");
+
+    // 全部权威覆盖：先删后拷，避免旧版本 DLL 残留导致协议/加载器状态不一致。
+    const wchar_t* aliases[] = { L"dxgi.dll", L"nvngx_dlssg.dll", L"fakerFG.dll" };
+    for (const wchar_t* name : aliases) {
+        if (!force_copy_file(dll, dir + L"\\" + name)) {
+            return fail(L"写入 fakerFG.dll 失败（游戏是否正在运行？目录是否只读？）");
+        }
+    }
+    line(L"已覆盖 fakerFG.dll（dxgi.dll / nvngx_dlssg.dll 两个别名）");
 
     if (exe_file_exists(L"xess_mfg_producer.dll")) {
-        if (CopyFileW((src + L"\\xess_mfg_producer.dll").c_str(),
-                      (dir + L"\\xess_mfg_producer.dll").c_str(), FALSE)) {
-            line(L"已写入 xess_mfg_producer.dll");
+        if (force_copy_file(src + L"\\xess_mfg_producer.dll",
+                            dir + L"\\xess_mfg_producer.dll")) {
+            line(L"已覆盖 xess_mfg_producer.dll");
         } else {
-            line(L"[注意] xess_mfg_producer.dll 复制失败");
+            line(L"[注意] xess_mfg_producer.dll 写入失败");
         }
     } else {
         line(L"[注意] 发布包里没有 xess_mfg_producer.dll");
@@ -1576,8 +1739,7 @@ static bool deploy_game_dir(const std::wstring& dir, std::wstring* out)
         for (const wchar_t* name : runtime) {
             if (!exe_file_exists(name)) { continue; }
             ++want;
-            if (CopyFileW((src + L"\\" + name).c_str(),
-                          (rt_dir + L"\\" + name).c_str(), FALSE)) {
+            if (force_copy_file(src + L"\\" + name, rt_dir + L"\\" + name)) {
                 ++copied;
             }
         }
@@ -1597,21 +1759,31 @@ static bool deploy_game_dir(const std::wstring& dir, std::wstring* out)
         }
     }
 
-    if (!file_in_dir(dir, L"fakerFG.ini")) {
-        if (exe_file_exists(L"fakerFG.ini") &&
-            CopyFileW((src + L"\\fakerFG.ini").c_str(),
-                      (dir + L"\\fakerFG.ini").c_str(), FALSE)) {
-            line(L"已放入 fakerFG.ini 模板");
+    // fakerFG.ini 也权威覆盖：旧版本的键（尤其已改名的写入项）留着会让下一次读取
+    // 得到混合配置。先备份一份用户文件，再用所选模板覆盖；安装完成后
+    // apply_config_after_deploy() 会把当前 UI 配置重新写进去。
+    {
+        const wchar_t* tmpl = S().ini_full ? L"fakerFG.full.ini" : L"fakerFG.ini";
+        const std::wstring ini = dir + L"\\fakerFG.ini";
+        if (!exe_file_exists(tmpl)) {
+            line(L"[注意] 发布包里没有 fakerFG.ini 模板，请手动放入");
         } else {
-            line(L"[注意] 没有 fakerFG.ini 模板，请手动放入");
+            if (file_in_dir(dir, L"fakerFG.ini")) {
+                wchar_t bak[512]{};
+                _snwprintf_s(bak, _TRUNCATE, L"%s.bak_%lu", ini.c_str(),
+                             (unsigned long)GetTickCount());
+                if (CopyFileW(ini.c_str(), bak, FALSE)) { prune_ini_backups(ini); }
+            }
+            if (force_copy_file(src + L"\\" + tmpl, ini)) {
+                line(S().ini_full
+                         ? L"已覆盖 fakerFG.ini（完整测试模板，旧文件已备份）"
+                         : L"已覆盖 fakerFG.ini（精简发布模板，旧文件已备份）");
+            } else {
+                line(L"[注意] fakerFG.ini 写入失败（游戏是否在运行？目录是否只读？）");
+            }
         }
-    } else {
-        line(L"保留现有 fakerFG.ini（未覆盖）");
     }
 
-    if (file_in_dir(dir, L"version.dll")) {
-        line(L"[重要] 目录里有 version.dll（dlssg_sm86），它会抢 nvngx_dlssg.dll，建议移除");
-    }
     line(L"完成。请重启游戏，进入实际画面后点[刷新窗口列表]。");
     if (out) { *out = log; }
     return true;
@@ -1693,6 +1865,14 @@ static bool undeploy_game_dir(const std::wstring& dir, std::wstring* out)
         if (MoveFileW((dir + L"\\nvngx_dlssg_real.dll").c_str(),
                       (dir + L"\\nvngx_dlssg.dll").c_str())) {
             line(L"已还原游戏原 nvngx_dlssg.dll");
+        }
+    }
+    if (file_in_dir(dir, L"version.dll.bak_mgpu")) {
+        if (MoveFileW((dir + L"\\version.dll.bak_mgpu").c_str(),
+                      (dir + L"\\version.dll").c_str())) {
+            line(L"已还原 version.dll");
+        } else {
+            line(L"[注意] version.dll.bak_mgpu 还原失败");
         }
     }
     line(L"fakerFG.ini 已保留（里面可能改过 FgInput）。");
@@ -1801,6 +1981,9 @@ static void save_state(const std::wstring& sec, const State& s, const wchar_t* f
     ini_w(sec, L"no_marker", s.no_marker ? 1 : 0);
     ini_w(sec, L"upsample", s.upsample ? 1 : 0);
     ini_w(sec, L"codec", s.codec);
+    ini_w(sec, L"depth_pct", s.depth_pct);
+    ini_w(sec, L"ui_compose", s.ui_compose ? 1 : 0);
+    ini_w(sec, L"ini_full", s.ini_full ? 1 : 0);
     ini_w(sec, L"stream_auto", s.stream_auto ? 1 : 0);
     ini_w(sec, L"stream_asym", s.stream_asym ? 1 : 0);
     ini_w(sec, L"input_prefetch", s.input_prefetch ? 1 : 0);
@@ -1843,6 +2026,7 @@ static void load_state(const std::wstring& sec, State& s, const wchar_t* file = 
     }
     s.fg_input    = ini_r(sec, L"fg_input", s.fg_input);
     if (s.fg_input < 0 || s.fg_input > 3) { s.fg_input = 0; }
+    s.fg_input = 0;
     s.out_mode    = ini_r(sec, L"out_mode", s.out_mode);
     s.pool        = ini_r(sec, L"pool", s.pool);
     s.latency     = ini_r(sec, L"latency", s.latency);
@@ -1859,6 +2043,12 @@ static void load_state(const std::wstring& sec, State& s, const wchar_t* file = 
     s.no_marker   = ini_r(sec, L"no_marker", s.no_marker ? 1 : 0) != 0;
     s.upsample    = ini_r(sec, L"upsample", s.upsample ? 1 : 0) != 0;
     s.codec       = ini_r(sec, L"codec", s.codec);
+    s.depth_pct   = ini_r(sec, L"depth_pct", s.depth_pct);
+    if (s.depth_pct != 100 && s.depth_pct != 150 && s.depth_pct != 200) {
+        s.depth_pct = 150;
+    }
+    s.ui_compose  = ini_r(sec, L"ui_compose", s.ui_compose ? 1 : 0) != 0;
+    s.ini_full    = ini_r(sec, L"ini_full", s.ini_full ? 1 : 0) != 0;
     s.stream_auto = ini_r(sec, L"stream_auto", s.stream_auto ? 1 : 0) != 0;
     s.stream_asym = ini_r(sec, L"stream_asym", s.stream_asym ? 1 : 0) != 0;
     s.input_prefetch = ini_r(sec, L"input_prefetch", s.input_prefetch ? 1 : 0) != 0;
@@ -2085,7 +2275,7 @@ static void clear_legacy_game_keys(const wchar_t* sec)
         L"rt", L"tmode", L"gpu_sel", L"hotkey3", L"jitter_zero", L"no_marker",
         L"upsample", L"stream_auto", L"stream_asym", L"input_prefetch", L"ui_none",
         L"unlock", L"slack1", L"tearing", L"sdr", L"overlay_layered", L"relay_input",
-        L"osd", L"perf", L"win_title", L"codec",
+        L"osd", L"perf", L"win_title", L"codec", L"depth_pct", L"ui_compose",
     };
     for (const wchar_t* k : keys) {
         WritePrivateProfileStringW(sec, k, nullptr, ini_path().c_str());
@@ -3130,16 +3320,23 @@ static std::wstring build_cmdline(HWND target, bool display)
     // 固定倍率：2x / 3x / 4x。--mode 直接决定插帧数；输入锁仍由游戏侧完成。
     // 这一段与定稿配方 lock_frame/run_3x.bat（2026-11-21 实测）逐项对齐：
     //   --mode Nx --interp N-1   两个都给，脚本里就是这么写的，日志能一眼对上；
-    //   --streams=mv,depth       默认 mask 还带 ui（020 的 g_stream_mask），
-    //                            producer 会因此多预留 stream 3，显式给出才和脚本一致；
+    //   --streams=mv,depth[,ui] 默认 mask 就带 ui（020 的 g_stream_mask）；UI 合成关掉时
+    //                            这里显式不给，避免 producer 白预留 8 个 UI 槽；
+    //   --ui-source auto         消费端 UI 组合的唯一开关（见下）；
     //   --wgc-minint 0           显式关掉 WGC 的 ~16 ms 交付节流（默认也是 0，写出来便于核对）。
     const int mul = S().fg_mode + 2;
     wchar_t b[256]{};
     _snwprintf_s(b, _TRUNCATE,
                  L" --pool %d --latency %d --mode %dx --interp %d"
-                 L" --streams=mv,depth --wgc-minint 0",
-                 S().pool, S().latency, mul, mul - 1);
+                 L" --streams=mv,depth%s --wgc-minint 0",
+                 S().pool, S().latency, mul, mul - 1,
+                 S().ui_compose ? L",ui" : L"");
     cmd += b;
+    // 1.2.9: the consumer's UI composition is OFF unless --ui-unblend / --ui-source is
+    // given (g_ui_unblend is CLI-only). Without this flag the producer publishes stream 3
+    // and the consumer never unblends it: that is the state 1.2.7 shipped in, and it
+    // silently disabled the whole HUDless path no matter what fakerFG.ini said.
+    if (S().ui_compose) { cmd += L" --ui-source auto"; }
     // v30: no --interp-cadence here. The continuous frameRenderTime feed (--fg-rt-mode auto)
     // keeps slow scenes smooth while the slot gate stays the single pacing owner.
     // Which GPU runs the frame generation (A card rendering + N card output, or the
@@ -4741,8 +4938,11 @@ static void library_install_selected()
         return;
     }
     if (!exe.empty()) { q += T(L"\r\n\r\n主程序：", L"\r\n\r\nexe: ") + last_component(exe); }
-    q += T(L"\r\n\r\n会备份 dxgi.dll，之后可还原。继续？",
-           L"\r\n\r\ndxgi.dll is backed up; [Restore] reverts it. Continue?");
+    q += T(L"\r\n\r\n会覆盖 dxgi.dll / nvngx_dlssg.dll / fakerFG.dll / xess_mfg_producer.dll，"
+           L"并按所选版本重写 fakerFG.ini（旧文件会备份；原 dxgi.dll / nvngx_dlssg.dll 可还原）。继续？",
+           L"\r\n\r\ndxgi.dll / nvngx_dlssg.dll / fakerFG.dll / xess_mfg_producer.dll will be "
+           L"overwritten, and fakerFG.ini is rewritten from the selected template "
+           L"(old file backed up; original dxgi.dll / nvngx_dlssg.dll can be restored). Continue?");
     if (MessageBoxW(g_hwnd, q.c_str(), T(L"安装到游戏", L"Install to game"),
                     MB_YESNO | MB_ICONQUESTION) != IDYES) {
         return;
@@ -4903,9 +5103,10 @@ static const wchar_t* tip_for(Id id)
     switch (id) {
     case ID_S_INSTALL:
         return L"选择游戏的 exe，把 fakerFG.dll / producer 装进它所在目录。"
-               L"会自动备份原 dxgi.dll，可随时还原。";
+               L"旧组件会被覆盖（dxgi.dll / nvngx_dlssg.dll 先备份，可还原），"
+               L"游戏侧 fakerFG.ini 会按所选版本重写并备份旧文件。";
     case ID_S_UNDEPLOY:
-        return L"移除组件并把游戏原来的 dxgi.dll / nvngx_dlssg.dll 换回去；"
+        return L"移除组件并把游戏原来的 dxgi.dll / nvngx_dlssg.dll / version.dll 换回去；"
                L"fakerFG.ini 保留。";
     case ID_S_GAMELIB:
         return L"从一个游戏的主程序 exe 添加条目；"
@@ -4940,8 +5141,11 @@ static const wchar_t* tip_for(Id id)
         return L"OptiScaler 的逐游戏 FG 输入表（49 行）。开启时按游戏 exe 自动套用："
                L"UE 无限远平面、jittered MV、inverted depth 等；日志会打印命中的行。";
     case ID_FG_INPUT:
-        return L"游戏侧取帧的来源。DLSSG（Streamline）为正式支持；"
-               L"NVNGX / Upscaler / FSR 为实验性。";
+        return L"本版只实现 DLSSG 输入（Streamline tag），固定不可改；"
+               L"NVNGX / Upscaler / FSR 车道未实现，ini 里写了也会被强制回 DLSSG。";
+    case ID_INI_PROFILE:
+        return L"游戏侧 fakerFG.ini 的版本：精简（发布，只保留常用键）/ 完整（测试，含全部"
+               L"实验与调试键）。切换会备份并覆盖游戏目录的 fakerFG.ini，重启游戏生效。";
     case ID_STREAM_PCT:
         return L"跨卡只传 MV/深度的比例：100%=1:1 最清晰、150%=每维 2/3（默认）、"
                L"200%=每维 1/2、400%=每维 1/4 最省；改动需重启游戏。"
@@ -4950,6 +5154,15 @@ static const wchar_t* tip_for(Id id)
         return L"无损传输（协议 v30）：渲染卡把 MV/深度编码进跨卡槽，副卡解码回逐位一致的"
                L"原数据，并强制 1:1。自动 = 能跑就用，硬件/格式不支持时自动退回桥接拷贝+"
                L"升降采样。改动需重启游戏。";
+    case ID_DEPTH_PCT:
+        return L"深度码流的分辨率（MV 永远是 100% 逐像素无损，不受这里影响）。"
+               L"深度只用于遮挡判断，实测 4K 下 150% 让 depth 编码 2.05→0.79 ms、码流减半，"
+               L"MV 一字不改。100% = 逐像素无损（最保守）；改动需重启游戏。";
+    case ID_UI_COMPOSE:
+        return L"实验性：把 UI 平面单独传过来、在副卡重建 HUDless，插值帧的 HUD 不残影；"
+               L"但边缘/半透明 UI 仍可能出现拖影或伪影，发布默认关闭。"
+               L"需要游戏在 DLSS-G evaluate 里提供 HUDless/UI 平面，没有就自动退化。"
+               L"只建议在 A/B 时打开；改动需重启游戏。";
     case ID_FG_LOG:
         return L"游戏侧日志（fakerFG.ini 的 Log）：排查问题打开，稳定后可关闭以减少写盘；"
                L"改动需重启游戏。";
@@ -5075,7 +5288,7 @@ static bool is_clickable_at(int mx, int my)
     case ID_S_WINDOW:
     case ID_S_REFRESH: case ID_S_2X: case ID_S_3X: case ID_S_4X: case ID_S_START:
     case ID_S_LOGVIEW: case ID_S_DIAG:
-    case ID_FG_MODE: case ID_OUT: case ID_FG_INPUT: case ID_SDR: case ID_POOL:
+    case ID_FG_MODE: case ID_OUT: case ID_INI_PROFILE: case ID_SDR: case ID_POOL:
     case ID_LAT: case ID_GPUSEL: case ID_UISCALE: case ID_TARGET: case ID_HOTKEY:
     case ID_CMD: case ID_TMODE: case ID_FOV: case ID_IVL: case ID_UI: case ID_RT:
     case ID_LOCK: case ID_LAYERED: case ID_RELAY: case ID_OSD: case ID_JITZ:
@@ -5864,9 +6077,9 @@ static void set_opt(Id id, int idx)
         S().fg_mode = idx % 3;
         S().interp = S().fg_mode + 2;
         break;
-    case ID_FG_INPUT:
-        S().fg_input = (idx < 0 || idx > 3) ? 0 : idx;
-        apply_fg_input();
+    case ID_INI_PROFILE:
+        S().ini_full = (idx % 2) == 1;
+        apply_ini_profile();
         remember_game(g_game_dir);
         break;
     case ID_STREAM_PCT:
@@ -5879,6 +6092,24 @@ static void set_opt(Id id, int idx)
         set_msg(S().codec == 0 ? L"已关闭无损传输：MV/深度走跨卡直接拷贝"
                 : S().codec == 1 ? L"已开启无损传输：MV/深度逐位无损（强制 1:1）"
                                  : L"无损传输=自动：能跑码流就用，跑不了自动退回老路径");
+        break;
+    case ID_DEPTH_PCT: {
+        const int k = (idx < 0 || idx > 2) ? 1 : idx;
+        S().depth_pct = kDepthPct[k];
+        apply_fg_input();          // write DepthCodecPercent now, like the codec dropdown
+        set_msg(S().depth_pct == 100
+                    ? L"深度码流 100%：逐像素无损（depth 编码 +1.3 ms）"
+                    : S().depth_pct == 150
+                          ? L"深度码流 150%：depth 编码 -61%，MV 仍逐像素无损（需重启游戏）"
+                          : L"深度码流 200%：更省，快速转视角时遮挡边缘风险更高（需重启游戏）");
+        break;
+    }
+    case ID_UI_COMPOSE:
+        S().ui_compose = (idx % 2) == 1;
+        apply_fg_input();          // writes UiStream/UiSource now
+        set_msg(S().ui_compose
+                    ? L"UI 合成（实验性）已开启：HUD 不残影，但边缘 UI 仍可能有伪影（需重启游戏）"
+                    : L"UI 合成已关闭（发布默认）：最大帧率，HUD 会在插值帧里残影（需重启游戏）");
         break;
     case ID_OUT:     S().out_mode = idx % 3; break;
     case ID_SDR:
@@ -5983,8 +6214,11 @@ static void simple_action(Id id)
                      S().fg_mode + 2, fg_input_ini_value(S().fg_input));
         const std::wstring q = T(L"把锁帧组件安装到：\r\n\r\n", L"Install into:\r\n\r\n") + short_path(dir) +
                                cfg +
-                               T(L"\r\n\r\n会备份 dxgi.dll，之后可还原。继续？",
-                                 L"\r\n\r\ndxgi.dll is backed up; [Restore] reverts it. Continue?");
+                               T(L"\r\n\r\n会覆盖 dxgi.dll / nvngx_dlssg.dll / fakerFG.dll / xess_mfg_producer.dll，"
+                                 L"并按所选版本重写 fakerFG.ini（旧文件会备份；原 dxgi.dll / nvngx_dlssg.dll 可还原）。继续？",
+                                 L"\r\n\r\ndxgi.dll / nvngx_dlssg.dll / fakerFG.dll / xess_mfg_producer.dll will be "
+                                 L"overwritten, and fakerFG.ini is rewritten from the selected template "
+                                 L"(old file backed up; original dxgi.dll / nvngx_dlssg.dll can be restored). Continue?");
         if (MessageBoxW(g_hwnd, q.c_str(), T(L"安装到游戏", L"Install to game"),
                         MB_YESNO | MB_ICONQUESTION) != IDYES) {
             return;

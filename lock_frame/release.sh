@@ -54,6 +54,7 @@ cp -f "$REPO/build/lock_frame_ui.exe"         "$OUT/"
 cp -f "$REPO/build/fakerFG.dll"               "$OUT/"
 cp -f "$REPO/build/xess_mfg_producer.dll"      "$OUT/"
 cp -f "$HERE/fakerFG.ini"                     "$OUT/"
+cp -f "$HERE/fakerFG.full.ini"                "$OUT/"
 cp -f "$HERE/collect_diagnostics.bat"         "$OUT/"
 cp -f "$HERE/README.md"                       "$OUT/README.md"
 # 发布说明按版本取；没有对应文件时退回 1.0.0（保持旧版本可复现打包）。
@@ -97,8 +98,14 @@ cat > "$OUT/docs/SUPPORTED-GAMES.md" <<'EOF'
 - UE5（已实测）
 - UE4（已实测）
 
-`NVNGX` / `Upscaler` / `FSR` 为实验性车道：代码可用，但请按游戏逐一验证。
+`NVNGX` / `Upscaler` / `FSR` 车道在当前构建中**未实现**：`FgInput` 固定为
+`DLSSG`，ini 里写其他值会被强制回 `DLSSG`（`FgInput=NoFG` 仍是显式禁用）。
 只支持无边框/窗口化全屏；不要在带反作弊的在线游戏中使用。
+
+游戏侧配置有两个模板：
+
+- `fakerFG.ini`：发布精简版（UI 部署时默认使用）；
+- `fakerFG.full.ini`：测试全参数版（UI →「游戏侧配置 → 配置版本」选「完整（测试）」）。
 EOF
 
 cat > "$OUT/docs/TROUBLESHOOTING.md" <<'EOF'

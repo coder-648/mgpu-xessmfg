@@ -4,14 +4,15 @@ This follows OptiScaler's split: an input lane only produces a `MgpuFgFrame`; an
 output sink only consumes it. The two are selected independently.
 
 ```ini
-FgInput=Upscaler   ; Upscaler | DLSSG | NVNGX | FSR
+FgInput=DLSSG      ; fixed: this build implements the DLSSG (Streamline tag) lane only
 FgOutput=Capture   ; Capture (producer/consumer) | XeFG (local presenter)
 Passthrough=0      ; 1 = hand everything to the real runtime
 ```
 
-`FgOutput` is optional. An explicit `FgInput` without `FgOutput` resolves to
-`Capture`, so the lock_frame producer is the only consumer. `FgOutput=XeFG`
-enables the local XeFG presenter.
+`FgInput` is pinned in code: any other value (except `NoFG`, which disables the
+pipeline) is forced back to `DLSSG`. `FgOutput` is optional; an explicit input
+without it resolves to `Capture`, so the lock_frame producer is the only consumer.
+`FgOutput=XeFG` enables the local XeFG presenter.
 
 There is no user-facing `Mode`. `Passthrough=1` replaces the old off/observe
 modes. `MgpuFgFrame.mode` remains on the API wire for `producer.cpp`'s
@@ -65,5 +66,6 @@ UiSource=Auto      ; Auto | Game | Hudless | Off
 
 The producer only runs the existing single `downsample_ui` pass; it never adds a second
 full-screen pass and never transports full-resolution HUDless. The consumer tags the
-rebuilt HUDless and XeFG uses `BACKBUFFER_HUDLESS` (mode 4). See
-[`UI_SOURCE_V29.md`](UI_SOURCE_V29.md).
+rebuilt HUDless together with the UI, and XeFG uses
+`BACKBUFFER_HUDLESS_UITEXTURE` (mode 5) since 2026-11-23; `--no-ui-mode5` restores
+`BACKBUFFER_HUDLESS` (mode 4). See [`UI_SOURCE_V29.md`](UI_SOURCE_V29.md).

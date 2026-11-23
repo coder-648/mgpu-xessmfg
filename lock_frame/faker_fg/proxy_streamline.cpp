@@ -64,7 +64,13 @@ struct Stage
     StageEntry mv{};
     StageEntry depth{};
     StageEntry ui{};
-    ID3D12Resource* backbuffer = nullptr;
+    // P0: UI alpha flavours. Streamline can tag alpha either combined with the colour
+    // (23, above) or as a separate plane: kBufferTypeUIAlpha (68, alpha only) and
+    // kBufferTypeScalingOutputAlpha (67, the alpha that overrides ScalingOutputColor).
+    // They are recorded but not transported yet (P4 consumes them).
+    StageEntry ui_alpha{};
+    uint32_t   ui_alpha_type = 0;      // sl::BufferType that filled ui_alpha (0 = none)
+    StageEntry backbuffer{};
     void*           cmd        = nullptr;       // the frame's command buffer (from the tag call)
 
     unsigned char constants_raw[512]{};   // sl::Constants copy (opaque)
@@ -159,6 +165,7 @@ struct HudlessSnapshot
 {
     ID3D12Resource* resource = nullptr;
     D3D12_RESOURCE_DESC desc{};
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
 };
 static HudlessSnapshot g_hud_snap[4];
 static UINT g_hud_snap_i = 0;
@@ -175,28 +182,42 @@ static bool snapshot_hudless(const sl::ResourceTag& tag, void* cmd, StageEntry& 
     const D3D12_RESOURCE_DESC d = src->GetDesc();
     if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) { dev->Release(); return false; }
 
+    // FP16 scRGB HUDless is converted once to R10 PQ. The UI synth only needs H and its
+    // transport convention is PQ, so this halves both the snapshot write and the later H
+    // read (66 MB + 66 MB -> 33 MB + 33 MB). Other formats keep the exact copy path.
+    const bool to_pq = cfg().ui_snapshot_pq != 0 &&
+                       (d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+                        d.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS);
+    const DXGI_FORMAT out_fmt = to_pq ? DXGI_FORMAT_R10G10B10A2_UNORM : d.Format;
+
     HudlessSnapshot& s = g_hud_snap[g_hud_snap_i];
     if (s.resource == nullptr || s.desc.Width != d.Width || s.desc.Height != d.Height ||
-        s.desc.Format != d.Format) {
+        s.desc.Format != out_fmt) {
         if (s.resource != nullptr) { s.resource->Release(); s.resource = nullptr; }
         D3D12_RESOURCE_DESC rd = d;
         rd.MipLevels = 1;
         rd.DepthOrArraySize = 1;
         rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-        rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+        rd.Flags = to_pq ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+                         : D3D12_RESOURCE_FLAG_NONE;
+        rd.Format = out_fmt;
         D3D12_HEAP_PROPERTIES hp{};
         hp.Type = D3D12_HEAP_TYPE_DEFAULT;
         hp.CreationNodeMask = 1;
         hp.VisibleNodeMask = 1;
-        if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-                                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                IID_PPV_ARGS(&s.resource)))) {
+        if (FAILED(dev->CreateCommittedResource(
+                &hp, D3D12_HEAP_FLAG_NONE, &rd,
+                to_pq ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_COPY_DEST,
+                nullptr, IID_PPV_ARGS(&s.resource)))) {
             dev->Release();
             s.resource = nullptr;
             return false;
         }
         s.desc = rd;
+        s.state = to_pq ? D3D12_RESOURCE_STATE_COMMON
+                        : D3D12_RESOURCE_STATE_COPY_DEST;
     }
+    pass_set_device(dev);
     dev->Release();
 
     const D3D12_RESOURCE_STATES declared =
@@ -212,25 +233,52 @@ static bool snapshot_hudless(const sl::ResourceTag& tag, void* cmd, StageEntry& 
                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)) {
         before = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     }
-    D3D12_RESOURCE_BARRIER b{};
-    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition.pResource = src;
-    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    b.Transition.StateBefore = before;
-    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    if (before != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+    if (to_pq) {
+        if (s.state != D3D12_RESOURCE_STATE_COMMON) {
+            D3D12_RESOURCE_BARRIER sb{};
+            sb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            sb.Transition.pResource = s.resource;
+            sb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            sb.Transition.StateBefore = s.state;
+            sb.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+            cl->ResourceBarrier(1, &sb);
+            s.state = D3D12_RESOURCE_STATE_COMMON;
+        }
+        if (!pass_hudless_to_pq(cl, src, before, s.resource,
+                                static_cast<UINT>(d.Width), d.Height)) {
+            return false;
+        }
+        s.state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    } else {
+        D3D12_RESOURCE_BARRIER b{};
+        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource = src;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        b.Transition.StateBefore = before;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        if (before != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+            cl->ResourceBarrier(1, &b);
+        }
+        if (s.state != D3D12_RESOURCE_STATE_COPY_DEST) {
+            b.Transition.pResource = s.resource;
+            b.Transition.StateBefore = s.state;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+            cl->ResourceBarrier(1, &b);
+            s.state = D3D12_RESOURCE_STATE_COPY_DEST;
+        }
+        cl->CopyResource(s.resource, src);
+        if (before != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+            b.Transition.pResource = src;
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            b.Transition.StateAfter = before;
+            cl->ResourceBarrier(1, &b);
+        }
+        b.Transition.pResource = s.resource;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
         cl->ResourceBarrier(1, &b);
+        s.state = D3D12_RESOURCE_STATE_COPY_SOURCE;
     }
-    cl->CopyResource(s.resource, src);
-    if (before != D3D12_RESOURCE_STATE_COPY_SOURCE) {
-        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        b.Transition.StateAfter = before;
-        cl->ResourceBarrier(1, &b);
-    }
-    b.Transition.pResource = s.resource;
-    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    cl->ResourceBarrier(1, &b);
 
     slot.resource = s.resource;
     slot.state = D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -239,8 +287,9 @@ static bool snapshot_hudless(const sl::ResourceTag& tag, void* cmd, StageEntry& 
     static bool logged = false;
     if (!logged) {
         logged = true;
-        logf("sl: HUDLESS snapshot (onlyValidNow) %ux%u fmt %u -> stable copy\n",
-             static_cast<unsigned>(d.Width), d.Height, static_cast<unsigned>(d.Format));
+        logf("sl: HUDLESS snapshot (onlyValidNow) %ux%u fmt %u -> %s\n",
+             static_cast<unsigned>(d.Width), d.Height, static_cast<unsigned>(d.Format),
+             to_pq ? "R10 PQ (compute, no full copy)" : "stable copy");
     }
     return true;
 }
@@ -286,18 +335,125 @@ void remember(StageEntry& slot, const sl::ResourceTag& tag, void* cmd)
     if (cmd != nullptr) { g_stage.cmd = cmd; }
 }
 
+// P0 census (read-only): one line per newly-seen tag type per session. It never changes
+// what is staged or published; a single run answers "which planes does this title
+// actually hand over?" (23/67/68/hudless/backbuffer/...).
+static uint32_t g_tag_census = 0;
+
+static void census_tag(const char* name, uint32_t bit, const sl::ResourceTag& t)
+{
+    if ((g_tag_census & bit) != 0) { return; }
+    g_tag_census |= bit;
+    const bool until = (t.lifecycle == sl::eValidUntilPresent);
+    if (t.resource == nullptr) {
+        logf("sl: tags %s (null resource, lc=%s)\n", name, until ? "until_present" : "now");
+        return;
+    }
+    // sl::Resource carries width/height/state but not the DXGI format; take it from the
+    // D3D12 object the tag points at (this proxy is D3D12-only).
+    unsigned fmt = 0;
+    if (t.resource->native != nullptr) {
+        const D3D12_RESOURCE_DESC d =
+            reinterpret_cast<ID3D12Resource*>(t.resource->native)->GetDesc();
+        fmt = static_cast<unsigned>(d.Format);
+    }
+    logf("sl: tags %s %ux%u fmt %u state 0x%X lc=%s extent %ux%u\n",
+         name, t.resource->width, t.resource->height, fmt, t.resource->state,
+         until ? "until_present" : "now", t.extent.width, t.extent.height);
+}
+
+// v32 cost isolation: the HUDless snapshot is a full-resolution CopyResource on the
+// render card. It is only useful when this session actually publishes a UI stream
+// (render-synth) or a clean HUDless stream. With both switches off, skip the tag copy so
+// the "feature off" baseline really has no extra render-card work.
+static bool hudless_staging_enabled()
+{
+    // Re-evaluate per call: the consumer can start after the game. With no consumer there
+    // is nothing to transport, so the full-resolution snapshot must not run.
+    wchar_t path[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    if (wchar_t* slash = wcsrchr(path, L'\\')) { *(slash + 1) = 0; }
+    wcscat_s(path, MAX_PATH, L"fakerFG.ini");
+    const int ui = GetPrivateProfileIntW(L"fakerFG", L"UiStream", 0, path);
+    const int hl = GetPrivateProfileIntW(L"fakerFG", L"HudlessStream", 0, path);
+    HANDLE ev = OpenEventW(SYNCHRONIZE, FALSE, L"Local\\mgpu_consumer_present_v1");
+    const bool consumer = (ev != nullptr);
+    if (ev != nullptr) { CloseHandle(ev); }
+    const bool enabled = (ui != 0 || hl != 0) && consumer;
+    static int last = -1;
+    if (last != (enabled ? 1 : 0)) {
+        last = enabled ? 1 : 0;
+        logf("sl: HUDless staging %s (UiStream=%d HudlessStream=%d consumer=%d)\n",
+             enabled ? "ON" : "OFF", ui, hl, consumer ? 1 : 0);
+    }
+    return enabled;
+}
+
+// v4: CP2077 delivers the HUDless plane as onlyValidNow. Build the UI on the tag's own
+// command list, using the current chain backbuffer as P, so the later record has a ready
+// UI texture and no full-resolution HUDless snapshot is required.
+static bool tag_time_synth(const sl::ResourceTag& tag, void* cmd, StageEntry& slot)
+{
+    if (cfg().ui_tag_synth == 0) { return false; }
+    if (tag.resource == nullptr || tag.resource->native == nullptr || cmd == nullptr) {
+        return false;
+    }
+    // CP2077 tags ScalingOutputColor before HUDless. It is the frame's final scaling
+    // output (P), while the chain's "current" index at tag time can still be the previous
+    // buffer. Prefer the explicitly tagged scaling output; fall back to the chain buffer.
+    const StageEntry* p = g_stage.scaling.resource != nullptr ? &g_stage.scaling : nullptr;
+    void* p_res = nullptr;
+    uint32_t p_state = 0;
+    if (p != nullptr) {
+        p_res = p->resource;
+        p_state = p->state;
+    } else {
+        MgpuFgFrame pb = make_empty_record();
+        if (!xefg_record_backbuffer(&pb)) { return false; }
+        const MgpuFgResource& bb = pb.stream[MGPU_FG_STREAM_BACKBUFFER];
+        if (bb.resource == nullptr) { return false; }
+        p_res = bb.resource;
+        p_state = bb.state;
+    }
+    if (!producer_ui_tag(cmd, p_res, p_state,
+                         reinterpret_cast<void*>(tag.resource->native),
+                         tag.resource->state)) {
+        return false;
+    }
+    slot.resource      = reinterpret_cast<ID3D12Resource*>(tag.resource->native);
+    slot.state         = tag.resource->state;
+    slot.until_present = false;      // only used if the pending tag synth is lost
+    slot.ext_w         = tag.extent.width;
+    slot.ext_h         = tag.extent.height;
+    if (cmd != nullptr) { g_stage.cmd = cmd; }
+    static bool told = false;
+    if (!told) {
+        told = true;
+        logf("sl: tag-time UI synth accepted - HUDless snapshot skipped\n");
+    }
+    return true;
+}
+
 void record_tags(const sl::ResourceTag* tags, uint32_t count, void* cmd)
 {
     if (tags == nullptr) { return; }
     for (uint32_t i = 0; i < count; ++i) {
         const sl::ResourceTag& t = tags[i];
         switch (t.type) {
-        case sl::kBufferTypeHUDLessColor:    remember(g_stage.hudless, t, cmd); break;
+        case sl::kBufferTypeHUDLessColor:
+            census_tag("hudless", 1u << 0, t);
+            if (hudless_staging_enabled()) {
+                if (!tag_time_synth(t, cmd, g_stage.hudless)) {
+                    remember(g_stage.hudless, t, cmd);
+                }
+            }
+            break;
         case sl::kBufferTypeScalingOutputColor:
+            census_tag("scaling_output", 1u << 1, t);
             // CP2077 tags HUDLESS_COLOR onlyValidNow (its content can already be
             // cleared at present). SCALING_OUTPUT is the upscaled scene image and is
             // tagged validUntilPresent; use it as the HUDless plane when available.
-            remember(g_stage.scaling, t, cmd);
+            if (hudless_staging_enabled()) { remember(g_stage.scaling, t, cmd); }
             {
                 static bool told = false;
                 if (!told && t.resource != nullptr) {
@@ -307,18 +463,50 @@ void record_tags(const sl::ResourceTag* tags, uint32_t count, void* cmd)
                 }
             }
             break;
-        case sl::kBufferTypeMotionVectors:   remember(g_stage.mv, t, cmd); break;
+        case sl::kBufferTypeMotionVectors:
+            census_tag("mv", 1u << 2, t);
+            remember(g_stage.mv, t, cmd);
+            break;
         // Sl_Inputs::GetResourceType maps all three depth flavours onto Depth
         // (Streamline_Inputs.cpp:287-300). A title that only tags HiResDepth or
         // LinearDepth used to reach us with no depth at all.
         case sl::kBufferTypeDepth:
+            census_tag("depth", 1u << 3, t);
+            remember(g_stage.depth, t, cmd);
+            break;
         case sl::kBufferTypeHiResDepth:
-        case sl::kBufferTypeLinearDepth:     remember(g_stage.depth, t, cmd); break;
-        case sl::kBufferTypeUIColorAndAlpha: remember(g_stage.ui, t, cmd); break;
-        case sl::kBufferTypeBackbuffer:
+            census_tag("hires_depth", 1u << 4, t);
+            remember(g_stage.depth, t, cmd);
+            break;
+        case sl::kBufferTypeLinearDepth:
+            census_tag("linear_depth", 1u << 5, t);
+            remember(g_stage.depth, t, cmd);
+            break;
+        case sl::kBufferTypeUIColorAndAlpha:
+            census_tag("ui_color_alpha", 1u << 6, t);
+            remember(g_stage.ui, t, cmd);
+            break;
+        // P0: alpha-only flavours (Streamline core types 68 / 67). Recorded, not
+        // transported yet; a title that only tags one of these currently looks like
+        // "no UI" to the producer, which is exactly what the census is meant to expose.
+        case sl::kBufferTypeUIAlpha:
+            census_tag("ui_alpha", 1u << 7, t);
             if (t.resource != nullptr && t.resource->native != nullptr) {
-                g_stage.backbuffer = reinterpret_cast<ID3D12Resource*>(t.resource->native);
+                remember(g_stage.ui_alpha, t, cmd);
+                g_stage.ui_alpha_type = static_cast<uint32_t>(t.type);
             }
+            break;
+        case sl::kBufferTypeScalingOutputAlpha:
+            census_tag("scaling_output_alpha", 1u << 8, t);
+            if (g_stage.ui_alpha.resource == nullptr &&
+                t.resource != nullptr && t.resource->native != nullptr) {
+                remember(g_stage.ui_alpha, t, cmd);
+                g_stage.ui_alpha_type = static_cast<uint32_t>(t.type);
+            }
+            break;
+        case sl::kBufferTypeBackbuffer:
+            census_tag("backbuffer", 1u << 9, t);
+            remember(g_stage.backbuffer, t, cmd);
             break;
         default: break;
         }
@@ -472,6 +660,24 @@ sl::Result dummy_set_options(const sl::ViewportHandle&, const sl::DLSSGOptions& 
     const bool enabled = options.mode != sl::DLSSGMode::eOff;
     uint32_t   frames  = options.numFramesToGenerate;
     if (frames < 1) { frames = 1; }
+
+    // P0 (read-only): does this engine even know about UI recomposition? We never modify
+    // the options here - the runtime that would consume the flag is stripped on this lane
+    // (strip_dlssg=1), so writing it has no effect. This line only answers "is it set?".
+    // structVersion guards the v4 field: an older game passes a shorter struct.
+    {
+        static int told_uir = -2;
+        const int uir = (options.structVersion >= sl::kStructVersion4)
+                            ? static_cast<int>(options.enableUserInterfaceRecomposition)
+                            : -1;
+        if (uir != told_uir) {
+            told_uir = uir;
+            logf("sl: SetOptions mode=%u frames=%u structVersion=%zu uir=%d uiFmt=%u hudFmt=%u\n",
+                 static_cast<unsigned>(options.mode), frames,
+                 static_cast<size_t>(options.structVersion), uir,
+                 options.uiBufferFormat, options.hudLessBufferFormat);
+        }
+    }
 
     if (enabled != g_stage.game_enabled || frames != g_stage.game_frames) {
         logf("sl: game requested DLSS-G mode=%u framesToGenerate=%u (was %d/%u)\n",
@@ -800,7 +1006,7 @@ sl::Result hk_evaluate(sl::Feature feature, const sl::FrameToken& frame,
     }
     f.output_w = f.stream[MGPU_FG_STREAM_HUDLESS].width;
     f.output_h = f.stream[MGPU_FG_STREAM_HUDLESS].height;
-    if (f.output_w < 8 && g_stage.backbuffer != nullptr) {
+    if (f.output_w < 8 && g_stage.backbuffer.resource != nullptr) {
         f.output_w = f.stream[MGPU_FG_STREAM_BACKBUFFER].width;
         f.output_h = f.stream[MGPU_FG_STREAM_BACKBUFFER].height;
     }
@@ -1116,15 +1322,20 @@ int sl_stage_inputs(MgpuFgFrame& f)
         put(MGPU_FG_STREAM_HUDLESS, g_stage.hudless);
     }
     put(MGPU_FG_STREAM_UI_COLOR, g_stage.ui);
-
-    if (g_stage.backbuffer != nullptr) {
-        const D3D12_RESOURCE_DESC d = g_stage.backbuffer->GetDesc();
-        f.stream[MGPU_FG_STREAM_BACKBUFFER].resource = g_stage.backbuffer;
-        f.stream[MGPU_FG_STREAM_BACKBUFFER].width    = static_cast<uint32_t>(d.Width);
-        f.stream[MGPU_FG_STREAM_BACKBUFFER].height   = d.Height;
-        f.stream[MGPU_FG_STREAM_BACKBUFFER].format   = static_cast<uint32_t>(d.Format);
-        ++provided;
+    // P0: carry the alpha-only plane in the record (the producer ignores it today).
+    put(MGPU_FG_STREAM_UI_ALPHA, g_stage.ui_alpha);
+    if (g_stage.ui.resource == nullptr && g_stage.ui_alpha.resource != nullptr) {
+        static bool told_alpha_only = false;
+        if (!told_alpha_only) {
+            told_alpha_only = true;
+            logf("sl: UI is alpha-only (tag %u) - no UIColorAndAlpha; recorded for P4\n",
+                 g_stage.ui_alpha_type);
+        }
     }
+
+    // The backbuffer is implicit for XeFG (proxy swapchain), but its declared state is
+    // part of the record now: the P1 synth pass has to read it on the title's list.
+    put(MGPU_FG_STREAM_BACKBUFFER, g_stage.backbuffer);
     return provided;
 }
 

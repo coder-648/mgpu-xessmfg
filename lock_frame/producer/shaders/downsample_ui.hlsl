@@ -1,4 +1,4 @@
-// Producer-side UI downsample (B mode 4).
+// Producer-side UI downsample (feeds XeFG mode 5; mode 4 with --no-ui-mode5).
 //
 // One 2x2-footprint box filter in premultiplied-alpha space. The transport target is
 // either the source format (R10/RGBA8) or R10G10B10A2_UNORM for FP16 scRGB sources.
@@ -16,6 +16,7 @@ cbuffer Params : register(b0)
     uint  DstH;
     uint  Mode;           // 0 = pass-through UI, 1 = UI scRGB -> PQ,
                           // 2 = opaque HUDless pass-through, 3 = opaque HUDless scRGB -> PQ
+                          // 4 = UI 1:1 (full-res copy/premultiply), 5 = UI 1:1 + scRGB -> PQ
     uint  Premultiplied;  // 1 = source UI.rgb is already premultiplied
 };
 
@@ -39,6 +40,40 @@ int2 clamp_src(int2 p)
 void CSMain(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= DstW || id.y >= DstH) { return; }
+
+    // P1: 1:1 UI path (full resolution, no downsample). A 2x2 box at 1:1 would blur text
+    // and 1 px lines, which is exactly what this path exists to avoid.
+    if (Mode >= 4) {
+        const float4 v = Src.Load(int3(int2(id.xy), 0));
+        const float  a = v.a;
+        const float3 straight = (Premultiplied != 0) ? v.rgb / max(a, 1e-5) : v.rgb;
+        float3 out_rgb = straight;
+        if (Mode == 5) {
+            const float3x3 k709to2020 = float3x3(
+                0.6274, 0.3293, 0.0433,
+                0.0691, 0.9195, 0.0114,
+                0.0164, 0.0880, 0.8956);
+            out_rgb = pq_encode(mul(k709to2020, out_rgb * 80.0));
+        }
+        Dst[id.xy] = saturate(float4(out_rgb * a, a));
+        return;
+    }
+
+    // v32: clean HUDless stream. Mode 6 = 1:1 opaque HUDless + scRGB->BT.2020 PQ;
+    // mode 7 = 1:1 R10 pass-through.
+    if (Mode >= 6) {
+        const float3 v = Src.Load(int3(int2(id.xy), 0)).rgb;
+        float3 rgb = v;
+        if (Mode == 6) {
+            const float3x3 k709to2020 = float3x3(
+                0.6274, 0.3293, 0.0433,
+                0.0691, 0.9195, 0.0114,
+                0.0164, 0.0880, 0.8956);
+            rgb = pq_encode(mul(k709to2020, rgb * 80.0f));
+        }
+        Dst[id.xy] = float4(saturate(rgb), 1.0f);
+        return;
+    }
 
     const float2 scale = float2((float)SrcW / (float)DstW, (float)SrcH / (float)DstH);
     const float2 c = (float2(id.xy) + 0.5) * scale - 0.5;

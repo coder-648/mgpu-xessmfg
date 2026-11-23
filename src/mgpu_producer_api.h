@@ -15,7 +15,7 @@
 
 #include <stdint.h>
 
-#define MGPU_PRODUCER_VERSION      3u
+#define MGPU_PRODUCER_VERSION      4u
 #define MGPU_PRODUCER_DLL_NAME     L"xess_mfg_producer.dll"
 #define MGPU_PRODUCER_API_EXPORT   "MgpuProducerGetApi"
 
@@ -58,6 +58,14 @@ typedef struct MgpuProducerApi
 
     // Unsubscribe and drop the mapping. Called from the loader thread at exit.
     void (*shutdown)(void);
+
+    // v4: tag-time UI synthesis. Called from slSetTag when the HUDless plane is
+    // onlyValidNow, with the current chain backbuffer and the HUDless resource. The
+    // producer records the synth dispatch on `cmd_list` immediately, so no full-res
+    // HUDless snapshot is needed. Returns 1 when a pending UI texture is ready for the
+    // next record. `backbuffer`/`hudless` are borrowed ID3D12Resource pointers.
+    int  (*ui_tag)(void* cmd_list, void* backbuffer, uint32_t backbuffer_state,
+                   void* hudless, uint32_t hudless_state);
 } MgpuProducerApi;
 
 typedef MgpuProducerApi* (MGPU_PRODUCER_CALL* MgpuProducerGetApiFn)(uint32_t min_version,

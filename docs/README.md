@@ -81,6 +81,15 @@
 | [`design/UPSAMPLE_QUALITY.md`](design/UPSAMPLE_QUALITY.md) | **降采样后的升采样质量**：为什么双线性降采样是信息瓶颈、medoid/中位数、深度引导 JBU、非对称流（MV 全分辨率）与验证方法 |
 | [`design/LOSSLESS_TRANSPORT.md`](design/LOSSLESS_TRANSPORT.md) | **用无损压缩替代降采样传输？（2026-11-21）**：两条不等式（字节/时间）、各流盈亏平衡压缩率、nvComp/hipComp 的五个落地障碍、"colour 换 R10 而不是压缩"、固定码率块变换设计草案与 gate 0–3；含 3080 Ti 实测（编码 0.13 ms/66 MB、降采样 0.30 ms）与 `scripts/lossless_ratio.py` |
 | [`design/UI_UNBLEND_MODE4.md`](design/UI_UNBLEND_MODE4.md) | **B 方案定案（UI 流 + 消费端 unblend + XeFG mode 4）**：UI 流作为 composition 唯一门控、生产端只降采样 UI、消费端用 `UiUnblend` 重建 HUDless、tag 互斥与回退矩阵、成本与验收 |
+| [`design/UI_HUDFIX_RENDER_CARD.md`](design/UI_HUDFIX_RENDER_CARD.md) | **渲染卡跑 hudfix、只传 UI 流的评估（2026-11-22）**：hudfix 产出的是 HUDless 而非 UI、"完整复用 = 完美兼容"不成立、UI 发布点必须在 present 侧（协议冲突）、5.5k–6.5k 行移植与新增 hook 面、渲染卡成本回归、三层门控与 M0 止损 |
+| [`design/UI_PLANE_TRANSPORT_COST.md`](design/UI_PLANE_TRANSPORT_COST.md) | **DLSSG 车道的 HUDless / UI 传输成本（2026-11-22）**：逐标题平面证据、用生产码流内核实测的 UI 压缩比（4K 0.26–3.0 MB，11–128x）与 HUDless 折算价（R10 22.7–27.6 MB）、链路/环/编解码三项账、为什么半分辨率 UI 不该上码流、全分辨率 UI 与 HUDless 的取舍 |
+| [`design/FORCE_UI_SUPPLY.md`](design/FORCE_UI_SUPPLY.md) | **能不能强制游戏按指定链路提供 UI（2026-11-22）**：把"强制"拆成链路/开关/产出三层；我们已强制链路（strip sl.dlss_g + 自答 GetState）、`enableUserInterfaceRecomposition` 在本架构无下游消费者、Khazan/CP2077 反例；可做的只有补齐 UI alpha tag 23/67/68 与普查；正解是"只要 HUDless，UI 由 present 侧差分" |
+| [`design/UI_COMPUTE_QUALITY.md`](design/UI_COMPUTE_QUALITY.md) | **现有 UI 计算方式与理论效果（2026-11-22）**：synth/unblend 的低频/高频分解（低频恒等于 `H_low`）、mask 只决定黑分支、2-bit alpha 的有效阈值 ~0.83、SDR(RGBA8) 与 HDR(R10A2) 的差别、按 UI 类型的预期、以 `UIAlpha` 做"直接重建"的改进顺序；§3.6 给出"无损 + 不下采样"的重估与成本表 |
+| [`design/XEFG_UI_INPUTS.md`](design/XEFG_UI_INPUTS.md) | **XeFG UI 合成的完整参数（2026-11-22）**：三种资源与 `Final=UI+(1−a)·HUDless` 公式、`uiMode`/`UITEXTURE_NOT_PREMUL_ALPHA`/composition state、每帧 tag 的 type/validity/base/size/state、模式 0–5 与必需资源矩阵、HDR 同格式/2-bit alpha 的厂商约束、我们的实现对照与错误码 |
+| [`design/UI_COMPOSE_DLSSG_PLAN.md`](design/UI_COMPOSE_DLSSG_PLAN.md) | **DLSSG-only UI 合成落地计划（2026-11-22）**：Evaluate 采集 → 全分辨率 synth → 只传 UI → 副卡 unblend → mode 4/5；P0 普查/P1 纹理/P2 码流+每流槽数/P3 mode 5/P4 UIAlpha 的分阶段改动、协议 v31 字段、逐文件清单、验收矩阵、kill criteria 与回退 |
+| [`design/UI_ITERATION_2026-11-23_SPARSE.md`](design/UI_ITERATION_2026-11-23_SPARSE.md) | **UI sparse 迭代记录（2026-11-23）**：1/2 稳定基线（8×8 group 早退 + 空 32×8 tile mode=3）、105%→103%、tag-time synth 与 R10 HUDless 快照两次失败实验、当前配置/构建哈希/复现步骤 |
+| [`design/HUDLESS_SOURCES_DLSSFG.md`](design/HUDLESS_SOURCES_DLSSFG.md) | **DLSS-FG 输入链路的 HUDless 从哪来（OptiScaler 对照）**：6 条 `FgInput` 车道各自的 hudless API 面（SL tag / NGX `DLSSG.HUDLess` / FSR3 `currentBackBuffer_HUDLess` / ffx `presentColor` / XeFG `RES_HUDLESS_COLOR` / upscaler 的 Hudfix），逐游戏落点（CP2077、Khazan、PRAGMATA、Nixxes/UE/Unity）、L0→L5 兜底阶梯、validity/格式/尺寸闸门，以及 HudCutoff 为什么不能替代 hudless |
+
 | [`design/PLAN_2026-11-13.md`](design/PLAN_2026-11-13.md) | **定案**：滤波器无条件改进 + `--upsample` 一个开关、XeFG 同尺寸约束下的取舍、A/B 计划与开关去留判据 |
 | [`design/FAKER_FG_PORT.md`](design/FAKER_FG_PORT.md) | **fakerFG × OptiScaler 逐机制对照与移植清单**：入口/呈现/输入契约三段 + 已踩过的坑 + “不要再做的事” |
 | [`design/FG_BACKEND.md`](design/FG_BACKEND.md) | "为什么不能当观察者"的论证（§9–§10 已作废，见 FAKER_FG） |
@@ -98,6 +107,7 @@
 | [`../lock_frame/docs/README.md`](../lock_frame/docs/README.md) | lock_frame 文档索引（规划/发布说明/测试步骤） |
 | [`findings/QUALITY_VARIABLES.md`](findings/QUALITY_VARIABLES.md) | **画质/预算变量作用表** + 怎么自己复测 |
 | [`findings/PERF_BASELINE.md`](findings/PERF_BASELINE.md) | **性能基线（别重测）+ 优化候选清单** + 怎么看 `breakdown` |
+| [`design/PERF_OPT_2026-11-23.md`](design/PERF_OPT_2026-11-23.md) | **性能优化批 1**：`CodecStreamPercent` 档位、Dispatch 合法性修复、marker 逐帧 syscall 缓存、`capture=`/`g_frame_ms_ema` 计时修正、**sparse unblend**（空 UI tile 不采样、不跑 PQ，占用表由 codec 头派生）、**UI 本地纹理按 UI 槽位建**（省 ~0.8 GB）；§5 是编码器成本的实测方法（`ProfGpu` 时间戳 + `FrCodecAblate` 消融档） |
 | [`findings/PERF_ROUND_HANDOVER.md`](findings/PERF_ROUND_HANDOVER.md) | **性能分析轮交接（2026-11-14）**：链路、日志速查、基线数字、杠杆排序、开关、五个坑 |
 | [`findings/M1_EVENT_LOOP.md`](findings/M1_EVENT_LOOP.md) | **M1 A/B 实测（2026-11-14）**：A5 bridge vs 独立 consumer 的 `total`/`pf`/3x/`wakes/s`，以及 CPU 对比的注意事项 |
 | [`findings/M2_CAPTURE_THREAD.md`](findings/M2_CAPTURE_THREAD.md) | **M2 实测**：capture 线程 CPU -1.37 ms/frame，但深度 2 队列 +20 ms 延迟；默认改深度 1 |

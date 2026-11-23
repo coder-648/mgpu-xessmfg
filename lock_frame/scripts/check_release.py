@@ -17,6 +17,7 @@ REQUIRED = [
     "fakerFG.dll",
     "xess_mfg_producer.dll",
     "fakerFG.ini",
+    "fakerFG.full.ini",
     "README.md",
     "RELEASE_NOTES.md",
     "collect_diagnostics.bat",
@@ -29,8 +30,21 @@ REQUIRED = [
 INI_REQUIRED = [
     "FgInput=DLSSG",
     "FgOutput=Capture",
-    "ColourStream=0",
-    "StreamPercent=150",
+    "StreamPercent=150",          # 非码流回退路径
+    # v30 无损码流：默认两条流都走 codec
+    "MvCodec=auto",
+    "DepthCodec=auto",
+    # 1.2.8 默认：MV 1:1 比特精确，depth 150%
+    "CodecStreamPercent=100",
+    "DepthCodecPercent=150",
+    # UI 合成是实验性：发布版必须默认关闭
+    "UiStream=0",
+    "UiSource=Off",
+    "UiSparseCodec=1",
+    # 诊断开关绝不能出现在发布包里
+    "DepthFp16=0",
+    "ProfGpu=0",
+    "FrCodecAblate=0",
 ]
 
 FORBIDDEN_SUFFIX = (".pdb", ".map", ".log", ".ilk", ".obj")
@@ -79,6 +93,15 @@ def main():
     for key in INI_REQUIRED:
         if key not in ini:
             fail("fakerFG.ini missing " + key)
+
+    # The test template ships in the same package; it must never turn a diagnostic on.
+    with open(os.path.join(root, "fakerFG.full.ini"), "r", encoding="utf-8-sig",
+              errors="replace") as f:
+        full_ini = f.read()
+    for key in ("FgInput=DLSSG", "UiStream=1", "DepthFp16=0", "ProfGpu=0",
+                "FrCodecAblate=0"):
+        if key not in full_ini:
+            fail("fakerFG.full.ini missing " + key)
 
     with open(os.path.join(root, "manifest.json"), "r", encoding="utf-8") as f:
         manifest = json.load(f)

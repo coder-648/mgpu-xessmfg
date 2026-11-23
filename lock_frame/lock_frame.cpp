@@ -78,6 +78,9 @@
 // v29: when stream 3 carries HUDless instead of a title UI, this pass synthesises an
 // approximate UI (present - hudless) before the unblend. Same bindings as unblend_ui.
 #include "synth_ui_cso.h"
+// Sparse unblend helper: one flag per 32x8 codec tile, derived from the sparse UI codec's
+// own headers. Lets the unblend write `present` for empty tiles (no UI sample, no PQ math).
+#include "ui_occ_cso.h"
 // v30: consumer side of the lossless MV transport (docs/design/LOSSLESS_TRANSPORT.md).
 // The producer runs the encode pass and writes fr-codec bytes into the MV slot; this
 // blob turns them back into the exact fp16 bit patterns into g_mv_local[slot].
@@ -88,6 +91,8 @@
 // D32 (depth) variants: one 32-bit value per pixel, same kernel with -DDEPTH32.
 #include "fr_decode32_cso.h"
 #include "fr_encode32_cso.h"
+#include "fr_decode_ui_r10_cso.h"
+#include "fr_decode_ui_rgba8_cso.h"
 
 // AMD FidelityFX optical flow: compute the motion vectors locally on the AMD card
 // instead of trusting the producer's MV stream (that stream measured as garbage on
@@ -136,6 +141,7 @@ using Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess;
 #include "modules/090_stream_auto.inc"
 #include "modules/110_pair_dump.inc"
 #include "modules/115_marker.inc"     // WGC 颜色四角 marker -> 精确配对
+#include "modules/118_tag_dump.inc"   // --tag-dump: backbuffer / HUDless / UI 视觉核对
 #include "modules/100_convert_warp.inc"
 #include "modules/120_dump_of.inc"
 #include "modules/130_input_cache.inc"

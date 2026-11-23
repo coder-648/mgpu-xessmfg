@@ -1377,7 +1377,7 @@ static bool init_fg()
     logf_("[lock] SetEnabled: %s (%d)\n", xefg_str(r), (int)r);
     if (r != XEFG_SWAPCHAIN_RESULT_SUCCESS) { return false; }
 
-    // B mode 4 gate: the UI stream existence is the only switch for XeFG UI composition.
+    // UI composition gate: the UI stream existence is the only switch for XeFG composition.
     // unblend success tags HUDless (mode 4); failure tags UI (mode 2). If the producer has
     // no UI stream there is nothing to compose, so keep the library default (DISABLED).
     {
@@ -1419,14 +1419,19 @@ static HANDLE g_map = nullptr;
 static bool place_shared_views()
 {
     if (!g_ctl || !g_shared_heap) { return false; }
+    g_ui_slots = g_ctl->streams[3].slots ? g_ctl->streams[3].slots : mgpu::kMaxSlots;
+    g_hudless_slots = g_ctl->streams[4].slots ? g_ctl->streams[4].slots : mgpu::kMaxSlots;
     for (UINT s = 0; s < mgpu::kMaxSlots; ++s) {
-        for (int k = 0; k <= 3; ++k) {                 // 0 = colour/hudless, 1 = MV, 2 = depth, 3 = UI
+        for (int k = 0; k <= 4; ++k) {                 // 0 colour, 1 MV, 2 depth, 3 UI, 4 HUDless
             const mgpu::StreamShared& st = g_ctl->streams[k];
             if (st.slot_size == 0) { continue; }
+            const UINT nslots = st.slots ? st.slots : mgpu::kMaxSlots;
+            if (s >= nslots) { continue; }
             ComPtr<ID3D12Resource>& dst = (k == 0) ? g_colour[s]
                                           : (k == 1) ? g_mv[s]
                                           : (k == 2) ? g_depth[s]
-                                                     : g_ui[s];
+                                          : (k == 3) ? g_ui[s]
+                                                     : g_hudless[s];
             if (dst) { continue; }                     // already placed (v9: never moves)
             const UINT pw = st.slot_w ? st.slot_w : st.width;
             const UINT ph = st.slot_h ? st.slot_h : st.height;

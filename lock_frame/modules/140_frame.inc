@@ -254,6 +254,14 @@ static bool slot_gate_drop()
 static void run_frame_ex(ID3D11Texture2D* colour11)
 {
     if (!service_shared_layout()) { return; }
+    // --run-sec: a measurement run has a fixed length and exits by itself.
+    if (g_run_sec != 0 && g_t0 > 0.0 &&
+        (static_cast<double>(GetTickCount64()) / 1000.0) - g_t0 >=
+            static_cast<double>(g_run_sec)) {
+        logf_("[lock] --run-sec %u reached - exiting for the next measurement segment\n",
+              g_run_sec);
+        hard_exit("--run-sec reached");
+    }
     collect_retired_inputs();
     probe_colour_black();
     lock_overlay_stall_gate();
@@ -581,13 +589,15 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     ack_previous_slot();
     const double t_work0 = qpc_ms();
 
-    // Real frame interval for XeSS-FG's pacing model.
-    const ULONGLONG now_tick = GetTickCount64();
-    if (g_last_frame_tick) {
-        const double dt = static_cast<double>(now_tick - g_last_frame_tick);
-        g_frame_ms_ema = g_frame_ms_ema * 0.9 + dt * 0.1;
+    // Real frame interval for XeSS-FG's pacing model. QPC: GetTickCount64 ticks in 15.6 ms
+    // steps, so this EMA could only ever read 0 / 16 / 31 ms.
+    {
+        const double now_tick = qpc_ms();
+        if (g_last_frame_tick > 0.0) {
+            g_frame_ms_ema = g_frame_ms_ema * 0.9 + (now_tick - g_last_frame_tick) * 0.1;
+        }
+        g_last_frame_tick = now_tick;
     }
-    g_last_frame_tick = now_tick;
     if (g_xell && !g_reuse_frame) {
         const uint32_t fid = present_id;
         xellAddMarkerData(g_xell, fid, XELL_SIMULATION_START);
@@ -890,7 +900,7 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     g_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_list->DrawInstanced(3, 1, 0, 0);
 
-    // B mode 4: the chain buffer now contains the presented backbuffer (UI included).
+    // UI unblend: the chain buffer now contains the presented backbuffer (UI included).
     // The unblend pass needs this frame's local UI copy, so it is recorded after
     // copy_inputs_local() below, not here. Keep the chain buffer in RENDER_TARGET until
     // then; it is transitioned to PRESENT after the pass.
@@ -935,9 +945,20 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     // copies available (the copy-fence wait is already queued before this list).
     if (g_upsample && pf_hit) { record_upsample(slot); }
 
-    // B mode 4: only after this frame's UI copy exists. A failed/missing UI stream leaves
+    // UI unblend: only after this frame's UI copy exists. A failed/missing UI stream leaves
     // hudless_res null, so the tag section below falls back to tagging UI (mode 2).
-    if (pair_ok && !g_of_miss && !g_no_inputs && !cq) {
+    D3D12_RESOURCE_STATES hudless_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    if (g_hudless_stream && pair_ok && g_hudless_fresh[slot] && g_hudless_local[slot] &&
+        draw_w >= 64 && draw_h >= 64) {
+        // v32: clean HUDless from stream 4. No unblend, no division by (1-a).
+        hudless_res = g_hudless_local[slot].Get();
+        hudless_state = D3D12_RESOURCE_STATE_COMMON;
+        static bool told_clean = false;
+        if (!told_clean) {
+            told_clean = true;
+            logf_("[lock] hudless: using clean stream 4 (no unblend), state=COMMON\n");
+        }
+    } else if (pair_ok && !g_of_miss && !g_no_inputs && !cq) {
         hudless_res = record_ui_unblend(slot, bbres, draw_w, draw_h);
     }
 
@@ -1112,37 +1133,90 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     rd.type = XEFG_SWAPCHAIN_RES_DEPTH;
     if (!g_mv_gate_off) { g_api.D3D12TagFrameResource(g_fg, tag_list, present_id, &rd); }
 
-    // B mode 4: if the unblend pass produced a HUDless this frame, tag it and do NOT tag
-    // UI. XeFG's AUTO mode then selects BACKBUFFER_HUDLESS (mode 4): interpolate HUDless,
-    // extract UI from the chain buffer. If unblend did not run, fall back to tagging UI
-    // alone (BACKBUFFER_UITEXTURE, mode 2). Tagging both would select mode 5, which is not
-    // what this path promises (and needs a higher-quality UI texture than we transport).
-    const bool ui_active = g_ui_local[slot] && g_ui_fresh[slot] && pair_ok && !g_of_miss &&
+    // Tag HUDless + UI together whenever both exist: XeFG's AUTO then selects
+    // BACKBUFFER_HUDLESS_UITEXTURE (mode 5) for BOTH a game-supplied and a render-card
+    // synthesised UI. Mode 5 composites our UI back over the HUDless (and refines with the
+    // full-resolution backbuffer), so the heuristic mask no longer has to be divided out of
+    // the interpolation base - mode 4's (P-U)/(1-a) unblend is exactly what left the ring
+    // around UI edges. 2026-11-23: default for every source; CP2077 A/B measured mode 5 as
+    // the better one for the derived UI too.
+    // Hard condition: XeFG requires HUDless/UI/backbuffer to share resourceSize, so a
+    // half-res UI stream (UiFullRes=0) still has to stay mode 4.
+    // --no-ui-mode5 restores mode 4 for every source. Without a HUDless this frame the
+    // fallback below still tags a game UI alone (mode 2); a derived UI is never tagged
+    // alone.
+    // UI resources are per UI publication slot (see ui_slot_index in 060), not per MV slot:
+    // 8 local decode targets instead of 32 at 4K (~1.06 GB -> 265 MB).
+    const UINT uil = ui_slot_index(slot);
+    const bool ui_active = g_ui_local[uil] && g_ui_fresh[uil] && pair_ok && !g_of_miss &&
                            (g_ctl->active_mask & mgpu::kRequestUi) != 0 &&
                            g_ctl->streams[3].width >= 64 && g_ctl->streams[3].height >= 64;
+    const uint32_t ui_src = ui_source_now();
+    const bool ui_derived = (g_ctl->streams[3].ui_flags & 1u) != 0;
+    const uint32_t ui_q = g_ctl->streams[3].ui_quality;
+    const bool ui_full_res = g_ctl->streams[3].width == draw_w &&
+                             g_ctl->streams[3].height == draw_h;
+    // mode 5 = HUDless + UI, for every UI source (game tag or render-card synth).
+    // 0/1 both mean "use it when allowed"; only --no-ui-mode5 (2) forces mode 4.
+    // Full-res is a hard condition: XeFG requires HUDless/UI/backbuffer to share
+    // resourceSize. The old 50..6000 bp coverage gate is gone: an empty derived UI in
+    // mode 5 composites back to the HUDless, so it is harmless.
+    bool mode5 = false;
+    if (hudless_res != nullptr && ui_active) {
+        mode5 = (g_ui_mode5 != 2) && ui_full_res;
+    }
     if (hudless_res != nullptr) {
         rd.resourceSize = { draw_w, draw_h };
         rd.pResource = hudless_res;
-        rd.incomingState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        rd.incomingState = hudless_state;
         rd.type = XEFG_SWAPCHAIN_RES_HUDLESS_COLOR;
         if (!g_mv_gate_off) { g_api.D3D12TagFrameResource(g_fg, tag_list, present_id, &rd); }
-    } else if (ui_active && ui_source_now() == mgpu::kUiSourceGame) {
+        if (mode5) {
+            rd.resourceSize = { draw_w, draw_h };
+            rd.pResource = g_ui_local[uil].Get();
+            rd.incomingState = D3D12_RESOURCE_STATE_COMMON;
+            rd.type = XEFG_SWAPCHAIN_RES_UI;
+            if (!g_mv_gate_off) {
+                g_api.D3D12TagFrameResource(g_fg, tag_list, present_id, &rd);
+            }
+            static int told_mode5 = -1;
+            const int k = ui_derived ? 1 : 0;
+            if (told_mode5 != k) {
+                told_mode5 = k;
+                logf_("[lock] ui: mode 5 (HUDless + UI), source=%s coverage=%u bp\n",
+                      ui_derived ? "render-synth" : "game", ui_q);
+            }
+        }
+    } else if (ui_active && ui_src == mgpu::kUiSourceGame) {
         rd.resourceSize = { g_ctl->streams[3].width, g_ctl->streams[3].height };
-        rd.pResource = g_ui_local[slot].Get();
+        rd.pResource = g_ui_local[uil].Get();
         rd.incomingState = D3D12_RESOURCE_STATE_COMMON;
         rd.type = XEFG_SWAPCHAIN_RES_UI;
         if (!g_mv_gate_off) { g_api.D3D12TagFrameResource(g_fg, tag_list, present_id, &rd); }
     } else if (ui_active) {
-        // Hudless-derived UI is only a means to rebuild HUDless; it must never be tagged
-        // as a UI texture (that would freeze scene colour into the overlay).
+        // Derived UI is only a means to rebuild HUDless; without a HUDless this frame it
+        // must not be tagged as UI (that would freeze scene colour into the overlay).
         static bool told_derived = false;
         if (!told_derived) {
             told_derived = true;
-            logf_("[lock] ui-unblend: source=hudless has no HUDless this frame -"
+            logf_("[lock] ui-unblend: derived UI has no HUDless this frame -"
                   " UI composition stays off (no UI tag fallback)\n");
         }
     }
 
+    // --tag-dump: copy exactly what XeFG is about to receive (backbuffer/HUDless/UI).
+    if (g_tag_dump_frames > 0) {
+        ID3D12Resource* tag_ui = g_ui_used_current;
+        D3D12_RESOURCE_STATES tag_ui_state = g_ui_used_state;
+        if (tag_ui == nullptr && ui_active) {
+            tag_ui = g_ui_local[uil].Get();
+            tag_ui_state = D3D12_RESOURCE_STATE_COMMON;
+        }
+        record_tag_dump(g_list.Get(), slot, mode5 ? 1u : 0u,
+                        bbres, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        hudless_res, hudless_state,
+                        tag_ui, tag_ui_state);
+    }
     // --dump: record the readback copies in this list, i.e. after everything that
     // feeds XeSS-FG and before Close, so they see exactly what was tagged.
     if (g_dump_frames > 0) { dump_record(g_list.Get(), slot, present_id); }
@@ -1605,6 +1679,7 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     // ones XeSS-FG was tagged with for this present id.
     if (g_dump_frames > 0) { dump_flush(); }
     if (g_ui_dump_frames > 0) { ui_dump_flush(); }
+    if (g_tag_dump_frames > 0) { tag_dump_flush(); }
 
     // Did this frame's GPU work fit inside the interval the game gives us? When the sum
     // exceeds it we cannot consume frames as fast as they arrive, the WGC pool backs up
@@ -1975,6 +2050,8 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
             for (int k = 1; k <= 8; ++k) { g_arr_hist[k] = 0; }
             if (g_fg_rt_mode == kFgRtAuto) {
                 const double vb = refresh_ms();
+                // 64-sample median, once per report window (it is only used right here).
+                g_rt_ema_slow = (g_arr_slow_n >= 32) ? arr_slow_median_ms() : g_rt_ema_fast;
                 const double diff = dabs_(g_rt_ema_fast - g_rt_ema_slow);
                 const bool moving = diff >= vb * 0.60;
                 const int want = moving ? 1 : 0;

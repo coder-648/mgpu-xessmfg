@@ -43,7 +43,16 @@ cbuffer Params : register(b0)
 //   Decode : compressed bytes in the slot -> the consumer's g_mv_local[] texture
 // The pixel side is a texture in both directions; only the compressed side is a buffer.
 // (fxc accepts two resources on one register when each entry point uses only one.)
-#if DEPTH32
+// UI variants (UIFMT_R10 / UIFMT_RGBA8): the pixel side is a typed R10G10B10A2 or
+// RGBA8 texture; the kernel packs/unpacks one u32 per pixel, so the tile body is
+// unchanged. Packing round-trips exactly for 10/8-bit UNORM values.
+#if UIFMT_R10
+Texture2D<float4>   SrcTex4 : register(t0);   // Encode source (R10G10B10A2_UNORM)
+RWTexture2D<float4> DstTex4 : register(u0);   // Decode output (local UI texture)
+#elif UIFMT_RGBA8
+Texture2D<float4>   SrcTex4 : register(t0);   // Encode source (R8G8B8A8_UNORM)
+RWTexture2D<float4> DstTex4 : register(u0);   // Decode output (local UI texture)
+#elif DEPTH32
 // Depth variant (compiled with -DDEPTH32): one 32-bit value per pixel, read/written as
 // float and bit-cast with asuint/asfloat, which is exact for EVERY bit pattern (NaN
 // payloads included - there is no conversion arithmetic). The kernel body is identical:
@@ -57,6 +66,10 @@ RWTexture2D<float2> DstTex   : register(u0);   // Decode output (local MV textur
 ByteAddressBuffer   SrcBytes : register(t0);   // Decode input
 RWByteAddressBuffer DstBytes : register(u0);   // Encode output (slot bytes)
 RWStructuredBuffer<uint> TileLen : register(u1);   // used by the offline harness only
+#ifdef UI_SPARSE
+StructuredBuffer<uint> GroupMask : register(t4);     // per-8x8 UI hit mask
+groupshared uint g_sparse_empty;
+#endif
 
 static const uint kTileW = 32;     // tile width: 32 px = 128 B per row store (= 1 cache line)
 static const uint kTileH = 8;      // tile height (vertical chain = 8)
@@ -78,7 +91,52 @@ int bitlen(uint v)
 // --- pixel accessors -----------------------------------------------------------
 // f16 -> f32 -> f16 is bit-exact for every finite half, so going through the texture
 // does not change the byte stream (the harness checks this against the buffer path).
-#if DEPTH32
+#if UIFMT_R10
+uint ldPix(uint y, uint x) {
+    const float4 v = saturate(SrcTex4.Load(int3((int)x, (int)y, 0)));
+    const uint r = (uint)round(v.r * 1023.0);
+    const uint g = (uint)round(v.g * 1023.0);
+    const uint b = (uint)round(v.b * 1023.0);
+    const uint a = (uint)round(v.a * 3.0);
+    return (r & 1023u) | ((g & 1023u) << 10) | ((b & 1023u) << 20) | ((a & 3u) << 30);
+}
+void stPix(uint y, uint x, uint v) {
+    DstTex4[int2((int)x, (int)y)] = float4(
+        (float)(v & 1023u) / 1023.0, (float)((v >> 10) & 1023u) / 1023.0,
+        (float)((v >> 20) & 1023u) / 1023.0, (float)((v >> 30) & 3u) / 3.0);
+}
+#elif UIFMT_RGBA8
+uint ldPix(uint y, uint x) {
+    const float4 v = saturate(SrcTex4.Load(int3((int)x, (int)y, 0)));
+    const uint r = (uint)round(v.r * 255.0);
+    const uint g = (uint)round(v.g * 255.0);
+    const uint b = (uint)round(v.b * 255.0);
+    const uint a = (uint)round(v.a * 255.0);
+    return (r & 255u) | ((g & 255u) << 8) | ((b & 255u) << 16) | ((a & 255u) << 24);
+}
+void stPix(uint y, uint x, uint v) {
+    DstTex4[int2((int)x, (int)y)] = float4(
+        (float)(v & 255u) / 255.0, (float)((v >> 8) & 255u) / 255.0,
+        (float)((v >> 16) & 255u) / 255.0, (float)((v >> 24) & 255u) / 255.0);
+}
+#elif DEPTH32 && DEPTH_FP16
+// Depth at fp16 precision (DepthFp16=1): the code word is the value rounded through
+// f32 -> f16 -> f32, so the stream only has to carry 16-bit-precision depth. On real CP2077
+// 4K depth that is -34% bytes (13.61 -> 8.95 MB) for a max relative distance error of
+// 0.089% (tests/lossless_bench/README.md), and 70% of tiles become "all residuals zero",
+// which the encoder below now exits early on.
+//
+// The DECODER needs no change: it writes back the exact words that were coded, and those
+// are already f16-rounded floats. Depth in [0,1] never overflows half, and an f16 NaN maps
+// to a fixed bit pattern, so the round trip stays exact.
+uint ldPix(uint y, uint x) {
+    const float v = SrcTexF.Load(int3((int)x, (int)y, 0));
+    return asuint(f16tof32(f32tof16(v)));
+}
+void stPix(uint y, uint x, uint v) {
+    DstTexF[int2((int)x, (int)y)] = asfloat(v);
+}
+#elif DEPTH32
 uint ldPix(uint y, uint x) {
     return asuint(SrcTexF.Load(int3((int)x, (int)y, 0)));
 }
@@ -142,12 +200,40 @@ void Encode(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID)
     // and is not implemented: colour goes over WGC anyway (section 15.1).
     if (NW != 1u) { return; }
 
+#ifdef UI_SPARSE
+    // Empty 32x8 tile: the synth group mask says no HUD in its four 8x8 groups.
+    // Write only a mode=3 header; the decoder turns that tile into zeros.
+    if (t == 0u) {
+        const uint gx = (W + 7u) / 8u;
+        const uint gx0 = tx / 8u, gy = ty / 8u;
+        uint any = 0u;
+        [unroll] for (uint dx = 0u; dx < 4u; ++dx) {
+            const uint gi = gx0 + dx + gy * gx;
+            if (gx0 + dx < gx) { any |= GroupMask[gi]; }
+        }
+        g_sparse_empty = (any == 0u) ? 1u : 0u;
+        if (g_sparse_empty != 0u) {
+            DstBytes.Store(tile * SlotWords * 4, 3u << 6);
+            TileLen[tile] = 4u;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (g_sparse_empty != 0u) { return; }
+#endif
+
     for (uint k0 = t; k0 < 264u; k0 += 256u) { e_hist[k0] = 0u; }
     if (t < 2u)  { e_meta[t] = 0u; }
     if (t < 16u) { e_mask[t] = 0u; }
     if (t < np) {
+#ifdef ABLATE_LOADS
+        // Ablation build (FrCodecAblate=3): skip the texture read. The histogram then
+        // collapses into one bucket, so the mode/width decision, the scan and the packing
+        // below still run with the same shape - only the pixel load disappears.
+        for (uint l = 0; l < NW; ++l) { e_px[t * NW + l] = 0x3C003C00u; }
+#else
         const uint y0 = ty + (t / kTileW), x0 = tx + (t % kTileW);
         for (uint l = 0; l < NW; ++l) { e_px[t * NW + l] = ldPix(y0, x0); }
+#endif
     }
     for (uint k = t; k < 520u; k += 256u) { e_out[k] = 0u; }
     GroupMemoryBarrierWithGroupSync();
@@ -204,6 +290,22 @@ void Encode(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID)
         return;
     }
 
+    // Constant tile: every residual is zero, so the winner is mode 0 at width 0 and the
+    // generic path below would write exactly "header + absolute pixel(s)" and nothing else.
+    // Emitting that here is BYTE-IDENTICAL to the generic path (same header word, same
+    // absolutes, same TileLen) but skips the mask write, the 8-step prefix scan (8 barriers)
+    // and the pack. fp16-precision depth is ~70% such tiles; flat sky/UI regions hit it too.
+    if (mode == 0u && width == 0u) {
+        if (t == 0u) {
+            DstBytes.Store(tile * SlotWords * 4, 0u);              // width 0, mode 0
+            for (uint l = 0; l < NW; ++l) {
+                DstBytes.Store(tile * SlotWords * 4 + 4u + l * 4u, e_px[l]);
+            }
+            TileLen[tile] = 4u + NW * 4u;
+        }
+        return;
+    }
+
     // mask bit for this value
     if (t < cnt && bl > width) { InterlockedOr(e_mask[t >> 5], 1u << (t & 31u)); }
     GroupMemoryBarrierWithGroupSync();
@@ -212,6 +314,9 @@ void Encode(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID)
     const uint myBits = (t < cnt) ? ((bl > width) ? 32u : width) : 0u;
     e_scan[t] = myBits;
     GroupMemoryBarrierWithGroupSync();
+#ifndef ABLATE_SCAN
+    // Ablation build (FrCodecAblate=1): the 8-step Hillis-Steele scan (and its 8 barriers)
+    // is what this variant exists to remove; every value then sits at the base offset.
     // ping-pong Hillis-Steele: read A / write B, so one barrier per step (was two)
     [unroll] for (uint st = 0u; st < 8u; ++st) {
         const uint off = 1u << st;
@@ -221,10 +326,20 @@ void Encode(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID)
         if (toB) { e_scan2[t] = val + add; } else { e_scan[t] = val + add; }
         GroupMemoryBarrierWithGroupSync();
     }
+#endif
     const uint maskWords = (mode == 1u) ? ((cnt + 31u) / 32u) : 0u;   // mode 0 has no mask block
     const uint valBase = 32u + NW * 32u + maskWords * 32u;
+#ifdef ABLATE_SCAN
+    // Keep the coalesced flush at its normal size: e_scan[255] is not a prefix sum here.
+    uint bitpos = valBase;
+    if (t == 0u) {
+        const uint approx = valBase + (cnt * (width ? width : 8u) + 7u) / 8u;
+        TileLen[tile] = min(approx, SlotWords * 4u - 4u);
+    }
+#else
     uint bitpos = valBase + ((t > 0u) ? e_scan[t - 1] : 0u);
     if (t == 0u) { TileLen[tile] = (valBase + e_scan[255] + 7u) / 8u; }
+#endif
 
     // header + absolutes + mask words + this thread's value, all OR-ed into LDS
     if (t == 0u) {
@@ -238,6 +353,12 @@ void Encode(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID)
         const uint bp = 32u + NW * 32u + t * 32u;
         InterlockedOr(e_out[bp >> 5], e_mask[t] << (bp & 31u));
     }
+#ifdef ABLATE_ATOMICS
+    // Ablation build (FrCodecAblate=2): no per-value LDS atomic. e_out still receives the
+    // header and the absolutes from other threads, so the coalesced flush below keeps its
+    // shape and size.
+    if (t == 0u) { e_out[0] |= z; }
+#else
     if (t < cnt) {
         const uint w = (bl > width) ? 32u : width;
         if (w) {
@@ -246,6 +367,7 @@ void Encode(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID)
             if (o + w > 32u) { InterlockedOr(e_out[w0 + 1u], z >> (32u - o)); }
         }
     }
+#endif
     GroupMemoryBarrierWithGroupSync();
 
     // coalesced flush
@@ -282,6 +404,13 @@ void Decode(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID)
             for (uint l = 0; l < NW; ++l) {
                 stPix(y, x, SrcBytes.Load(base + 4 + (t * NW + l) * 4));
             }
+        }
+        return;
+    }
+    if (mode == 3) {                                  // sparse zero tile
+        if (t < pw * ph) {
+            const uint y = ty + (t / kTileW), x = tx + (t % kTileW);
+            for (uint l = 0; l < NW; ++l) { stPix(y, x, 0u); }
         }
         return;
     }

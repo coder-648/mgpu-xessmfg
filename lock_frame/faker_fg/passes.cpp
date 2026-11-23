@@ -30,6 +30,7 @@ namespace {
 #include "render_ui_pm_PSMain_cso.h"     // kRenderUiPmPSCSO
 #include "hudless_compare_PSMain_cso.h"  // kHudlessComparePSCSO
 #include "hud_copy_CSMain_cso.h"         // kHudCopyCSO
+#include "hudless_to_pq_CSMain_cso.h"    // kHudlessToPQCSO
 #include "marker_PSMain_cso.h"           // kMarkerPSCSO
 
 ID3D12RootSignature*        g_pass_gfx_root = nullptr;
@@ -37,6 +38,7 @@ ID3D12RootSignature*        g_pass_cs_root = nullptr;
 ID3D12PipelineState*        g_pass_rui_pso[2]{};     // [0] premultiplied, [1] straight
 ID3D12PipelineState*        g_pass_hc_pso = nullptr;
 ID3D12PipelineState*        g_pass_hudcopy_pso = nullptr;
+ID3D12PipelineState*        g_pass_hudpq_pso = nullptr;
 ID3D12DescriptorHeap*       g_pass_heap = nullptr;   // SRV, SRV, CBV
 ID3D12DescriptorHeap*       g_pass_sampler_heap = nullptr;
 ID3D12DescriptorHeap*       g_pass_rtv_heap = nullptr;
@@ -75,8 +77,10 @@ bool pass_ensure(ID3D12Device* device)
         g_pass_rui_pso[0] = g_pass_rui_pso[1] = nullptr;
         g_pass_hc_pso = nullptr;
         g_pass_hudcopy_pso = nullptr;
+        g_pass_hudpq_pso = nullptr;
     }
-    if (g_pass_hudcopy_pso != nullptr && g_pass_heap != nullptr) { return true; }
+    if (g_pass_hudcopy_pso != nullptr && g_pass_hudpq_pso != nullptr &&
+        g_pass_heap != nullptr) { return true; }
 
     auto make_root = [&](bool compute, ID3D12RootSignature** out) -> bool {
         D3D12_DESCRIPTOR_RANGE ranges[4]{};
@@ -304,24 +308,46 @@ static bool pass_marker_impl(ID3D12CommandList* list, ID3D12Resource* sc_buffer,
     vp.Height = static_cast<FLOAT>(h);
     vp.MaxDepth = 1.0f;
     cl->RSSetViewports(1, &vp);
-    // Full-screen scissor: the shader discards everything outside the four corner blocks,
-    // so this pass needs no per-block scissor (and cannot be lost to one).
-    D3D12_RECT rc{ 0, 0, static_cast<LONG>(w), static_cast<LONG>(h) };
-    cl->RSSetScissorRects(1, &rc);
     cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    cl->DrawInstanced(3, 1, 0, 0);
+
+    // v32 marker cost fix: the full-screen triangle only needs to rasterize 4 x 6x6
+    // blocks. A full-screen scissor still runs the PS over the whole 4K frame; four tiny
+    // viewport+scissor draws reduce pixel coverage from 8.3M to 144. The marker PS uses
+    // absolute SV_Position, so the viewport origin is transparent to it.
+    const uint32_t side = mgpu::kMarkerSide;
+    for (uint32_t i = 0; i < mgpu::kMarkerCorners; ++i) {
+        uint32_t x = 0, y = 0;
+        mgpu::marker_corner(i, w, h, &x, &y);
+        D3D12_VIEWPORT bvp{};
+        bvp.TopLeftX = static_cast<FLOAT>(x);
+        bvp.TopLeftY = static_cast<FLOAT>(y);
+        bvp.Width = static_cast<FLOAT>(side);
+        bvp.Height = static_cast<FLOAT>(side);
+        bvp.MaxDepth = 1.0f;
+        cl->RSSetViewports(1, &bvp);
+        D3D12_RECT rc{ static_cast<LONG>(x), static_cast<LONG>(y),
+                       static_cast<LONG>(x + side), static_cast<LONG>(y + side) };
+        cl->RSSetScissorRects(1, &rc);
+        cl->DrawInstanced(3, 1, 0, 0);
+    }
     return true;
 }
 
 bool pass_ensure_cs()
 {
-    if (g_pass_hudcopy_pso != nullptr) { return true; }
+    if (g_pass_hudcopy_pso != nullptr && g_pass_hudpq_pso != nullptr) { return true; }
     D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = g_pass_cs_root;
     pd.CS.pShaderBytecode = kHudCopyCSO;
     pd.CS.BytecodeLength = sizeof(kHudCopyCSO);
     if (FAILED(g_pass_device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_pass_hudcopy_pso)))) {
         g_pass_hudcopy_pso = nullptr;
+        return false;
+    }
+    pd.CS.pShaderBytecode = kHudlessToPQCSO;
+    pd.CS.BytecodeLength = sizeof(kHudlessToPQCSO);
+    if (FAILED(g_pass_device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_pass_hudpq_pso)))) {
+        g_pass_hudpq_pso = nullptr;
         return false;
     }
     return true;
@@ -593,6 +619,77 @@ bool pass_hud_copy(ID3D12CommandList* list, ID3D12Resource* hudless, ID3D12Resou
         told = true;
         logf("pass: HudCopy %ux%u threshold=%.3f\n", w, h, static_cast<double>(threshold));
     }
+    return true;
+}
+
+// ---------------------------------------------------------------- HUDless -> PQ
+// The snapshot is recorded on the tag's own list, so the HUDless resource is still valid.
+// One compute pass replaces the full-resolution CopyResource with a smaller R10 write.
+bool pass_hudless_to_pq(ID3D12CommandList* list, ID3D12Resource* hudless,
+                        uint32_t hudless_state, ID3D12Resource* out_r10,
+                        UINT w, UINT h)
+{
+    if (list == nullptr || hudless == nullptr || out_r10 == nullptr) { return false; }
+    if (!pass_ensure(g_pass_device) || !pass_ensure_cs() || !pass_ensure_cb()) { return false; }
+    ID3D12GraphicsCommandList* cl = static_cast<ID3D12GraphicsCommandList*>(list);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu =
+        g_pass_heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu =
+        g_pass_heap->GetGPUDescriptorHandleForHeapStart();
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    g_pass_device->CreateShaderResourceView(hudless, &srv, cpu);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu1 = cpu;
+    cpu1.ptr += g_pass_desc_size;
+    g_pass_device->CreateShaderResourceView(hudless, &srv, cpu1);  // t1 is unused
+
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu2 = cpu1;
+    cpu2.ptr += g_pass_desc_size;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uavd{};
+    uavd.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    uavd.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+    g_pass_device->CreateUnorderedAccessView(out_r10, nullptr, &uavd, cpu2);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu3 = cpu2;
+    cpu3.ptr += g_pass_desc_size;
+    D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};
+    cbv.BufferLocation = g_pass_cb->GetGPUVirtualAddress();
+    cbv.SizeInBytes = 256;
+    g_pass_device->CreateConstantBufferView(&cbv, cpu3);
+
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.pResource = hudless;
+    b.Transition.StateBefore = static_cast<D3D12_RESOURCE_STATES>(hudless_state);
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    cl->ResourceBarrier(1, &b);
+
+    b.Transition.pResource = out_r10;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    cl->ResourceBarrier(1, &b);
+
+    ID3D12DescriptorHeap* heaps[] = { g_pass_heap };
+    cl->SetDescriptorHeaps(1, heaps);
+    cl->SetComputeRootSignature(g_pass_cs_root);
+    cl->SetPipelineState(g_pass_hudpq_pso);
+    cl->SetComputeRootDescriptorTable(0, gpu);
+    cl->Dispatch((w + 15) / 16, (h + 15) / 16, 1);
+
+    b.Transition.pResource = out_r10;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    cl->ResourceBarrier(1, &b);
+
+    b.Transition.pResource = hudless;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    b.Transition.StateAfter = static_cast<D3D12_RESOURCE_STATES>(hudless_state);
+    cl->ResourceBarrier(1, &b);
     return true;
 }
 

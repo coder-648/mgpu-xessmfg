@@ -1,5 +1,10 @@
 # UI synthesis gate — CLOSED
 
+> **2026-11-22 update**: the DLSSG-only full-resolution path (render-card synth, P1) is
+> implemented behind `UiStream=1 + UiFullRes=1`; the default remains **closed**
+> (`UiStream=0` / `UiSource=Off`). See `docs/design/UI_COMPOSE_DLSSG_PLAN.md` and
+> `docs/design/UI_COMPUTE_QUALITY.md` before reopening it.
+
 ```
 UI_SYNTHESIS_GATE = CLOSED
 ```
