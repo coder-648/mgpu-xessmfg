@@ -1,7 +1,7 @@
 # 现有 UI 计算方式与理论效果（2026-11-22）
 
-> **2026-11-23 状态**：UI 合成整体标记为**实验性**，发布默认关闭
-> （`UiStream=0` / `UiSource=Off`）。本文是打开后的误差分析。
+> **1.3.0 状态**：UI 合成**默认开启**（producer patch + mode 4 + 每通道 LUT）；
+> `UiPatch=0` 可回退。本文是误差分析。
 
 > 对象：`UiSynthesis` 这条实验链路的两种源（GameUi / Hudless）+ 消费端 unblend。
 > 代码：`lock_frame/producer/shaders/downsample_ui.hlsl`、`lock_frame/shaders/synth_ui.hlsl`、

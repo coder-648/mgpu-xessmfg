@@ -402,7 +402,8 @@ typedef struct GameProfile
 // the Upscaler lane never tags a colour here, which is that setting's effect.
 // 0x40 = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE (their default when unset).
 static const GameProfile g_profiles[] = {
-    { L"cyberpunk2077.exe",                 nullptr, Quirk_CyberpunkHudlessState, 0, 0, 0, 0, 0 },
+    { L"cyberpunk2077.exe",                 nullptr, Quirk_CyberpunkHudlessState,
+      0, 0, 0, 0, 0 },
     // Wuchang: `.defaults = { SkipFirstFrames = 10 }` ("Skip 1 frame use of upscaler which
     // cause crash").
     { L"project_plague-win64-shipping.exe", nullptr, 0u, 10, 0, 0, 0, 0 },
@@ -505,6 +506,13 @@ Config& cfg()
     g_cfg.fg_depth_valid_now    = ini_int(path, L"FGDepthValidNow", 0);
     g_cfg.fg_velocity_valid_now = ini_int(path, L"FGVelocityValidNow", 0);
     g_cfg.fg_hudless_valid_now  = ini_int(path, L"FGHudlessValidNow", 0);
+    {
+        wchar_t hs[32]{};
+        GetPrivateProfileStringW(L"fakerFG", L"HudlessSource", L"Auto", hs, 32, path);
+        if (_wcsicmp(hs, L"Scaling") == 0) { g_cfg.hudless_source = 1; }
+        else if (_wcsicmp(hs, L"Hudless") == 0) { g_cfg.hudless_source = 2; }
+        else { g_cfg.hudless_source = 0; }
+    }
     g_cfg.real_swapchain_object = ini_int(path, L"RealSwapchainObject", 0);
     g_cfg.fake_dlssg_feature = ini_int(path, L"FakeDlssgFeature", 1);
     g_cfg.write_output_real = ini_int(path, L"WriteOutputReal", 0);

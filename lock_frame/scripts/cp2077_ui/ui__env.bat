@@ -17,4 +17,5 @@ if not exist "%RESDIR%\" mkdir "%RESDIR%" >nul 2>&1
 rem The 3x recipe that is already validated for CP2077 (run_3x.bat in the game
 rem folder): game/RTSS locks the input at 40 fps, consumer presents 3x = 120.
 set "BASE=--game %GAME_NAME% --mode 3x --interp 2 --streams=mv,depth --overlay-layered --wgc-minint 0 --pool 4 --latency 1 --unlock-mfg --mfg-model=keep2x --fg-rt-mode auto --report 40"
-set "COMMON=%BASE% --ui-source auto"
+rem Patch-only path: stream 4 is the support patch; stream 3 / mode 5 stays off.
+set "COMMON=%BASE% --hudless-stream --ui-source off"

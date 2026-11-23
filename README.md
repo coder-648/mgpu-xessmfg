@@ -11,16 +11,21 @@
 
 ## 版本与维护状态
 
-**正式版 1.2.9**（2026-11-23）· 共享协议 **v32** · GPL-3.0
+**正式版 1.3.0**（2026-11-24）· 共享协议 **v34** · GPL-3.0
 
-- 跨卡只传 **MV / depth**（UI 合成为实验性、默认关闭；颜色走 WGC 单卡捕获）：
-  MV 100% **比特精确**、depth 150%；硬件不支持无损码流时自动退回拷贝路径。
+- 跨卡只传 **MV / depth / UI 支撑域 patch**（颜色走 WGC 单卡捕获）：
+  MV 100% **比特精确**、depth 150%；UI 合成默认开启（producer 支撑域 patch，
+  **固定 mode 4**，stream 3 / mode 5 关闭）。
+  硬件不支持无损码流时自动退回拷贝路径。
+- **DLSS FG 双卡补帧链路已完成**：CP2077 / PBZ / Wuchang 实机通过，UI 稳定无拖影；
+  CP2077 patch-only UI 开销约 2.5 pp。模型边缘剩余伪影来自 XeFG 模型本身。
 - 发布包**自带 Intel 运行时**（`libxess_fg.dll` / `libxell.dll`），解压即用；安装时写入
   `<游戏>\fakerFG\`（游戏进程里的 XeFG 只从这里加载）。
 
 **维护状态：核心功能已到尽头。** 后续只做两件事——**修 issue** 和**加游戏支持**
 （范围见[「维护范围」](#维护范围)）。
-**UI 合成（HUDless + XeFG mode 5）仍是实验性**，发布默认关闭，见[「已知限制」](#已知限制)。
+**UI 合成（producer 支撑域 patch；固定 mode 4，stream 3 / mode 5 关闭）自 1.3.0 起默认开启**，`UiPatch=0` 可回退，
+见[「已知限制」](#已知限制)。
 
 ## 这个工具适合谁
 
@@ -92,10 +97,12 @@
 | 游戏原生（无本工具） | 94% | — | — |
 | 开启 DLSS-FG 管线（未接 consumer） | 97.5% | **+3.5 pp** | 激活 FG 管线本身，必须支付 |
 | + MV/depth 传输（降采样、编码、跨卡 DMA）+ WGC 捕获/配对 | 100% | **+2.5 pp** | 本工具的固定开销 |
-| + UI 合成（实验性，sparse） | 103% | **+3 pp** | 可开关 |
+| + UI 合成（默认；1.3.0 patch-only mode 4） | 102.5% | **+2.5 pp** | `UiPatch=0` 可回退 |
 
-三项合计 **+9 pp**（94% → 103%）。其中 **3.5 pp 是游戏开启 DLSS FG 管线本身就要付的成本**，
-与 MV/depth 传输无关；MV/depth 及其余固定开销合计 **2.5 pp**；UI 合成单独 **3 pp**。
+三项合计约 **+8.5 pp**（94% → 102.5%）。其中 **3.5 pp 是游戏开启 DLSS FG 管线本身就要付的成本**，
+与 MV/depth 传输无关；MV/depth 及其余固定开销合计 **2.5 pp**；UI patch-only 约 **2.5 pp**。
+> 1.3.0 已关闭 stream 3 / mode 5，比旧 sparse UI 基线的约 3 pp 少；渲染卡 patch synth 仍是
+> 全帧读写，tile-gated 是下一步优化（见 `docs/design/UI_PATCH_PERF.md`）。
 
 ### 各 pass 时间（`prof:`，UI 合成开启时，4K/帧）
 
@@ -120,7 +127,7 @@ UI 增量 5 pp → 3 pp（sparse UI codec，105% → 103%）。
   tag 接管与记录等），不属于 MV/depth 传输。
 - **MV/depth 传输（+2.5 pp，固定）**：两个全屏降采样 pass + 无损编码 + 跨卡 DMA，
   以及同卡的 WGC 捕获与 present 配对。旧的可选跨卡颜色流实测 80% → 95%（+15 pp），已废弃。
-- **UI 合成（+3 pp，默认关）**：`synth 0.20 + encode 0.61 ≈ 0.8 ms/帧`。
+- **UI 合成（+3 pp，默认开）**：`synth 0.20 + encode 0.61 ≈ 0.8 ms/帧`；`UiPatch=0` 可回退。
 - **消费端在副卡**：XeFG 插帧、unblend、叠加不占渲染卡；副卡与游戏同卡时会抢 GPU
   （日志 `note: same GPU as the producer`），不建议这样用。
 
@@ -132,10 +139,10 @@ UI 增量 5 pp → 3 pp（sparse UI codec，105% → 103%）。
 
 ## 已知限制
 
-- **UI 合成是实验性**：只在标题提供 HUDless/UI 平面时可用（1.2.9 实测 CP2077 4K 可复现），
-  边缘/半透明 UI 仍可能拖影或伪影；发布默认关闭（`UiStream=0` / `UiSource=Off`），
-  手动打开时走 XeFG mode 5（`--no-ui-mode5` 回 mode 4）。HDR 下若 XeFG 报
-  `-12 MISMATCH_INPUT_RESOURCES`，在游戏侧 ini 加 `UiAlpha8=0` 后重启游戏。
+- **UI 合成默认开启**（1.3.0+）：producer 只传 UI 支撑域内的 HUDless patch，consumer 还原
+  干净 HUDless，XeFG 有游戏 UI 时走 mode 5、没有时走 mode 4；`UiPatch=0`（或 UI「UI 合成 → 关闭」）可回退。
+  需要游戏在 DLSS-G evaluate 里提供 HUDless；HDR 下要求 R10/HDR10，SDR 标题会自动
+  退化（不 tag UI）。已知残差约 3–4%（逐通道 LUT 无法表达交叉通道项）。
 - 全局扫描（Steam/Epic/GOG/注册表批量导入）暂从界面下线，改为手动添加 exe。
 - 中文重命名依赖输入法提交字符，暂没有 IME 候选浮层。
 - 没有「删除游戏配置」按钮：删掉 `profiles\*.ini` 后重启 UI 即可。
@@ -156,9 +163,10 @@ UI 增量 5 pp → 3 pp（sparse UI codec，105% → 103%）。
 
 - **新的插帧算法或倍率模型**：模型固定 **keep2x（model 18，所有倍率）**，
   `--mfg-model=port` 只是显式实验入口（3x 略好、4x 更差，见 `lock_frame/docs/RELEASE_NOTES_1.2.7.md`）。
-- **UI 合成的通用方案**：只在有 HUDless/UI 平面的标题上可用，不承诺做成与游戏无关的
-  通用方案（见[「已知限制」](#已知限制)）。
-- **跨卡颜色传输**：颜色仍走 WGC 单卡捕获，跨卡的只有 MV/depth（以及实验性的 UI）。
+- **UI 合成**：默认开启（producer patch + consumer 还原干净 HUDless + XeFG mode 4/5）。
+  需要游戏在 DLSS-G evaluate 里提供 HUDless；没有 HUDless 时自动退化。
+  `UiPatch=0` 可回退（见[「已知限制」](#已知限制)）。
+- **跨卡颜色传输**：颜色仍走 WGC 单卡捕获，跨卡的只有 MV/depth（以及 UI 支撑域 patch）。
 - **反作弊在线游戏、独占全屏游戏**：设计上就不支持。
 - **全局扫描 / 批量导入游戏**：仍从界面下线，需手动添加 exe。
 

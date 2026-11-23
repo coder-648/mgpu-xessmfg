@@ -265,7 +265,9 @@ int main()
         // `--streams=mv,depth` replaces the request mask, so the UI bit has to be added
         // explicitly - otherwise the producer never copies stream 3 (log: streams -> ...
         // ui=0) and the unblend pass has nothing to read even with UiStream=1.
-        g_stream_mask |= mgpu::kRequestUi;
+        // v34: the support patch travels on stream 4, so request it as well. It is
+        // harmless when the producer is in legacy mode (UiPatch=0).
+        g_stream_mask |= mgpu::kRequestUi | mgpu::kRequestHudless;
         const char* src = (g_ui_source_mode == 1) ? "game"
                         : (g_ui_source_mode == 2) ? "hudless"
                         : (g_ui_source_mode == 3) ? "off" : "auto";

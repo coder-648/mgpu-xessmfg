@@ -3,6 +3,74 @@
 只记**用户能感知**的变化与对应实测依据。每条结论的原始数据在
 `docs/findings/PERF_BASELINE.md` / `FINAL_CONFIG.md`。
 
+### release: lock_frame 1.3.0（2026-11-24）—— UI 合成 mode 4 定稿（DLSS FG 双卡链路完成）
+
+发布说明见 `lock_frame/docs/RELEASE_NOTES_1.3.0.md`。协议 **v34**。
+
+- **CP2077 / PBZ / Wuchang 实机通过**：UI 稳定无拖影，准星移动时的色块/抖动消失；
+  模型边缘剩余伪影来自 XeFG 模型本身，不在 UI 合成链路。CP2077 patch-only 开销约 2.5pp。
+
+- **UI 合成不再是实验性选项，默认开启；固定为 mode 4 only**：
+  stream 3（`UiStream`）关闭；stream 4（`HudlessStream`）承载 producer 计算出的
+  支撑域 H patch（sparse codec header 即掩码）。consumer 还原
+  `H' = present（支撑外）/ patch（支撑内）`；只 tag `H'` → mode 4。
+- 默认 ini：`UiStream=0 / UiSource=Off / UiSlots=2 / UiPatch=1 /
+  UiPatchWhiteNits=80 / UiFullRes=1 / UiCodec=1 / UiSparseCodec=1 / UiAlpha8=0 /
+  HudlessStream=1`。
+  回退：`UiPatch=0` + `HudlessStream=0`；stream 3 / mode 5 不再默认使用。
+- **颜色校正**：consumer 默认 **33³ 3D LUT**（`alpha=0` 干净像素配对 H/scene code →
+  WGC P code；GPU 内建表，无回读），修复 1D LUT 无法表达交叉通道 tone/gamut 的问题；
+  1D 32 档 LUT 保留为 3D 初始化失败时的兜底。CP2077 最终 3D LUT 实机通过；
+  历史 1D 数据：亮度均值 +0.003、中位 +0.022，RGB MAE 0.032–0.041，色度比 0.894×。
+- 修复诊断回读 buffer 越界（256B → 512B，LUT 388B），该越界会导致 AMD 设备移除。
+- UI 工具：默认开启；写入 `UiPatch/UiPatchWhiteNits/UiAlpha8/HudlessStream` 等基线键；
+  启动命令带 `--hudless-stream --ui-source off`，不再请求 stream 3 / mode 5；文案去掉“实验性”。
+- `check_release.py` 的发布默认键同步为 UI 开启 + `HudlessStream=1`。
+- 性能：`docs/design/UI_PATCH_PERF.md`；3D 默认路径 compose 用 8 个角点做四面体插值；
+  1D 兜底保留“无 LUT 直接拷贝 patch”的快速路径；渲染卡 patch synth 仍是全帧读写，
+  tile-gated 是下一步 P1。
+
+### baseline: UI 支撑补丁冻结（每通道 32 档 LUT，2026-11-24）
+
+`docs/design/UI_SUPPORT_PATCH.md`。**默认开启（1.3.0+）**；`UiPatch=0` 可回退。
+
+- 最终基线：producer 写逐像素 UI 掩码到 patch alpha；consumer 在 `alpha=0` 的干净像素上
+  按 `[3 通道][32 亮度档][32 log2 比例]` 建直方图，每通道每档取中位数得到 3×32 档 LUT，
+  合成时按 nits 应用。全 GPU、同帧、无回读；置信度按有效/候选样本数。
+- 实测（CP2077 4K/3x/HDR10，干净像素 n=7683）：亮度均值 **+0.003**、中位 **+0.022**；
+  RGB MAE **0.037 / 0.032 / 0.041**；色度比 **0.894×**；置信度 **0.966**。
+- 同时修掉诊断回读 buffer 越界（256B → 512B，LUT 388B），该越界会导致 AMD 设备移除、
+  consumer 退出。`UiSynthDump` 在基线里为 0（诊断时才开）。
+- 已知残差：1D LUT 无法表达交叉通道项，约 3–4%；UI 区域无 ground truth。**基线冻结**，
+  不再继续调参；未来只有 display-referred HUDless 或 3D LUT 才可能进一步降低。
+
+### local: UI 支撑补丁 + XeFG mode 4（协议 v33，2026-11-23）
+
+`docs/design/UI_SUPPORT_PATCH.md`。**实验路径，发布默认关**（`UiPatch=0`）。
+
+- stream 3 新增 `kUiSourcePatch`：渲染卡把 **HUDless 在 UI 支撑域上的切片** 当作
+  载荷（`ui_flags` bit4），sparse codec 的 per-tile mode=3 头就是消费端的占位掩码。
+  支撑来自游戏 UI alpha（tag 67/68），否则用 `P−H` 的线性相对差 + 阈值。
+- 消费端 unblend 增加 patch 分支：`H' = present`（空 tile）/ `H`（占用 tile），
+  全程没有 alpha、没有 `1/(1−a)`；随后 **只 tag HUDless**，XeFG AUTO 走
+  `BACKBUFFER_HUDLESS`（mode 4）。patch 永远不会被当成 `RES_UI` tag。
+- 协议 **v32 → v33**（新增 source 值与 flag 位）；producer / consumer 必须一起重编。
+- 打开方式：游戏目录 `fakerFG.ini` 写 `UiPatch=1`；消费端不需要额外参数
+  （检测到 patch flag 会自动打开 composition / unblend 路径；`--fg-ui-none` 可显式禁用）。
+  `UiPatch=1` 会强制 `UiStream=0 / UiSource=Off / UiFullRes=1 / UiSparseCodec=1 /
+  UiAlpha8=0 / UiCodec=1`。patch 固定 mode 4；`--[no-]ui-mode5` 不再影响它。
+- 渲染卡仍跑一次全分辨率 synth，但只编码有支撑的 tile；消费端一次
+  copy+overwrite 的 H' 合成，比原来的除法 unblend 便宜。支撑宁多勿少：
+  多传的像素就是 H 本身，**不影响画质**；漏检才会让 HUD 残留在 H' 里。
+- **白点修正**：CP2077 的 HUDless 是 scene-referred（scRGB 1.0≈20 nits），消费端
+  present 是 display-referred。patch 用 80 nits 编码会比周围亮 ~1.6 倍（“补偿区发白”）。
+- **动态增益（v33，消费端）**：producer 把逐像素 UI 掩码写进 patch 的 alpha；
+  consumer 在占用 tile 内用 `alpha=0` 的干净像素建 `log2(present_nits/patch_nits)`
+  的**亮度**直方图（32 亮度 × 32 log2 比例 × 3 通道），每通道每档取中位数得到
+  **3 组 32 档亮度 LUT**（逐通道 tone/gamut；单一亮度 LUT 会把画面变灰），在合成时按 nits 应用。全 GPU、同帧、无回读；样本不足保留上一帧。CP2077 预期收敛到
+  gain≈0.25（20 nits），不再需要按机器写死白点；`UiPatchWhiteNits` 只是传输编码提示
+  （默认 80）。实现：`patch_calib.hlsl` / `patch_gain.hlsl` + `085_ui_unblend.inc`。
+
 ### release: lock_frame 1.2.9（2026-11-23）—— 1.2.7 之后的性能批 + UI 合成实验性关闭 + fakerFG.ini 两版
 
 发布说明见 `lock_frame/docs/RELEASE_NOTES_1.2.9.md`。协议仍 **v32**，默认 `keep2x` 不变。

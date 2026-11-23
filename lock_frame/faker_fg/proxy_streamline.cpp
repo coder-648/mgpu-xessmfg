@@ -1306,20 +1306,45 @@ int sl_stage_inputs(MgpuFgFrame& f)
     // even though the tag exists (measured: the transported stream 3 was all black and
     // the unblend mask became all-ones). Prefer the snapshot when we have one.
     static int logged_hudless_src = 0;
-    if (g_stage.hudless.resource != nullptr && g_stage.hudless.until_present) {
+    const bool scaling_ok = g_stage.scaling.resource != nullptr;
+    const bool snapshot_ok = g_stage.hudless.resource != nullptr &&
+                             g_stage.hudless.until_present;
+    // v34: the support mask must be computed against the scene-referred HUDLess (the
+    // same space as DLSSG.Backbuffer). The patch colour, however, can come from the
+    // display-referred ScalingOutputColor, which matches the WGC present. Keep the two
+    // roles separate: HUDLESS = mask/fallback, SCALING = optional display patch source.
+    const bool want_scaling =
+        (cfg().hudless_source == 1) ||
+        (cfg().hudless_source == 0 && has_game_quirk(Quirk_CyberpunkScalingHudless));
+    const bool use_scaling = scaling_ok && (want_scaling || !snapshot_ok);
+    if (snapshot_ok) {
+        put(MGPU_FG_STREAM_HUDLESS, g_stage.hudless);
+    } else if (scaling_ok) {
+        // No stable HUDLess: the scaling image is the only colour we have. It is also
+        // display-referred, so the mask will be full-frame and the patch path will be
+        // expensive, but it is better than publishing nothing.
+        put(MGPU_FG_STREAM_HUDLESS, g_stage.scaling);
+    } else {
+        put(MGPU_FG_STREAM_HUDLESS, g_stage.hudless);
+    }
+    if (use_scaling) {
+        put(MGPU_FG_STREAM_SCALING, g_stage.scaling);
+        f.stream[MGPU_FG_STREAM_SCALING]._pad = 1;   // display-referred patch source
+        if (logged_hudless_src != 2) {
+            logged_hudless_src = 2;
+            logf("sl: HUDless patch = SCALING_OUTPUT (display-referred);"
+                 " mask = %s\n", snapshot_ok ? "HUDLess snapshot" : "SCALING_OUTPUT");
+        }
+    } else if (snapshot_ok) {
         if (logged_hudless_src != 1) {
             logged_hudless_src = 1;
             logf("sl: HUDless source = HUDLESS snapshot (stable copy)\n");
         }
-        put(MGPU_FG_STREAM_HUDLESS, g_stage.hudless);
-    } else if (g_stage.scaling.resource != nullptr) {
+    } else if (scaling_ok) {
         if (logged_hudless_src != 2) {
             logged_hudless_src = 2;
-            logf("sl: HUDless source = SCALING_OUTPUT (fallback)\n");
+            logf("sl: HUDless source = SCALING_OUTPUT (no stable snapshot)\n");
         }
-        put(MGPU_FG_STREAM_HUDLESS, g_stage.scaling);
-    } else {
-        put(MGPU_FG_STREAM_HUDLESS, g_stage.hudless);
     }
     put(MGPU_FG_STREAM_UI_COLOR, g_stage.ui);
     // P0: carry the alpha-only plane in the record (the producer ignores it today).

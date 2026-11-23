@@ -1,7 +1,9 @@
 # XeFG UI 合成实际需要的完整参数（2026-11-22）
 
-> **2026-11-23 状态**：UI 合成整体标记为**实验性**，发布默认关闭
-> （`UiStream=0` / `UiSource=Off`）。本文描述的是打开后的实现（mode 5 / mode 4）。
+> **1.3.0/v34 状态**：UI 合成**默认开启**。stream 3 只承载游戏 UI 平面；
+> stream 4（`HudlessStream`）承载支撑域 H patch。CP2077 默认用
+> `ScalingOutputColor`（显示侧、UI 前）作为 patch 颜色，mask 仍由 scene-referred
+> HUDLess 计算；consumer 只跑一次全局 WGC 色彩映射，不跑局部 tone field。
 
 > 依据：`third_party/xess/inc/xess_fg/xefg_swapchain.h`、
 > `xefg_swapchain_d3d12.h`、`third_party/xess/doc/xess_fg_developer_guide_english.md`
@@ -167,7 +169,18 @@ shader 写得不对**；如果只用 mode 4，2-bit alpha 的黑边是理论上�
 
 ---
 
-## 8. 证据索引
+## 9. 补充：支撑补丁（v34，mode 4/5 的共同 HUDless 来源）
+
+`docs/design/UI_SUPPORT_PATCH.md`：渲染卡把 **HUDless 在 UI 支撑域上的切片** 走
+stream 4（`HudlessStream` + `kHudlessFlagPatchPayload`），消费端
+`H' = present outside / patch inside`：
+
+- 没有游戏 UI：只 tag H' → AUTO 选 mode 4；
+- 有游戏 UI：stream 3 tag UI，同时 tag H' → AUTO 选 mode 5。
+
+patch 本身**永远不 tag 成 RES_UI**；`UiPatch=1` 发布默认，仅 R10/HDR。
+
+## 10. 证据索引
 
 | 内容 | 位置 |
 |---|---|

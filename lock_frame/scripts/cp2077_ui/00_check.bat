@@ -36,7 +36,7 @@ if errorlevel 1 ( echo [FAIL] nvngx_dlssg.dll != fakerFG.dll & set "RC=1" ) else
 
 echo.
 echo --- fakerFG.ini (producer reads it once per game session) --
-findstr /b /c:"FgInput=" /c:"FgOutput=" /c:"ColourStream=" /c:"UiStream=" /c:"UiPremultiplied=" /c:"UiSource=" /c:"UiFullRes=" /c:"UiSlots=" /c:"UiCodec=" /c:"UiLinear=" /c:"StreamPercentUi=" "%INI%" 2>nul
+findstr /b /c:"FgInput=" /c:"FgOutput=" /c:"ColourStream=" /c:"UiStream=" /c:"UiPremultiplied=" /c:"UiSource=" /c:"UiPatch=" /c:"UiFullRes=" /c:"UiSlots=" /c:"UiCodec=" /c:"UiLinear=" /c:"StreamPercentUi=" "%INI%" 2>nul
 if errorlevel 1 ( echo [FAIL] UI keys not found - run 01_ui_on.bat & set "RC=1" )
 
 echo.

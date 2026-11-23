@@ -1,6 +1,9 @@
 # UI 流 v29：有 UI 用 UI，没有 UI 用 HUDless 自造
 
-> **2026-11-23 更新**：UI 合成是**实验性**，发布默认关闭（`UiStream=0` / `UiSource=Off`）。
+> **1.3.0 更新**：UI 合成**默认开启**（producer patch + consumer 还原干净 HUDless，
+> XeFG mode 4）；`UiPatch=0` 可回退。下面保留 v29 的历史数据流说明。
+>
+> **2026-11-23 更新**：当时 UI 合成是实验性，发布默认关闭（`UiStream=0` / `UiSource=Off`）。
 > 手动打开时，消费端把 HUDless 和 UI 一起 tag，XeFG 选 **mode 5**（`--no-ui-mode5` 才回退
 > mode 4）。下面描述的数据流不变，只是最后的 tag 组合变了。
 

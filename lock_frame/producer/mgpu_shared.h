@@ -112,7 +112,11 @@ inline constexpr uint32_t kSharedMagic   = 0x55475047u;   // 'GPUM'
 // v31: stream 3 can also carry a **full-resolution UI synthesised on the render card**
 //      (kUiSourceSynth), and the colour stream is retired (WGC is the only colour path).
 //      Layout is unchanged; the version bump rejects mixed binaries.
-inline constexpr uint32_t kSharedVersion = 32;
+// v33: stream 3 could carry the HUDless scene under the UI support (kUiSourcePatch).
+// v34: the support patch moves to stream 4 (HudlessStream); stream 3 is again the
+//      title's UI plane only. Both routes (UI + patch -> mode 5, patch alone -> mode 4)
+//      share the reconstructed H'. The patch flag lives on stream 4.
+inline constexpr uint32_t kSharedVersion = 34;
 
 // The mapping is created once, at a size that fits the largest stream we support
 // (see kStreamMaxW/H), so a layout rebuild never has to recreate it - that would
@@ -184,7 +188,7 @@ inline constexpr uint32_t kRequestMeta  = 1u << 4;  // camera/matrix/jitter meta
 // trades main-GPU time for cross-adapter bytes: MV +51 MB/frame, depth +14.8 MB/frame.
 inline constexpr uint32_t kRequestRawMv    = 1u << 5;
 inline constexpr uint32_t kRequestRawDepth = 1u << 6;
-inline constexpr uint32_t kRequestHudless = 1u << 7; // clean HUDless colour (stream 4)
+inline constexpr uint32_t kRequestHudless = 1u << 7; // stream 4: patch (v34) / clean HUDless (legacy)
 inline constexpr uint32_t kRequestAll   = 0x1Fu;
 inline constexpr uint32_t kRequestAllV15 = 0x7Fu;
 
@@ -193,13 +197,33 @@ inline constexpr uint32_t kRequestAllV15 = 0x7Fu;
 // unblending; **Synth (v31) = UI synthesised on the render card from (backbuffer, HUDless)
 // at full resolution**, so the consumer treats stream 3 exactly like Game (unblend only);
 // Off = no stream 3. The producer writes it, the consumer reads it.
-// UI_SYNTHESIS_GATE: CLOSED. Do not enable stream 3 until the title always
-// supplies a valid UI stream by default. See docs/UI_SYNTHESIS_GATE.md.
-inline constexpr bool kUiSynthesisGateOpen = false;
+// v34: kUiSourcePatch is retired as a stream-3 source. The support patch lives on stream 4
+// (see kHudlessFlagPatchPayload).
+inline constexpr bool kUiSynthesisGateOpen = true;   // 1.3.0: UI composition is a
+                                                    // supported default (patch + mode 4)
 inline constexpr uint32_t kUiSourceOff     = 0;
 inline constexpr uint32_t kUiSourceGame    = 1;
 inline constexpr uint32_t kUiSourceHudless = 2;
 inline constexpr uint32_t kUiSourceSynth   = 3;   // v31: render-card full-res synth
+inline constexpr uint32_t kUiSourcePatch   = 4;   // v33: retired stream-3 patch source
+
+// StreamShared.ui_flags bits (stream 3).
+inline constexpr uint32_t kUiFlagDerived       = 1u << 0;   // v31: render-card UI synth
+inline constexpr uint32_t kUiFlagPremultiplied = 1u << 1;
+inline constexpr uint32_t kUiFlagUsedAlpha     = 1u << 2;   // true game alpha was used
+inline constexpr uint32_t kUiFlagLinear        = 1u << 3;   // P/U subtract in linear nits
+inline constexpr uint32_t kUiFlagPatchPayload  = 1u << 4;   // v33 legacy: stream 3 patch
+                                                            // (never produced since v34)
+
+// StreamShared.ui_flags bits (stream 4 = HudlessStream).
+// v34: bit0 = this stream is the support-domain H patch (scene under the UI mask), not a
+// full-frame clean HUDless. Its sparse codec tile headers are the consumer's occupancy
+// mask; the consumer composes H' = present outside / patch inside.
+inline constexpr uint32_t kHudlessFlagPatchPayload = 1u << 0;
+// v34: stream 4's source was already display-referred (e.g. CP2077 ScalingOutputColor),
+// the same space as the consumer's WGC present. The consumer can skip the scene->display
+// LUT/local tone field and use the patch directly.
+inline constexpr uint32_t kHudlessFlagDisplayReferred = 1u << 1;
 
 // ---- v11: measured semantics (FrameShared.semantics) --------------------------------
 // Packed so the whole verdict fits in one word. `Measured` tells the consumer whether the
@@ -261,8 +285,9 @@ inline constexpr uint32_t kStreamMv     = 1;
 inline constexpr uint32_t kStreamDepth  = 2;
 inline constexpr uint32_t kStreamUi     = 3;
 
-// v32: stream 4 carries a clean full-resolution HUDless (R10 PQ). It reuses the slot that
-// was reserved for the retired marker/scar stream.
+// v32: stream 4 carries a clean full-resolution HUDless (R10 PQ) in legacy mode.
+// v34: when the support patch is active it carries the sparse masked HUDless patch
+// instead (kHudlessFlagPatchPayload); stream 3 stays the game UI plane.
 inline constexpr uint32_t kStreamHudless = 4;
 inline constexpr uint32_t kStreamScar    = kStreamHudless;   // legacy alias
 inline constexpr uint32_t kScarSide   = 16u;

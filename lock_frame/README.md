@@ -63,8 +63,10 @@ XeSS-FG 插帧，再叠加回游戏窗口。支持固定 **2x / 3x / 4x**。
 - **改了配置没生效**：游戏侧 `fakerFG.ini` 每次进游戏只读一次，改完要重启游戏。
 - **想恢复原样**：点「还原 / 移除组件」（会恢复游戏原来的 `dxgi.dll` / `nvngx_dlssg.dll` /
   `version.dll` 并删除组件；`fakerFG.ini` 保留）。
-- **UI 合成（HUDless）**：**实验性，默认关闭**。开启后插值帧的 HUD 不残影，但边缘/半透明
-  UI 仍可能出现拖影或伪影，只在 A/B 时打开（改完需重启游戏）。
+- **UI 合成（HUDless）**：**默认开启，固定 mode 4**（producer 支撑域 patch；
+  stream 3 / mode 5 关闭）。consumer 只 tag H' 走 mode 4；插值帧的 HUD
+  不再残影。默认用 33³ 3D LUT 对齐 HUDless 与 WGC 的颜色；`UiPatch=0` 可回退
+  （改完需重启游戏）。
 - **反馈问题**：运行 `collect_diagnostics.bat`，把 zip 和日志一起提供。
 
 更多排障见 `docs/TROUBLESHOOTING.md`；玩法与原理见 `docs/SUPPORTED-GAMES.md` 与本仓库文档。

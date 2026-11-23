@@ -948,8 +948,13 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     // UI unblend: only after this frame's UI copy exists. A failed/missing UI stream leaves
     // hudless_res null, so the tag section below falls back to tagging UI (mode 2).
     D3D12_RESOURCE_STATES hudless_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    if (g_hudless_stream && pair_ok && g_hudless_fresh[slot] && g_hudless_local[slot] &&
-        draw_w >= 64 && draw_h >= 64) {
+    // v34: the support patch lives on stream 4. It is composed on this card (H' = present
+    // outside the support, patch inside); stream 4 itself is never tagged directly.
+    const bool patch_stream = g_ctl != nullptr &&
+        (g_ctl->active_mask & mgpu::kRequestHudless) != 0 &&
+        (g_ctl->streams[4].ui_flags & mgpu::kHudlessFlagPatchPayload) != 0;
+    if (!patch_stream && g_hudless_stream && pair_ok && g_hudless_fresh[slot] &&
+        g_hudless_local[slot] && draw_w >= 64 && draw_h >= 64) {
         // v32: clean HUDless from stream 4. No unblend, no division by (1-a).
         hudless_res = g_hudless_local[slot].Get();
         hudless_state = D3D12_RESOURCE_STATE_COMMON;
@@ -1152,17 +1157,24 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
                            (g_ctl->active_mask & mgpu::kRequestUi) != 0 &&
                            g_ctl->streams[3].width >= 64 && g_ctl->streams[3].height >= 64;
     const uint32_t ui_src = ui_source_now();
-    const bool ui_derived = (g_ctl->streams[3].ui_flags & 1u) != 0;
+    const bool ui_derived = (g_ctl->streams[3].ui_flags & mgpu::kUiFlagDerived) != 0;
+    const bool ui_patch = (g_ctl->streams[4].ui_flags & mgpu::kHudlessFlagPatchPayload) != 0;
     const uint32_t ui_q = g_ctl->streams[3].ui_quality;
     const bool ui_full_res = g_ctl->streams[3].width == draw_w &&
                              g_ctl->streams[3].height == draw_h;
-    // mode 5 = HUDless + UI, for every UI source (game tag or render-card synth).
+    // mode 5 = HUDless + UI, for every UI source (game tag or render-card synth). A patch
+    // is only the HUDless source; when stream 3 carries a game UI plane, tag both and
+    // AUTO selects mode 5. Without a UI plane the same H' goes alone -> mode 4.
     // 0/1 both mean "use it when allowed"; only --no-ui-mode5 (2) forces mode 4.
     // Full-res is a hard condition: XeFG requires HUDless/UI/backbuffer to share
     // resourceSize. The old 50..6000 bp coverage gate is gone: an empty derived UI in
     // mode 5 composites back to the HUDless, so it is harmless.
     bool mode5 = false;
-    if (hudless_res != nullptr && ui_active) {
+    // v34 patch path: stream 4 is the reconstruction material and the consumer tags H'
+    // only. The UI stream is disabled by default; if a stale UiStream=1 still publishes
+    // a game UI plane, do not combine it here (mode 5 costs another UI encode/decode and
+    // is intentionally sealed off).
+    if (!ui_patch && hudless_res != nullptr && ui_active) {
         mode5 = (g_ui_mode5 != 2) && ui_full_res;
     }
     if (hudless_res != nullptr) {
@@ -1187,13 +1199,13 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
                       ui_derived ? "render-synth" : "game", ui_q);
             }
         }
-    } else if (ui_active && ui_src == mgpu::kUiSourceGame) {
+    } else if (ui_active && !ui_patch && ui_src == mgpu::kUiSourceGame) {
         rd.resourceSize = { g_ctl->streams[3].width, g_ctl->streams[3].height };
         rd.pResource = g_ui_local[uil].Get();
         rd.incomingState = D3D12_RESOURCE_STATE_COMMON;
         rd.type = XEFG_SWAPCHAIN_RES_UI;
         if (!g_mv_gate_off) { g_api.D3D12TagFrameResource(g_fg, tag_list, present_id, &rd); }
-    } else if (ui_active) {
+    } else if (ui_active && !ui_patch) {
         // Derived UI is only a means to rebuild HUDless; without a HUDless this frame it
         // must not be tagged as UI (that would freeze scene colour into the overlay).
         static bool told_derived = false;
@@ -1202,13 +1214,28 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
             logf_("[lock] ui-unblend: derived UI has no HUDless this frame -"
                   " UI composition stays off (no UI tag fallback)\n");
         }
+    } else if (ui_patch && ui_active) {
+        static bool told_patch = false;
+        if (!told_patch) {
+            told_patch = true;
+            logf_("[lock] ui-patch: patch stream present but H' compose did not run -"
+                  " no tag this frame (composition stays off)\n");
+        }
     }
 
     // --tag-dump: copy exactly what XeFG is about to receive (backbuffer/HUDless/UI).
     if (g_tag_dump_frames > 0) {
         ID3D12Resource* tag_ui = g_ui_used_current;
         D3D12_RESOURCE_STATES tag_ui_state = g_ui_used_state;
-        if (tag_ui == nullptr && ui_active) {
+        // v33/v34: in patch mode the third dump is the reconstruction material (the
+        // decoded HUDless patch), not a UI plane. stream 4 is the patch stream.
+        if (ui_patch) {
+            const UINT hslot = g_hudless_slots ? (slot % g_hudless_slots) : slot;
+            if (hslot < mgpu::kMaxSlots && g_hudless_local[hslot]) {
+                tag_ui = g_hudless_local[hslot].Get();
+                tag_ui_state = D3D12_RESOURCE_STATE_COMMON;
+            }
+        } else if (tag_ui == nullptr && ui_active) {
             tag_ui = g_ui_local[uil].Get();
             tag_ui_state = D3D12_RESOURCE_STATE_COMMON;
         }

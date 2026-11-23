@@ -117,6 +117,24 @@ build_consumer() {
         "$stage/synth_ui_cso.h" "SynthUI" \
         || { echo "[build] embed failed for synth_ui"; return 1; }
 
+    # v33: dynamic reference-white calibration for the HUDless patch (mode 4).
+    # v34: patch_local / patch_local_fill add the per-32x8-tile spatial tone residual.
+    for spec in "patch_calib:cs_5_0:CSMain:PatchCalib" \
+                "patch_gain:cs_5_0:CSMain:PatchGain" \
+                "patch_local:cs_5_0:CSMain:PatchLocal" \
+                "patch_local_fill:cs_5_0:CSMain:PatchLocalFill" \
+                "patch_lut3d:cs_5_0:CSMain:PatchLut3D" \
+                "patch_lut3d_fill:cs_5_0:CSMain:PatchLut3dFill"; do
+        IFS=: read -r base prof entry sym <<< "$spec"
+        "$FXC_WIN" -nologo -T "$prof" -E "$entry" \
+            -Fo "$(wslpath -w "$stage/$base.cso")" \
+            "$(wslpath -w "$HERE/shaders/$base.hlsl")" \
+            || { echo "[build] fxc failed for $base"; return 1; }
+        python3 "$REPO/scripts/embed_cso.py" "$stage/$base.cso" \
+            "$stage/${base}_cso.h" "$sym" \
+            || { echo "[build] embed failed for $base"; return 1; }
+    done
+
     # Sparse unblend: per-tile UI occupancy derived from the codec headers (no protocol
     # change). One 4-byte word per 32x8 tile; the unblend writes `present` for empty tiles
     # instead of sampling UI and running the PQ math.

@@ -8,6 +8,7 @@
 #    WITH_XESS=1 ./lock_frame/release.sh     # 把 Intel 运行时一起放进包里
 #    WITH_MFG_ASSETS=1 ./lock_frame/release.sh # 本地包带上 MFG 实验资产（不公开分发）
 #    WITH_THIRD_PARTY=1 ./lock_frame/release.sh  # 源码包也放入本地 third_party 副本
+#    DIST_DIR=/mnt/c/Users/.../Downloads ./lock_frame/release.sh  # 输出到指定目录
 #
 #  产物：
 #    dist/lock_frame-<ver>/                 完整运行包（不含 Intel DLL）
@@ -31,9 +32,10 @@ PROTO="$(sed -n 's/^inline constexpr uint32_t kSharedVersion = \([0-9]*\);/\1/p'
 [ -n "$PROTO" ] || die "cannot read kSharedVersion from include/mgpu_shared.h"
 SHA="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo nogit)"
 
-OUT="$REPO/dist/lock_frame-$VER"
-ZIP="$REPO/dist/lock_frame-$VER.zip"
-SRC_ZIP="$REPO/dist/lock_frame-$VER-src.zip"
+DIST="$(mkdir -p "${DIST_DIR:-$REPO/dist}" && cd "${DIST_DIR:-$REPO/dist}" && pwd)"
+OUT="$DIST/lock_frame-$VER"
+ZIP="$DIST/lock_frame-$VER.zip"
+SRC_ZIP="$DIST/lock_frame-$VER-src.zip"
 
 if [ "${BUILD:-0}" = "1" ]; then
     say "building all artifacts"
@@ -65,6 +67,7 @@ else
 fi
 cp -f "$REPO/LICENSE"                         "$OUT/"
 cp -f "$REPO/NOTICE"                          "$OUT/"
+cp -f "$REPO/docs/design/UI_PATCH_PERF.md"    "$OUT/docs/UI_PATCH_PERF.md"
 
 # --- optional Intel runtime --------------------------------------------------
 # Intel's licence allows unmodified redistribution with the notice. Since 1.2.0 the
@@ -94,6 +97,7 @@ cat > "$OUT/docs/SUPPORTED-GAMES.md" <<'EOF'
 
 - Cyberpunk 2077
 - PBZ
+- Wuchang: Fallen Feathers
 - RED 引擎（已实测）
 - UE5（已实测）
 - UE4（已实测）
@@ -148,7 +152,7 @@ python3 "$HERE/scripts/write_manifest.py" \
 
 # --- source package (GPL-3.0) ------------------------------------------------
 say "packing source (GPL-3.0)"
-SRC_TMP="$REPO/dist/.lock_frame-src-$VER"
+SRC_TMP="$DIST/.lock_frame-src-$VER"
 rm -rf "$SRC_TMP"; mkdir -p "$SRC_TMP"
 cp -a "$HERE" "$SRC_TMP/lock_frame"
 cp -a "$REPO/src" "$SRC_TMP/src"
@@ -183,7 +187,7 @@ EOF
 rm -rf "$SRC_TMP"
 
 # --- main zip ----------------------------------------------------------------
-( cd "$REPO/dist" && zip -qr "$(basename "$ZIP")" "$(basename "$OUT")" )
+( cd "$DIST" && zip -qr "$(basename "$ZIP")" "$(basename "$OUT")" )
 
 # --- validation --------------------------------------------------------------
 python3 "$HERE/scripts/check_release.py" "$OUT" --protocol "$PROTO" --version "$VER"

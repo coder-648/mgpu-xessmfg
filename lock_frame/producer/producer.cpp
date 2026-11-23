@@ -149,6 +149,7 @@ bool     g_ui_dilate = false;
 // v32: optional clean HUDless stream (stream 4). Full-resolution R10 PQ; consumer tags it
 // directly instead of reconstructing H' from WGC present - UI.
 bool     g_want_hudless_session = false;
+bool     g_hudless_display_referred = false;
 uint32_t g_hudless_slots = 8;
 uint32_t g_hudless_format = static_cast<uint32_t>(DXGI_FORMAT_R10G10B10A2_UNORM);
 uint32_t g_hudless_w = 0, g_hudless_h = 0;
@@ -156,9 +157,26 @@ uint32_t g_hudless_w = 0, g_hudless_h = 0;
 // is ~34 MB at 4K, so 32 slots would reserve ~1.09 GB for a stream that only needs a few
 // frames of in-flight depth.
 uint32_t g_ui_slots = 8;
-// Local A/B override for the closed synthesis gate (`fakerFG.ini UiSynthesis=1`). It is
-// never a release default: UiStream=0/UiSource=Off remain the shipped configuration.
+// 1.3.0: UI composition is a supported default (producer patch + consumer mode 4).
 static bool g_ui_synthesis_override = false;
+// v33: stream 3 carries the **HUDless scene under the UI support** instead of a UI plane
+// (UiPatch=1). The render card builds the support mask from P/H (or the game's UI alpha)
+// and writes H into the transport texture; the sparse codec drops every tile without
+// support. The consumer composes H' = present outside the support, patch inside it, and
+// tags H' alone - XeFG AUTO then picks BACKBUFFER_HUDLESS (mode 4). No alpha, no division.
+bool     g_ui_patch = false;
+// v34: when the patch colour source is display-referred (ScalingOutputColor), the
+// producer's Evaluate-time image is not final yet. Defer the patch synth + mask + encode
+// to the Present boundary, where the game's processed backbuffer/scaling output are
+// complete.
+bool     g_patch_deferred = false;
+// v33: scRGB 1.0 = N nits for the patch's HUDless source. 80 is the spec scale, but a
+// title may hand a scene-referred target with a different white (CP2077 measures ~20).
+float    g_ui_patch_white = 80.0f;
+static bool ui_synth_source(uint32_t s)
+{
+    return s == mgpu::kUiSourceSynth || s == mgpu::kUiSourcePatch;
+}
 // 锁帧版：颜色走消费者侧的 WGC。ColourStream 选项已删除（v31）；producer 永不发布
 // colour 流，g_want_colour_session 恒 false，stream 0 的 slot_size=0。
 bool     g_want_colour_session = false;
@@ -288,7 +306,7 @@ struct UiDumpImage
     DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
     UINT w = 0, h = 0;
 };
-static UiDumpImage g_ui_dump_img[3];       // 0 = P, 1 = H, 2 = U
+static UiDumpImage g_ui_dump_img[4];       // 0=P, 1=Hmask, 2=U/patch, 3=ScalingOutputColor
 static bool        g_ui_dump_pending = false;
 static int         g_ui_dump_index = 0;
 static int         g_ui_dump_after = -1;
@@ -297,7 +315,7 @@ static uint32_t    g_ui_synth_frames = 0;
 
 static bool ui_dump_prepare(ID3D12Device* device, int idx, ID3D12Resource* res)
 {
-    if (device == nullptr || res == nullptr || idx < 0 || idx > 2) { return false; }
+    if (device == nullptr || res == nullptr || idx < 0 || idx > 3) { return false; }
     UiDumpImage& d = g_ui_dump_img[idx];
     const D3D12_RESOURCE_DESC desc = res->GetDesc();
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) { return false; }
@@ -448,8 +466,10 @@ static void ui_dump_flush()
     const bool h = ui_dump_write(1, path);
     snprintf(path, sizeof(path), "%s\\frame_%02d_u.bmp", dir, idx);
     const bool u = ui_dump_write(2, path);
-    logf("ui-dump: frame %d -> P %d H %d U %d (%s)\n", idx, p ? 1 : 0, h ? 1 : 0,
-         u ? 1 : 0, dir);
+    snprintf(path, sizeof(path), "%s\\frame_%02d_s.bmp", dir, idx);
+    const bool s = ui_dump_write(3, path);
+    logf("ui-dump: frame %d -> P %d Hmask %d U %d Scaling %d (%s)\n", idx, p ? 1 : 0,
+         h ? 1 : 0, u ? 1 : 0, s ? 1 : 0, dir);
     g_ui_dump_pending = false;
 }
 
@@ -701,6 +721,8 @@ bool layout_streams(ID3D12Device* device, mgpu::SharedControl* c,
         // consumer. Its live rectangle is the downsampled size, not the output size.
         { static_cast<DXGI_FORMAT>(ui_format), ui_w, ui_h, ui_slot_w, ui_slot_h },
         // v32: clean full-resolution HUDless, R10 PQ.
+        // v34: when UiPatch=1 this same slot carries the sparse masked HUDless patch
+        // (stream 4); stream 3 stays the game UI plane.
         { static_cast<DXGI_FORMAT>(g_hudless_format), g_hudless_w, g_hudless_h,
           g_hudless_w, g_hudless_h },
     };
@@ -723,7 +745,7 @@ bool layout_streams(ID3D12Device* device, mgpu::SharedControl* c,
         const bool needed = (i == static_cast<int>(mgpu::kStreamColour) ||
                              i == static_cast<int>(mgpu::kStreamMv) ||
                              i == static_cast<int>(mgpu::kStreamDepth) ||
-                             i == static_cast<int>(mgpu::kStreamUi) ||
+                             (i == static_cast<int>(mgpu::kStreamUi) && g_want_ui_session) ||
                              (i == static_cast<int>(mgpu::kStreamHudless) &&
                               g_want_hudless_session && g_hudless_w >= 64 &&
                               g_hudless_h >= 64));
@@ -732,7 +754,8 @@ bool layout_streams(ID3D12Device* device, mgpu::SharedControl* c,
         bool fr_fmt_ok = false;
         if (i == static_cast<int>(mgpu::kStreamMv)) {
             fr_fmt_ok = (specs[i].format == DXGI_FORMAT_R16G16_FLOAT);
-        } else if (i == static_cast<int>(mgpu::kStreamUi)) {
+        } else if (i == static_cast<int>(mgpu::kStreamUi) ||
+                   i == static_cast<int>(mgpu::kStreamHudless)) {
             fr_fmt_ok = (specs[i].format == DXGI_FORMAT_R10G10B10A2_UNORM ||
                          specs[i].format == DXGI_FORMAT_R10G10B10A2_TYPELESS ||
                          specs[i].format == DXGI_FORMAT_R8G8B8A8_UNORM ||
@@ -996,8 +1019,7 @@ void compute_ui_target(uint32_t ui_w, uint32_t ui_h, DXGI_FORMAT src_format)
     // The synth pass writes the transport format directly (including R10->RGBA8), so it
     // must not be followed by a scale/convert dispatch.
     const bool synth_writes_target = g_ui_full_res &&
-        (g_ui_source == mgpu::kUiSourceSynth ||
-         g_ui_source_type == mgpu::kUiSourceSynth);
+        (ui_synth_source(g_ui_source) || ui_synth_source(g_ui_source_type));
     g_scaled[3] = (g_percent[3] > 100) || (convert && !synth_writes_target);
     if (!g_scaled[3]) {
         g_stream_w[3] = ui_w;
@@ -1332,7 +1354,8 @@ bool ensure_fr_objects(ID3D12Device* device)
     // both dispatches then ran with the depth tables and only depth was written
     // (measured on PBZ 2026-11-22: `fr: coded mv 0.00 MB/frame` for the whole session
     // while depth encoded fine - TileLen[0] was never written).
-    hd.NumDescriptors = 10;         // mv srv,uav,tl | depth srv,uav,tl | ui srv,uav,tl | ui mask
+    hd.NumDescriptors = 14;        // mv srv,uav,tl | depth srv,uav,tl | ui srv,uav,tl |
+                                   // patch srv,uav,tl | ui mask
     hd.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_fr_heap)))) {
         logf("fr: descriptor heap FAILED\n");
@@ -1629,8 +1652,10 @@ bool fr_encode_dispatch(ID3D12GraphicsCommandList* list, ID3D12Resource* src,
     ID3D12Device* device = g_device.Get();
     if (!ensure_fr_objects(device)) { return false; }
     prof_reload_ini();   // 1 Hz: FrCodecAblate / DepthFp16 / ProfGpu can change without a restart
-    const uint32_t dst_slot = (stream == 3 && g_ui_slots)
-                                  ? (slot % g_ui_slots) : slot;
+    const uint32_t dst_slot = (stream == 4)
+                                  ? ((g_hudless_slots && slot < mgpu::kMaxSlots)
+                                         ? (slot % g_hudless_slots) : slot)
+                                  : (stream == 3 && g_ui_slots) ? (slot % g_ui_slots) : slot;
     ID3D12Resource* dst = (slot < mgpu::kMaxSlots && dst_slot < mgpu::kMaxSlots)
                               ? g_slot[stream][dst_slot].Get() : nullptr;
     if (dst == nullptr || dst->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
@@ -1640,9 +1665,14 @@ bool fr_encode_dispatch(ID3D12GraphicsCommandList* list, ID3D12Resource* src,
     // stream 1 = MV (fp16 pairs), stream 2 = depth (one R32 value per pixel), stream 3 =
     // UI (R10G10B10A2 / RGBA8, packed to one u32 per pixel by the UI kernel variants).
     const bool d32 = (stream == 2);
-    const bool ui  = (stream == 3);
+    const bool patch = (stream == 4);
+    const bool ui  = (stream == 3 || patch);
+    // The group mask is the patch's P/H support (or a render-card synth UI mask). A game
+    // UI plane must not use it: when both streams are encoded, the UI descriptor/base is
+    // separate but the mask would otherwise be the patch's.
     const bool ui_sparse = ui && g_ui_sparse_codec && g_ui_mask_valid &&
-                           g_ui_mask != nullptr;
+                           g_ui_mask != nullptr &&
+                           (patch || g_ui_source == mgpu::kUiSourceSynth);
     bool ui_r10 = false, ui_rgba = false;
     DXGI_FORMAT codec_srv_fmt = DXGI_FORMAT_UNKNOWN;
     if (ui) {
@@ -1683,7 +1713,8 @@ bool fr_encode_dispatch(ID3D12GraphicsCommandList* list, ID3D12Resource* src,
     // private buffer (bisect: is a UAV write to a cross-adapter buffer the invalid call?);
     // 3 = everything except the Dispatch. See docs/design/LOSSLESS_TRANSPORT.md 17.6.
     // UI uses its own UiCodec switch (0 = texture path, 1 = codec).
-    const uint32_t fr_mode = ui ? (ui_codec() != 0 ? 1u : 0u) : mv_codec();
+    const uint32_t fr_mode = patch ? 1u
+                            : ui ? (ui_codec() != 0 ? 1u : 0u) : mv_codec();
     if (fr_mode == 0) { return false; }
     ID3D12Resource* uav_target = dst;
     if (fr_mode == 2) {
@@ -1730,9 +1761,11 @@ bool fr_encode_dispatch(ID3D12GraphicsCommandList* list, ID3D12Resource* src,
 
     const UINT inc = device->GetDescriptorHandleIncrementSize(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    // MV -> slots 0..2, depth -> slots 3..5. Both encodes are recorded into the same
-    // list before it is submitted, so the two streams must never share a slot.
-    const UINT base_index = ui ? 6u : (d32 ? 3u : 0u);
+    // MV -> slots 0..2, depth -> slots 3..5, UI -> 6..8, patch -> 10..12, masks at
+    // 9 / 13. Both encodes are recorded into the same list before it is submitted, so
+    // the streams must never share a descriptor slot.
+    const UINT base_index = patch ? 10u : (ui ? 6u : (d32 ? 3u : 0u));
+    const UINT mask_index = patch ? 13u : 9u;
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_fr_heap->GetCPUDescriptorHandleForHeapStart();
     cpu.ptr += static_cast<SIZE_T>(inc) * base_index;
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = g_fr_heap->GetGPUDescriptorHandleForHeapStart();
@@ -1782,9 +1815,9 @@ bool fr_encode_dispatch(ID3D12GraphicsCommandList* list, ID3D12Resource* src,
     // UI sparse group mask at descriptor 9 (t4). For non-sparse kernels it is unused but
     // the root signature still has the table, so bind a valid structured SRV.
     D3D12_CPU_DESCRIPTOR_HANDLE cpu_mask = g_fr_heap->GetCPUDescriptorHandleForHeapStart();
-    cpu_mask.ptr += static_cast<SIZE_T>(inc) * 9u;
+    cpu_mask.ptr += static_cast<SIZE_T>(inc) * mask_index;
     D3D12_GPU_DESCRIPTOR_HANDLE gpu_mask = g_fr_heap->GetGPUDescriptorHandleForHeapStart();
-    gpu_mask.ptr += static_cast<UINT64>(inc) * 9u;
+    gpu_mask.ptr += static_cast<UINT64>(inc) * mask_index;
     D3D12_SHADER_RESOURCE_VIEW_DESC msrv{};
     msrv.Format = DXGI_FORMAT_UNKNOWN;
     msrv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
@@ -1979,6 +2012,17 @@ bool ensure_shared(ID3D12Device* device, uint32_t render_w, uint32_t render_h,
         g_ui_format = 0;
         g_stream_w[3] = g_stream_h[3] = 0;
     }
+    // v34 mode 4-only: stream 3 is off, but the support patch still needs its own
+    // transport format (the patch is written by synth_ui_dispatch to stream 4). Keep
+    // g_ui_format/geometry for the patch without publishing/placing stream 3.
+    if (g_ui_patch && !g_want_ui_session && ui_w >= 64 && ui_h >= 64 && ui_format != 0) {
+        g_ui_w = ui_w;
+        g_ui_h = ui_h;
+        g_ui_format = static_cast<uint32_t>(
+            ui_transport_format(static_cast<DXGI_FORMAT>(ui_format)));
+        logf("producer: UiPatch=1 mode 4-only; stream 3 off, patch transport fmt %u\n",
+             g_ui_format);
+    }
 
     // "auto" codec: decide BEFORE the layout, because the layout picks buffer vs texture
     // slots and the stream sizes (a codec stream runs at 100%).
@@ -2073,7 +2117,7 @@ bool ensure_shared(ID3D12Device* device, uint32_t render_w, uint32_t render_h,
         !place_slots(device, mgpu::kStreamDepth, g_depth_format, g_slot_w, g_slot_h,
                      probe.streams[mgpu::kStreamDepth].offset,
                      probe.streams[mgpu::kStreamDepth].slot_size, mgpu::kMaxSlots) ||
-        (g_ui_format != 0 &&
+        (g_ui_format != 0 && g_want_ui_session &&
          !place_slots(device, mgpu::kStreamUi, g_ui_format, g_ui_slot_w, g_ui_slot_h,
                       probe.streams[mgpu::kStreamUi].offset,
                       probe.streams[mgpu::kStreamUi].slot_size, g_ui_slots)) ||
@@ -2643,7 +2687,8 @@ int ini_codec_mode(const wchar_t* key)
     return 2;                                    // "auto", empty or anything else
 }
 
-int  g_codec_mode[4] = { 0, -1, -1, -1 };       // [1] = mv, [2] = depth, [3] = UI; -1 = unread
+int  g_codec_mode[5] = { 0, -1, -1, -1, -1 };   // [1] = mv, [2] = depth, [3] = UI,
+                                              // [4] = v34 patch (always 1)
 bool g_codec_resolved = false;
 
 
@@ -2693,12 +2738,13 @@ void fr_resolve_codec(ID3D12Device* device)
 
 bool ensure_fr_objects(ID3D12Device* device);   // defined with the encode pass below
 
-// 1 = MV, 2 = depth; everything else is not a codec stream.
+// 1 = MV, 2 = depth, 3 = UI, 4 = v34 support patch (sparse). Everything else is texture.
 uint32_t stream_codec(int stream)
 {
     if (stream == 1) { return mv_codec(); }
     if (stream == 2) { return depth_codec(); }
     if (stream == 3) { return g_ui_full_res ? ui_codec() : 0; }
+    if (stream == 4) { return g_ui_patch ? 1u : 0u; }
     return 0;
 }
 
@@ -2759,7 +2805,7 @@ static bool ensure_ui_synth_objects(ID3D12Device* device)
 
     D3D12_DESCRIPTOR_RANGE srv_range{};
     srv_range.RangeType          = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    srv_range.NumDescriptors     = 3;          // P, H, Alpha
+    srv_range.NumDescriptors     = 4;          // P, Hmask, Alpha, Hpatch
     srv_range.BaseShaderRegister = 0;
     D3D12_DESCRIPTOR_RANGE uav_range{};
     uav_range.RangeType          = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
@@ -2769,7 +2815,9 @@ static bool ensure_ui_synth_objects(ID3D12Device* device)
     D3D12_ROOT_PARAMETER rp[3]{};
     rp[0].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     rp[0].Constants.ShaderRegister = 0;
-    rp[0].Constants.Num32BitValues = 9;        // W,H,Threshold,UseAlpha,Linear,PSrcScRGB,HSrcScRGB,Dilate,Sparse
+    rp[0].Constants.Num32BitValues = 12;       // W,H,Threshold,UseAlpha,Linear,PSrcScRGB,
+                                               // HSrcScRGB,Dilate,Sparse,Patch,PatchDirect,
+                                               // PatchWhite
     rp[0].ShaderVisibility         = D3D12_SHADER_VISIBILITY_ALL;
     rp[1].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     rp[1].DescriptorTable.NumDescriptorRanges = 1;
@@ -2805,7 +2853,7 @@ static bool ensure_ui_synth_objects(ID3D12Device* device)
 
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
     hd.Type           = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = 6;                      // P/H/A SRV, UI/Mask/Stats UAV
+    hd.NumDescriptors = 7;                      // P/H/A/Hpatch SRV, UI/Mask/Stats UAV
     hd.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_ui_synth_heap)))) {
         logf("ui-synth: descriptor heap FAILED\n");
@@ -3021,10 +3069,18 @@ static bool synth_ui_dispatch(ID3D12GraphicsCommandList* list, const MgpuFgFrame
                           g_ui_synth_frames >= static_cast<uint32_t>(g_ui_dump_after);
     const MgpuFgResource& P = f.stream[MGPU_FG_STREAM_BACKBUFFER];
     const MgpuFgResource& H = f.stream[MGPU_FG_STREAM_HUDLESS];
-    if (P.resource == nullptr || H.resource == nullptr || P.resource == H.resource) {
+    // v34: the mask reference stays H (scene-referred), while the patch colour may come
+    // from the display-referred ScalingOutputColor. Keep them separate instead of letting
+    // the display image create a full-frame support mask.
+    const MgpuFgResource& Hp =
+        (g_hudless_display_referred && f.stream[MGPU_FG_STREAM_SCALING].resource != nullptr)
+            ? f.stream[MGPU_FG_STREAM_SCALING] : H;
+    if (P.resource == nullptr || H.resource == nullptr || P.resource == H.resource ||
+        Hp.resource == nullptr) {
         return false;
     }
-    if (P.state == 0xFFFFFFFFu || H.state == 0xFFFFFFFFu) {
+    if (P.state == 0xFFFFFFFFu || H.state == 0xFFFFFFFFu ||
+        Hp.state == 0xFFFFFFFFu) {
         static bool told = false;
         if (!told) {
             told = true;
@@ -3034,15 +3090,23 @@ static bool synth_ui_dispatch(ID3D12GraphicsCommandList* list, const MgpuFgFrame
     }
     auto* pr = static_cast<ID3D12Resource*>(P.resource);
     auto* hr = static_cast<ID3D12Resource*>(H.resource);
+    auto* hpr = static_cast<ID3D12Resource*>(Hp.resource);
     const D3D12_RESOURCE_DESC pd = pr->GetDesc();
     const D3D12_RESOURCE_DESC hd = hr->GetDesc();
+    const D3D12_RESOURCE_DESC hpd = hpr->GetDesc();
     if (pd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
-        hd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+        hd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        hpd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
         return false;
     }
+    const bool patch_direct = g_hudless_display_referred &&
+                              Hp.resource != H.resource &&
+                              Hp.resource != P.resource &&
+                              hpd.Format == DXGI_FORMAT_R10G10B10A2_UNORM;
     const uint32_t w = static_cast<uint32_t>(pd.Width);
     const uint32_t h = static_cast<uint32_t>(pd.Height);
-    if (w < 64 || h < 64 || w != hd.Width || h != hd.Height) {
+    if (w < 64 || h < 64 || w != hd.Width || h != hd.Height ||
+        (patch_direct && (w != hpd.Width || h != hpd.Height))) {
         static bool told_size = false;
         if (!told_size) {
             told_size = true;
@@ -3052,14 +3116,19 @@ static bool synth_ui_dispatch(ID3D12GraphicsCommandList* list, const MgpuFgFrame
         }
         return false;
     }
-    // The stream-3 slot was laid out at the reserved content size. Writing a larger
-    // texture here would overflow the copy; refuse instead of corrupting transport.
-    if (w != g_stream_w[3] || h != g_stream_h[3]) {
+    // The stream-3 slot was laid out at the reserved content size. In v34 mode 4-only
+    // stream 3 is deliberately not placed; the patch target is stream 4's HUDless slot.
+    // Writing a larger texture here would overflow the copy; refuse instead of corrupting
+    // transport.
+    const uint32_t target_w = g_ui_patch ? g_stream_w[4] : g_stream_w[3];
+    const uint32_t target_h = g_ui_patch ? g_stream_h[4] : g_stream_h[3];
+    if (w != target_w || h != target_h) {
         static bool told_slot = false;
         if (!told_slot) {
             told_slot = true;
-            logf("ui-synth: P %ux%u != stream 3 slot %ux%u - synth skipped\n",
-                 w, h, g_stream_w[3], g_stream_h[3]);
+            logf("ui-synth: P %ux%u != %s slot %ux%u - synth skipped\n",
+                 w, h, g_ui_patch ? "stream 4 patch" : "stream 3",
+                 target_w, target_h);
         }
         return false;
     }
@@ -3148,14 +3217,18 @@ static bool synth_ui_dispatch(ID3D12GraphicsCommandList* list, const MgpuFgFrame
         device->CreateShaderResourceView(hr, &srv, cpu);
     }
     cpu.ptr += inc; gpu.ptr += inc;
+    // t3: display-referred patch colour (or a valid duplicate of Hmask when not used).
+    srv.Format = typed_color_format(hpd.Format);
+    device->CreateShaderResourceView(hpr, &srv, cpu);
+    cpu.ptr += inc; gpu.ptr += inc;
 
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
     uav.Format        = fmt;
     uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     device->CreateUnorderedAccessView(g_ui_synth_tex.Get(), nullptr, &uav, cpu);
-    const D3D12_GPU_DESCRIPTOR_HANDLE gpu_ui = gpu;   // index 3: UI UAV table target
+    const D3D12_GPU_DESCRIPTOR_HANDLE gpu_ui = gpu;   // index 4: UI UAV table target
 
-    // index 4: sparse group mask (u1). index 5: stats counters (u2).
+    // index 5: sparse group mask (u1). index 6: stats counters (u2).
     cpu.ptr += inc; gpu.ptr += inc;
     if (g_ui_mask) {
         D3D12_UNORDERED_ACCESS_VIEW_DESC muav{};
@@ -3180,10 +3253,14 @@ static bool synth_ui_dispatch(ID3D12GraphicsCommandList* list, const MgpuFgFrame
 
     const auto p_before = static_cast<D3D12_RESOURCE_STATES>(P.state);
     const auto h_before = static_cast<D3D12_RESOURCE_STATES>(H.state);
+    const auto hp_before = static_cast<D3D12_RESOURCE_STATES>(Hp.state);
     const auto a_before = use_alpha ? static_cast<D3D12_RESOURCE_STATES>(A.state)
                                     : D3D12_RESOURCE_STATE_COMMON;
     barrier(list, pr, p_before, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     barrier(list, hr, h_before, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (hpr != hr) {
+        barrier(list, hpr, hp_before, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
     if (use_alpha) {
         barrier(list, ar, a_before, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     }
@@ -3208,10 +3285,13 @@ static bool synth_ui_dispatch(ID3D12GraphicsCommandList* list, const MgpuFgFrame
     struct SynthConsts {
         uint32_t w, h;
         float threshold;
-        uint32_t use_alpha, linear, p_scrgb, h_scrgb, dilate, sparse;
+        uint32_t use_alpha, linear, p_scrgb, h_scrgb, dilate, sparse, patch;
+        uint32_t patch_direct;
+        float patch_white;
     } c{ w, h, g_ui_synth_threshold, (use_alpha ? 1u : 0u), (linear ? 1u : 0u),
          (p_scrgb ? 1u : 0u), (h_scrgb ? 1u : 0u), (g_ui_dilate ? 1u : 0u),
-         (sparse_skip ? 1u : 0u) };
+         (sparse_skip ? 1u : 0u), (g_ui_patch ? 1u : 0u),
+         (patch_direct ? 1u : 0u), g_ui_patch_white };
 
     list->SetComputeRootSignature(g_ui_synth_rs.Get());
     list->SetPipelineState(g_ui_synth_pso.Get());
@@ -3236,7 +3316,7 @@ static bool synth_ui_dispatch(ID3D12GraphicsCommandList* list, const MgpuFgFrame
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         g_ui_mask_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     }
-    list->SetComputeRoot32BitConstants(0, 9, &c, 0);
+    list->SetComputeRoot32BitConstants(0, 12, &c, 0);
     list->SetComputeRootDescriptorTable(1, gpu_srv);
     // UI UAV lives at descriptor 3 (three SRVs precede it); Stats is descriptor 4 and is
     // bound separately as a root UAV.
@@ -3269,24 +3349,30 @@ static bool synth_ui_dispatch(ID3D12GraphicsCommandList* list, const MgpuFgFrame
 
     if (dump_now && ui_dump_prepare(device, 0, pr) &&
         ui_dump_prepare(device, 1, hr) &&
-        ui_dump_prepare(device, 2, g_ui_synth_tex.Get())) {
+        ui_dump_prepare(device, 2, g_ui_synth_tex.Get()) &&
+        ui_dump_prepare(device, 3, hpr)) {
         ui_dump_copy(list, 0, pr, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         ui_dump_copy(list, 1, hr, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         ui_dump_copy(list, 2, g_ui_synth_tex.Get(),
                      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        ui_dump_copy(list, 3, hpr, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         g_ui_dump_pending = true;
         static bool told_dump = false;
         if (!told_dump) {
             told_dump = true;
-            logf("ui-dump: recorded P/H/U at synth frame %u (P fmt %u, H fmt %u, U fmt %u)\n",
+            logf("ui-dump: recorded P/Hmask/U/Scaling at synth frame %u"
+                 " (P fmt %u, Hmask fmt %u, U fmt %u, Scaling fmt %u)\n",
                  static_cast<unsigned>(g_ui_synth_frames),
                  static_cast<unsigned>(pd.Format), static_cast<unsigned>(hd.Format),
-                 static_cast<unsigned>(fmt));
+                 static_cast<unsigned>(fmt), static_cast<unsigned>(hpd.Format));
         }
     }
 
     barrier(list, pr, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, p_before);
     barrier(list, hr, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, h_before);
+    if (hpr != hr) {
+        barrier(list, hpr, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, hp_before);
+    }
     if (use_alpha) {
         barrier(list, ar, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, a_before);
         static bool told_alpha = false;
@@ -3325,6 +3411,46 @@ static bool synth_ui_dispatch(ID3D12GraphicsCommandList* list, const MgpuFgFrame
         logf("ui-synth: %ux%u fmt %u from P/H (threshold %.4f)\n",
              w, h, static_cast<unsigned>(fmt), static_cast<double>(g_ui_synth_threshold));
     }
+    return true;
+}
+
+// v34: deferred present-time patch. The Evaluate-time ScalingOutputColor is not final
+// (green/incomplete blocks), so the support mask and patch encode are recorded here,
+// after the game's lists have been submitted. The command list must be DIRECT.
+static bool record_patch_present(ID3D12GraphicsCommandList* list)
+{
+    if (!g_patch_deferred) { return false; }
+    g_patch_deferred = false;
+    if (list == nullptr ||
+        (list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT &&
+         list->GetType() != D3D12_COMMAND_LIST_TYPE_COMPUTE)) {
+        static bool told = false;
+        if (!told) {
+            told = true;
+            logf("ui-patch: present list is not DIRECT/COMPUTE - patch deferred next frame\n");
+        }
+        return false;
+    }
+    MgpuFgResource patch_res{};
+    if (!synth_ui_dispatch(list, g_frame, patch_res)) {
+        static bool told_synth = false;
+        if (!told_synth) {
+            told_synth = true;
+            logf("ui-patch: present-time synth failed - stream 4 idles\n");
+        }
+        return false;
+    }
+    if (!fr_encode_dispatch(list, g_ui_synth_tex.Get(),
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, 4,
+                            g_cur_slot)) {
+        static bool told_enc = false;
+        if (!told_enc) {
+            told_enc = true;
+            logf("ui-patch: present-time encode failed - stream 4 idles\n");
+        }
+        return false;
+    }
+    g_copied_mask |= mgpu::kRequestHudless;
     return true;
 }
 
@@ -3421,6 +3547,14 @@ const MgpuFgResource* select_ui_source(const MgpuFgFrame& f, uint32_t* out_sourc
                bb.format != 0 && bb.state != 0xFFFFFFFFu && hud.state != 0xFFFFFFFFu;
     };
 
+    // v34: UiPatch=1 moves the support patch to stream 4 and seals stream 3 / mode 5.
+    // The patch is independent of the game UI plane: stream 4 is the reconstruction
+    // material and the consumer tags H' only (mode 4).
+    if (g_ui_patch) {
+        if (out_source) { *out_source = mgpu::kUiSourceOff; }
+        return nullptr;
+    }
+
     // Once a type was selected, keep it: stream 3's slot format was laid out for it.
     const uint32_t mode = (g_ui_source_type == mgpu::kUiSourceGame) ? 1
                         : (g_ui_source_type == mgpu::kUiSourceHudless) ? 2
@@ -3513,6 +3647,7 @@ void present_watchdog()
 void on_record(const MgpuFgFrame* f, void* /*user*/)
 {
     present_watchdog();
+    g_patch_deferred = false;
     ++g_record_in;
     if (g_t0 == 0) { g_t0 = GetTickCount64(); }
     static uint64_t s_last_hb = 0;
@@ -3553,6 +3688,8 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
     const MgpuFgResource& col = colour_source(*f);
     const MgpuFgResource& ui = f->stream[MGPU_FG_STREAM_UI_COLOR];
     const MgpuFgResource& hud = f->stream[MGPU_FG_STREAM_HUDLESS];
+    g_hudless_display_referred = (f->stream[MGPU_FG_STREAM_SCALING]._pad & 1u) != 0u &&
+                                 f->stream[MGPU_FG_STREAM_SCALING].resource != nullptr;
     if (mv.resource == nullptr && dp.resource == nullptr && col.resource == nullptr) {
         return;
     }
@@ -3630,6 +3767,10 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
                 g_ui_alpha8 = ini_int(L"UiAlpha8", 1) != 0;
                 g_ui_dilate = ini_int(L"UiDilate", 0) != 0;
                 g_ui_sparse_codec = ini_int(L"UiSparseCodec", 1) != 0;
+                // v33: HUDless support patch (case 2 of the UI plan). It reuses stream 3,
+                // the sparse codec and the consumer's H' ring, but the payload is scene,
+                // so the consumer tags H' only (XeFG mode 4) and never a UI plane.
+                g_ui_patch = ini_int(L"UiPatch", 1) != 0;
                 g_want_hudless_session = ini_int(L"HudlessStream", 0) != 0;
                 g_hudless_slots = ini_int(L"HudlessSlots", 8);
                 if (g_hudless_slots < 2) { g_hudless_slots = 2; }
@@ -3660,6 +3801,33 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
                 } else if (g_ui_synthesis_override) {
                     logf("producer: UiSynthesis=1 - UI synthesis gate overridden for this"
                          " session (local A/B only; see docs/UI_SYNTHESIS_GATE.md)\n");
+                }
+                if (g_ui_patch) {
+                    // v34: the support patch travels on stream 4 (HudlessStream), not on
+                    // stream 3. Stream 3 remains the game UI plane for mode 5; if the
+                    // title has no UI tag, only the patch -> mode 4 is published.
+                    // The patch needs the full-res P/H pair, the sparse codec (its
+                    // per-tile headers are the consumer's occupancy mask) and R10
+                    // transport (the patch is PQ scene, not 8-bit UI alpha).
+                    g_want_hudless_session = true;
+                    g_ui_full_res = true;
+                    g_ui_sparse_codec = true;
+                    g_ui_alpha8 = false;
+                    g_ui_synthesis_override = true;
+                    g_ui_source_mode = 3;          // stream 3 sealed off; patch is stream 4
+                    g_want_ui_session = false;     // no UI plane / mode 5, even with stale ini
+                    g_codec_mode[4] = 1;           // stream 4 sparse patch
+                    wchar_t wn[32]{};
+                    ini_string(L"UiPatchWhiteNits", L"80", wn, 32);
+                    g_ui_patch_white = static_cast<float>(_wtof(wn));
+                    if (!(g_ui_patch_white >= 1.0f && g_ui_patch_white <= 10000.0f)) {
+                        g_ui_patch_white = 80.0f;
+                    }
+                    logf("producer: UiPatch=1 - stream 4 carries the sparse HUDless patch"
+                         " under the UI support; stream 3 is sealed off, consumer tags H'"
+                         " only (mode 4)\n");
+                    logf("producer: UiPatchWhiteNits=%.1f (scRGB 1.0 = nits)\n",
+                         static_cast<double>(g_ui_patch_white));
                 }
                 if (g_ui_source_mode == 3) {
                     g_want_ui_session = false;
@@ -3714,6 +3882,9 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
                          " HUDless must not equal BACKBUFFER)\n");
                 } else if (g_ui_source == mgpu::kUiSourceSynth) {
                     logf("producer: UI source = render-card synth (full-res P/H)\n");
+                } else if (g_ui_source == mgpu::kUiSourcePatch) {
+                    logf("producer: UI source = HUDless patch under UI (mode 4; no UI"
+                         " plane, no division)\n");
                 } else {
                     logf("producer: UI source = Off\n");
                 }
@@ -3732,9 +3903,9 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
                 if (uf == 0) { uf = static_cast<uint32_t>(ud.Format); }
             }
             if (uw < 64 || uh < 64 || uf == 0) { uw = uh = uf = 0; }
-        } else if (g_want_ui_session) {
+        } else if (g_want_ui_session || g_ui_patch) {
             // Reserved placeholder: the real source is selected after the FG tag appears.
-            // For the full-res synth path the transport format follows the backbuffer
+            // For the full-res synth/patch path the transport format follows the backbuffer
             // (R10 PQ for HDR, RGBA8 for SDR), not a hard-coded R10.
             uw = f->output_w ? f->output_w : f->render_w;
             uh = f->output_h ? f->output_h : f->render_h;
@@ -3839,14 +4010,16 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
             sel = nullptr;
             new_source = mgpu::kUiSourceOff;
         }
-        if (sel != nullptr || new_source == mgpu::kUiSourceSynth) {
+        if (sel != nullptr || ui_synth_source(new_source)) {
             if (new_source != g_ui_source) {
                 logf("producer: UI source %u -> %u%s\n", g_ui_source, new_source,
                      new_source == mgpu::kUiSourceHudless
                          ? " (consumer synthesises UI)"
                          : (new_source == mgpu::kUiSourceGame ? " (game UI tag)"
                             : (new_source == mgpu::kUiSourceSynth
-                                   ? " (render-card synth, full-res)" : "")));
+                                   ? " (render-card synth, full-res)"
+                                   : (new_source == mgpu::kUiSourcePatch
+                                          ? " (HUDless patch under UI, mode 4)" : ""))));
             }
             g_ui_source = new_source;
             g_ui_source_type = new_source;
@@ -3861,13 +4034,22 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
                              ? g_ui_premultiplied_cfg
                              : (g_ui_source == mgpu::kUiSourceSynth);
     const bool ui_planned = ui_aux != nullptr ||
-                            (g_want_ui_session && g_ui_source == mgpu::kUiSourceSynth);
+                            (g_want_ui_session && ui_synth_source(g_ui_source));
     bool want_ui = g_want_ui_session &&
                    (want & mgpu::kRequestUi) != 0 &&
                    ui_planned && g_ui_format != 0 &&
                    g_stream_w[3] >= 64 && g_stream_h[3] >= 64;
+    // v34: the support patch is independent of stream 3. A title without a UI tag still
+    // gets a clean H' (mode 4); with a game UI tag the same H' is combined with stream 3
+    // (mode 5). Patch only makes sense on the R10 PQ transport.
+    const bool want_patch = g_ui_patch &&
+                            (want & mgpu::kRequestHudless) != 0 &&
+                            g_ui_format == static_cast<uint32_t>(DXGI_FORMAT_R10G10B10A2_UNORM) &&
+                            g_stream_w[4] >= 64 && g_stream_h[4] >= 64 &&
+                            f->stream[MGPU_FG_STREAM_HUDLESS].resource != nullptr &&
+                            f->stream[MGPU_FG_STREAM_BACKBUFFER].resource != nullptr;
     if ((want & mgpu::kRequestUi) && ui_aux == nullptr && g_want_ui_session &&
-        g_ui_source != mgpu::kUiSourceSynth) {
+        !ui_synth_source(g_ui_source)) {
         static bool told_no_ui = false;
         if (!told_no_ui) {
             told_no_ui = true;
@@ -4064,6 +4246,8 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
     // Present lane: the passes go on our own DIRECT queue list (gpu_list below), so the
     // DMA/COPY queue must not be the only list we opened for this frame.
     if (want_dispatch && !title_list_open && own_direct_ok) { use_dma = false; }
+    // Display-referred patch synthesis is deferred to Present and needs a DIRECT list.
+    if (g_ui_patch && g_hudless_display_referred) { use_dma = false; }
     if (!g_force_inline && g_dma_enabled && !want_colour && !depth_convert) {
         const bool mv_ok = !want_mv || g_scaled[1] ||
             static_cast<D3D12_RESOURCE_STATES>(mv.state) == D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -4119,11 +4303,34 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
         (gpu_list->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT ||
          gpu_list->GetType() == D3D12_COMMAND_LIST_TYPE_COMPUTE);
 
+    // v34: the support patch is built from P/H regardless of whether the title has a UI
+    // tag. It travels on stream 4; stream 3 is reserved for the game UI plane below.
+    bool patch_ok = false;
+    if (want_patch) {
+        if (g_hudless_display_referred) {
+            // ScalingOutputColor is not final at Evaluate; record the synth/mask/encode at
+            // Present instead.
+            g_patch_deferred = true;
+        } else {
+            MgpuFgResource patch_res{};
+            if (dispatch_lane_ok && synth_ui_dispatch(gpu_list, *f, patch_res)) {
+                patch_ok = true;
+            } else {
+                static bool told_patch_synth = false;
+                if (!told_patch_synth) {
+                    told_patch_synth = true;
+                    logf("ui-patch: synth not dispatched this frame (list/P/H/states) -"
+                         " stream 4 idles\n");
+                }
+            }
+        }
+    }
+
     // P1-B: build the full-resolution UI from (P, H) on this frame's list before the
     // copy/scale decisions. It writes the transport format directly, so the copy path
     // below sees a normal UI texture.
     MgpuFgResource synth_res{};
-    if (want_ui && g_ui_source == mgpu::kUiSourceSynth && ui_aux == nullptr) {
+    if (want_ui && ui_synth_source(g_ui_source) && ui_aux == nullptr) {
         const bool tag_match = g_ui_tag_pending && g_ui_tag_tex != nullptr;
         if (tag_match) {
             synth_res.resource = g_ui_tag_tex;
@@ -4316,10 +4523,27 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
             g_copied_mask |= mgpu::kRequestUi;
         }
     }
-    // v32: clean HUDless stream (stream 4): H FP16 scRGB -> R10 PQ 1:1, then copy to the
-    // shared texture slot. The consumer tags this directly; it never reconstructs H'.
-    if (g_want_hudless_session && (want & mgpu::kRequestHudless) &&
-        hud.resource != nullptr && g_hudless_w >= 64 && g_hudless_h >= 64) {
+    // v34: support patch (stream 4). The synth already wrote the R10 PQ masked H (and
+    // the sparse group mask); encode it with the UI sparse kernel. The consumer composes
+    // H' and tags it alone (mode 4) or together with stream 3's game UI (mode 5).
+    if (g_ui_patch) {
+        if (want_patch && patch_ok && (g_copied_mask & mgpu::kRequestHudless) == 0) {
+            if (dispatch_lane_ok &&
+                fr_encode_dispatch(gpu_list, g_ui_synth_tex.Get(),
+                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, 4,
+                                   g_cur_slot)) {
+                g_copied_mask |= mgpu::kRequestHudless;
+            } else {
+                static bool told_patch_enc = false;
+                if (!told_patch_enc) {
+                    told_patch_enc = true;
+                    logf("ui-patch: stream 4 encode failed - patch idles this frame\n");
+                }
+            }
+        }
+    } else if (g_want_hudless_session && (want & mgpu::kRequestHudless) &&
+               hud.resource != nullptr && g_hudless_w >= 64 && g_hudless_h >= 64) {
+        // Legacy v32: clean full-resolution HUDless (texture), no reconstruction.
         bool ok = false;
         if (dispatch_lane_ok) {
             ok = scale_dispatch(gpu_list, static_cast<ID3D12Resource*>(hud.resource),
@@ -4345,6 +4569,7 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
     }
     // Resolve this frame's GPU timestamps (ProfGpu=1) before the list is closed/submitted.
     prof_frame_end(gpu_list);
+    if (g_patch_deferred) { g_copy_open = true; }
     if ((g_copy_enabled || g_dma_enabled) && g_copied_mask != 0) { g_copy_open = true; }
     if (g_copied_mask != 0) { g_frame_valid = true; }
 }
@@ -4432,6 +4657,20 @@ void publish_frame(void* queue_ptr)
             g_last_publish_frame_qpc = pub_fq;
         }
     }
+
+    if (g_patch_deferred) {
+        if (g_copy_active_list != nullptr) {
+            (void)record_patch_present(g_copy_active_list);
+        } else {
+            static bool told_no_list = false;
+            if (!told_no_list) {
+                told_no_list = true;
+                logf("ui-patch: no DIRECT present list for deferred patch - patch idles\n");
+            }
+            g_patch_deferred = false;
+        }
+    }
+    if (g_copied_mask != 0) { g_frame_valid = true; }
 
     if (!g_ready || !g_frame_valid || g_copied_mask == 0) {
         ++g_publish_skips;
@@ -4561,13 +4800,20 @@ void publish_frame(void* queue_ptr)
                            ? g_ui_source
                            : mgpu::kUiSourceOff;
         c->streams[mgpu::kStreamUi].ui_flags =
-            ((g_ui_source == mgpu::kUiSourceSynth) ? 1u : 0u) |
-            (g_ui_premultiplied ? 2u : 0u) |
-            (g_ui_used_alpha ? 4u : 0u) |
-            ((g_ui_linear && g_ui_full_res &&
+            ((g_ui_source == mgpu::kUiSourceSynth) ? mgpu::kUiFlagDerived : 0u) |
+            (g_ui_premultiplied ? mgpu::kUiFlagPremultiplied : 0u) |
+            (g_ui_used_alpha ? mgpu::kUiFlagUsedAlpha : 0u) |
+            ((g_ui_linear && g_ui_full_res && !g_ui_patch &&
               (g_ui_format == static_cast<uint32_t>(DXGI_FORMAT_R10G10B10A2_UNORM) ||
-               g_ui_format == static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM))) ? 8u : 0u);
+               g_ui_format == static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM)))
+                 ? mgpu::kUiFlagLinear : 0u);
         c->streams[mgpu::kStreamUi].ui_quality = g_ui_quality;
+        c->streams[mgpu::kStreamHudless].ui_flags =
+            ((g_ui_patch && (g_copied_mask & mgpu::kRequestHudless))
+                 ? mgpu::kHudlessFlagPatchPayload : 0u) |
+            (g_hudless_display_referred ? mgpu::kHudlessFlagDisplayReferred : 0u);
+        c->streams[mgpu::kStreamHudless].ui_quality =
+            (g_ui_patch && (g_copied_mask & mgpu::kRequestHudless)) ? g_ui_quality : 0u;
         MemoryBarrier();
     }
 

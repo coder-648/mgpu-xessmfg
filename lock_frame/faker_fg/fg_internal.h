@@ -83,6 +83,9 @@ struct Config
     int     fg_depth_valid_now    = 0;
     int     fg_velocity_valid_now = 0;
     int     fg_hudless_valid_now  = 0;
+    // v34: 0 = Auto (CP2077 quirk uses ScalingOutputColor), 1 = force ScalingOutputColor,
+    //       2 = force HUDLess snapshot.
+    int     hudless_source        = 0;
     // 1 = hand the title the swap chain libxess created and detour its vtable, the way
     // OptiScaler does (FGHooks::HookFGSwapchain). 0 = our own facade object.
     int     real_swapchain_object = 0;
@@ -205,6 +208,9 @@ enum GameQuirk : unsigned
     Quirk_NoFSRFGFirstSwapchain = 1u << 1,   // NoFSRFGFirstSwapchain: first chain passes through
     Quirk_ForceFGRenderSizeMVs  = 1u << 2,   // ForceFGRenderSizeMVs: activate without low-res MV
     Quirk_CyberpunkHudlessState = 1u << 3,   // CyberpunkHudlessState (hudless arrives SDR)
+    // CP2077 tags ScalingOutputColor (display-referred, before UI) alongside the
+    // scene-referred HUDLess. The former is the correct patch source for WGC matching.
+    Quirk_CyberpunkScalingHudless = 1u << 4,
 };
 
 unsigned game_quirks();

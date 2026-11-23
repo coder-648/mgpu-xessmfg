@@ -33,12 +33,20 @@ cbuffer Params : register(b0)
     uint  HSrcScRGB;      // 1 = H is FP16 scRGB, 0 = H is R10 PQ (or SDR code-space)
     uint  Dilate;         // 1 = 3x3 max-dilate the difference mask (edge coverage)
     uint  Sparse;         // 1 = empty groups are skipped (codec writes mode=3 zero tiles)
+    uint  Patch;          // v33: 1 = stream 3 carries the HUDless patch (scene under UI),
+                          //      not a UI plane. The consumer tags H' only (XeFG mode 4).
+    uint  PatchDirect;    // v34: 1 = PatchH (t3) is already display-referred; write raw
+    float PatchWhite;     // v33: scRGB 1.0 = N nits for the patch. CP2077's HUDless is
+                          //      scene-referred at ~20 nits (measured), not 80.
 };
 
 Texture2D<float4>   P : register(t0);
 Texture2D<float4>   Hudless : register(t1);
 // Only sampled when UseAlpha != 0; the producer binds a valid descriptor either way.
 Texture2D<float>    Alpha : register(t2);
+// v34: optional display-referred patch source (ScalingOutputColor). When PatchDirect=1
+// this is the colour written to the patch; Hudless remains the mask reference above.
+Texture2D<float4>   PatchH : register(t3);
 SamplerState        Smp : register(s0);
 RWTexture2D<float4> Ui : register(u0);
 // [0] = pixels with m > 0.5, [1] = pixels with m > 0.01. The producer reads these at most
@@ -82,6 +90,14 @@ float3 linear709_to_nits2020(float3 c)
 float3 to_pq(float3 linear709)
 {
     return pq_encode(linear709_to_nits2020(linear709));
+}
+
+// v33 patch: same conversion, but the HUDless's scRGB scale is not always 80 nits.
+// CP2077 hands a scene-referred target whose 1.0 is ~20 nits; encoding it at 80 made
+// the transported patch ~1.6x brighter than the consumer's display-referred present.
+float3 to_pq_white(float3 linear709, float white_nits)
+{
+    return pq_encode(mul(k709to2020, linear709 * white_nits));
 }
 
 float raw_diff(float3 a, float3 b)
@@ -135,6 +151,80 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID,
 {
     // Do not return before the group barrier: out-of-range lanes still participate.
     const int2 p = int2(id.xy);
+
+    // ---- v33: HUDless support patch ------------------------------------------------
+    // Case 2 of the UI plan: the consumer needs a clean HUDless, and the only place it
+    // cannot get one from `present` is where UI covers the scene. H already contains that
+    // scene, so ship H on the UI support and let the consumer copy it. `a` is not an
+    // opacity here - the support is a recall-first set (over-cover only costs bytes).
+    //
+    // We fill the whole frame with H (empty tiles are dropped by the sparse codec), which
+    // guarantees every transmitted 32x8 tile carries valid scene pixels: the encoder works
+    // per tile, not per 8x8 group, so a partially covered tile must not contain stale H.
+    if (Patch != 0u) {
+        if (tid.x == 0u && tid.y == 0u) { g_ui_group_hit = 0u; }
+        GroupMemoryBarrierWithGroupSync();
+
+        float3 h_enc = float3(0.0f, 0.0f, 0.0f);
+        float  hit   = 0.0f;
+        const bool in_range = (id.x < W && id.y < H);
+        if (in_range) {
+            const float3 hudless_raw = Hudless.Load(int3(p, 0)).rgb;
+            const float3 present_raw = P.Load(int3(p, 0)).rgb;
+            // Transport space: R10 PQ when the source is HDR (FP16 scRGB), otherwise the
+            // source is already in the transport encoding (R10 PQ or SDR code values).
+            // v34: PatchH may be a display-referred plane (ScalingOutputColor); in that
+            // case write it raw, while the mask still comes from Hudless.
+            const float3 patch_raw = (PatchDirect != 0u) ? PatchH.Load(int3(p, 0)).rgb
+                                                         : hudless_raw;
+            h_enc = (PatchDirect != 0u)
+                        ? patch_raw
+                        : ((HSrcScRGB != 0) ? to_pq_white(patch_raw, PatchWhite)
+                                            : patch_raw);
+
+            // Difference support (relative, in linear nits when UiLinear=1). This is also
+            // the fallback for additive UI: such UI can have alpha 0 while still changing
+            // P, and alpha alone would miss it.
+            float3 pv, hv;
+            if (Linear != 0) {
+                pv = (PSrcScRGB != 0) ? linear709_to_nits2020(present_raw) : pq_decode(present_raw);
+                hv = (HSrcScRGB != 0) ? linear709_to_nits2020(hudless_raw) : pq_decode(hudless_raw);
+            } else {
+                pv = (PSrcScRGB != 0) ? to_pq(present_raw) : present_raw;
+                hv = (HSrcScRGB != 0) ? to_pq(hudless_raw) : hudless_raw;
+            }
+            float d = max(max(abs(pv.r - hv.r), abs(pv.g - hv.g)), abs(pv.b - hv.b));
+            if (Linear != 0) {
+                d /= max(max(pv.r, pv.g), max(pv.b, 1.0f));
+            }
+            bool hit_b = (d > max(Threshold, 0.002f));
+            if (UseAlpha != 0) {
+                // The title's own alpha plane is the exact support for normal alpha UI;
+                // OR it with the difference so additive/glow UI is not missed.
+                const float2 uv = (float2(p) + 0.5f) / float2((float)W, (float)H);
+                hit_b = hit_b || (Alpha.SampleLevel(Smp, uv, 0).r > 0.002f);
+            }
+            hit = hit_b ? 1.0f : 0.0f;
+            if (marker_pixel(p)) { hit = 0.0f; }
+        }
+
+        if (hit > 0.5f) { InterlockedOr(g_ui_group_hit, 1u); }
+        GroupMemoryBarrierWithGroupSync();
+        const uint gx = (W + 7u) / 8u;
+        if (tid.x == 0u && tid.y == 0u) {
+            GroupMask[gid.y * gx + gid.x] = g_ui_group_hit;
+        }
+        if (in_range) {
+            // alpha = per-pixel UI mask (1 = UI, 0 = clean scene). The consumer uses
+            // alpha=0 pixels to calibrate the scene-referred -> display-referred ratio;
+            // the patch RGB itself is always the clean HUDless.
+            Ui[p] = float4(saturate(h_enc), (hit > 0.5f) ? 1.0f : 0.0f);
+            if (hit > 0.5f) {
+                InterlockedAdd(Stats[0], 1u);
+                InterlockedAdd(Stats[1], 1u);
+            }
+        }
+    } else {
 
     // Coarse group gate: 4x4 point samples over this 8x8 group. A group with no P/H
     // difference writes zero and returns before the 4K P/H loads. UseAlpha keeps the old
@@ -258,4 +348,5 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID,
         InterlockedAdd(Stats[7], uint(saturate(raw_diff(present_raw, hy)) * 255.0f));
         InterlockedAdd(Stats[8], uint(saturate(raw_diff(present_raw, hxy)) * 255.0f));
     }
+    }   // else (non-patch)
 }

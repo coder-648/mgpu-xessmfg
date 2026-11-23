@@ -13,9 +13,9 @@ XeFG（mode 4 / mode 5）。这一轮只验证这条链路，不要混入别的�
 当前部署状态：已执行 01_ui_on.bat（UiLinear=1），直接启动游戏即可；若之后
 改过 fakerFG.ini，重新运行 01 / 01b / 02 并重启游戏。
 
-定稿架构：只传 UI，不传 HUDless。`HudlessStream=0`（07/08 是 clean HUDless
-实验脚本，默认不要用）；`UiDilate=0`、`UiAlpha8=0`（R10A2，和 OptiScaler 推荐
-口径一致）。
+定稿架构（1.3.0+ / v34，mode 4-only）：stream 3 / mode 5 关闭；stream 4
+（`HudlessStream=1`）只放「被 UI 遮挡的画面」的支撑域 patch。消费端还原干净 HUDless，
+只 tag H' 走 mode 4。`UiPatch=0` 可回退。`UiDilate=0`、`UiAlpha8=0`（patch 强制 R10）。
 
 目录
 ----
@@ -38,10 +38,12 @@ XeFG（mode 4 / mode 5）。这一轮只验证这条链路，不要混入别的�
 脚本顺序
 --------
   00_check.bat               文件/配置/进程检查
-  01_ui_on.bat               UiStream=1, UiSource=Auto, UiFullRes=1,
-                             UiSlots=8, UiCodec=auto, UiLinear=1
-  03_run_3x_mode4.bat        mode 4：HUDless only；全分辨率 UI 只用于重建 H'
-  04_run_3x_mode5.bat        mode 5：HUDless + UI（强制）
+  01_ui_on.bat               patch 模式：UiStream=0, UiSource=Off, UiPatch=1,
+                             HudlessStream=1, UiFullRes=1, UiSlots=2
+  09_run_3x_patch_mode4.bat  patch：只传「UI 遮挡域里的 HUDless」，消费端
+                             合成 H' 后只 tag HUDless（mode 4）
+  03_run_3x_mode4.bat        patch/mode 4（当前脚本走 COMMON = patch）
+  04_run_3x_mode5.bat        **已封死**：即使运行也不会 tag UI；不再使用
   01b_ui_on_linear0.bat      A/B：UiLinear=0（旧 PQ 码值减法）
   02_ui_off.bat              A/B 基线：UiStream=0 / UiSource=Off
   05_run_3x_ui_off.bat       基线运行
@@ -60,6 +62,10 @@ A/B 组合
   B1  UiLinear=0 + mode 4    （需要 01b + 重启游戏）
   B2  UiLinear=0 + mode 5
   C   UiStream=0 + 05        （基线；需要 02 + 重启游戏）
+  D   UiPatch=1 + 09         （v33 支撑补丁；producer 应打印
+                              `UI source = HUDless patch under UI (mode 4)`，
+                              consumer 打印 `ui-unblend: ... HUDless patch`，
+                              不应出现 `ui: mode 5`）
 
 每组都保持同一个场景、同一个 40 fps 锁。换 UiLinear/UiStream 后必须重启游戏，
 只换 mode 4/5 可以直接重跑 consumer。
@@ -68,8 +74,7 @@ A/B 组合
 -----------------------------------------------------
 - `ui-unblend: HUDless rebuilt from 3840x2160 present + 3840x2160 ...`
   说明 unblend 路径真的启用，且 UI 是全分辨率。
-- `ui: mode 5 (HUDless + UI)`（默认）或 `ui: mode 4`（`--no-ui-mode5`）
-  2026-11-23 起所有 UI 来源都走 mode 5；派生 UI 的覆盖率不再作为门控。
+- `ui: mode 4`；**不应出现 `ui: mode 5`**（patch 模式固定 mode 4）
 - `pair: exact=... no_slot=...`：命中率。exact 应远大于 no_slot。
 - `cadence: ... input=25.0ms = 3.00 vblanks -> interp=2 (avg 3.00x, 120.0 fps out)`
   40 fps 输入、3x、120 Hz。
@@ -97,9 +102,13 @@ BMP 判读
 - `tag_XX_backbuffer.bmp`：上屏画面（含 UI）。
 - `tag_XX_hudless.bmp`：应干净无 HUD；有残留说明 unblend/mask 不对。
 - `tag_XX_ui.bmp`：重建用的 UI；边缘应贴合 HUD，而不是整屏。
-- `meta.txt`：source / mode5 / derived / linear / ui_quality_bp / bmp 是否写出。
-  `derived 1` = 渲染卡合成；`linear 1` = 线性光减法；`ui_quality_bp` 应在
-  50..6000 才允许 mode 5。
+- `tag_XX_patch.bmp`：**v33 patch 模式的重建素材**（解码后的 HUDless 补丁）。
+  支撑外的 32x8 tile 在 codec 头里是 mode=3，解码为 0，所以 BMP 里是黑块；
+  这些黑块正是消费端从 present 拷贝的区域。把 patch.bmp 与 present 对齐看，
+  支撑应该覆盖所有 HUD；hudless.bmp 应与真实 HUDless 逐像素一致。
+- `meta.txt`：source / mode5 / derived / linear / patch / ui_quality_bp / bmp 是否写出。
+  `patch 1` = v33 支撑补丁；`mode5 0` = 只 tag HUDless（mode 4）；
+  `reconstruct_bmp 1` = 第三张图（patch.bmp）已写出。
 
 结果收集
 --------
@@ -132,7 +141,7 @@ off - native = 基础截获/传输 + marker + MV/depth codec
 
 GPU 成本 A/B（只测渲染卡额外开销）
 -----------------------------------
-先确认 `HudlessStream=0`（默认），这样关闭时没有 HUDless snapshot / stream 4。
+先确认 `HudlessStream=1`（v34 patch 默认），这样 UI 开时 stream 4 是支撑域 patch。
 
 1. 关闭游戏，运行 `10_cost_ui_off.bat`，重启游戏读同一个存档，锁 40 fps。
    运行 `05_run_3x_ui_off.bat`，同时开 `12_gpu_sample.bat off 60`。

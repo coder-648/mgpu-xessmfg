@@ -122,6 +122,9 @@ typedef enum MgpuFgStream
     MGPU_FG_STREAM_BACKBUFFER,
     MGPU_FG_STREAM_OUTPUT_REAL,
     MGPU_FG_STREAM_OUTPUT_INTERP,
+    // v34: display-referred HUDless candidate (Streamline ScalingOutputColor). Used only
+    // as the patch colour source when the mask still comes from HUDLessColor.
+    MGPU_FG_STREAM_SCALING,
     MGPU_FG_STREAM_COUNT
 } MgpuFgStream;
 

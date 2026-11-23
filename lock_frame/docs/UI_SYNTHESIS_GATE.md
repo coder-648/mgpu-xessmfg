@@ -1,22 +1,30 @@
-# UI synthesis gate — CLOSED
+# UI synthesis gate — OPEN（1.3.0+）
 
-> **2026-11-22 update**: the DLSSG-only full-resolution path (render-card synth, P1) is
-> implemented behind `UiStream=1 + UiFullRes=1`; the default remains **closed**
-> (`UiStream=0` / `UiSource=Off`). See `docs/design/UI_COMPOSE_DLSSG_PLAN.md` and
-> `docs/design/UI_COMPUTE_QUALITY.md` before reopening it.
+> **1.3.0 update**: UI composition is a supported default. The producer ships the
+> HUDless patch under the UI support; the consumer reconstructs a clean HUDless and
+> XeFG uses mode 4. `UiPatch=0` restores the old closed behavior.
 
 ```
-UI_SYNTHESIS_GATE = CLOSED
+UI_SYNTHESIS_GATE = OPEN
 ```
 
-UI stream / UI synthesis is intentionally disabled in this release:
+Default configuration (v34):
 
 ```ini
-UiStream=0
-UiSource=Off
+UiStream=1
+UiSource=Auto
+UiPatch=1
+UiFullRes=1
+UiCodec=1
+UiSparseCodec=1
+UiAlpha8=0
+HudlessStream=1
 ```
 
-## Only reopen when all of these are true
+stream 3 is the game UI plane; stream 4 is the support-domain H patch. With a game
+UI, the consumer tags H' + UI (mode 5); without, H' only (mode 4).
+
+## Historical reopen conditions (kept for reference)
 
 1. The title **always** provides a real UI stream by default, on every normal
    frame, not only in menus or on some frames.

@@ -1224,6 +1224,7 @@ static bool decode_depth_slot(UINT slot, ID3D12Resource* dst, UINT w, UINT h)
 }
 
 static ComPtr<ID3D12DescriptorHeap> g_fr_u_heap;
+static ComPtr<ID3D12DescriptorHeap> g_fr_u_heap_patch;   // stream 4, same PSOs
 static ComPtr<ID3D12PipelineState>  g_fr_u_pso_r10;
 static ComPtr<ID3D12PipelineState>  g_fr_u_pso_rgba8;
 
@@ -1231,12 +1232,11 @@ static bool init_fr_decode_ui();
 static bool ensure_ui_sink_codec(ComPtr<ID3D12Resource>& dst, UINT w, UINT h,
                                  DXGI_FORMAT fmt);
 
-static bool decode_ui_slot(UINT slot, ID3D12Resource* dst, UINT w, UINT h,
-                           DXGI_FORMAT fmt)
+static bool decode_ui_slot_from(ID3D12Resource* src, UINT slot, ID3D12Resource* dst,
+                                UINT w, UINT h, DXGI_FORMAT fmt, bool patch_slot)
 {
-    if (dst == nullptr || slot >= mgpu::kMaxSlots || !g_ui[slot]) { return false; }
-    ID3D12Resource* src = g_ui[slot].Get();
-    if (src == nullptr || src->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+    if (dst == nullptr || src == nullptr || slot >= mgpu::kMaxSlots) { return false; }
+    if (src->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
         return false;
     }
     ID3D12GraphicsCommandList* list = g_list.Get();
@@ -1256,8 +1256,10 @@ static bool decode_ui_slot(UINT slot, ID3D12Resource* dst, UINT w, UINT h,
 
     const UINT inc = g_device->GetDescriptorHandleIncrementSize(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_fr_u_heap->GetCPUDescriptorHandleForHeapStart();
-    D3D12_GPU_DESCRIPTOR_HANDLE gpu = g_fr_u_heap->GetGPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = (patch_slot ? g_fr_u_heap_patch : g_fr_u_heap)
+                                          ->GetCPUDescriptorHandleForHeapStart();
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = (patch_slot ? g_fr_u_heap_patch : g_fr_u_heap)
+                                          ->GetGPUDescriptorHandleForHeapStart();
 
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     srv.Format                     = DXGI_FORMAT_R32_TYPELESS;   // raw ByteAddressBuffer
@@ -1285,7 +1287,8 @@ static bool decode_ui_slot(UINT slot, ID3D12Resource* dst, UINT w, UINT h,
     list->SetComputeRootSignature(g_fr_rs.Get());
     list->SetPipelineState(fmt == DXGI_FORMAT_R10G10B10A2_UNORM
                                ? g_fr_u_pso_r10.Get() : g_fr_u_pso_rgba8.Get());
-    ID3D12DescriptorHeap* heaps[1] = { g_fr_u_heap.Get() };
+    ID3D12DescriptorHeap* heaps[1] = { patch_slot ? g_fr_u_heap_patch.Get()
+                                                  : g_fr_u_heap.Get() };
     list->SetDescriptorHeaps(1, heaps);
     list->SetComputeRoot32BitConstants(0, 6, params, 0);
     list->SetComputeRootDescriptorTable(1, gpu);
@@ -1315,6 +1318,12 @@ static bool decode_ui_slot(UINT slot, ID3D12Resource* dst, UINT w, UINT h,
     return true;
 }
 
+static bool decode_ui_slot(UINT slot, ID3D12Resource* dst, UINT w, UINT h,
+                           DXGI_FORMAT fmt)
+{
+    return decode_ui_slot_from(g_ui[slot].Get(), slot, dst, w, h, fmt, false);
+}
+
 
 // ------------------------------------------------- v31/P2: UI decode (fr codec, packed)
 // Same kernel, UI variants: R10G10B10A2 / R8G8B8A8 packed to one u32 per pixel on the
@@ -1334,6 +1343,12 @@ static bool init_fr_decode_ui()
     hd.Flags          = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_fr_u_heap)))) {
         logf_("[lock] fr: UI descriptor heap FAILED\n");
+        return false;
+    }
+    // Stream 4 patch decode shares the PSOs but needs its own descriptor slots: both
+    // decodes are recorded into the same command list before submit.
+    if (FAILED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_fr_u_heap_patch)))) {
+        logf_("[lock] fr: patch descriptor heap FAILED\n");
         return false;
     }
     D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
@@ -1408,6 +1423,7 @@ static void copy_inputs_local(UINT slot)
     const UINT uislot = ui_slot_index(slot);
     g_ui_fresh[uislot] = false;
     g_hudless_fresh[slot] = false;
+    if (g_hudless_slots) { g_hudless_fresh[slot % g_hudless_slots] = false; }
     // --fg-colour shared: the colour rides the same path as MV/depth - one cross-adapter
     // CopyTextureRegion of the live rectangle into the sink the convert draw reads.
     if (g_fg_colour_shared && g_colour[slot] && g_shared12) {
@@ -1608,22 +1624,43 @@ static void copy_inputs_local(UINT slot)
         }
     }
 
-    // stream 4: clean HUDless (v32). R10 PQ texture; consumer tags it directly.
-    if (g_hudless_stream && g_ctl->streams[4].slot_size != 0) {
+    // stream 4: v34 support patch (codec, sparse) or legacy clean HUDless (texture).
+    // The patch is decoded into a local R10 texture; the consumer composes H' from it.
+    if ((g_hudless_stream || (g_ctl->streams[4].ui_flags & mgpu::kHudlessFlagPatchPayload) != 0) &&
+        g_ctl->streams[4].slot_size != 0) {
         const UINT hslot = g_hudless_slots ? (slot % g_hudless_slots) : slot;
         const mgpu::StreamShared& sh = g_ctl->streams[4];
-        if (g_hudless[hslot] && sh.width >= 64 && sh.height >= 64 &&
-            sh.codec == 0 &&
-            ensure_local_copy(g_hudless_local[slot], g_hudless[hslot].Get(),
-                              sh.width, sh.height)) {
-            copy_content(g_hudless_local[slot].Get(), g_hudless[hslot].Get(),
-                         sh.width, sh.height);
-            g_hudless_fresh[slot] = true;
-            static bool told_h = false;
-            if (!told_h) {
-                told_h = true;
-                logf_("[lock] stream 4: clean HUDless %ux%u fmt %u\n",
-                      sh.width, sh.height, sh.format);
+        const bool patch4 = (sh.ui_flags & mgpu::kHudlessFlagPatchPayload) != 0;
+        if (g_hudless[hslot] && sh.width >= 64 && sh.height >= 64) {
+            if (patch4 && sh.codec != 0) {
+                const DXGI_FORMAT fmt =
+                    (sh.format == static_cast<uint32_t>(DXGI_FORMAT_R10G10B10A2_UNORM))
+                        ? DXGI_FORMAT_R10G10B10A2_UNORM
+                        : DXGI_FORMAT_R8G8B8A8_UNORM;
+                if (ensure_ui_sink_codec(g_hudless_local[hslot], sh.width, sh.height, fmt) &&
+                    decode_ui_slot_from(g_hudless[hslot].Get(), hslot,
+                                        g_hudless_local[hslot].Get(), sh.width, sh.height,
+                                        fmt, true)) {
+                    g_hudless_fresh[hslot] = true;
+                    static bool told_p4 = false;
+                    if (!told_p4) {
+                        told_p4 = true;
+                        logf_("[lock] stream 4: support patch %ux%u fmt %u (sparse)\n",
+                              sh.width, sh.height, sh.format);
+                    }
+                }
+            } else if (!patch4 && sh.codec == 0 &&
+                       ensure_local_copy(g_hudless_local[slot], g_hudless[hslot].Get(),
+                                         sh.width, sh.height)) {
+                copy_content(g_hudless_local[slot].Get(), g_hudless[hslot].Get(),
+                             sh.width, sh.height);
+                g_hudless_fresh[slot] = true;
+                static bool told_h = false;
+                if (!told_h) {
+                    told_h = true;
+                    logf_("[lock] stream 4: clean HUDless %ux%u fmt %u\n",
+                          sh.width, sh.height, sh.format);
+                }
             }
         }
     }

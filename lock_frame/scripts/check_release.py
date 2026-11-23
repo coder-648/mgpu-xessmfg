@@ -37,9 +37,17 @@ INI_REQUIRED = [
     # 1.2.8 默认：MV 1:1 比特精确，depth 150%
     "CodecStreamPercent=100",
     "DepthCodecPercent=150",
-    # UI 合成是实验性：发布版必须默认关闭
+    # 1.3.0/v34: UI composition is a supported default (patch + mode 4 only)
     "UiStream=0",
     "UiSource=Off",
+    "UiSlots=2",
+    "UiFullRes=1",
+    "UiCodec=1",
+    # 1.3.0/v34: stream 4 carries the support patch by default; stream 3 is sealed off.
+    "HudlessStream=1",
+    "UiPatch=1",
+    "UiPatchWhiteNits=80",
+    "UiAlpha8=0",
     "UiSparseCodec=1",
     # 诊断开关绝不能出现在发布包里
     "DepthFp16=0",
@@ -98,8 +106,8 @@ def main():
     with open(os.path.join(root, "fakerFG.full.ini"), "r", encoding="utf-8-sig",
               errors="replace") as f:
         full_ini = f.read()
-    for key in ("FgInput=DLSSG", "UiStream=1", "DepthFp16=0", "ProfGpu=0",
-                "FrCodecAblate=0"):
+    for key in ("FgInput=DLSSG", "UiStream=0", "UiSource=Off", "UiPatch=1",
+                "HudlessStream=1", "DepthFp16=0", "ProfGpu=0", "FrCodecAblate=0"):
         if key not in full_ini:
             fail("fakerFG.full.ini missing " + key)
 

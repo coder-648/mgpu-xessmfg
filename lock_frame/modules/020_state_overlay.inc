@@ -722,19 +722,23 @@ static bool producer_has_mv_stream()
 static uint32_t ui_source_now()
 {
     // The producer is authoritative about what stream 3 carries: a render-card synth
-    // (kUiSourceSynth) must be unblended as UI even if an explicit --ui-source asks for
-    // the legacy Hudless path. Otherwise we would run synth_ui on an already-synth UI.
-    if (g_ctl != nullptr && g_ctl->ui_source == mgpu::kUiSourceSynth &&
+    // (kUiSourceSynth / kUiSourcePatch) must be unblended accordingly even if an explicit
+    // --ui-source asks for the legacy path, otherwise we would treat a patch as UI.
+    if (g_ctl != nullptr &&
+        (g_ctl->ui_source == mgpu::kUiSourceSynth ||
+         g_ctl->ui_source == mgpu::kUiSourcePatch) &&
         g_ui_source_mode != 3) {
         if (g_ui_source_mode != 0) {
             static bool told = false;
             if (!told) {
                 told = true;
-                logf_("[lock] ui: producer publishes a full-res synth UI;"
-                      " ignoring --ui-source override for stream 3\n");
+                logf_("[lock] ui: producer publishes a render-card %s;"
+                      " ignoring --ui-source override for stream 3\n",
+                      g_ctl->ui_source == mgpu::kUiSourcePatch ? "HUDless patch"
+                                                               : "full-res synth UI");
             }
         }
-        return mgpu::kUiSourceSynth;
+        return g_ctl->ui_source;
     }
     if (g_ui_source_mode == 1) {
         if (!mgpu::kUiSynthesisGateOpen && g_ui_unblend) {

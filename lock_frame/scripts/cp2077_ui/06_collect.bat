@@ -9,6 +9,7 @@ if not exist "%OUT%\" mkdir "%OUT%" >nul 2>&1
 
 echo [collect] -> %OUT%
 if exist "%LOGDIR%\" xcopy /e /i /y "%LOGDIR%" "%OUT%\consumer_logs" >nul 2>&1
+if exist "%GAME_DIR%\ui_synth_dump\" xcopy /e /i /y "%GAME_DIR%\ui_synth_dump" "%OUT%\producer_synth_dump" >nul 2>&1
 for %%F in (Cyberpunk2077_fakerFG.log Cyberpunk2077_mfg_producer.log fakerFG.ini) do (
   if exist "%GAME_DIR%\%%F" copy /y "%GAME_DIR%\%%F" "%OUT%\%%F" >nul 2>&1
 )

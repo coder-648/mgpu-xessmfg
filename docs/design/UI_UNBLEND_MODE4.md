@@ -2,8 +2,8 @@
 
 > **2026-11-23 更新**：默认模式已改为 XeFG **mode 5**（HUDless + UI 一起 tag），
 > 不再区分游戏 UI 与 render-card 派生 UI；`--no-ui-mode5` 才退回本文描述的 mode 4。
-> **UI 合成整体标记为实验性**：重打包的 1.2.9 默认关闭（`UiStream=0` / `UiSource=Off`），
-> 只在 A/B 时手动打开。本文其余内容保留为 mode 4 的设计记录。
+> **1.3.0 状态**：默认走 producer patch + mode 4（每通道 LUT），`UiPatch=0` 可回退。
+> 本文其余内容保留为 mode 4 的设计记录。
 
 > **状态（2026-11-20）**：代码已落地但**未通过验收**。因此发布上：
 > `UiStream` 默认 **0**（producer 不发布 UI 流）、消费端 unblend 默认 **关闭**，

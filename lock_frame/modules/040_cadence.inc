@@ -1148,25 +1148,28 @@ static bool init_fg()
               static_cast<unsigned>(ip.initFlags), g_fg_depth_inv ? 1 : 0,
               g_fg_jittered_mv ? 1 : 0, ndc_mv ? 1 : 0);
     }
-    // AUTO probes for a UI texture we never provide; NONE says it outright.
-    // AUTO only when the UI really travels: XeFG composits a UI texture we tag, and with
-    // none tagged "AUTO" is the same as promising something that never arrives.
-    // slot_size alone is NOT evidence: the producer reserves stream 3 at output size even
-    // when its UiStream=1 source is still Off (no UI/HUDless yet). Require a selected
-    // producer source, or an explicit local opt-in (--ui-source + --ui-unblend).
+    // AUTO needs to be set whenever stream 3 or the stream-4 support patch is *reserved*,
+    // not only when a source is already selected: the producer picks its source after the
+    // first P/H records (late FG tags), and v34's patch is only known later. With
+    // composition still DISABLED, AUTO + no tags behaves exactly like NONE; once a source
+    // appears, SetUiCompositionState(ENABLED) can actually take effect. --fg-ui-none still
+    // forces NONE.
     const bool ui_source_on = g_ctl != nullptr && g_ctl->ui_source != mgpu::kUiSourceOff;
-    const bool ui_cli_optin = g_ui_unblend && g_ui_source_mode != 0;
+    const bool ui_cli_optin = (g_ui_unblend && g_ui_source_mode != 0) || g_hudless_stream;
     const bool have_ui_stream = g_ctl && g_ctl->streams[3].slot_size != 0 &&
-                                g_ctl->streams[3].width >= 64 &&
-                                (ui_source_on || ui_cli_optin);
-    if (g_ctl && g_ctl->streams[3].slot_size != 0 && g_ctl->streams[3].width >= 64 &&
-        !have_ui_stream) {
-        logf_("[lock] note: stream 3 is reserved but the producer UI source is Off -"
-              " UI composition stays disabled (start lock_frame after the game has presented"
-              " a few frames, or check fakerFG.ini UiStream/UiSource)\n");
+                                g_ctl->streams[3].width >= 64;
+    const bool have_patch_stream = g_ctl && g_ctl->streams[4].slot_size != 0 &&
+                                   g_ctl->streams[4].width >= 64;
+    if (g_ctl && ((g_ctl->streams[3].slot_size != 0 && g_ctl->streams[3].width >= 64) ||
+                  (g_ctl->streams[4].slot_size != 0 && g_ctl->streams[4].width >= 64)) &&
+        !ui_source_on && !ui_cli_optin) {
+        logf_("[lock] note: stream 3/4 reserved but no producer source is selected yet"
+              " - AUTO is set so a late source (HUDless patch / synth) can enable"
+              " composition without re-init\n");
     }
-    ip.uiMode = (!g_fg_ui_none && have_ui_stream) ? XEFG_SWAPCHAIN_UI_MODE_AUTO
-                                                  : XEFG_SWAPCHAIN_UI_MODE_NONE;
+    ip.uiMode = (!g_fg_ui_none && (have_ui_stream || have_patch_stream))
+                    ? XEFG_SWAPCHAIN_UI_MODE_AUTO
+                    : XEFG_SWAPCHAIN_UI_MODE_NONE;
     ip.creationNodeMask = 1;
     ip.visibleNodeMask  = 1;
 
@@ -1382,10 +1385,11 @@ static bool init_fg()
     // no UI stream there is nothing to compose, so keep the library default (DISABLED).
     {
         const bool ui_source_on = g_ctl != nullptr && g_ctl->ui_source != mgpu::kUiSourceOff;
-        const bool ui_cli_optin = g_ui_unblend && g_ui_source_mode != 0;
-        const bool have_ui_stream = g_ctl && g_ctl->streams[3].slot_size != 0 &&
-                                    g_ctl->streams[3].width >= 64 &&
-                                    (ui_source_on || ui_cli_optin);
+        const bool ui_cli_optin = (g_ui_unblend && g_ui_source_mode != 0) || g_hudless_stream;
+        const bool have_ui_stream = g_ctl &&
+            ((g_ctl->streams[3].slot_size != 0 && g_ctl->streams[3].width >= 64 &&
+              (ui_source_on || ui_cli_optin)) ||
+             (g_ctl->streams[4].slot_size != 0 && g_ctl->streams[4].width >= 64));
         if (g_api.has_ui_composition()) {
             const auto st = (have_ui_stream && !g_fg_ui_none)
                                 ? XEFG_SWAPCHAIN_UI_COMPOSITION_STATE_ENABLED

@@ -389,11 +389,9 @@ struct State
     // 10.8 -> 5.56 MB per frame with MV untouched (docs/design/PERF_OPT_2026-11-23.md 7.3).
     // 100 = per-pixel lossless, 150 = default, 200 = smaller still (higher edge risk).
     int  depth_pct = 150;
-    // 1.2.9: UI composition (HUDless / XeFG mode 5) — EXPERIMENTAL, default OFF.
-    // ON = interpolated frames no longer smear the HUD, at ~0.8 ms/frame, but the
-    // render-card synth / unblend chain still shows edge artefacts on some titles.
-    // Release default is OFF; enable only for A/B.
-    bool ui_compose = false;
+    // 1.3.0: UI composition (producer HUDless patch + consumer reconstruction + XeFG
+    // mode 4) is a supported default. ON = interpolated frames no longer smear the HUD.
+    bool ui_compose = true;
     // 游戏侧配置版本：false = fakerFG.ini（发布精简版），true = fakerFG.full.ini
     // （测试全参数版）。切换时会备份并覆盖游戏目录的 fakerFG.ini，重启游戏生效。
     bool ini_full = false;
@@ -645,7 +643,7 @@ static const RowDef kRowsGame[] = {
     { ID_STREAM_PCT, L"MV/深度传输比例",    RK_DD   },
     { ID_CODEC,      L"无损传输（码流）",   RK_DD   },
     { ID_DEPTH_PCT,  L"深度码流（无损）",   RK_DD   },
-    { ID_UI_COMPOSE, L"UI 合成（HUDless，实验性）", RK_DD   },
+    { ID_UI_COMPOSE, L"UI 合成（HUDless）", RK_DD   },
     { ID_INI_PROFILE, L"配置版本（游戏侧）", RK_DD   },
     { ID_GAME_QUIRKS, L"游戏适配（OptiScaler 表）", RK_TOG },
     { ID_FG_LOG,     L"游戏侧日志 (Log)",   RK_TOG  },
@@ -727,10 +725,10 @@ static const wchar_t* kOptDepthPct[] = {
     L"200%（每维 1/2，更省）"
 };
 static const int kDepthPct[] = { 100, 150, 200 };
-// 1.2.9: UI 合成（HUDless / XeFG mode 5）——实验性，发布默认关闭。
+// 1.3.0: UI composition（producer HUDless patch + mode 4），默认开启。
 static const wchar_t* kOptUiCompose[] = {
-    L"关闭（默认；最大帧率，HUD 会在插值帧里残影）",
-    L"开启（实验性；HUD 不残影，但边缘/半透明 UI 仍可能出伪影）"
+    L"关闭（最大帧率，HUD 会在插值帧里残影）",
+    L"开启（默认；producer patch + XeFG mode 4，HUD 不残影）"
 };
 static const wchar_t* kFgInputIni[]  = { L"DLSSG", L"NVNGX", L"Upscaler", L"FSR" };
 static const wchar_t* kOptOut[]    = { L"1:1 原生", L"5K -> 4K (0.75x)", L"半分辨率" };
@@ -1369,12 +1367,13 @@ static void read_game_ini_state(const std::wstring& ini)
     S().fg_log = (GetPrivateProfileIntW(L"fakerFG", L"Log", 1, ini.c_str()) != 0);
     // 1.2.9: reflect the file's codec resolution / UI composition so the dropdowns show what
     // the game will actually load. Missing keys mean "not configured yet": depth defaults to
-    // 150 (the 1.2.8+ default) and UI composition to OFF, which is what an old ini does.
+    // 150 (the 1.2.8+ default) and UI composition to ON (the 1.3.0+ default). An older ini
+    // that still carries UiStream=0 stays off.
     {
         const int dpct = (int)GetPrivateProfileIntW(L"fakerFG", L"DepthCodecPercent", 150,
                                                     ini.c_str());
         S().depth_pct = (dpct == 100 || dpct == 200) ? dpct : 150;
-        S().ui_compose = GetPrivateProfileIntW(L"fakerFG", L"UiStream", 0, ini.c_str()) != 0;
+        S().ui_compose = GetPrivateProfileIntW(L"fakerFG", L"UiPatch", 0, ini.c_str()) != 0;
     }
     // The full test template carries keys the release one does not; use one of them to
     // show the right "配置版本" entry instead of trusting the remembered state.
@@ -1544,14 +1543,25 @@ static void apply_fg_input()
     ok = ok && WritePrivateProfileStringW(L"fakerFG", L"CodecStreamPercent", L"100", ini.c_str()) != 0;
     ok = ok && WritePrivateProfileStringW(L"fakerFG", L"MvCodecPercent", L"100", ini.c_str()) != 0;
     ok = ok && WritePrivateProfileStringW(L"fakerFG", L"DepthCodecPercent", dpct, ini.c_str()) != 0;
-    // UI composition (HUDless / XeFG mode 4). The producer reads these once per session;
-    // the consumer needs `--ui-source auto` (build_cmdline) for its unblend half.
-    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"UiStream",
+    // UI composition (default ON since 1.3.0): producer HUDless patch -> consumer
+    // reconstruction -> XeFG mode 4. Stream 3 / mode 5 is sealed off to avoid the extra
+    // UI encode/decode; the producer reads these once per session.
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"UiStream", L"0", ini.c_str()) != 0;
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"UiSource", L"Off", ini.c_str()) != 0;
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"UiPatch",
                                           S().ui_compose ? L"1" : L"0", ini.c_str()) != 0;
-    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"UiSource",
-                                          S().ui_compose ? L"Auto" : L"Off", ini.c_str()) != 0;
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"UiPatchWhiteNits", L"80", ini.c_str()) != 0;
     ok = ok && WritePrivateProfileStringW(L"fakerFG", L"UiFullRes", L"1", ini.c_str()) != 0;
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"UiCodec",
+                                          S().ui_compose ? L"1" : L"0", ini.c_str()) != 0;
     ok = ok && WritePrivateProfileStringW(L"fakerFG", L"UiSparseCodec", L"1", ini.c_str()) != 0;
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"UiAlpha8", L"0", ini.c_str()) != 0;
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"UiDilate", L"0", ini.c_str()) != 0;
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"UiSynthDump", L"0", ini.c_str()) != 0;
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"UiSlots", L"2", ini.c_str()) != 0;
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"HudlessStream",
+                                          S().ui_compose ? L"1" : L"0", ini.c_str()) != 0;
+    ok = ok && WritePrivateProfileStringW(L"fakerFG", L"StreamPercentUi", L"100", ini.c_str()) != 0;
     ok = ok && WritePrivateProfileStringW(L"fakerFG", L"Log", S().fg_log ? L"1" : L"0",
                                           ini.c_str()) != 0;
     if (!ok) {
@@ -1587,8 +1597,8 @@ static void apply_ini_profile()
     }
     const wchar_t* tmpl = S().ini_full ? L"fakerFG.full.ini" : L"fakerFG.ini";
     if (!exe_file_exists(tmpl)) {
-        set_msg(T(L"发布包缺少 fakerFG.full.ini（完整测试模板）",
-                  L"fakerFG.full.ini is missing from the package"));
+        set_msg(T(L"发布包缺少游戏侧配置模板（fakerFG.ini / fakerFG.full.ini）",
+                  L"Game-side ini template is missing from the package (fakerFG.ini / fakerFG.full.ini)"));
         uilog("ini: %ls missing in the package", tmpl);
         return;
     }
@@ -3320,23 +3330,24 @@ static std::wstring build_cmdline(HWND target, bool display)
     // 固定倍率：2x / 3x / 4x。--mode 直接决定插帧数；输入锁仍由游戏侧完成。
     // 这一段与定稿配方 lock_frame/run_3x.bat（2026-11-21 实测）逐项对齐：
     //   --mode Nx --interp N-1   两个都给，脚本里就是这么写的，日志能一眼对上；
-    //   --streams=mv,depth[,ui] 默认 mask 就带 ui（020 的 g_stream_mask）；UI 合成关掉时
-    //                            这里显式不给，避免 producer 白预留 8 个 UI 槽；
-    //   --ui-source auto         消费端 UI 组合的唯一开关（见下）；
+    //   --streams=mv,depth       不再请求 stream 3；patch 走 --hudless-stream；
+    //   --ui-source off          关闭 UI 平面合成；patch 仍由 stream 4 驱动；
     //   --wgc-minint 0           显式关掉 WGC 的 ~16 ms 交付节流（默认也是 0，写出来便于核对）。
     const int mul = S().fg_mode + 2;
     wchar_t b[256]{};
+    // mode 4 patch path: stream 4 carries the support patch; stream 3 / mode 5 is not
+    // requested. --ui-source off disables UI unblend/synthesis but --hudless-stream keeps
+    // the patch stream and the consumer's H' reconstruction.
     _snwprintf_s(b, _TRUNCATE,
                  L" --pool %d --latency %d --mode %dx --interp %d"
-                 L" --streams=mv,depth%s --wgc-minint 0",
-                 S().pool, S().latency, mul, mul - 1,
-                 S().ui_compose ? L",ui" : L"");
+                 L" --streams=mv,depth --wgc-minint 0",
+                 S().pool, S().latency, mul, mul - 1);
     cmd += b;
     // 1.2.9: the consumer's UI composition is OFF unless --ui-unblend / --ui-source is
-    // given (g_ui_unblend is CLI-only). Without this flag the producer publishes stream 3
-    // and the consumer never unblends it: that is the state 1.2.7 shipped in, and it
-    // silently disabled the whole HUDless path no matter what fakerFG.ini said.
-    if (S().ui_compose) { cmd += L" --ui-source auto"; }
+    // given (g_ui_unblend is CLI-only). Patch mode is driven by --hudless-stream.
+    if (S().ui_compose) {
+        cmd += L" --hudless-stream --ui-source off";
+    }
     // v30: no --interp-cadence here. The continuous frameRenderTime feed (--fg-rt-mode auto)
     // keeps slow scenes smooth while the slot gate stays the single pacing owner.
     // Which GPU runs the frame generation (A card rendering + N card output, or the
@@ -5159,10 +5170,10 @@ static const wchar_t* tip_for(Id id)
                L"深度只用于遮挡判断，实测 4K 下 150% 让 depth 编码 2.05→0.79 ms、码流减半，"
                L"MV 一字不改。100% = 逐像素无损（最保守）；改动需重启游戏。";
     case ID_UI_COMPOSE:
-        return L"实验性：把 UI 平面单独传过来、在副卡重建 HUDless，插值帧的 HUD 不残影；"
-               L"但边缘/半透明 UI 仍可能出现拖影或伪影，发布默认关闭。"
-               L"需要游戏在 DLSS-G evaluate 里提供 HUDless/UI 平面，没有就自动退化。"
-               L"只建议在 A/B 时打开；改动需重启游戏。";
+        return L"默认开启：渲染卡只传「被 UI 遮挡的画面」的支撑域 patch，副卡还原干净 HUDless，"
+               L"XeFG 走 mode 4；插值帧的 HUD 不再残影。"
+               L"需要游戏在 DLSS-G evaluate 里提供 HUDless；没有 HUDless 时自动退化。"
+               L"UiPatch=0 可完全关闭；改动需重启游戏。";
     case ID_FG_LOG:
         return L"游戏侧日志（fakerFG.ini 的 Log）：排查问题打开，稳定后可关闭以减少写盘；"
                L"改动需重启游戏。";
@@ -6108,8 +6119,8 @@ static void set_opt(Id id, int idx)
         S().ui_compose = (idx % 2) == 1;
         apply_fg_input();          // writes UiStream/UiSource now
         set_msg(S().ui_compose
-                    ? L"UI 合成（实验性）已开启：HUD 不残影，但边缘 UI 仍可能有伪影（需重启游戏）"
-                    : L"UI 合成已关闭（发布默认）：最大帧率，HUD 会在插值帧里残影（需重启游戏）");
+                    ? L"UI 合成已开启（默认）：producer patch + XeFG mode 4，HUD 不残影（需重启游戏）"
+                    : L"UI 合成已关闭：最大帧率，HUD 会在插值帧里残影（需重启游戏）");
         break;
     case ID_OUT:     S().out_mode = idx % 3; break;
     case ID_SDR:
