@@ -945,6 +945,11 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     const bool cq = (pf_hit || g_of_miss || g_upsample || !pair_ok || mv_codec_shared())
                         ? false : input_copy_begin();
     if (pair_ok && !pf_hit && !g_of_miss) {
+        // Everything below reads the producer's slot, so order those reads after the
+        // producer's publication of THIS slot. A queue-side wait costs no CPU time; it is
+        // the only thing that makes "the copies run on our queue" a guarantee instead of a
+        // timing coincidence (docs/SELF_AUDIT_2026-11-25.md A).
+        order_publication_read(slot, cq);
         const double m0 = qpc_ms();
         if (g_no_inputs) { ensure_dummy_inputs(slot); } else { copy_inputs_local(slot); }
         const double m1 = qpc_ms();
@@ -1143,6 +1148,13 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     // library only needs the list for resources that stop being valid before the next
     // present; ours live until then (see the switch's comment).
     ID3D12CommandList* tag_list = (cq || pf_hit) ? nullptr : g_list.Get();
+    // The upsample pair is only valid for the publication it was built from: the ring
+    // reuses slot numbers and the rebuild pass may skip a frame, so `slot` alone can match
+    // a pair from an older publication (docs/SELF_AUDIT_2026-11-25.md C). A reuse frame
+    // keeps the same publication, so it still matches.
+    const uint64_t slot_pub = g_ctl->frames[slot].published;
+    const bool up_pair_ok = g_upsample && g_up_valid && g_up_slot == slot &&
+                            g_up_pub != 0 && g_up_pub == slot_pub;
     // MV and depth can be different sizes (UE5: MVs at render size, depth at full res), so
     // each is tagged with its own stream size - the old code used streams[1] for both.
 #if MGPU_FG_OF
@@ -1159,7 +1171,7 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     {
         // --upsample: both streams were rebuilt to the render size by the joint pass, so
         // the pair below is same-size by construction (XeFG rejects mismatches).
-        if (g_upsample && g_up_valid && g_up_slot == slot && g_up_mv) {
+        if (up_pair_ok && g_up_mv) {
             rd.resourceSize = { g_up_w, g_up_h };
             rd.pResource = g_up_mv.Get();
         } else {
@@ -1175,7 +1187,7 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
         fg_tag_result("tag MV", g_api.D3D12TagFrameResource(g_fg, tag_list, present_id, &rd));
     }
 
-    if (g_upsample && g_up_valid && g_up_slot == slot && g_up_depth) {
+    if (up_pair_ok && g_up_depth) {
         rd.resourceSize = { g_up_w, g_up_h };
         rd.pResource = g_up_depth.Get();
     } else if (g_pf_pub && g_depth_local[slot]) {

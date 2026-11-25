@@ -145,6 +145,7 @@ static void release_shared_views()
     // reuse them after a generation change (a reuse frame would otherwise publish them).
     g_up_valid = false;
     g_up_slot  = mgpu::kMaxSlots;
+    g_up_pub   = 0;
     // copy-on-publication: the cache describes the old geometry/publications
     for (UINT s = 0; s < mgpu::kMaxSlots; ++s) {
         g_local_pub[s]   = 0;
@@ -242,7 +243,12 @@ static bool service_shared_layout()
 // (ClearRenderTargetView is illegal on a COPY list), --dump records readback copies in our
 // own list that must be ordered after the input copies, and --fg-of owns depth through its
 // own descriptor heap.
-static bool g_input_copy_queue = true;      // --input-copy-queue (implied by prefetch)
+static bool g_input_copy_queue = true;      // --input-copy-queue / --no-prefetch-inputs
+                                            // turns it off. NOTE: the default lock_frame
+                                            // path (g_upsample=ON) never uses it because
+                                            // run_frame_ex's `cq` is false whenever the
+                                            // upsample pass (or codec decode) reads the copies
+                                            // in the frame's own list.
 static bool g_cq_reported = false;
 static ComPtr<ID3D12CommandQueue>         g_copy_queue;
 // Several allocators/lists so the prefetch never has to wait on the CPU for the previous
@@ -374,6 +380,26 @@ static void input_copy_wait()
     if (dt > g_max_cq) { g_max_cq = dt; }
 }
 
+// Orders this frame's reads of a shared slot after the producer's publication of *that*
+// slot. The producer signals fwd[slot] only once its copy/encode batch has finished, and a
+// queue-side Wait costs no CPU time, so this belongs in front of every read of producer
+// memory. Without it the frame path raced the producer's transfer: WGC happening to arrive
+// one frame late hid the problem, but a fast game frame or a congested producer copy queue
+// would hand XeFG the previous publication's MV/depth for one frame (ghosting that no log
+// can attribute). The prefetch path already did this; the in-frame path did not.
+//
+// `copy_queue` must match where the copies/decode are recorded (run_frame_ex's cq), because
+// the wait has to sit on the same queue ahead of the batch that executes them.
+static void order_publication_read(UINT slot, bool copy_queue)
+{
+    if (g_ctl == nullptr || slot >= mgpu::kMaxSlots || !g_fwd[slot]) { return; }
+    const uint64_t pub = g_ctl->frames[slot].published;
+    if (pub == 0) { return; }
+    ID3D12CommandQueue* q = copy_queue ? g_copy_queue.Get() : nullptr;
+    if (q == nullptr) { q = g_queue.Get(); }
+    if (q != nullptr) { q->Wait(g_fwd[slot].Get(), pub); }
+}
+
 // ---------------------- --prefetch-inputs: copy one frame ahead ---------------
 // The round-robin slot walk makes the *next* frame's slot known while the current one is
 // still being presented, so its MV/depth can be copied during that Present() block instead
@@ -384,8 +410,8 @@ static void input_copy_wait()
 //              bought ~1 ms; here they leave the frame entirely.
 //   safe     : the copy runs on the COPY queue and the producer's cross-adapter fence is
 //              waited on *on that queue* (GPU side, no CPU polling), so the copy cannot
-//              read a slot the producer has not finished publishing. That is stricter than
-//              the main path, which never waits for the producer at all.
+//              read a slot the producer has not finished publishing. The in-frame path now
+//              does the same thing via order_publication_read() (see 140_frame.inc).
 //   --depth-lag still works: copy_inputs_local() advances g_ring_write here, which is
 //              exactly the entry the next frame's tag picks up (nothing advances it in
 //              between because the frame's own copy stage is skipped on a prefetch hit).
@@ -411,6 +437,13 @@ static bool   g_pf_reported = false;
 
 static bool prefetch_usable()
 {
+    // A codec stream is reconstructed by a Dispatch, which only a DIRECT/COMPUTE list can
+    // record. decode_*_slot() always records into the frame's own g_list, which is closed
+    // and submitted by the time prefetch_next_inputs() runs - so a prefetch here would
+    // record into a dead list (and, when one stream is a texture, also suppress the
+    // in-frame decode that would have produced the data). prefetch_publications() has had
+    // this guard from the start; the per-slot variant did not.
+    if (mv_codec_shared() || depth_codec_shared()) { return false; }
     return g_prefetch_inputs && !g_reuse_frame && input_copy_queue_usable();
 }
 

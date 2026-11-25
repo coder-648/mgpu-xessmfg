@@ -124,7 +124,8 @@ build_consumer() {
                 "patch_local:cs_5_0:CSMain:PatchLocal" \
                 "patch_local_fill:cs_5_0:CSMain:PatchLocalFill" \
                 "patch_lut3d:cs_5_0:CSMain:PatchLut3D" \
-                "patch_lut3d_fill:cs_5_0:CSMain:PatchLut3dFill"; do
+                "patch_lut3d_fill:cs_5_0:CSMain:PatchLut3dFill" \
+                "patch_lut3d_decay:cs_5_0:CSMain:PatchLut3dDecay"; do
         IFS=: read -r base prof entry sym <<< "$spec"
         "$FXC_WIN" -nologo -T "$prof" -E "$entry" \
             -Fo "$(wslpath -w "$stage/$base.cso")" \

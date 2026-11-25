@@ -266,6 +266,33 @@ int main()
     if (wcsstr(GetCommandLineW(), L"--ui-mode5-auto")) { g_ui_mode5 = 0; }
     else if (wcsstr(GetCommandLineW(), L"--no-ui-mode5")) { g_ui_mode5 = 2; }
     else if (wcsstr(GetCommandLineW(), L"--ui-mode5 ")) { g_ui_mode5 = 1; }
+    // 2026-11-25: the hard edge (5x5 max dilation) won the A/B against the 7x7 box feather
+    // on small moving UI (the box's weight changes in 1/49 steps as the UI slides), so it is
+    // the default now. --ui-patch-box-feather restores the old behaviour.
+    g_ui_patch_hard_edge = true;
+    if (wcsstr(GetCommandLineW(), L"--ui-patch-box-feather")) {
+        g_ui_patch_hard_edge = false;
+        logf_("[lock] ui-patch: 7x7 box feather (old path)\n");
+    }
+    if (wcsstr(GetCommandLineW(), L"--ui-patch-hard-edge")) {
+        g_ui_patch_hard_edge = true;
+        logf_("[lock] ui-patch: hard edge (5x5 max dilation, no box feather)\n");
+    }
+    // --ui-lut-decay N: keep N% of the H->P histogram per frame (0 = clear every frame).
+    if (const wchar_t* ld = wcsstr(GetCommandLineW(), L"--ui-lut-decay ")) {
+        const int n = _wtoi(ld + 15);
+        if (n >= 0 && n <= 99) { g_ui_lut_decay = static_cast<UINT>(n); }
+        logf_("[lock] ui-patch: LUT histogram decay %u%%/frame (%s)\n", g_ui_lut_decay,
+              g_ui_lut_decay == 0 ? "cleared every frame (old)"
+                                  : "exponential average (stable LUT)");
+    }
+    // --ui-lut-stride N: sample every Nth clean pixel when building the LUT (4 = old).
+    if (const wchar_t* ls = wcsstr(GetCommandLineW(), L"--ui-lut-stride ")) {
+        const int n = _wtoi(ls + 15);
+        if (n >= 1 && n <= 32) { g_ui_lut_stride = static_cast<UINT>(n); }
+        logf_("[lock] ui-patch: LUT sample stride %u (%s)\n", g_ui_lut_stride,
+              g_ui_lut_stride == 4 ? "default" : "sparser, relies on the decay");
+    }
     if (g_ui_unblend) {
         // `--streams=mv,depth` replaces the request mask, so the UI bit has to be added
         // explicitly - otherwise the producer never copies stream 3 (log: streams -> ...
@@ -1656,6 +1683,10 @@ int main()
             if (g_lock_next == 0) { g_lock_next = now; }
             if (now + 1 < g_lock_next) {
                 ++g_lock_drops;          // too early: this frame is not used
+                // With --jbuf the texture belongs to our own pool, not to the WGC frame:
+                // skipping jbuf_give_back() here leaked one full-resolution colour texture
+                // per dropped frame (docs/SELF_AUDIT_2026-11-25.md F).
+                if (g_jbuf > 0) { jbuf_give_back(texture); }
                 continue;
             }
             g_lock_next += (period > 0) ? period : 1;

@@ -17,5 +17,8 @@
 | [`PBZ_DLSSG_LANE_TEST.md`](PBZ_DLSSG_LANE_TEST.md) | PBZ DLSSG 输入车道测试 |
 | [`PER_GAME_COMPAT_2026-11-25.md`](PER_GAME_COMPAT_2026-11-25.md) | 逐游戏兼容性：本轮落地与剩余清单 |
 | [`NEXT_ROUND_2026-11-26.md`](NEXT_ROUND_2026-11-26.md) | 下一轮回归、未覆盖链路的验证项与禁止项 |
+| [`SELF_AUDIT_2026-11-25.md`](SELF_AUDIT_2026-11-25.md) | **lock_frame 自身链路审查**：consumer/producer 的同步、状态、显存与性能项（A–O） |
+| [`UI_MODE4_2026-11-25.md`](UI_MODE4_2026-11-25.md) | **UI 合成（mode 4）审查**：patch 的渲染卡开销、小 UI 抖动定位与 A/B 步骤 |
+| [`RELEASE_NOTES_1.3.3-local.ui.md`](RELEASE_NOTES_1.3.3-local.ui.md) | 1.3.3-local.ui 发布说明（A/C/D/E/F + B/J/R + UI mode 4） |
 | [`test-configs/pbz_dlssg_lane.ini`](test-configs/pbz_dlssg_lane.ini) | PBZ DLSSG 车道测试配置 |
 | [`archive/LOCK_FRAME_30X4_NOTES.md`](archive/LOCK_FRAME_30X4_NOTES.md) | 30x4 版本的历史设计笔记 |

@@ -1596,9 +1596,13 @@ static bool open_shared()
                         // compares this token and clears all per-session ACK/frame
                         // state before publishing, so an old colour_seq can never
                         // hold the new session at a stale watermark.
+                        // R: the producer reads the consumer pid from the high 32 bits to
+                        // decide whether the consumer process is still alive, so keep the
+                        // layout exact: (pid << 32) | tick (low 32). A plain XOR could
+                        // carry the tick into the pid half after a long uptime.
                         const uint64_t session =
-                            (static_cast<uint64_t>(GetCurrentProcessId()) << 32) ^
-                            static_cast<uint64_t>(GetTickCount64());
+                            (static_cast<uint64_t>(GetCurrentProcessId()) << 32) |
+                            static_cast<uint64_t>(static_cast<uint32_t>(GetTickCount64()));
                         g_ctl->consumer_session = session != 0 ? session : 1;
                         MemoryBarrier();
                         logf_("[lock] new consumer session 0x%llX - producer state will reset\n",

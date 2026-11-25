@@ -448,6 +448,12 @@ static D3D12_RESOURCE_STATES        g_up_depth_state = D3D12_RESOURCE_STATE_COMM
 static UINT  g_up_w = 0, g_up_h = 0;
 static UINT  g_up_slot = mgpu::kMaxSlots;
 static bool  g_up_valid = false;
+// The publication the current g_up_* pair was built from. A slot number alone is not a
+// frame identity: the ring reuses the same slot a few frames later, and the rebuild pass
+// may legitimately skip a frame (nothing to gain / --depth-lag / prefetch). Without this
+// key the tag could pick up the pair of an older publication that happened to use the
+// same slot (see docs/SELF_AUDIT_2026-11-25.md C).
+static uint64_t g_up_pub = 0;
 static bool  g_up_told = false;
 
 // --stream-auto / --stream-asym (protocol v15). The consumer writes per-stream percent
@@ -975,9 +981,10 @@ static bool ensure_mv_local_codec(ComPtr<ID3D12Resource>& dst, UINT w, UINT h)
     return true;
 }
 
-// Decodes this slot's MV bytes into g_mv_local[slot]. wait_slot() has already blocked on
-// the slot's forward fence, so the producer's writes are complete; the barriers below are
-// only state bookkeeping (the slot is our own view of the shared memory).
+// Decodes this slot's MV bytes into g_mv_local[slot]. The read of the shared slot is ordered
+// after the producer's publication by order_publication_read() (queue-side wait on fwd[slot],
+// issued by run_frame_ex before copy_inputs_local()); the barriers below are state
+// bookkeeping for our own view of the shared memory.
 static bool decode_mv_slot(UINT slot, UINT w, UINT h)
 {
     if (slot >= mgpu::kMaxSlots || !g_mv[slot]) { return false; }

@@ -28,6 +28,7 @@
 #include "patch_local_fill_cso.h"
 #include "patch_lut3d_cso.h"
 #include "patch_lut3d_fill_cso.h"
+#include "patch_lut3d_decay_cso.h"
 
 static ComPtr<ID3D12RootSignature> g_unblend_rs;   // 5 SRVs (present, UI, occupancy,
                                                    // patch gain, local gain) + 1 UAV
@@ -85,6 +86,8 @@ static const UINT kPatchLutN = 33;
 static const UINT kPatchLutCells = kPatchLutN * kPatchLutN * kPatchLutN;
 static ComPtr<ID3D12RootSignature> g_patch_lut3d_rs;
 static ComPtr<ID3D12RootSignature> g_patch_lut3d_fill_rs;
+static ComPtr<ID3D12RootSignature> g_patch_lut3d_decay_rs;  // 1 UAV + consts
+static ComPtr<ID3D12PipelineState>  g_patch_lut3d_decay_pso;
 static ComPtr<ID3D12PipelineState>  g_patch_lut3d_pso;
 static ComPtr<ID3D12PipelineState>  g_patch_lut3d_fill_pso;
 static ComPtr<ID3D12DescriptorHeap> g_patch_lut3d_heap;
@@ -165,7 +168,7 @@ static bool ensure_unblend_objects()
         D3D12_ROOT_PARAMETER p[3]{};
         p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         p[0].Constants.ShaderRegister = 0;
-        p[0].Constants.Num32BitValues = 13;           // DstW/DstH/UiW/UiH + 3 floats
+        p[0].Constants.Num32BitValues = 14;           // DstW/DstH/UiW/UiH + 3 floats
                                                       // + Sparse+Patch+Local+DisplayRef+Use3D
                                                       // + LutN
         p[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -661,8 +664,8 @@ static bool record_patch_local(UINT w, UINT h, ID3D12Resource* present,
 // v34: 3D LUT resources: H(scene code) -> P(WGC code), 17^3.
 static bool ensure_patch_lut3d_objects()
 {
-    if (g_patch_lut3d_pso && g_patch_lut3d_fill_pso && g_patch_lut3d_heap &&
-        g_patch_lut3d && g_patch_lut3d_sum && g_patch_lut3d_zero) {
+    if (g_patch_lut3d_pso && g_patch_lut3d_fill_pso && g_patch_lut3d_decay_pso &&
+        g_patch_lut3d_heap && g_patch_lut3d && g_patch_lut3d_sum && g_patch_lut3d_zero) {
         return true;
     }
     if (!g_device) { return false; }
@@ -702,6 +705,36 @@ static bool ensure_patch_lut3d_objects()
     };
     if (!g_patch_lut3d_rs && !make_rs(3, 1, g_patch_lut3d_rs)) { return false; }
     if (!g_patch_lut3d_fill_rs && !make_rs(1, 1, g_patch_lut3d_fill_rs)) { return false; }
+    // The decay pass only needs the accumulator UAV (u0) and the two constants.
+    if (!g_patch_lut3d_decay_rs) {
+        D3D12_DESCRIPTOR_RANGE ur{};
+        ur.RangeType          = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        ur.NumDescriptors     = 1;
+        ur.BaseShaderRegister = 0;
+        D3D12_ROOT_PARAMETER dp[2]{};
+        dp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        dp[0].Constants.ShaderRegister = 0;
+        dp[0].Constants.Num32BitValues = 4;
+        dp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        dp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        dp[1].DescriptorTable.NumDescriptorRanges = 1;
+        dp[1].DescriptorTable.pDescriptorRanges = &ur;
+        dp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_ROOT_SIGNATURE_DESC drs{};
+        drs.NumParameters = 2;
+        drs.pParameters = dp;
+        drs.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+        ComPtr<ID3DBlob> dsig, derr;
+        if (FAILED(D3D12SerializeRootSignature(&drs, D3D_ROOT_SIGNATURE_VERSION_1,
+                                               &dsig, &derr)) || !dsig) {
+            return false;
+        }
+        if (FAILED(g_device->CreateRootSignature(0, dsig->GetBufferPointer(),
+                                                 dsig->GetBufferSize(),
+                                                 IID_PPV_ARGS(&g_patch_lut3d_decay_rs)))) {
+            return false;
+        }
+    }
 
     D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
     pd.pRootSignature = g_patch_lut3d_rs.Get();
@@ -717,6 +750,16 @@ static bool ensure_patch_lut3d_objects()
     if (FAILED(g_device->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_patch_lut3d_fill_pso)))) {
         logf_("[lock] ui-patch: LUT3D fill PSO FAILED\n");
         return false;
+    }
+    if (!g_patch_lut3d_decay_pso) {
+        pd.pRootSignature = g_patch_lut3d_decay_rs.Get();
+        pd.CS.pShaderBytecode = kPatchLut3dDecayCSO;
+        pd.CS.BytecodeLength = sizeof(kPatchLut3dDecayCSO);
+        if (FAILED(g_device->CreateComputePipelineState(
+                &pd, IID_PPV_ARGS(&g_patch_lut3d_decay_pso)))) {
+            logf_("[lock] ui-patch: LUT3D decay PSO FAILED\n");
+            return false;
+        }
     }
     if (!g_patch_lut3d_heap) {
         D3D12_DESCRIPTOR_HEAP_DESC hd{};
@@ -802,24 +845,49 @@ static bool record_patch_lut3d(UINT w, UINT h, ID3D12Resource* present,
     D3D12_CPU_DESCRIPTOR_HANDLE cpu = g_patch_lut3d_heap->GetCPUDescriptorHandleForHeapStart();
     D3D12_GPU_DESCRIPTOR_HANDLE gpu = g_patch_lut3d_heap->GetGPUDescriptorHandleForHeapStart();
 
-    up_transition(g_patch_lut3d_sum.Get(), g_patch_lut3d_sum_state,
-                  D3D12_RESOURCE_STATE_COPY_DEST);
-    g_list->CopyBufferRegion(g_patch_lut3d_sum.Get(), 0, g_patch_lut3d_zero.Get(), 0,
-                             kPatchLutCells * 16u);
-    up_transition(g_patch_lut3d_sum.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
-                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    g_patch_lut3d_sum_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-
     make_srv(present, cpu, DXGI_FORMAT_R10G10B10A2_UNORM); cpu.ptr += inc;
     make_srv(patch, cpu, DXGI_FORMAT_R10G10B10A2_UNORM);   cpu.ptr += inc;
     make_buf_srv(occ, cpu, 4, occ_tiles);                  cpu.ptr += inc;
     make_buf_uav(g_patch_lut3d_sum.Get(), cpu, 4, kPatchLutCells * 4u);
+    D3D12_GPU_DESCRIPTOR_HANDLE sums_uav_gpu = gpu;
+    sums_uav_gpu.ptr += static_cast<UINT64>(inc) * 3u;
+
+    // Histogram lifetime: 0 (or >=100) = clear every frame (the old single-frame LUT),
+    // 1..99 = exponential decay, so the LUT stops flickering with this frame's sample set
+    // (the remaining "slight jitter" of a small moving UI). Both paths leave the buffer in
+    // UNORDERED_ACCESS for the build pass below.
+    if (g_ui_lut_decay >= 1u && g_ui_lut_decay <= 99u) {
+        up_transition(g_patch_lut3d_sum.Get(), g_patch_lut3d_sum_state,
+                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        g_patch_lut3d_sum_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        g_list->SetComputeRootSignature(g_patch_lut3d_decay_rs.Get());
+        g_list->SetPipelineState(g_patch_lut3d_decay_pso.Get());
+        ID3D12DescriptorHeap* dheaps[1] = { g_patch_lut3d_heap.Get() };
+        g_list->SetDescriptorHeaps(1, dheaps);
+        struct DecayConsts { UINT cells, retain, p0, p1; }
+            dc{ kPatchLutCells, g_ui_lut_decay, 0u, 0u };
+        g_list->SetComputeRoot32BitConstants(0, 4, &dc, 0);
+        g_list->SetComputeRootDescriptorTable(1, sums_uav_gpu);
+        g_list->Dispatch((kPatchLutCells + 63u) / 64u, 1u, 1u);
+        D3D12_RESOURCE_BARRIER dub{};
+        dub.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        dub.UAV.pResource = g_patch_lut3d_sum.Get();
+        g_list->ResourceBarrier(1, &dub);
+    } else {
+        up_transition(g_patch_lut3d_sum.Get(), g_patch_lut3d_sum_state,
+                      D3D12_RESOURCE_STATE_COPY_DEST);
+        g_list->CopyBufferRegion(g_patch_lut3d_sum.Get(), 0, g_patch_lut3d_zero.Get(), 0,
+                                 kPatchLutCells * 16u);
+        up_transition(g_patch_lut3d_sum.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        g_patch_lut3d_sum_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
 
     g_list->SetComputeRootSignature(g_patch_lut3d_rs.Get());
     g_list->SetPipelineState(g_patch_lut3d_pso.Get());
     ID3D12DescriptorHeap* heaps[1] = { g_patch_lut3d_heap.Get() };
     g_list->SetDescriptorHeaps(1, heaps);
-    struct BuildConsts { UINT w, h, stride, n; } bc{ w, h, 4u, kPatchLutN };
+    struct BuildConsts { UINT w, h, stride, n; } bc{ w, h, g_ui_lut_stride, kPatchLutN };
     g_list->SetComputeRoot32BitConstants(0, 4, &bc, 0);
     g_list->SetComputeRootDescriptorTable(1, gpu);
     D3D12_GPU_DESCRIPTOR_HANDLE uav_gpu = gpu;
@@ -1871,16 +1939,18 @@ static ID3D12Resource* record_ui_unblend(UINT slot, ID3D12Resource* present, UIN
                                 : ((g_ctl->streams[3].ui_flags & mgpu::kUiFlagLinear)
                                        ? 1.0f : 0.0f));
     struct UnblendConsts { UINT dst_w, dst_h, ui_w, ui_h; float premul, opaque, linear;
-                           UINT sparse, patch, local, display_ref, use3d, lut_n; }
+                           UINT sparse, patch, local, display_ref, use3d, lut_n;
+                           UINT hard_edge; }
         c{ w, h, su.width, su.height, 1.0f, 0.99f, linear, sparse_ok ? 1u : 0u,
            patch ? 1u : 0u, local_ok ? 1u : 0u, display_ref ? 1u : 0u,
-           (patch && lut3d_ok) ? 1u : 0u, kPatchLutN };
+           (patch && lut3d_ok) ? 1u : 0u, kPatchLutN,
+           g_ui_patch_hard_edge ? 1u : 0u };
 
     g_list->SetComputeRootSignature(g_unblend_rs.Get());
     g_list->SetPipelineState(g_unblend_pso.Get());
     ID3D12DescriptorHeap* heaps[] = { g_unblend_heap.Get() };
     g_list->SetDescriptorHeaps(1, heaps);
-    g_list->SetComputeRoot32BitConstants(0, 13, &c, 0);
+    g_list->SetComputeRoot32BitConstants(0, 14, &c, 0);
     g_list->SetComputeRootDescriptorTable(1, srv_gpu);
     g_list->SetComputeRootDescriptorTable(2, uav_gpu);
     g_list->Dispatch((w + 7) / 8, (h + 7) / 8, 1);

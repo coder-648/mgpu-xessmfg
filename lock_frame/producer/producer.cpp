@@ -113,6 +113,15 @@ uint32_t g_stream_w[mgpu::kMaxStreams] = {}, g_stream_h[mgpu::kMaxStreams] = {};
 uint32_t g_slot_w = 0, g_slot_h = 0;          // placed capacity (= render size, see ensure_shared)
 uint32_t g_mv_format = 0, g_depth_format = 0; // slot formats (follow the source)
 
+// J (2026-11-25): how many publication slots the ring actually uses. frames[]/consumed[]
+// keep their kMaxSlots size in the protocol, but only the first N are published, placed and
+// scanned. 4K codec slots are ~33 MiB each, so 32 slots reserved 1.7 GiB of cross-adapter
+// mapping (measured 2026-11-25: "shared ready ... used=1773.6 MB"); 16 halves that and still
+// covers the measured colour lag (max 13 publications). fakerFG.ini TransportSlots.
+// Read once, before the layout decides the reserve.
+uint32_t g_ring_slots = 16;
+uint32_t ring_slots() { return g_ring_slots; }
+
 // v22: the colour stream. It is the frame's OUTPUT image, copied verbatim (source
 // format, no shader): FP16 scRGB stays FP16 scRGB, R10 PQ stays R10 PQ. Placed once
 // at cap_dim(output), so a resolution or upscaler-preset change only rewrites the
@@ -281,6 +290,12 @@ D3D12_RESOURCE_STATES        g_ui_synth_state = D3D12_RESOURCE_STATE_COMMON;
 uint32_t                     g_ui_synth_w = 0, g_ui_synth_h = 0;
 uint32_t                     g_ui_synth_fmt = 0;
 float                        g_ui_synth_threshold = 8.0f / 255.0f;
+// UiStats: run the synth coverage/diagnostic counters every Nth frame (0 = never,
+// 1 = every frame). They are per-pixel atomics; 1 Hz logging is enough.
+uint32_t                     g_ui_stats_every = 60;
+// Incremented on every frame that actually wrote the counters, so the 1 Hz readout
+// is not logged twice with the same values.
+uint32_t                     g_ui_stats_seq = 0;
 // P3b: coverage counters written by the synth pass and sampled at 1 Hz.
 ComPtr<ID3D12Resource>       g_ui_stats;
 ComPtr<ID3D12Resource>       g_ui_stats_rb;
@@ -801,7 +816,7 @@ bool layout_streams(ID3D12Device* device, mgpu::SharedControl* c,
         const uint32_t slots =
             (needed && i == static_cast<int>(mgpu::kStreamUi)) ? g_ui_slots
             : (needed && i == static_cast<int>(mgpu::kStreamHudless)) ? g_hudless_slots
-                                                                      : mgpu::kMaxSlots;
+                                                                      : ring_slots();
         c->streams[i].slots     = slots;
         cursor += slot_size * slots;
     }
@@ -1949,6 +1964,15 @@ bool ensure_shared(ID3D12Device* device, uint32_t render_w, uint32_t render_h,
 {
     if (g_ready) { return true; }
     if (device == nullptr || render_w < 256 || render_h < 256) { return false; }
+    // J: ring depth for this session. Read here, before layout_streams() decides the reserve
+    // (the mapping is sized from the per-stream slot counts). 32 was the colour-backlog
+    // default; MV/depth only needs to cover the measured lag (13), so 16 is the new default.
+    {
+        const uint32_t req = ini_int(L"TransportSlots", 16);
+        g_ring_slots = (req < 4u) ? 4u : (req > mgpu::kMaxSlots ? mgpu::kMaxSlots : req);
+        logf("shared: TransportSlots=%u (frames[] array stays %u; slots/limits follow the"
+             " ring)\n", g_ring_slots, mgpu::kMaxSlots);
+    }
     if (colour_w < 256 || colour_h < 256 || colour_format == 0) {
         // lock_frame: ColourStream=0 means this is the normal state, not a fault.
         if (g_want_colour_session) {
@@ -2070,12 +2094,12 @@ bool ensure_shared(ID3D12Device* device, uint32_t render_w, uint32_t render_h,
     uint64_t reserve = mgpu::kDataStart;
     for (int i = 0; i < static_cast<int>(mgpu::kMaxStreams); ++i) {
         const uint32_t slots = probe.streams[i].slots ? probe.streams[i].slots
-                                                      : mgpu::kMaxSlots;
+                                                      : ring_slots();
         reserve += probe.streams[i].slot_size * slots;
     }
 
-    logf("shared: begin mapping reserve=%.1f MB slots=%u capacity=%ux%u streams %ux%u/%ux%u\n",
-         static_cast<double>(reserve) / 1048576.0, mgpu::kMaxSlots,
+    logf("shared: begin mapping reserve=%.1f MB ring=%u capacity=%ux%u streams %ux%u/%ux%u\n",
+         static_cast<double>(reserve) / 1048576.0, ring_slots(),
          g_slot_w, g_slot_h, g_stream_w[1], g_stream_h[1], g_stream_w[2], g_stream_h[2]);
 
     std::wstring name(mgpu::kMappingName, mgpu::kMappingName + strlen(mgpu::kMappingName));
@@ -2110,13 +2134,13 @@ bool ensure_shared(ID3D12Device* device, uint32_t render_w, uint32_t render_h,
                       g_colour_slot_w, g_colour_slot_h,
                       probe.streams[mgpu::kStreamColour].offset,
                       probe.streams[mgpu::kStreamColour].slot_size,
-                      mgpu::kMaxSlots)) ||
+                      ring_slots())) ||
         !place_slots(device, mgpu::kStreamMv, g_mv_format, g_slot_w, g_slot_h,
                      probe.streams[mgpu::kStreamMv].offset,
-                     probe.streams[mgpu::kStreamMv].slot_size, mgpu::kMaxSlots) ||
+                     probe.streams[mgpu::kStreamMv].slot_size, ring_slots()) ||
         !place_slots(device, mgpu::kStreamDepth, g_depth_format, g_slot_w, g_slot_h,
                      probe.streams[mgpu::kStreamDepth].offset,
-                     probe.streams[mgpu::kStreamDepth].slot_size, mgpu::kMaxSlots) ||
+                     probe.streams[mgpu::kStreamDepth].slot_size, ring_slots()) ||
         (g_ui_format != 0 && g_want_ui_session &&
          !place_slots(device, mgpu::kStreamUi, g_ui_format, g_ui_slot_w, g_ui_slot_h,
                       probe.streams[mgpu::kStreamUi].offset,
@@ -2133,7 +2157,7 @@ bool ensure_shared(ID3D12Device* device, uint32_t render_w, uint32_t render_h,
 
     const D3D12_FENCE_FLAGS ff =
         (D3D12_FENCE_FLAG_SHARED | D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER);
-    for (uint32_t s = 0; s < mgpu::kMaxSlots; ++s) {
+    for (uint32_t s = 0; s < ring_slots(); ++s) {
         if (FAILED(device->CreateFence(0, ff, IID_PPV_ARGS(&g_fwd[s]))) ||
             FAILED(device->CreateFence(0, ff, IID_PPV_ARGS(&g_back[s])))) {
             logf("shared: CreateFence FAILED\n");
@@ -2228,7 +2252,7 @@ bool ensure_shared(ID3D12Device* device, uint32_t render_w, uint32_t render_h,
     probe.magic          = mgpu::kSharedMagic;   // v9: non-zero = the mapping is usable
     probe.version        = mgpu::kSharedVersion;
     probe.producer_pid   = GetCurrentProcessId();
-    probe.slots          = mgpu::kMaxSlots;
+    probe.slots          = ring_slots();
     probe.stream_count   = 5;                 // colour + mv + depth + ui + scar (0..4)
     probe.mapping_size   = reserve;
     probe.generation     = 1;
@@ -2258,10 +2282,10 @@ bool ensure_shared(ID3D12Device* device, uint32_t render_w, uint32_t render_h,
          codec_plan_dp ? "codec " : "texture ", g_stream_w[2], g_stream_h[2],
          g_want_colour_session ? "on" : "off",
          mv_codec(), depth_codec(), g_percent[1], g_percent[2]);
-    logf("shared ready: name=%hs pid=%lu used=%.1f MB slots=%u mv %ux%u fmt %u"
+    logf("shared ready: name=%hs pid=%lu used=%.1f MB ring=%u mv %ux%u fmt %u"
          " depth %ux%u fmt %u\n",
          mgpu::kMappingName, GetCurrentProcessId(),
-         static_cast<double>(reserve) / 1048576.0, mgpu::kMaxSlots,
+         static_cast<double>(reserve) / 1048576.0, ring_slots(),
          g_stream_w[1], g_stream_h[1], g_mv_format,
          g_stream_w[2], g_stream_h[2], g_depth_format);
     return true;
@@ -2331,12 +2355,13 @@ void start_shared_init(ID3D12Device* device, uint32_t render_w, uint32_t render_
 // A slot may only be reused once the consumer ACKed the value we last published
 // there (`consumed[k]`). While the consumer is silent for 30 frames we fall back
 // to round-robin - otherwise a dead bridge would stop the producer forever.
+// (R: a consumer that has *exited* is handled before this, by consumer_alive().)
 void update_credit()
 {
     mgpu::SharedControl* c = ctl();
     if (c == nullptr || !g_ready) { g_credit_on = false; return; }
     uint64_t sum = 0;
-    for (uint32_t i = 0; i < mgpu::kMaxSlots; ++i) { sum += c->consumed[i]; }
+    for (uint32_t i = 0; i < ring_slots(); ++i) { sum += c->consumed[i]; }
     if (sum != g_ack_sum) { g_ack_sum = sum; g_ack_idle = 0; }
     else if (g_ack_idle < 1000000ull) { ++g_ack_idle; }
     const bool alive = (g_ack_idle < kAckGraceFrames);
@@ -2366,55 +2391,74 @@ bool slot_free(uint32_t slot)
     return c->consumed[slot] >= published;
 }
 
+uint32_t g_claim_misses = 0;    // consecutive claim_slot() failures (diagnostics only)
+
 bool claim_slot()
 {
     update_credit();
-    for (uint32_t i = 0; i < mgpu::kMaxSlots; ++i) {
-        const uint32_t s = (g_next_slot + i) % mgpu::kMaxSlots;
+    const uint32_t ring = ring_slots();
+    for (uint32_t i = 0; i < ring; ++i) {
+        const uint32_t s = (g_next_slot + i) % ring;
         if (!slot_free(s)) { continue; }
         g_cur_slot = s;
         // Round-robin: without advancing g_next_slot the producer reused slot 0 on every
         // frame (as soon as the consumer ACKed it), overwriting the publication the WGC
         // colour was still in flight to match. That is exactly "marker seq = newest-1,
         // hits=0" on Wuchang: only one slot ever held the newest frame.
-        g_next_slot = (s + 1u) % mgpu::kMaxSlots;
+        g_next_slot = (s + 1u) % ring;
+        g_claim_misses = 0;
         return true;
     }
 
-    // No ACKed slot. Dropping this publication leaves a permanent hole in frames[] (the
-    // marker seq can never be paired) and collapses the ring. Reclaim the OLDEST
-    // publication instead: its colour is several frames behind and can no longer be
-    // matched; a continuous 32-slot stream is worth more than preserving one stale slot.
+    // No ACKed slot. Reclaiming one publication is still the only way to keep the stream
+    // alive, but it must target a slot the consumer cannot still be reading. v23.1's
+    // unconditional "reclaim the oldest" did exactly that and is what produced
+    // "no ACKed slot - reclaimed oldest slot N" in every start window (measured
+    // 2026-11-25): a fresh session zeroes `consumed[]`, the ring is already full, and the
+    // producer overwrites slots the consumer has not paired yet.
+    //
+    // Safe to overwrite:
+    //   * frame_id == 0  -> the slot carries no frame (fresh/cleared session);
+    //   * frame_id + 2 <= colour_seq -> older than the consumer's last *verified* frame by
+    //     at least one publication. The consumer's in-flight frame is colour_seq-1 (it
+    //     writes colour_seq during pairing, before gpu_throttle), so margin 2 is the first
+    //     value that cannot race that frame's copy of the shared slot.
+    // Everything newer is dropped: the consumer keeps its last frame for one input interval
+    // and re-anchors, and the producer resumes as soon as an ACK arrives.
     if (mgpu::SharedControl* c = ctl()) {
+        const uint64_t ack = c->colour_seq;
         int oldest = -1;
         uint64_t oldest_pub = UINT64_MAX;
-        for (uint32_t i = 0; i < mgpu::kMaxSlots; ++i) {
+        for (uint32_t i = 0; i < ring; ++i) {
+            const uint64_t fid = c->frames[i].frame_id;
+            const bool safe = (fid == 0) || (ack > 2 && fid + 2 <= ack);
+            if (!safe) { continue; }
             const uint64_t p = g_fwd_value[i];
-            if (p == 0) { oldest = static_cast<int>(i); oldest_pub = 0; break; }
-            if (p < oldest_pub) { oldest_pub = p; oldest = static_cast<int>(i); }
+            if (oldest < 0 || p < oldest_pub) {
+                oldest = static_cast<int>(i);
+                oldest_pub = p;
+            }
         }
         if (oldest >= 0) {
             g_cur_slot = static_cast<uint32_t>(oldest);
-            g_next_slot = (g_cur_slot + 1u) % mgpu::kMaxSlots;
-            ++c->producer_skipped;   // keep the diagnostic counter meaningful
+            g_next_slot = (g_cur_slot + 1u) % ring;
+            g_claim_misses = 0;
             static uint32_t reclaimed = 0;
             if (++reclaimed <= 3 || (reclaimed % 300u) == 0u) {
-                logf("producer: no ACKed slot - reclaimed oldest slot %d (pub=%llu, %u so far)\n",
-                     oldest, static_cast<unsigned long long>(oldest_pub), reclaimed);
+                logf("producer: ring full - reclaimed SAFE slot %d (pub=%llu, ack=%llu,"
+                     " %u so far)\n", oldest, static_cast<unsigned long long>(oldest_pub),
+                     static_cast<unsigned long long>(ack), reclaimed);
             }
             return true;
         }
     }
 
-    // v23.1: no ACKed slot. The old behaviour overwrote the oldest slot, which could be
-    // the exact slot the consumer had just picked: its colour/MV/depth then came from two
-    // different frames (measured as "the picture zooms/shifts every few frames") and the
-    // consumer's identity check failed, flapping the MV gate. Dropping this publication is
-    // strictly better: the consumer repeats the previous frame for one input interval.
+    // Nothing safe to reclaim: drop this publication (the counter stays "skipped", reclaims
+    // above are no longer counted as skips).
     if (mgpu::SharedControl* c = ctl()) { ++c->producer_skipped; ++c->producer_overrun; }
-    static uint32_t skipped = 0;
-    if (++skipped <= 3 || (skipped % 300u) == 0u) {
-        logf("producer: no ACKed slot - publication skipped (%u so far)\n", skipped);
+    if (++g_claim_misses <= 3 || (g_claim_misses % 300u) == 0u) {
+        logf("producer: no safe slot to reuse (ack=%llu) - publication skipped (%u so far)\n",
+             static_cast<unsigned long long>(ctl() ? ctl()->colour_seq : 0), g_claim_misses);
     }
     return false;
 }
@@ -2646,6 +2690,67 @@ bool consumer_present()
     return seen;
 }
 
+// R (2026-11-25): is the consumer process still there? It exits with TerminateProcess
+// (Ctrl+Alt+End), so it never clears request_mask; without this check the producer keeps
+// running two codec encodes + the cross-adapter copies for nobody until the game restarts
+// (measured: publishes continued between runs with mask=0x83/0x3).
+//
+// The named event cannot answer this: lock_frame_ui.exe creates it for its whole lifetime,
+// so it outlives the consumer it launched. consumer_session carries the consumer's pid in
+// its high 32 bits (see 040_cadence.inc / 115_marker.inc), which is exact.
+//   * 3 s of grace before pausing, so a forked/restarted consumer is never cut off;
+//   * one keep-alive publication every 5 s afterwards, so a pid we mis-parse (e.g. a token
+//     written before a >49-day uptime wrapped the tick) can still re-arm us via an ACK.
+bool consumer_keep_publishing()
+{
+    static bool      alive = true;
+    static ULONGLONG dead_since = 0;
+    static ULONGLONG last_probe = 0;
+    static ULONGLONG last_check = 0;
+    static bool      now_alive = false;
+
+    const ULONGLONG now = GetTickCount64();
+    // OpenProcess is a syscall: this runs on the title's render thread twice per frame, so
+    // probe at most once a second (the grace window is 3 s, so that is still 3 samples).
+    if (last_check == 0 || now - last_check >= 1000ull) {
+        last_check = now;
+        now_alive = false;
+        mgpu::SharedControl* c = ctl();
+        const uint32_t pid = (c != nullptr)
+                                 ? static_cast<uint32_t>(c->consumer_session >> 32) : 0;
+        if (pid != 0) {
+            HANDLE hp = OpenProcess(SYNCHRONIZE, FALSE, pid);
+            if (hp != nullptr) {
+                now_alive = (WaitForSingleObject(hp, 0) == WAIT_TIMEOUT);
+                CloseHandle(hp);
+            }
+        }
+    }
+
+    if (now_alive) {
+        if (!alive || dead_since != 0) {
+            logf("producer: consumer process is alive - transport running\n");
+        }
+        alive = true;
+        dead_since = 0;
+        last_probe = 0;
+        return true;
+    }
+    if (alive || dead_since == 0) {
+        alive = false;
+        dead_since = now;
+        logf("producer: consumer process is gone - pausing copies after 3 s"
+             " (keep-alive every 5 s until a new consumer appears)\n");
+        return true;                       // grace window
+    }
+    if (now - dead_since < 3000ull) { return true; }
+    if (last_probe == 0 || now - last_probe >= 5000ull) {
+        last_probe = now;
+        return true;                       // keep-alive publication
+    }
+    return false;
+}
+
 // A new consumer must not inherit the previous consumer's ACK/frame history.
 void reset_consumer_session(mgpu::SharedControl* c, uint64_t session)
 {
@@ -2815,9 +2920,9 @@ static bool ensure_ui_synth_objects(ID3D12Device* device)
     D3D12_ROOT_PARAMETER rp[3]{};
     rp[0].ParameterType            = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     rp[0].Constants.ShaderRegister = 0;
-    rp[0].Constants.Num32BitValues = 12;       // W,H,Threshold,UseAlpha,Linear,PSrcScRGB,
+    rp[0].Constants.Num32BitValues = 13;       // W,H,Threshold,UseAlpha,Linear,PSrcScRGB,
                                                // HSrcScRGB,Dilate,Sparse,Patch,PatchDirect,
-                                               // PatchWhite
+                                               // PatchWhite,StatsOn
     rp[0].ShaderVisibility         = D3D12_SHADER_VISIBILITY_ALL;
     rp[1].ParameterType                       = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     rp[1].DescriptorTable.NumDescriptorRanges = 1;
@@ -3022,7 +3127,9 @@ static void ui_stats_tick(ID3D12GraphicsCommandList* list, uint32_t w, uint32_t 
     const ULONGLONG now = GetTickCount64();
     if (g_ui_stats_ms != 0 && (now - g_ui_stats_ms) < 1000) { return; }
 
-    if (g_ui_stats_ms != 0) {
+    static uint32_t s_logged_seq = 0xFFFFFFFFu;
+    if (g_ui_stats_ms != 0 && s_logged_seq != g_ui_stats_seq) {
+        s_logged_seq = g_ui_stats_seq;
         void* p = nullptr;
         const D3D12_RANGE rr{ 0, 36 };
         if (SUCCEEDED(g_ui_stats_rb->Map(0, &rr, &p)) && p != nullptr) {
@@ -3288,10 +3395,12 @@ static bool synth_ui_dispatch(ID3D12GraphicsCommandList* list, const MgpuFgFrame
         uint32_t use_alpha, linear, p_scrgb, h_scrgb, dilate, sparse, patch;
         uint32_t patch_direct;
         float patch_white;
+        uint32_t stats_on;
     } c{ w, h, g_ui_synth_threshold, (use_alpha ? 1u : 0u), (linear ? 1u : 0u),
          (p_scrgb ? 1u : 0u), (h_scrgb ? 1u : 0u), (g_ui_dilate ? 1u : 0u),
          (sparse_skip ? 1u : 0u), (g_ui_patch ? 1u : 0u),
-         (patch_direct ? 1u : 0u), g_ui_patch_white };
+         (patch_direct ? 1u : 0u), g_ui_patch_white,
+         (g_ui_stats_every != 0u && (g_ui_synth_frames % g_ui_stats_every) == 0u) ? 1u : 0u };
 
     list->SetComputeRootSignature(g_ui_synth_rs.Get());
     list->SetPipelineState(g_ui_synth_pso.Get());
@@ -3300,11 +3409,18 @@ static bool synth_ui_dispatch(ID3D12GraphicsCommandList* list, const MgpuFgFrame
     // P3b: reset the two counters by copying 8 zero bytes from an upload buffer, then
     // bind the buffer as a root UAV (register u1). Do not use
     // ClearUnorderedAccessViewUint on this structured UAV: it AVs inside nvwgf2umx.
-    barrier(list, g_ui_stats.Get(), D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_COPY_DEST);
-    list->CopyBufferRegion(g_ui_stats.Get(), 0, g_ui_stats_zero.Get(), 0, 36);
-    barrier(list, g_ui_stats.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (c.stats_on != 0u) {
+        ++g_ui_stats_seq;
+        barrier(list, g_ui_stats.Get(), D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyBufferRegion(g_ui_stats.Get(), 0, g_ui_stats_zero.Get(), 0, 36);
+        barrier(list, g_ui_stats.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    } else {
+        // The UAV is still bound; COMMON cannot be promoted to UNORDERED_ACCESS.
+        barrier(list, g_ui_stats.Get(), D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
     static bool told_clear = false;
     if (!told_clear) { told_clear = true; logf("ui-synth: stats cleared\n"); }
     D3D12_RESOURCE_BARRIER ub_stats{};
@@ -3316,7 +3432,7 @@ static bool synth_ui_dispatch(ID3D12GraphicsCommandList* list, const MgpuFgFrame
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         g_ui_mask_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     }
-    list->SetComputeRoot32BitConstants(0, 12, &c, 0);
+    list->SetComputeRoot32BitConstants(0, 13, &c, 0);
     list->SetComputeRootDescriptorTable(1, gpu_srv);
     // UI UAV lives at descriptor 3 (three SRVs precede it); Stats is descriptor 4 and is
     // bound separately as a root UAV.
@@ -3767,6 +3883,20 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
                 g_ui_alpha8 = ini_int(L"UiAlpha8", 1) != 0;
                 g_ui_dilate = ini_int(L"UiDilate", 0) != 0;
                 g_ui_sparse_codec = ini_int(L"UiSparseCodec", 1) != 0;
+                // Support threshold of the P/H difference mask, in 1/255 code units. This
+                // is the patch coverage knob: too high and the UI's AA/faint edge stays in
+                // `present` (H' keeps a little UI -> mode 4 warps that fringe), too low and
+                // the support grows for nothing. Was hardcoded to 8 until 2026-11-25.
+                {
+                    const int t = ini_int(L"UiSynthThreshold", 8);
+                    const int tc = (t < 0) ? 0 : (t > 255 ? 255 : t);
+                    g_ui_synth_threshold = static_cast<float>(tc) / 255.0f;
+                }
+                // P3b coverage counters: run every Nth synth frame (1 = every frame, 0 =
+                // never). The counters are per-pixel atomics; the readout is logged at
+                // 1 Hz, so every 60th frame is plenty.
+                g_ui_stats_every = ini_int(L"UiStats", 60);
+                if (g_ui_stats_every > 600u) { g_ui_stats_every = 600u; }
                 // v33: HUDless support patch (case 2 of the UI plan). It reuses stream 3,
                 // the sparse codec and the consumer's H' ring, but the payload is scene,
                 // so the consumer tags H' only (XeFG mode 4) and never a UI plane.
@@ -3990,6 +4120,10 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
     if (want == 0) { want = mgpu::kRequestMv | mgpu::kRequestDepth; }
     if (want & mgpu::kRequestRawMv)    { want |= mgpu::kRequestMv; }
     if (want & mgpu::kRequestRawDepth) { want |= mgpu::kRequestDepth; }
+    // R: no live consumer process -> stop here, before any slot claim / copy / encode. The
+    // mask above is stale once the consumer is gone (it dies by TerminateProcess), so it
+    // cannot be used as evidence that somebody is reading.
+    if (!consumer_keep_publishing()) { return; }
     const bool want_mv    = (want & mgpu::kRequestMv) != 0;
     const bool want_depth = (want & mgpu::kRequestDepth) != 0;
     const bool want_colour = g_want_colour_session &&
@@ -4109,15 +4243,15 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
         // MV frames whose colour was still on its way, which the consumer could only count
         // as no_slot (74% hit). Keep two slots as safety: the window now covers the real
         // lag, and only a genuine overflow drops an MV frame.
-        const uint64_t limit = mgpu::kMaxSlots - 2;
+        const uint64_t limit = (ring_slots() > 2) ? (ring_slots() - 2) : 1;
         // An ACK beyond the ring is not a usable watermark: the slot it refers to has
         // already been recycled, and a consumer restart can leave colour_seq far above
         // the new producer's frame ids (measured: ack=226 while seq was 8k+). Skipping
         // forever in that state starves the consumer, so treat it as stale and publish.
         const bool ack_in_window = (ack != 0 && f->seq >= ack &&
-                                    (f->seq - ack) <= mgpu::kMaxSlots);
+                                    (f->seq - ack) <= ring_slots());
         const bool ack_stale = (ack != 0 && f->seq >= ack &&
-                                (f->seq - ack) > mgpu::kMaxSlots);
+                                (f->seq - ack) > ring_slots());
         if (ack_in_window && f->seq > ack + limit) {
             ++g_publish_skips;
             static uint32_t rate_skips = 0;
@@ -4135,7 +4269,7 @@ void on_record(const MgpuFgFrame* f, void* /*user*/)
                 logf("producer: stale colour ACK seq=%llu ack=%llu (ahead=%llu > ring %u)"
                      " - ACK ignored, publishing so the consumer can re-anchor\n",
                      (unsigned long long)f->seq, (unsigned long long)ack,
-                     (unsigned long long)(f->seq - ack), mgpu::kMaxSlots);
+                     (unsigned long long)(f->seq - ack), ring_slots());
             }
         }
     }
@@ -4853,7 +4987,7 @@ void publish_frame(void* queue_ptr)
         logf("publish: Signal FAILED (queue=%p slot=%u value=%llu)\n", queue_ptr, slot,
              static_cast<unsigned long long>(value));
     } else {
-        g_next_slot = (slot + 1) % mgpu::kMaxSlots;
+        g_next_slot = (slot + 1) % ring_slots();
     }
 
     static uint32_t logged = 0;

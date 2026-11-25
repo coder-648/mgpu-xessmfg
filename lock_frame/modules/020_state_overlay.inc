@@ -497,6 +497,20 @@ static int          g_ui_mode5 = 0;
 // Difference threshold for the HUDless-derived UI mask, normalised (0..1). The ini/CLI
 // value is 0..255; 8 is a good first cut for an 8-bit-equivalent HUD overlay.
 static float        g_ui_synth_threshold = 8.0f / 255.0f;
+// --ui-patch-hard-edge (A/B): the mode-4 compose currently feathers the patch/present
+// boundary with a 7x7 box average of the binary support. For small moving UI that
+// weight changes in 1/49 steps, which moves the UI region XeFG detects. This flag
+// switches to a hard 5x5 max dilation (transition ring lies in clean scene, weight is
+// always exactly 1 or 0). Default off = current behaviour.
+static bool         g_ui_patch_hard_edge = false;
+// --ui-lut-decay N: keep N% of the H->P histogram each frame (0 = old behaviour,
+// clear every frame). 92 gives ~12 frames of memory: the LUT stops flickering with the
+// per-frame sample set, which is the remaining "slight jitter" of small UI.
+static UINT         g_ui_lut_decay = 92;
+// --ui-lut-stride N: sample every Nth pixel of the clean pairs when building the LUT.
+// The histogram is an exponential average now (--ui-lut-decay), so a sparser per-frame
+// sample set still converges to the same LUT; stride 8 cuts the build cost ~4x.
+static UINT         g_ui_lut_stride = 4;
 static bool         g_mv_gate_off = false;   // this frame has no MV -> 1X, no tagging
 // --fg-gate N (default 0): tolerate up to N consecutive frames that only lack the
 // motion-vector stream. During those frames XeFG gets no inputs and no present id

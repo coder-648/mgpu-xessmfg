@@ -317,6 +317,7 @@ static bool ensure_upsample_targets(UINT w, UINT h)
     g_up_depth.Reset();
     g_up_valid = false;
     g_up_slot = mgpu::kMaxSlots;
+    g_up_pub  = 0;
 
     auto make = [&](ComPtr<ID3D12Resource>& r, DXGI_FORMAT fmt) -> HRESULT {
         D3D12_RESOURCE_DESC d{};
@@ -444,10 +445,14 @@ static void record_upsample(UINT slot)
     cpu.ptr += inc;
     make_uav(g_up_depth.Get(), cpu, DXGI_FORMAT_R32_FLOAT);
 
-    // The copies left both local textures in COPY_DEST; the targets start in COMMON.
-    up_transition(g_mv_local[slot].Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+    // The copies left both local textures in COMMON: copy_content() only issues
+    // CopyTextureRegion (D3D12 promotes/demotes implicitly, the app-side state stays
+    // COMMON), and decode_mv_slot/decode_depth_slot end with an explicit UAV -> COMMON
+    // transition. Declaring COPY_DEST here was an invalid transition barrier; use the
+    // state the resources are actually in.
+    up_transition(g_mv_local[slot].Get(), D3D12_RESOURCE_STATE_COMMON,
                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    up_transition(depth_src, D3D12_RESOURCE_STATE_COPY_DEST,
+    up_transition(depth_src, D3D12_RESOURCE_STATE_COMMON,
                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     barrier_to(g_up_mv.Get(), g_up_mv_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     barrier_to(g_up_depth.Get(), g_up_depth_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -480,6 +485,10 @@ static void record_upsample(UINT slot)
                   D3D12_RESOURCE_STATE_COMMON);
 
     g_up_slot = slot;
+    // Key the pair by the publication, not just the slot: the ring reuses slot numbers
+    // every few frames and this pass may skip a frame, so `slot` alone can match a pair
+    // built from an older publication (docs/SELF_AUDIT_2026-11-25.md C).
+    g_up_pub  = (g_ctl && slot < mgpu::kMaxSlots) ? g_ctl->frames[slot].published : 0;
     g_up_valid = true;
     if (!g_up_told) {
         g_up_told = true;

@@ -156,6 +156,11 @@ if [ "${WITH_LOCAL_EXTRAS:-0}" = "1" ]; then
     cp -f "$HERE/scripts/cp2077_ab/AB_README_CAMVM.txt" "$OUT/extras/cp2077_ab/"
     mkdir -p "$OUT/extras/pbz_ab"
     cp -f "$HERE"/scripts/pbz_ab/* "$OUT/extras/pbz_ab/" 2>/dev/null || true
+    if [ -d "$HERE/scripts/audit_cp2077" ]; then
+        say "including local audit scripts (audit_cp2077)"
+        mkdir -p "$OUT/extras/audit_cp2077"
+        cp -f "$HERE"/scripts/audit_cp2077/* "$OUT/extras/audit_cp2077/"
+    fi
     if [ -f "$REPO/docs/design/INPUT_ALIGNMENT_CAMVM.md" ]; then
         cp -f "$REPO/docs/design/INPUT_ALIGNMENT_CAMVM.md" "$OUT/docs/"
     fi

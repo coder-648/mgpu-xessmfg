@@ -32,6 +32,8 @@ cbuffer Params : register(b0)
     uint  DisplayRef;      // v34: 1 = patch is already display-referred (WGC-matched)
     uint  Use3D;           // v34: 1 = Lut (t5) is a valid H->P 3D LUT
     uint  LutN;            // 3D LUT edge length (17): nodes live at i/(LutN-1)
+    uint  HardEdge;        // A/B: 1 = hard 5x5 max dilation instead of the 7x7 box
+                           //      feather (consumer flag --ui-patch-hard-edge)
 };
 
 Texture2D<float4>    Present : register(t0);   // R10G10B10A2_UNORM, with UI
@@ -153,16 +155,36 @@ void CSMain(uint3 id : SV_DispatchThreadID)
                 // boundary left by a pure dilate.
                 float blend = saturate(u.a);
                 if (blend < 0.5f) {
-                    float cov = 0.0f;
-                    [unroll] for (int oy = -3; oy <= 3; ++oy) {
-                        [unroll] for (int ox = -3; ox <= 3; ++ox) {
-                            const int2 q = clamp(p + int2(ox, oy),
-                                                 int2(0, 0), int2((int)DstW - 1, (int)DstH - 1));
-                            cov += Ui.Load(int3(q, 0)).a;
+                    if (HardEdge != 0u) {
+                        // 2-px hard dilation: max of the binary support. The transition ring
+                        // then lies ~2 px outside the support, in clean scene (the producer's
+                        // LUT sampling already excludes a +/-2 px AA ring there), and the
+                        // weight is always exactly 1 or 0. The 7x7 box below instead changes
+                        // it in 1/49 steps, so a 1-px UI move changes the blend *strength*
+                        // and therefore the region XeFG classifies as UI: that is what makes
+                        // a small moving UI jitter.
+                        float m = 0.0f;
+                        [unroll] for (int oy = -2; oy <= 2; ++oy) {
+                            [unroll] for (int ox = -2; ox <= 2; ++ox) {
+                                const int2 q = clamp(p + int2(ox, oy),
+                                                     int2(0, 0),
+                                                     int2((int)DstW - 1, (int)DstH - 1));
+                                m = max(m, Ui.Load(int3(q, 0)).a);
+                            }
                         }
+                        blend = (m > 0.5f) ? 1.0f : 0.0f;
+                    } else {
+                        float cov = 0.0f;
+                        [unroll] for (int oy = -3; oy <= 3; ++oy) {
+                            [unroll] for (int ox = -3; ox <= 3; ++ox) {
+                                const int2 q = clamp(p + int2(ox, oy),
+                                                     int2(0, 0), int2((int)DstW - 1, (int)DstH - 1));
+                                cov += Ui.Load(int3(q, 0)).a;
+                            }
+                        }
+                        cov /= 49.0f;
+                        blend = smoothstep(0.02f, 0.35f, cov);
                     }
-                    cov /= 49.0f;
-                    blend = smoothstep(0.02f, 0.35f, cov);
                 }
                 blend = saturate(blend);
                 if (blend <= 0.001f) {

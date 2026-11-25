@@ -1,5 +1,57 @@
 # 下一轮计划（2026-11-26 起）
 
+## 0. 2026-11-25 追加（consumer 自身链路修正，已实机回归）
+
+`SELF_AUDIT_2026-11-25.md` 的 A/C/D/E/F 已落地并重新构建（源码级，版本号仍
+`1.3.1-local.camvm`，二进制 md5 与已验证包不同）。CP2077 4K / 40 fps / 3x keep2x
+三次 run（基线 / UI patch / `--d3d-debug`）结果见审查文档 §8：
+
+- A/C/E 无回归：`pair: exact=40 no_slot=0` 全程、`xefg-in` MV/depth 都是 3840x2160、
+  `wait=0.0ms`、`pf:` 0 行、`xN=3.00`、`slow/timeouts=0`、`out 120/120`；
+- D 已用 debug layer 验证：1045 条消息里 0 条 barrier/state/invalid-call
+  （其余是 XeFG 的 `CheckFeatureSupport` 与 6 条 upload buffer `GENERIC_READ` 提示）；
+- F 未被执行到（本轮没有 `--lock/--jbuf`）。
+
+新发现（详见 §3 Q / §4 R）：
+
+- **Q**：把 `lock_frame.exe` 放在游戏目录会让 consumer 进程也加载 fakerFG
+  （第二个 XeFG context + XeLL + Present 钩子）。后续 A/B 统一用
+  `C:\temp\lock_frame_audit\` + `audit_out_3x_keep2x.bat`（发布包布局）。
+- **R**：consumer 退出后 `request_mask` 残留，producer 继续每帧编码/拷贝两路流，
+  直到游戏重启。建议 producer 用 `kConsumerPresentEvent` 是否仍存在来判活。
+
+仍未做：G/H/I（显存 / SDR / UI 组合边界）、K（producer copy ring）、L（LUT 间隔）、
+M（marker 日志量）、O（>3840 渲染的纹理档静默跳过）、P（`--fg-colour shared` 失效路径）、
+F（`--lock`+`--jbuf` 泄漏的实机验证）。
+
+### 2026-11-25 晚追加（B/J/R，已实现并实机确认）
+
+实测（21:39–21:43，4K/40/3x，三次 run，详见审查文档 §10）：
+
+- **J** 映射 1773.6 → **1017.6 MB**（-43%）；
+- **B** `reclaimed oldest slot` 0 次，`no safe slot` 只在 run 开始/结束，稳态零丢帧；
+- **R** 退出后 3 s 宽限 + 5 s 一次保活，不再连续编码（更长的空闲窗口待补测）；
+- 回归全绿：`exact=40 no_slot=0`、`xN=3.00`、`out 120/120`、`wait=0`、`slow/timeouts=0`；
+  debug 层 0 条 barrier 校验。
+
+新增待办：
+- `record: no slot for seq=...` 在退出窗口最多刷 300 行（本轮 76 行），建议降频；
+- `TransportSlots=16` 在 debug 层下 `lag max=13`（watermark 上限 14），
+  若某标题稳态出现 `no safe slot` / `pair no_slot`，调到 24/32；
+- **Q 的干净布局仍未实测**：本轮还是从游戏目录启动的 consumer
+  （`lock_frame_fakerFG.log` 有 21:41:39 / 21:42:16 / 21:43:16 三个 pid）。
+  下次至少跑一次 `audit_out_3x_keep2x.bat`。
+
+实现说明：
+- **B** `claim_slot()` 只覆盖安全槽（`fid==0` 或 `fid+2 <= colour_seq`），其余丢帧；
+  日志由 `reclaimed oldest slot` 变为 `reclaimed SAFE slot` / `no safe slot to reuse`。
+- **J** `TransportSlots=16`（`fakerFG.ini`，4..32）。
+- **R** producer 用 `consumer_session` 高 32 位 pid 判活：3 s 宽限后停止拷贝，
+  每 5 s 一次保活发布。
+- 部署：`xess_mfg_producer.dll`（**需重启游戏**）、`lock_frame.exe`
+  （游戏目录 + `C:\temp\lock_frame_audit\`）。md5 每 rebuild 都变，
+  本轮值见 `audit_logs\audit_deploy_info.txt`。
+
 ## 当前基线
 
 - CP2077：`keep2x` + 3x 仍是默认画质配置；4x 只作对照，不推荐。

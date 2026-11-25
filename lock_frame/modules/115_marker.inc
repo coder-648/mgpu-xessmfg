@@ -466,10 +466,12 @@ static bool lock_request_session_reset()
     }
     // A fresh token is how the producer learns that this is a new consumer session.
     // It clears colour_seq/consumed[]/frames[] and bumps generation on its next record.
+    // R: keep the producer's pid extraction exact (high 32 = pid, see 040_cadence.inc) -
+    // the serial only perturbs the low half.
+    const uint32_t serial = ++g_lock_session_reset_serial;
     const uint64_t token =
-        (static_cast<uint64_t>(GetCurrentProcessId()) << 32) ^
-        (static_cast<uint64_t>(now) << 1) ^
-        static_cast<uint64_t>(++g_lock_session_reset_serial);
+        (static_cast<uint64_t>(GetCurrentProcessId()) << 32) |
+        static_cast<uint64_t>((static_cast<uint32_t>(now) ^ (serial * 2654435761u)));
     g_ctl->consumer_session = token != 0 ? token : 1;
     MemoryBarrier();
 

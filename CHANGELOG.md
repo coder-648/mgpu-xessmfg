@@ -3,6 +3,124 @@
 只记**用户能感知**的变化与对应实测依据。每条结论的原始数据在
 `docs/findings/PERF_BASELINE.md` / `FINAL_CONFIG.md`。
 
+### release: lock_frame 1.3.3-local.ui（2026-11-25）
+
+发布说明见 `lock_frame/docs/RELEASE_NOTES_1.3.3-local.ui.md`。协议仍 **v34**，
+`fakerFG` API v4；producer / fakerFG / consumer / UI 需一起更新。
+
+- **consumer**：A 跨卡读等待 `fwd[slot]`；C 重建结果按 publication 校验；
+  D `record_upsample()` barrier 改 `COMMON`（debug 层 0 条 barrier 消息）；
+  E codec 会话禁用 prefetch；F `--lock`+`--jbuf` 泄漏修复。
+- **producer**：B 只覆盖安全槽（`reclaimed SAFE slot` / `no safe slot to reuse`）；
+  J `TransportSlots=16`（4K 映射 1773.6 → **1017.6 MB**）；R consumer 判活
+  （退出 3 s 后暂停拷贝 + 5 s 保活）；`UiStats` 计数器降频；`UiSynthThreshold` 可配。
+- **UI mode 4**：hard edge 设为默认（`--ui-patch-box-feather` 回退）；LUT 直方图
+  时间平滑（`--ui-lut-decay 92`）；`--ui-lut-stride`；`--tag-dump` 增加 alpha/diff。
+- **默认值**：`TransportSlots=16`、`UiSynthThreshold=2`、`UiStats=60`、hard edge on、
+  LUT decay 92%。
+- 实机（CP2077 4K/40/3x）：`pair exact=40 no_slot=0`、`xN=3.00`、`out 120/120`、
+  `wait=0`、`slow/timeouts=0`；UI 重建与呈现画面无可肉眼分辨的色差。
+
+### local: UI 合成（mode 4）— patch 开销 + 小 UI 抖动排查（2026-11-25 深夜）
+
+审查见 `lock_frame/docs/UI_MODE4_2026-11-25.md`。默认行为不变，新增的都是 knob：
+
+- **producer `UiStats`（默认 60）**：`synth_ui_full.hlsl` 的覆盖率/诊断计数器原来是
+  **每帧、每 UI 像素 2 次 + 每 8×8 一次 4 连发**的 `InterlockedAdd`（4K、6% 覆盖 ≈ 50 万 + 13 万次，
+  全部打在固定的几个地址上），而读数只有 1 Hz 一行日志。现在只在每 N 帧写一次
+  （`0`=从不，`1`=旧行为），渲染卡稳态少几十万次 atomic。
+- **producer `UiSynthThreshold`（默认 8/255）**：patch 支撑阈值之前是硬编码的，
+  现在可以在 ini 里调。它是"淡边/孤立小 UI 是否进支撑"的旋钮。
+- **consumer `--ui-patch-hard-edge`（默认关）**：把 7×7 盒平均 + smoothstep 的羽化换成
+  5×5 max 硬膨胀。盒平均的权重是 1/49 量化的，小 UI 移动时混合强度逐帧变化；
+  硬膨胀的权重只会是 1 或 0。用于定位"小 UI 移动抖动"。
+
+A/B：`audit_2_3x_keep2x_ui.bat`（基线）→ 改 `UiSynthThreshold=2` 重启再跑 →
+`audit_ui_hard_edge.bat`。观察小 UI 边缘 + `ProfGpu=1` 的 `prof: ... ui .. synth`。
+
+**实测（阈值 2）**：默认 feather 与 hard-edge 都比阈值 8 时抖动小，hard-edge 更好；
+支撑覆盖率从 6.4–6.8% 升到 8.5–11.2%（多出来的是之前漏掉的 AA/软边）。仍有轻微残留，
+指向每帧 LUT 噪声。因此本轮追加（consumer only，默认生效）：
+
+- **hard edge 设为默认**（`--ui-patch-box-feather` 可回退）；
+- **LUT 直方图时间平滑**：新 `patch_lut3d_decay.hlsl` + `--ui-lut-decay N`（默认 92%，
+  约 12 帧记忆；0 = 旧行为每帧清零），让 `LUT(patch)` 不再逐帧跳变。
+- **`--tag-dump` 增加两张图**：`tag_XX_alpha.bmp`（patch/UI 的 alpha，patch 模式即支撑掩码）
+  和 `tag_XX_diff.bmp`（`|P − H'| × 8`，亮 = H' 仍与呈现画面不同），用来肉眼判断
+  消费端 H' 的重建效果。新脚本 `audit_ui_tagdump.bat`（8 帧连续，第 300 帧起）。
+
+
+
+审查与实测见 `lock_frame/docs/SELF_AUDIT_2026-11-25.md` §3 B、§4 J、§3 R、§9。协议仍 **v34**，
+布局不变；producer 与 consumer 需要一起更新（consumer 只改了会话令牌格式）。
+
+- **B（producer `claim_slot`）**：环满且没有 ACKed 槽时，只覆盖“消费者不可能还需要”的槽
+  （`frame_id == 0`，或 `frame_id + 2 <= colour_seq`）；其余情况丢这一帧
+  （`no safe slot to reuse`），生产者等 ACK 后自然恢复。旧代码无条件覆盖最旧槽
+  （实测每个新 run 启动都会 `reclaimed oldest slot 1/2/3`），可能盖掉消费者正要配对的槽。
+  日志从 `reclaimed oldest slot` 变为 `reclaimed SAFE slot`。
+- **J（`TransportSlots`，默认 16）**：只发布/放置前 N 个槽（4..32）。4K codec 每槽约 33 MiB，
+  32 槽实测映射 **1773.6 MB**；16 槽约 **890 MB**。`frames[]/consumed[]` 仍是 32 项，
+  consumer 按 `c->slots` / `st.slots` 工作，无需改逻辑。出现 `pair: no_slot` 时把
+  `fakerFG.ini TransportSlots` 调到 24/32 并重启游戏。
+- **R（producer 判活）**：consumer 以 `TerminateProcess` 退出、`request_mask` 残留，
+  producer 以前会一直每帧编码/拷贝两路流。现在用 `consumer_session` 高 32 位的 pid
+  每秒探测一次进程；消失 3 s 后暂停拷贝，之后每 5 s 放一次保活发布以便被 ACK 唤醒。
+  不能用 `kConsumerPresentEvent`：`lock_frame_ui.exe` 会持有一整个生命周期。
+  消费者两处令牌构造改为 `(pid << 32) | 低 32 位`，保证高半区永远是 pid。
+
+构建：`./lock_frame/build.sh producer && ./lock_frame/build.sh consumer`（均通过，仅既有
+`wcsicmp` C4996 警告）。部署：`xess_mfg_producer.dll`（需重启游戏）、`lock_frame.exe`
+（游戏目录 + `C:\temp\lock_frame_audit\`）、`fakerFG.ini` 增加 `TransportSlots=16`。
+
+**实机结果（2026-11-25 21:39–21:43，4K/40 fps/3x keep2x）**：映射 1773.6 → **1017.6 MB**
+（-43%）；`reclaimed oldest slot` **0** 次，`no safe slot` 只出现在 run 开始/结束
+（含新会话 ack=0 的 3 帧），稳态零丢帧；`consumer process is gone/alive` 正常切换，
+退出后只剩 3 s 宽限 + 5 s 一次的保活编码。配对/输出无回归（`exact=40 no_slot=0`、
+`xN=3.00`、`out 120/120`、`wait=0`、`slow/timeouts=0`；debug 层 0 条 barrier 校验）。
+详见审查文档 §10；pair lag 从 ~1 升到 2.3–7（debug 13），`TransportSlots=16` 的余量变薄，
+出现稳态 `no_safe_slot` 时调到 24/32 即可。
+
+### local: lock_frame 自身链路修正（A/C/D/E/F，2026-11-25，已实机回归）
+
+审查见 `lock_frame/docs/SELF_AUDIT_2026-11-25.md`。本轮只动 consumer，不改协议、不改
+producer、不改模型与节奏：
+
+- **跨卡读同步（A）**：帧内 MV/depth 的拷贝/解码现在在读取前把 producer 的
+  `fwd[slot]`（值 = `frames[slot].published`）排进同一条队列（`order_publication_read()`，
+  `130_input_cache.inc`）。此前只有 prefetch 路径做这件事，而 prefetch 在锁帧版被强制关闭，
+  主路径完全依赖"WGC 恰好晚一帧"的时序巧合。队列级 Wait，不阻塞 CPU。
+  注意这只在 GPU 上等，不会增加 CPU 时间；代价是 consumer 现在依赖 producer 一定 signal
+  `fwd[slot]`（协议 v5 的 "metadata first, fence last"）——出现 `publish: Signal FAILED`
+  时 consumer 会停在一个不会到来的 fence 上，应视为 producer 端致命错误。
+- **重建结果按 publication 失效（C）**：`g_up_pub` 与 `g_upsample` 的 tag 条件一起校验，
+  槽号复用/重建 pass 跳帧时不再可能 tag 到上一轮的重建结果（reuse 帧 publication 不变，
+  仍然命中）。
+- **重建 pass 的 barrier 状态（D）**：`record_upsample()` 的 `StateBefore` 从
+  `COPY_DEST` 改为 `COMMON`——codec 解码显式以 UAV→COMMON 收尾，纹理 copy 的资源
+  app 侧也一直是 COMMON，原写法是非法 transition。
+- **prefetch 的 codec 守卫（E）**：`prefetch_usable()` 在 codec 会话直接返回 false
+  （`decode_*_slot()` 只录 `g_list`，prefetch 时该 list 已 Close/Execute）。
+  锁帧版本来就强制关闭 prefetch，因此无行为变化。
+- **`--lock` + `--jbuf` 泄漏（F）**：丢帧路径补 `jbuf_give_back()`。
+
+> 版本号仍为 **1.3.1-local.camvm**（仓库已验证基线），因此新二进制的 md5 与已验证发布包
+> **不同**：在 CP2077/PBZ 跑完 `pair: exact` / `xefg-in:` / `load` / `slow` 回归之前，
+> 不要用它替换 1.3.1 的发布包。构建：`./lock_frame/build.sh consumer`（已通过，仅既有
+> `wcsicmp` C4996 警告）。
+
+**CP2077 实机回归（2026-11-25 21:19–21:22，4K/40 fps/3x keep2x，基线 + UI patch +
+`--d3d-debug` 三次）**：`pair: exact=40 no_slot=0` 全程（首个窗口为启动 2 帧）、
+`xefg-in` MV/depth 均为 3840x2160（depth 码流 2560x1440 每帧重建）、`wait=0.0ms`、
+`pf:` 0 行、`xN=3.00`、`slow/timeouts=0`、`out 120/120`；debug layer 1045 条消息中
+**0 条** barrier/state/invalid-call。详见 `lock_frame/docs/SELF_AUDIT_2026-11-25.md` §8。
+
+同轮新增两条现场问题（未在本轮修）：
+
+- 把 `lock_frame.exe` 放在游戏目录时，consumer 进程会额外加载 fakerFG（第二个 XeFG context
+  + XeLL + Present 钩子）；发布包布局不会，后续 A/B 改用 `C:\temp\lock_frame_audit\`；
+- consumer 退出后 `request_mask` 残留，producer 仍每帧编码/拷贝 MV+depth 直到游戏重启。
+
 ### local: 逐游戏 XeFG 兼容补齐 + 输入契约修复（2026-11-25）
 
 详见 `lock_frame/docs/PER_GAME_COMPAT_2026-11-25.md`。只动输入/一致性，不改模型与节奏：

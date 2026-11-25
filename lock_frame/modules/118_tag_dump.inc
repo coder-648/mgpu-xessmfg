@@ -8,6 +8,8 @@
 //      tag_XX_hudless.bmp     the rebuilt HUDless (tagged in mode 4/5)
 //      tag_XX_ui.bmp          the UI texture (decoded/copied or render-card synth)
 //      tag_XX_patch.bmp       v33: the HUDless support patch (when ui_flags bit4 is set)
+//      tag_XX_alpha.bmp       the patch/UI alpha channel (patch mode: the support mask)
+//      tag_XX_diff.bmp        |backbuffer - H'| x8 (bright = H' still differs there)
 //      tag_XX_meta.txt        present id / slot / source / mode5 / derived / linear / patch / sizes
 //
 //  In patch mode the third image is the *reconstruction material*: H' is present outside
@@ -192,6 +194,61 @@ static bool write_dumpstream_alpha_bmp(const DumpStream& s, const char* path)
     return write_bmp24(path, rgb, static_cast<int>(w), static_cast<int>(h));
 }
 
+// |backbuffer - H'| amplified, as grey. This is the image to look at when judging the
+// reconstruction: bright pixels are where H' still differs from the presented picture
+// (residual UI, a support miss, or the LUT/patch error at the boundary). Both readbacks are
+// the same R10 code space, so the difference is directly comparable.
+static bool write_tag_diff_bmp(const DumpStream& a, const DumpStream& b, const char* path,
+                               int amp)
+{
+    if (!a.rb || !b.rb) { return false; }
+    const UINT w = static_cast<UINT>(a.desc.Width);
+    const UINT h = static_cast<UINT>(a.desc.Height);
+    if (w == 0 || h == 0 || b.desc.Width != w || b.desc.Height != h) { return false; }
+    void* ma = nullptr;
+    if (FAILED(a.rb->Map(0, nullptr, &ma)) || ma == nullptr) { return false; }
+    void* mb = nullptr;
+    if (FAILED(b.rb->Map(0, nullptr, &mb)) || mb == nullptr) {
+        a.rb->Unmap(0, nullptr);
+        return false;
+    }
+    std::vector<uint8_t> rgb(static_cast<size_t>(w) * h * 3, 0);
+    const uint8_t* ba = static_cast<const uint8_t*>(ma) + a.fp.Offset;
+    const uint8_t* bb = static_cast<const uint8_t*>(mb) + b.fp.Offset;
+    const UINT pa = a.fp.Footprint.RowPitch;
+    const UINT pb = b.fp.Footprint.RowPitch;
+    const bool r10a = (a.desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM ||
+                       a.desc.Format == DXGI_FORMAT_R10G10B10A2_TYPELESS);
+    const bool r10b = (b.desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM ||
+                       b.desc.Format == DXGI_FORMAT_R10G10B10A2_TYPELESS);
+    if (!r10a || !r10b) {
+        a.rb->Unmap(0, nullptr);
+        b.rb->Unmap(0, nullptr);
+        return false;
+    }
+    for (UINT y = 0; y < h; ++y) {
+        const uint32_t* ra = reinterpret_cast<const uint32_t*>(ba + static_cast<size_t>(y) * pa);
+        const uint32_t* rb2 = reinterpret_cast<const uint32_t*>(bb + static_cast<size_t>(y) * pb);
+        for (UINT x = 0; x < w; ++x) {
+            const uint32_t va = ra[x], vb = rb2[x];
+            const int dr = std::abs(static_cast<int>(va & 0x3FFu) - static_cast<int>(vb & 0x3FFu));
+            const int dg = std::abs(static_cast<int>((va >> 10) & 0x3FFu) -
+                                    static_cast<int>((vb >> 10) & 0x3FFu));
+            const int db = std::abs(static_cast<int>((va >> 20) & 0x3FFu) -
+                                    static_cast<int>((vb >> 20) & 0x3FFu));
+            int d = (dr > dg) ? dr : dg;
+            if (db > d) { d = db; }
+            d *= amp;
+            if (d > 255) { d = 255; }
+            const size_t i = (static_cast<size_t>(y) * w + x) * 3;
+            rgb[i + 0] = rgb[i + 1] = rgb[i + 2] = static_cast<uint8_t>(d);
+        }
+    }
+    a.rb->Unmap(0, nullptr);
+    b.rb->Unmap(0, nullptr);
+    return write_bmp24(path, rgb, static_cast<int>(w), static_cast<int>(h));
+}
+
 static void tag_dump_flush()
 {
     if (g_tag_dump_frames <= 0 || g_tag_dump_flushed ||
@@ -229,22 +286,29 @@ static void tag_dump_flush()
         snprintf(path, sizeof(path), "%s\\tag_%02d_alpha.bmp",
                  g_tag_dump_dir, static_cast<int>(k));
         const bool oka = write_dumpstream_alpha_bmp(e.s[2], path);
+        // |P - H'| x8: bright = H' still differs from the presented picture there.
+        bool okd = false;
+        if (e.have[0] && e.have[1]) {
+            snprintf(path, sizeof(path), "%s\\tag_%02d_diff.bmp",
+                     g_tag_dump_dir, static_cast<int>(k));
+            okd = write_tag_diff_bmp(e.s[0], e.s[1], path, 8);
+        }
         snprintf(path, sizeof(path), "%s\\tag_%02d_meta.txt",
                  g_tag_dump_dir, static_cast<int>(k));
         if (FILE* mf = fopen(path, "w")) {
             fprintf(mf, "present_id %llu\nslot %u\nsource %u\nmode5 %u\nderived %u\n"
                         "linear %u\npatch %u\nw %u\nh %u\nui_w %u\nui_h %u\nui_fmt %u\n"
                         "ui_quality_bp %u\nbackbuffer_bmp %d\nhudless_bmp %d\n"
-                        "reconstruct_bmp %d\nalpha_bmp %d\n",
+                        "reconstruct_bmp %d\nalpha_bmp %d\ndiff_bmp %d\n",
                     static_cast<unsigned long long>(e.present_id), e.slot, e.source,
                     e.mode5, e.derived, e.linear, e.patch, e.w, e.h, e.ui_w, e.ui_h,
                     e.ui_fmt, e.ui_quality, okb ? 1 : 0, okh ? 1 : 0, oku ? 1 : 0,
-                    oka ? 1 : 0);
+                    oka ? 1 : 0, okd ? 1 : 0);
             fclose(mf);
         }
-        logf_("[lock] tag-dump %zu: bb=%d hud=%d %s=%d mode5=%u derived=%u patch=%u"
-              " -> %s\n", k, okb ? 1 : 0, okh ? 1 : 0,
-              e.patch ? "patch" : "ui", oku ? 1 : 0,
+        logf_("[lock] tag-dump %zu: bb=%d hud=%d %s=%d alpha=%d diff=%d mode5=%u"
+              " derived=%u patch=%u -> %s\n", k, okb ? 1 : 0, okh ? 1 : 0,
+              e.patch ? "patch" : "ui", oku ? 1 : 0, oka ? 1 : 0, okd ? 1 : 0,
               e.mode5, e.derived, e.patch, g_tag_dump_dir);
     }
     g_tag_dump_entries.clear();

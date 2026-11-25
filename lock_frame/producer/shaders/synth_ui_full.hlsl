@@ -38,6 +38,10 @@ cbuffer Params : register(b0)
     uint  PatchDirect;    // v34: 1 = PatchH (t3) is already display-referred; write raw
     float PatchWhite;     // v33: scRGB 1.0 = N nits for the patch. CP2077's HUDless is
                           //      scene-referred at ~20 nits (measured), not 80.
+    uint  StatsOn;        // 1 = write the coverage/diagnostic counters this frame. The
+                          // counters are per-pixel/8x8 InterlockedAdds into 9 addresses,
+                          // which is measurable at 4K; UiStats (fakerFG.ini) sets how
+                          // often they run (default every 60th frame).
 };
 
 Texture2D<float4>   P : register(t0);
@@ -219,7 +223,7 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID,
             // alpha=0 pixels to calibrate the scene-referred -> display-referred ratio;
             // the patch RGB itself is always the clean HUDless.
             Ui[p] = float4(saturate(h_enc), (hit > 0.5f) ? 1.0f : 0.0f);
-            if (hit > 0.5f) {
+            if (StatsOn != 0u && hit > 0.5f) {
                 InterlockedAdd(Stats[0], 1u);
                 InterlockedAdd(Stats[1], 1u);
             }
@@ -326,12 +330,17 @@ void CSMain(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID,
     if (marker_pixel(p)) { m = 0.0f; u = 0.0f; }
     Ui[p] = float4(saturate(u), saturate(m));
 
-    // P3b coverage counters (cheap: one atomic per qualifying pixel).
-    if (m > 0.5f)  { InterlockedAdd(Stats[0], 1u); }
-    if (m > 0.01f) { InterlockedAdd(Stats[1], 1u); }
+    // P3b coverage counters. Only on the frames the CPU asked for (Stats != 0): these are
+    // per-pixel InterlockedAdds into two addresses, plus a 4-load/4-atomic diagnostic block
+    // every 8x8 pixels. At 4K that is ~500k atomics/frame for a 6% UI and ~130k more for
+    // the diagnostics - measurable on the render card for a readout that is logged 1 Hz.
+    if (StatsOn != 0u) {
+        if (m > 0.5f)  { InterlockedAdd(Stats[0], 1u); }
+        if (m > 0.01f) { InterlockedAdd(Stats[1], 1u); }
+    }
     // Diagnostic sample every 8x8: raw code maxima. If H is black this is ~0 even when
     // the scene is bright; if H is a valid scene these two means are close.
-    if (((p.x | p.y) & 7) == 0) {
+    if (StatsOn != 0u && ((p.x | p.y) & 7) == 0) {
         const float ph = max(max(hudless_raw.r, hudless_raw.g), hudless_raw.b);
         const float pp = max(max(present_raw.r, present_raw.g), present_raw.b);
         InterlockedAdd(Stats[2], uint(saturate(ph) * 255.0f));
