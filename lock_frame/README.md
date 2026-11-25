@@ -7,7 +7,7 @@ XeSS-FG 插帧，再叠加回游戏窗口。支持固定 **2x / 3x / 4x**。
 安装时这两个 DLL 会被写入 `<游戏>\fakerFG\`，供游戏进程里的 XeFG 使用
 （1.2.1 修复：此前只放在工具目录，游戏会加载它自带的旧版运行时）。
 
-当前包版本 **1.3.3-local.ui**（共享协议 v34）。producer / fakerFG / consumer / UI
+当前包版本 **1.3.3**（共享协议 v34）。producer / fakerFG / consumer / UI
 必须同版本一起更新；替换 `xess_mfg_producer.dll` 后需要重启游戏。
 从旧版升级请点一次 **安装 / 应用配置**，让新的 `fakerFG.ini` 模板
 （`TransportSlots` / `UiSynthThreshold` / `UiStats`）写进游戏目录。

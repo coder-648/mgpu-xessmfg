@@ -3,9 +3,9 @@
 只记**用户能感知**的变化与对应实测依据。每条结论的原始数据在
 `docs/findings/PERF_BASELINE.md` / `FINAL_CONFIG.md`。
 
-### release: lock_frame 1.3.3-local.ui（2026-11-25）
+### release: lock_frame 1.3.3（2026-11-25）
 
-发布说明见 `lock_frame/docs/RELEASE_NOTES_1.3.3-local.ui.md`。协议仍 **v34**，
+发布说明见 `lock_frame/docs/RELEASE_NOTES_1.3.3.md`。协议仍 **v34**，
 `fakerFG` API v4；producer / fakerFG / consumer / UI 需一起更新。
 
 - **consumer**：A 跨卡读等待 `fwd[slot]`；C 重建结果按 publication 校验；

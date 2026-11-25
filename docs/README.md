@@ -4,7 +4,7 @@
 
 ## 0. 当前状态（2026-11-25）
 
-**当前发布：lock_frame 1.3.3-local.ui**（共享协议 **v34**）。先看
+**当前发布：lock_frame 1.3.3**（共享协议 **v34**）。先看
 [`../README.md`](../README.md)（项目说明）与
 [`../lock_frame/docs/README.md`](../lock_frame/docs/README.md)（当前技术文档、发布说明、
 审查记录）。本文件第 1–4 节是 0.14 时代的索引，**只作历史参考**。

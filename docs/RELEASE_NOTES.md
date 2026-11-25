@@ -4,7 +4,7 @@
 
 > **存档说明（2026-11-25）**：本文件只保留 0.14 及更早的发布说明。1.x 的发布说明见
 > [`../lock_frame/docs/`](../lock_frame/docs/) 下的 `RELEASE_NOTES_*.md`
-> （最新：[`RELEASE_NOTES_1.3.3-local.ui.md`](../lock_frame/docs/RELEASE_NOTES_1.3.3-local.ui.md)）。
+> （最新：[`RELEASE_NOTES_1.3.3.md`](../lock_frame/docs/RELEASE_NOTES_1.3.3.md)）。
 
 ---
 

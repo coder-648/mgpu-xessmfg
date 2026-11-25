@@ -9,7 +9,7 @@
 | [`RELEASE_NOTES_1.3.0.md`](RELEASE_NOTES_1.3.0.md) | 1.3.0 发布说明（UI 合成 mode 4 定稿，DLSS FG 双卡链路完成） |
 | [`RELEASE_NOTES_1.3.1-local.camvm.md`](RELEASE_NOTES_1.3.1-local.camvm.md) | 1.3.1 本地验证版（XeFG 输入契约：view/proj/rect/extent） |
 | [`RELEASE_NOTES_1.3.2-local.camvm.md`](RELEASE_NOTES_1.3.2-local.camvm.md) | 1.3.2 本地版（100/100，**已回退，勿用**） |
-| [`RELEASE_NOTES_1.3.3-local.ui.md`](RELEASE_NOTES_1.3.3-local.ui.md) | **1.3.3-local.ui 发布说明**（A/C/D/E/F + B/J/R + UI mode 4） |
+| [`RELEASE_NOTES_1.3.3.md`](RELEASE_NOTES_1.3.3.md) | **1.3.3 发布说明**（A/C/D/E/F + B/J/R + UI mode 4） |
 | [`RELEASE_PLAN_2026-11-17.md`](RELEASE_PLAN_2026-11-17.md) | 正式版规划、决策记录、实施状态 |
 | [`PRE_RELEASE_20261117.md`](PRE_RELEASE_20261117.md) | 尝鲜版说明（历史） |
 | [`FG_PIPELINE.md`](FG_PIPELINE.md) | fakerFG 输入/输出管线 |

@@ -11,11 +11,11 @@
 
 | 当前发布 | 共享协议 | 许可证 | 维护状态 |
 |---|---|---|---|
-| **1.3.3-local.ui**（2026-11-25） | **v34** | GPL-3.0 | 核心功能定稿，只修 issue + 加游戏支持 |
+| **1.3.3**（2026-11-25） | **v34** | GPL-3.0 | 核心功能定稿，只修 issue + 加游戏支持 |
 
 上一版是 [`1.3.0`](lock_frame/docs/RELEASE_NOTES_1.3.0.md)（2026-11-24）；1.3.1 / 1.3.2 是
 本地验证与回退，没有单独发布。本版改动与实测见
-[`RELEASE_NOTES_1.3.3-local.ui.md`](lock_frame/docs/RELEASE_NOTES_1.3.3-local.ui.md)。
+[`RELEASE_NOTES_1.3.3.md`](lock_frame/docs/RELEASE_NOTES_1.3.3.md)。
 
 ## 它解决什么问题
 
