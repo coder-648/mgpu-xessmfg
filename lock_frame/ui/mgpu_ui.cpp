@@ -347,6 +347,8 @@ struct State
     // fakerFG 侧输入源：0 DLSSG（推荐）, 1 NVNGX, 2 Upscaler, 3 FSR
     int  fg_input = 0;
     // fakerFG.ini：MV/深度传输比例（100=1:1，150=每维 2/3，200=1/2，400=1/4）
+    // 1.3.2 tried 100/100 + no rebuild; reverted to the 1.3.1 default (150) because the
+    // extra depth bandwidth/codec cost was not offset by a visible edge improvement.
     int  stream_pct = 150;
     bool fg_log = true;        // fakerFG.ini 的 Log
     // v30: the old per-frame multiplier (--interp-cadence, "low-fps adaptation") was
@@ -376,8 +378,7 @@ struct State
     bool no_marker = false;     // --no-marker: no in-frame pairing key (falls back to time/FIFO)
     // --upsample (A/B): rebuild MV+depth from the StreamPercent size to the game's render
     // size on the consumer GPU. XeFG requires both to be the same size, so this is one
-    // all-or-nothing switch. Off by default until a real run decides whether it stays
-    // (docs/design/UPSAMPLE_QUALITY.md).
+    // all-or-nothing switch. Off by default in the UI (the consumer enables it by default).
     bool upsample = false;
     // v30 lossless transport (fakerFG.ini MvCodec/DepthCodec): 0 = off, 1 = forced on,
     // 2 = auto (default: use the codec when this machine can run it, otherwise the old
@@ -386,8 +387,8 @@ struct State
     // 1.2.9: depth codec resolution. MV stays 1:1 unconditionally (it drives the warp and
     // must stay bit-exact); depth only feeds the disocclusion clamp, so it can travel at
     // 150% (2560x1440) - measured on CP2077 4K: depth encode 2.05 -> 0.79 ms (-61%) and
-    // 10.8 -> 5.56 MB per frame with MV untouched (docs/design/PERF_OPT_2026-11-23.md 7.3).
-    // 100 = per-pixel lossless, 150 = default, 200 = smaller still (higher edge risk).
+    // 10.8 -> 5.56 MB per frame with MV untouched. 100 = per-pixel lossless,
+    // 150 = default (1.3.1), 200 = smaller still (higher edge risk).
     int  depth_pct = 150;
     // 1.3.0: UI composition (producer HUDless patch + consumer reconstruction + XeFG
     // mode 4) is a supported default. ON = interpolated frames no longer smear the HUD.
@@ -635,7 +636,7 @@ static const RowDef kRowsFg[] = {
     { ID_FG_MODE, L"固定倍率",        RK_DD   },
     { ID_OUT,     L"输出",            RK_DD   },
     { ID_UPSAMPLE_INFO, L"MV/深度重建", RK_INFO },
-    // 颜色走 WGC；MV/depth 的 StreamPercent 由 fakerFG.ini 决定（默认 150，Wuchang 实测用 100），
+    // 颜色走 WGC；MV/depth 的 StreamPercent 由 fakerFG.ini 决定（默认 150），
     // 消费端把收到的 MV/depth 联合重建到输入画面尺寸。
 };
 static const RowDef kRowsGame[] = {
@@ -706,7 +707,7 @@ static const int kCardCount = (int)(sizeof(kCards) / sizeof(kCards[0]));
 // 固定倍率：2x / 3x / 4x。显示文本按当前面板刷新率动态计算输入帧率。
 // 本版只实现 DLSSG 输入（Streamline tag）。UI 不再暴露输入源选择。
 static const wchar_t* kOptIniProfile[] = { L"精简（发布）", L"完整（测试）" };
-// StreamPercent：100 = 1:1，150 = 每维 2/3，200 = 每维 1/2，400 = 每维 1/4
+// StreamPercent：100 = 1:1，150 = 每维 2/3（默认），200 = 每维 1/2，400 = 每维 1/4
 static const wchar_t* kOptStream[] = {
     L"100%（1:1，最清晰）", L"150%（默认，每维 2/3）", L"200%（每维 1/2）", L"400%（每维 1/4，最省）"
 };
@@ -847,14 +848,14 @@ static int opt_get(Id id)
         for (int i = 0; i < 3; ++i) {
             if (kDepthPct[i] == S().depth_pct) { return i; }
         }
-        return 1;
+        return 1;                    // 150 = default
     }
     case ID_UI_COMPOSE: return S().ui_compose ? 1 : 0;
     case ID_STREAM_PCT: {
         for (int i = 0; i < 4; ++i) {
             if (kStreamPct[i] == S().stream_pct) { return i; }
         }
-        return 1;
+        return 1;                    // 150 = default
     }
     case ID_OUT:     return S().out_mode;
     case ID_SDR:     return S().sdr ? 1 : 0;
@@ -1367,8 +1368,7 @@ static void read_game_ini_state(const std::wstring& ini)
     S().fg_log = (GetPrivateProfileIntW(L"fakerFG", L"Log", 1, ini.c_str()) != 0);
     // 1.2.9: reflect the file's codec resolution / UI composition so the dropdowns show what
     // the game will actually load. Missing keys mean "not configured yet": depth defaults to
-    // 150 (the 1.2.8+ default) and UI composition to ON (the 1.3.0+ default). An older ini
-    // that still carries UiStream=0 stays off.
+    // 150 (the 1.2.8+ / 1.3.1 default) and UI composition to ON (the 1.3.0+ default).
     {
         const int dpct = (int)GetPrivateProfileIntW(L"fakerFG", L"DepthCodecPercent", 150,
                                                     ini.c_str());

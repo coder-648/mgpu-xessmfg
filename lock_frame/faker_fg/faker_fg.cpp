@@ -117,9 +117,18 @@ int api_frame_available() { return (g_seq != g_consumed) ? 1 : 0; }
 
 int api_acquire(MgpuFgFrame* out)
 {
-    if (out == nullptr || out->size < sizeof(MgpuFgFrame)) { return 1; }
+    if (out == nullptr || out->size < 8u) { return 1; }
     lock_record();
-    *out = g_record;
+    // Prefix-safe: v3 appended the camera basis, so a capture built against v2 passes a
+    // smaller `out`. Never write past the size the caller declared, and keep its
+    // size/version so it cannot read a field it does not know.
+    const uint32_t want = out->size;
+    const uint32_t want_ver = out->version;
+    const uint32_t have = static_cast<uint32_t>(sizeof(MgpuFgFrame));
+    const uint32_t n    = (want < have) ? want : have;
+    memcpy(reinterpret_cast<void*>(out), &g_record, n);
+    out->size    = want;
+    out->version = want_ver;
     unlock_record();
     return 0;
 }
@@ -394,6 +403,9 @@ typedef struct GameProfile
     int            mv_state;            // MVResourceBarrier  (0 = ini/code default)
     int            depth_state;         // DepthResourceBarrier
     int            color_state;         // ColorResourceBarrier
+    int            recreate_swapchain;  // FGPreserveSwapChain = false
+    int            override_vsync;      // OverrideVsync = true
+    int            simulate_waitable;   // SimulateWaitableObject = true
 } GameProfile;
 
 // Ported from misc/GameConfigs.cpp, restricted to the settings this module actually has
@@ -420,11 +432,43 @@ static const GameProfile g_profiles[] = {
     { L"observersystemredux.exe",  nullptr, 0u, 0, 0, 0x40, 0, 0x40 },
     // ColorResourceBarrier = NON_PIXEL_SHADER_RESOURCE
     { nullptr, L"avowed",         0u, 0, 0, 0, 0, 0x40 },
-    // FGXeFGForceBorderless = true
-    { L"dead space.exe",           nullptr, 0u, 0, 1, 0, 0, 0 },
+    // FGXeFGForceBorderless = true (and OverrideVsync for Dead Space)
+    { L"dead space.exe",           nullptr, 0u, 0, 1, 0, 0, 0, 0, 1, 0 },
     { L"metroexodus.exe",          nullptr, 0u, 0, 1, 0, 0, 0 },
     // ForceUnrealEngine
     { nullptr, L"ff7rebirth_",    Quirk_ForceUnrealEngine, 0, 0, 0, 0, 0 },
+
+    // ---------------------------------------------------------------- input-side quirks
+    // OptiScaler GameConfigs, restricted to what the XeFG input lane can use.
+    // Endfield / ZZZ: Streamline_Hooks.cpp:487-515, a DLSS-SR tag batch (depth+MV, no
+    // HUDless) must not overwrite the DLSS-G inputs (Unity flipped MVs/Depth).
+    { L"endfield.exe",            nullptr, Quirk_IgnoreTagsWithoutHudless, 0, 0, 0, 0, 0 },
+    { L"zenlesszonezero.exe",     nullptr, Quirk_IgnoreTagsWithoutHudless, 0, 0, 0, 0, 0 },
+    // 007 First Light: Streamline_Inputs.cpp:316-323 drops eValidUntilEvaluate tags.
+    { L"007firstlight.exe",       nullptr, Quirk_IgnoreValidUntilEvaluate, 0, 0, 0, 0, 0 },
+    // Where Winds Meet: ForceFGRenderSizeMVs. The DLSSG lane uses the declaration to
+    // decide activation and resamples MV/depth when their extents differ.
+    { L"wwm.exe",                 nullptr, Quirk_ForceFGRenderSizeMVs, 0, 0, 0, 0, 0 },
+    // The Witcher 3: OptiScaler's CameraMotionFill needs the velocity alpha mask; we only
+    // have RG16, so mark it and warn instead of silently producing unfilled MV.
+    { L"witcher3.exe",            nullptr, Quirk_XeFGCameraMotionFill, 0, 0, 0, 0, 0 },
+    // CONTROL Resonant: SimulateWaitableObject required to avoid a freeze with DLSSG inputs
+    // (GameConfigs.cpp:667-672).
+    { L"controlresonant.exe",     nullptr, 0u, 0, 0, 0, 0, 0, 0, 0, 1 },
+    // Kingdom Come: Deliverance II: DLSSGFrameLatencyWaitable. Request the real swap-chain
+    // waitable (the flag) instead of handing out a second simulated semaphore.
+    { L"kingdomcome.exe",         nullptr, Quirk_DLSSGFrameLatencyWaitable,
+      0, 0, 0, 0, 0, 0, 0, 0 },
+    // FGPreserveSwapChain = false: a second chain for the same window must recreate the
+    // XeFG context (Wuthering Waves' comment says this is what fixes XeFG).
+    { nullptr, L"client",         0u, 0, 0, 0, 0, 0, 1, 0, 0 },
+    { L"ninjagaiden4-steam.exe",  nullptr, 0u, 0, 0, 0, 0, 0, 1, 0, 0 },
+    { L"ninjagaiden4-wingdk.exe", nullptr, 0u, 0, 0, 0, 0, 0, 1, 0, 0 },
+    { L"doa6lr.exe",              nullptr, 0u, 0, 0, 0, 0, 0, 1, 0, 0 },
+    { L"talos2-win64-shipping.exe", nullptr, 0u, 0, 0, 0, 0, 0, 1, 0, 0 },
+    { L"rdr.exe",                 nullptr, Quirk_NoFSRFGFirstSwapchain, 0, 0, 0, 0, 0, 1, 0, 0 },
+    { L"playrdr.exe",             nullptr, Quirk_NoFSRFGFirstSwapchain, 0, 0, 0, 0, 0, 1, 0, 0 },
+
     { nullptr, 0u, 0u, 0, 0, 0, 0, 0 },
 };
 
@@ -480,6 +524,9 @@ Config& cfg()
     int profile_mv_state = 0;
     int profile_depth_state = 0;
     int profile_color_state = 0;
+    int profile_recreate = 0;
+    int profile_vsync = 0;
+    int profile_sim_waitable = 0;
     for (const GameProfile* p = g_profiles; p->exe != nullptr || p->ue != nullptr; ++p) {
         if (!exe_matches(p->exe) && !ue_matches(p->ue)) { continue; }
         g_quirks |= p->quirks;
@@ -488,7 +535,14 @@ Config& cfg()
         profile_mv_state    = p->mv_state;
         profile_depth_state = p->depth_state;
         profile_color_state = p->color_state;
+        profile_recreate    = p->recreate_swapchain;
+        profile_vsync       = p->override_vsync;
+        profile_sim_waitable = p->simulate_waitable;
         break;
+    }
+    if (has_game_quirk(Quirk_XeFGCameraMotionFill)) {
+        logf("cfg: XeFGCameraMotionFill is not implemented (RG16 transport has no alpha mask)"
+             " - camera-only pixels will not get a filled motion vector\n");
     }
 
     wchar_t path[MAX_PATH]{};
@@ -532,6 +586,8 @@ Config& cfg()
     g_cfg.rect_w         = ini_int(path, L"RectWidth", 0);
     g_cfg.rect_h         = ini_int(path, L"RectHeight", 0);
     g_cfg.tag_ui         = ini_int(path, L"TagUi", 0);
+    g_cfg.hudless_first  = ini_int(path, L"FGOnlyAcceptFirstHudless", 0);
+    g_cfg.strict_frame_token = ini_int(path, L"StrictFrameToken", 1);
     g_cfg.strip_dlssg    = ini_int(path, L"StripDlssGPlugin", 0);
     g_cfg.fake_sl_player = ini_int(path, L"FakeSlDlssg", 1);
     g_cfg.ngx_core_proxy = ini_int(path, L"NgxCoreProxy", 0);
@@ -552,7 +608,9 @@ Config& cfg()
     g_cfg.color_state = ini_int(path, L"ColorState", profile_color_state);
     g_cfg.force_borderless = ini_int(path, L"ForceBorderless", profile_borderless);
     g_cfg.skip_first_frames = ini_int(path, L"SkipFirstFrames", profile_skip);
-    g_cfg.simulate_waitable = ini_int(path, L"SimulateWaitableObject", 0);
+    g_cfg.simulate_waitable = ini_int(path, L"SimulateWaitableObject", profile_sim_waitable);
+    g_cfg.recreate_swapchain = ini_int(path, L"RecreateSwapChain", profile_recreate);
+    g_cfg.override_vsync = ini_int(path, L"OverrideVsync", profile_vsync);
     {
         wchar_t v[32]{};
         GetPrivateProfileStringW(L"fakerFG", L"CameraNear", L"0.1", v, 32, path);

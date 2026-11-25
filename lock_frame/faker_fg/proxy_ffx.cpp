@@ -104,6 +104,7 @@ void capture_prepare(const ffxDispatchDescFrameGenerationPrepare* p)
 
 
     f.cmd_list = p->commandList;
+    for (int i = 0; i < MGPU_FG_STREAM_COUNT; ++i) { f.stream_cmd[i] = p->commandList; }
     f.mode = api_mode();
     f.frame_qpc_ms = now_qpc_ms();
     f.declared_frames = 1;
@@ -221,6 +222,7 @@ void capture_legacy(const FfxFrameInterpolationDispatchDescription* p)
 
 
     f.cmd_list = p->commandList;
+    for (int i = 0; i < MGPU_FG_STREAM_COUNT; ++i) { f.stream_cmd[i] = p->commandList; }
     f.mode = api_mode();
     f.frame_qpc_ms = now_qpc_ms();
     f.declared_frames = 1;

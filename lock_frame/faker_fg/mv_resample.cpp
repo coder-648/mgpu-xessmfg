@@ -153,14 +153,26 @@ bool mvr_ensure_output(ID3D12Device* device, MvrOut& out, UINT w, UINT h)
 
 void mv_resample_set_device(ID3D12Device* device) { g_mvr_device = device; }
 
-bool mv_resample_frame(ID3D12CommandList* list, MgpuFgFrame* f)
+bool mv_resample_frame(ID3D12CommandList* list, MgpuFgFrame* f, bool force)
 {
-    if (cfg().mv_resample == 0 || list == nullptr || f == nullptr || g_mvr_device == nullptr) {
+    if ((cfg().mv_resample == 0 && !force) || list == nullptr || f == nullptr ||
+        g_mvr_device == nullptr) {
         return false;
     }
     MgpuFgResource& mv = f->stream[MGPU_FG_STREAM_MV];
     MgpuFgResource& dp = f->stream[MGPU_FG_STREAM_DEPTH];
     if (mv.resource == nullptr || dp.width < 8 || dp.height < 8) { return false; }
+    // The pass creates its SRV as R16G16_FLOAT; another format would be an invalid view.
+    // R16G16_TYPELESS is accepted and viewed as R16G16_FLOAT (the same memory layout).
+    if (mv.format != static_cast<uint32_t>(DXGI_FORMAT_R16G16_FLOAT) &&
+        mv.format != static_cast<uint32_t>(DXGI_FORMAT_R16G16_TYPELESS)) {
+        static bool told_fmt = false;
+        if (!told_fmt) {
+            told_fmt = true;
+            logf("mvr: MV format %u is not R16G16_FLOAT - cannot resample\n", mv.format);
+        }
+        return false;
+    }
     if (mv.width == dp.width && mv.height == dp.height) { return false; }   // already render-sized
     const UINT sw = mv.width, sh = mv.height;
 
@@ -222,6 +234,7 @@ bool mv_resample_frame(ID3D12CommandList* list, MgpuFgFrame* f)
     mv.format   = static_cast<uint32_t>(DXGI_FORMAT_R16G16_FLOAT);
     mv.state    = static_cast<uint32_t>(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     mv.validity = MGPU_FG_RV_UNTIL_PRESENT;
+    f->stream_cmd[MGPU_FG_STREAM_MV] = list;   // the pass that produced it
 
     static bool told = false;
     if (!told) {

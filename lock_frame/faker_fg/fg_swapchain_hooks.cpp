@@ -183,7 +183,8 @@ HRESULT STDMETHODCALLTYPE hk_present(IDXGISwapChain* This, UINT sync, UINT flags
         return S_OK;
     }
     xefg_before_present((flags & DXGI_PRESENT_TEST) == 0);
-    const HRESULT hr = o_present(This, sync, flags);
+    const UINT sync_eff = cfg().override_vsync ? 0u : sync;
+    const HRESULT hr = o_present(This, sync_eff, flags);
     // v22: present_ring_commit() removed (the publication is the identity).
     release_waitable();
     xefg_present_result(hr);
@@ -202,7 +203,8 @@ HRESULT STDMETHODCALLTYPE hk_present1(IDXGISwapChain* This, UINT sync, UINT flag
         return S_OK;
     }
     xefg_before_present((flags & DXGI_PRESENT_TEST) == 0);
-    const HRESULT hr = o_present1(This, sync, flags, params);
+    const UINT sync_eff = cfg().override_vsync ? 0u : sync;
+    const HRESULT hr = o_present1(This, sync_eff, flags, params);
     // v22: present_ring_commit() removed (the publication is the identity).
     release_waitable();
     xefg_present_result(hr);
@@ -319,6 +321,8 @@ HANDLE STDMETHODCALLTYPE hk_get_waitable(IDXGISwapChain* This)
 }
 
 } // namespace
+
+void fg_reset_swapchain_hook() { g_hooked_chain = nullptr; }
 
 // ---------------------------------------------------------------- install
 // FGHooks::HookFGSwapchain(): the same slots, detoured with MinHook instead of Detours.

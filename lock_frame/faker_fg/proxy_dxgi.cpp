@@ -314,6 +314,18 @@ HRESULT STDMETHODCALLTYPE hook_create_swapchain_for_hwnd(
         return original(self, device, hwnd, desc, fs, restrict_to, out);
     }
 
+    // P2-F: if the window that owned the FG chain was destroyed, the next real chain may
+    // become the new owner. Simultaneous second windows still pass through below (one
+    // XeFG context/facade per process).
+    if (g_took_over && g_owner_hwnd != nullptr && !IsWindow(g_owner_hwnd)) {
+        logf("dxgi: previous FG owner window %p is gone - allowing a new owner\n",
+             (void*)g_owner_hwnd);
+        if (!xefg_prepare_recreate()) {
+            return original(self, device, hwnd, desc, fs, restrict_to, out);
+        }
+        g_took_over = false;
+    }
+
     // IsOtherWindowWhileFGSwapchainExists (FG_Hooks.cpp:177-186, :312-313): only ONE window
     // may own the FG chain. A second window (launcher, editor, overlay helper) keeps its own
     // chain - OptiScaler answers E_NOINTERFACE there; passing through has the same effect and
@@ -328,7 +340,20 @@ HRESULT STDMETHODCALLTYPE hook_create_swapchain_for_hwnd(
         return original(self, device, hwnd, desc, fs, restrict_to, out);
     }
 
-    if (g_took_over) {
+    if (g_took_over && cfg().recreate_swapchain && hwnd != nullptr &&
+        hwnd == g_owner_hwnd) {
+        // FGPreserveSwapChain=false (Wuthering Waves / NINJA GAIDEN 4 / DoA6 / Talos 2 /
+        // RDR2): OptiScaler releases the old FG swap chain and builds a new one. Do the
+        // same, then fall through to the normal create path with a fresh XeFG context.
+        if (xefg_prepare_recreate()) {
+            logf("dxgi: FGPreserveSwapChain=false - recreating the XeFG chain for the same window\n");
+            g_took_over = false;
+        } else {
+            logf("dxgi: recreate requested but the old XeFG context is still in use -"
+                 " passing the new chain through\n");
+            return original(self, device, hwnd, desc, fs, restrict_to, out);
+        }
+    } else if (g_took_over) {
         // XeFG_Dx12::CreateSwapchain's FGPreserveSwapChain branch: a second chain for the
         // SAME window gets the chain we already own (ResizeBuffers + AddRef), instead of a
         // second real chain the title would then render into - which is how a title that
@@ -394,6 +419,18 @@ HRESULT STDMETHODCALLTYPE hook_create_swapchain_for_hwnd(
         borderless.Scaling = DXGI_SCALING_STRETCH;
         logf("dxgi: XeFG needs borderless - FG chain created windowed (title asked"
              " fullscreen)\n");
+    }
+
+    // DLSSGFrameLatencyWaitable (KCD2): create the FG chain with the real waitable flag.
+    // OptiScaler sets this on the DLSS-G swap-chain description (DLSSG_Dx12.cpp:52-55),
+    // so the game's GetFrameLatencyWaitableObject is not a second simulated semaphore.
+    DXGI_SWAP_CHAIN_DESC1 latency_desc{};
+    if (has_game_quirk(Quirk_DLSSGFrameLatencyWaitable) &&
+        (use_desc->Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) == 0) {
+        latency_desc = *use_desc;
+        latency_desc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        use_desc = &latency_desc;
+        logf("dxgi: DLSSGFrameLatencyWaitable - FG chain has FRAME_LATENCY_WAITABLE_OBJECT\n");
     }
 
     IDXGISwapChain1* chain = nullptr;

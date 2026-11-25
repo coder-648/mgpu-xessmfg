@@ -44,6 +44,7 @@ IDXGISwapChain*          g_chain = nullptr;
 unsigned                 g_max_interp = 1;
 unsigned                 g_width = 0;
 unsigned                 g_height = 0;
+uint32_t                 g_chain_fmt = 0;       // DXGI_FORMAT of the XeFG chain
 bool                     g_generate = false;   // XeFG generation actually on
 bool                     g_want_generate = false; // FgOutput=XeFG and not passthrough
 std::atomic<unsigned>    g_native_pending{ 0 };   // one Present per native publication
@@ -65,6 +66,7 @@ HWND                     g_owner_hwnd = nullptr;
 MgpuFgFrame              g_last_frame{};             // the frame the tags describe (for the present path)
 bool                     g_tags_had_depth = false;  // what the last xefg_tag() delivered
 bool                     g_tags_had_mv = false;
+bool                     g_tags_size_ok = true;    // MV/depth resourceSize match (SDK rule)
 bool                     g_inputs_logged = false;
 bool                     g_lane_logged = false;
 uint32_t                 g_last_tagged_id = 0;       // the frame the tags describe
@@ -84,6 +86,12 @@ float                    g_cam_up[3]{};
 float                    g_cam_forward[3]{};
 float                    g_cam_pos[3]{};
 bool                     g_cam_known = false;
+// P2-E: contexts retired by FGPreserveSwapChain=false. The game may still hold the old
+// facade/chain; destroying the context immediately is a use-after-free hazard. Keep a
+// bounded retire list alive until backend_shutdown (a leak only for the rare title that
+// recreates its chain; safer than returning from Present through freed memory).
+xefg_swapchain_handle_t  g_retired_ctx[8]{};
+unsigned                 g_retired_n = 0;
 bool                     g_waiting_new_frame_data = false;   // _waitingNewFrameData
 uint32_t                 g_fg_frame_present_id = 0;         // _fgFramePresentId
 uint32_t                 g_last_fg_frame_present_id = 0;    // _lastFGFramePresentId
@@ -148,16 +156,20 @@ void log_cb(const char* message, xefg_swapchain_logging_level_t level, void*)
 // Note what is *not* set: no pResource (it is XeFG's own backbuffer) and no state - this
 // tag only declares which rectangle of that backbuffer gets interpolated. The Upscaler
 // input lane skips it, because there the interpolation rect is the full display size.
-bool tag_backbuffer(uint32_t frame_id, ID3D12CommandList* list)
+// Interpolation rectangle. XeFG requires HUDless/UI/back buffer to have the same
+// resourceSize (xess_fg_developer_guide_english.md:796-802). When the title's HUDless is
+// smaller than the chain, OptiScaler uses the HUDless extent and centres it inside the
+// back buffer (XeFG_Dx12.cpp:943-991); the same rule is applied here.
+bool tag_backbuffer(uint32_t frame_id, ID3D12CommandList* list, UINT w, UINT h,
+                    UINT left, UINT top)
 {
     if (g_ctx == nullptr || g_xapi.D3D12TagFrameResource == nullptr) { return false; }
 
     xefg_swapchain_d3d12_resource_data_t d{};
     d.type         = XEFG_SWAPCHAIN_RES_BACKBUFFER;
     d.validity     = XEFG_SWAPCHAIN_RV_UNTIL_NEXT_PRESENT;
-    d.resourceBase = { static_cast<uint32_t>(cfg().rect_left), static_cast<uint32_t>(cfg().rect_top) };
-    d.resourceSize = { (cfg().rect_w > 0) ? static_cast<uint32_t>(cfg().rect_w) : g_width,
-                       (cfg().rect_h > 0) ? static_cast<uint32_t>(cfg().rect_h) : g_height };
+    d.resourceBase = { left, top };
+    d.resourceSize = { w, h };
     d.pResource    = nullptr;
 
     // intel/xess#45: with an UNTIL_NEXT_PRESENT tag the library wants a non-null pointer.
@@ -204,6 +216,18 @@ bool tag_one(xefg_swapchain_resource_type_t type, ID3D12Resource* res,
              idx, w, h, declared_state, result_name(r), static_cast<int>(r));
     }
     return r == XEFG_SWAPCHAIN_RESULT_SUCCESS;
+}
+
+// OptiScaler's Sl_Inputs stores cmdList per resource and XeFG copies a ValidNow resource
+// on that list. Use the tag's own list when it has one; fall back to the list the caller
+// passed (Evaluate / present) for UntilPresent resources and old records.
+ID3D12CommandList* resource_cmd(const MgpuFgResource& r, void* per_resource_cmd,
+                                ID3D12CommandList* fallback)
+{
+    if (r.validity == MGPU_FG_RV_ONLY_NOW && per_resource_cmd != nullptr) {
+        return static_cast<ID3D12CommandList*>(per_resource_cmd);
+    }
+    return fallback;
 }
 
 } // namespace
@@ -896,11 +920,15 @@ void before_present(void*)
     // back buffer onto the window. A frozen framesPresented while our own present counter
     // keeps moving is exactly the black-screen shape, so it must be visible in the log.
     // It runs in both states on purpose: while generating, frameGenResult carries the
-    // library's own rejection code (-12 MISMATCH_INPUT_RESOURCES and friends).
-    if (g_xapi.GetLastPresentStatus != nullptr) {
+    // library's own rejection code (-12 MISMATCH_INPUT_RESOURCES and friends). Skip it in
+    // the Capture lane: local XeFG is only watching the title's chain there and its 1X
+    // status is expected, not diagnostic.
+    if (cfg().fg_output == static_cast<int>(FgOutputSink::XeFG) &&
+        g_xapi.GetLastPresentStatus != nullptr) {
         static unsigned polls = 0, seen = 0, no_input = 0, last_harvests = 0;
         ++polls;
-        if (polls % 120 == 0) {
+        if (cfg().fg_input == static_cast<int>(FgInputSource::Upscaler) &&
+            polls % 120 == 0) {
             const unsigned h = sr_harvest_count();
             logf("xefg: upscaler Evaluates %u in the last 120 presents (total %u)\n",
                  h - last_harvests, h);
@@ -919,7 +947,8 @@ void before_present(void*)
             // The lane is configured but nothing ever arrived: with FgInput=Upscaler that
             // means the title never evaluated DLSS-SR (DLSS off in the menu), not a broken
             // link - say so once instead of leaving the reader to infer it.
-            if (!sr_lane_ready() && no_input < 2) {
+            if (cfg().fg_input == static_cast<int>(FgInputSource::Upscaler) &&
+                !sr_lane_ready() && no_input < 2) {
                 ++no_input;
                 logf("xefg: FgInput=Upscaler but no upscaler Evaluate has been seen - turn"
                      " DLSS (not TAA/TSR) on in the game; FG stays at 1X until then\n");
@@ -1108,6 +1137,7 @@ bool xefg_start(ID3D12Device* device, ID3D12CommandQueue* queue, IDXGIFactory2* 
     g_chain_ready = true;
     g_width  = desc->Width;
     g_height = desc->Height;
+    g_chain_fmt = static_cast<uint32_t>(desc->Format);
     g_owner_hwnd = hwnd;
 
     // No SetEnabled() here: a new XeFG context starts with generation off until the app
@@ -1271,6 +1301,35 @@ void present_failed(long hr, void*)
     xefg_enable(false);
 }
 
+bool xefg_prepare_recreate()
+{
+    if (g_chain == nullptr && g_ctx == nullptr) { return true; }
+    // Do NOT Destroy(g_ctx): the game may still Present through the old facade/chain.
+    // Retire it until shutdown and build the new context; the library allows a second
+    // context for the new chain. (See g_retired_ctx.)
+    if (g_ctx != nullptr) {
+        if (g_retired_n < 8) {
+            g_retired_ctx[g_retired_n++] = g_ctx;
+            logf("xefg: FGPreserveSwapChain=false - retired old context (kept alive until"
+                 " shutdown, %u total); creating a new chain\n", g_retired_n);
+        } else {
+            logf("xefg: recreate: retire list full - refusing to drop an old context\n");
+            return false;
+        }
+    }
+    g_ctx = nullptr;
+    g_chain = nullptr;
+    g_chain_api = nullptr;
+    g_facade = nullptr;       // the game still owns the old facade object
+    fg_reset_swapchain_hook();
+    g_chain_ready = false;
+    g_owner_hwnd = nullptr;
+    g_chain_fmt = 0;
+    g_generate = false;
+    return true;
+}
+
+
 // FGPreserveSwapChain: hand the same window the chain we already own. XeFG has no second
 // chain, and a title that re-creates its chain (settings change, mode switch) would
 // otherwise render into a chain nobody presents.
@@ -1288,6 +1347,7 @@ IDXGISwapChain1* xefg_owned_chain(HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc)
         if (SUCCEEDED(hr)) {
             g_width  = desc->Width;
             g_height = desc->Height;
+            g_chain_fmt = static_cast<uint32_t>(desc->Format);
         }
     }
     g_chain_api->AddRef();
@@ -1299,7 +1359,7 @@ IDXGISwapChain1* xefg_owned_chain(HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc)
 
 // OptiScaler's Dispatch() gate: both Depth and Velocity must be ready for the frame
 // that is about to be presented (XeFG_Dx12::Dispatch lines 696-699).
-bool xefg_tags_complete() { return g_tags_had_depth && g_tags_had_mv; }
+bool xefg_tags_complete() { return g_tags_had_depth && g_tags_had_mv && g_tags_size_ok; }
 
 // xefg_swapchain_frame_constant_data_t for the frame being presented. OptiScaler sends
 // this from Dispatch() (TagFrameConstants) right before SetPresentId; `frameRenderTime`
@@ -1322,12 +1382,25 @@ void tag_frame_constants(const MgpuFgFrame& f, uint32_t frame_id)
     xefg_swapchain_frame_constant_data_t cd{};
 
     // viewMatrix, exactly as above (zero when the title declared no camera position).
-    if (g_cam_known && (g_cam_pos[0] != 0.0f || g_cam_pos[1] != 0.0f || g_cam_pos[2] != 0.0f)) {
+    // Prefer the frame's own record (Streamline fills it; the NGX DLSSG lane sets it from
+    // CameraPos/Right/Up/Fwd). Fall back to the last sl::Constants camera for lanes whose
+    // record does not carry a basis (e.g. the upscaler lane).
+    const bool rec_cam =
+        (f.camera_right[0] != 0.0f || f.camera_right[1] != 0.0f || f.camera_right[2] != 0.0f) &&
+        (f.camera_up[0] != 0.0f || f.camera_up[1] != 0.0f || f.camera_up[2] != 0.0f) &&
+        (f.camera_forward[0] != 0.0f || f.camera_forward[1] != 0.0f ||
+         f.camera_forward[2] != 0.0f);
+    const float* cam_r = rec_cam ? f.camera_right : g_cam_right;
+    const float* cam_u = rec_cam ? f.camera_up : g_cam_up;
+    const float* cam_f = rec_cam ? f.camera_forward : g_cam_forward;
+    const float* cam_p = rec_cam ? f.camera_pos : g_cam_pos;
+    const bool cam_known = rec_cam || g_cam_known;
+    if (cam_known && (cam_p[0] != 0.0f || cam_p[1] != 0.0f || cam_p[2] != 0.0f)) {
         using namespace DirectX;
-        const XMVECTOR right   = XMLoadFloat3(reinterpret_cast<const XMFLOAT3*>(g_cam_right));
-        const XMVECTOR up      = XMLoadFloat3(reinterpret_cast<const XMFLOAT3*>(g_cam_up));
-        const XMVECTOR forward = XMLoadFloat3(reinterpret_cast<const XMFLOAT3*>(g_cam_forward));
-        const XMVECTOR pos     = XMLoadFloat3(reinterpret_cast<const XMFLOAT3*>(g_cam_pos));
+        const XMVECTOR right   = XMLoadFloat3(reinterpret_cast<const XMFLOAT3*>(cam_r));
+        const XMVECTOR up      = XMLoadFloat3(reinterpret_cast<const XMFLOAT3*>(cam_u));
+        const XMVECTOR forward = XMLoadFloat3(reinterpret_cast<const XMFLOAT3*>(cam_f));
+        const XMVECTOR pos     = XMLoadFloat3(reinterpret_cast<const XMFLOAT3*>(cam_p));
 
         const float x = -XMVectorGetX(XMVector3Dot(pos, right));
         const float y = -XMVectorGetX(XMVector3Dot(pos, up));
@@ -1344,29 +1417,83 @@ void tag_frame_constants(const MgpuFgFrame& f, uint32_t frame_id)
 
     float near_plane = f.camera_near;
     float far_plane  = f.camera_far;
-    // Sl_Inputs: "A CameraFar value of zero indicates an infinite far plane."
-    bool infinite = false;
+    // Sl_Inputs: "A CameraFar value of zero indicates an infinite far plane." The producer
+    // now also publishes the *derived* infinity as a real +inf, so both spellings mean the
+    // same thing here.
+    bool infinite = !std::isfinite(far_plane) || (near_plane != 0.0f && far_plane == 0.0f);
     if (near_plane != 0.0f && far_plane == 0.0f) {
-        infinite   = true;
         far_plane  = near_plane + 1.0f;
+    }
+    if (!std::isfinite(far_plane)) {
+        far_plane = (near_plane > 0.0f) ? near_plane + 1.0f : 1.0f;
     }
     if (cfg().depth_inverted) { std::swap(near_plane, far_plane); }
     // Dispatch(): `_infiniteDepth` swaps the infinity onto whichever side the swap left it.
     if (infinite && far_plane > near_plane) { far_plane = std::numeric_limits<float>::infinity(); }
     else if (infinite && near_plane > far_plane) { near_plane = std::numeric_limits<float>::infinity(); }
 
+    // OptiScaler's Unreal rule (XeFG_Inputs_Dx12.cpp:464-478): Unreal's XeFG integration
+    // sends an infinite far plane, but its own DLSSG integration sends 75000 instead.
+    // Apply the finite form with the same near plane; the limit form is mathematically
+    // equivalent for XeFG's purposes.
+    const bool ue_far = sl_engine_unreal() || has_game_quirk(Quirk_ForceUnrealEngine);
+    if (infinite && ue_far) {
+        const float zn = std::min(near_plane, far_plane);
+        near_plane = zn;
+        far_plane  = 75000.0f;
+        infinite   = false;
+        static bool told_ue = false;
+        if (!told_ue) {
+            told_ue = true;
+            logf("xefg: Unreal far plane -> 75000 (near %.3f)\n", zn);
+        }
+    }
+
     if (near_plane > 0.0f && far_plane > 0.0f && f.camera_fov_y != 0.0f && f.aspect != 0.0f) {
         using namespace DirectX;
         if (std::abs(near_plane - far_plane) < 1e-5f) { far_plane += 1.0f; }
-        const XMMATRIX projection = XMMatrixPerspectiveFovLH(f.camera_fov_y, f.aspect,
-                                                             near_plane, far_plane);
-        memcpy(cd.projectionMatrix, projection.r, sizeof(cd.projectionMatrix));
+        if (infinite) {
+            // DirectXMath's XMMatrixPerspectiveFovLH computes far/(far-near) and would turn
+            // an infinite far plane into inf/inf = NaN. Use the limit form: the same matrix
+            // XeFG_Dx12 builds for a finite far, with m[10]=1 and m[14]=-near.
+            const float fl = 1.0f / tanf(f.camera_fov_y * 0.5f);
+            memset(cd.projectionMatrix, 0, sizeof(cd.projectionMatrix));
+            cd.projectionMatrix[0]  = fl / f.aspect;
+            cd.projectionMatrix[5]  = fl;
+            cd.projectionMatrix[10] = 1.0f;
+            cd.projectionMatrix[11] = 1.0f;
+            const float zn = std::isfinite(near_plane) ? near_plane
+                             : (std::isfinite(far_plane) ? far_plane : 1.0f);
+            cd.projectionMatrix[14] = -zn;
+        } else {
+            const XMMATRIX projection = XMMatrixPerspectiveFovLH(f.camera_fov_y, f.aspect,
+                                                                 near_plane, far_plane);
+            memcpy(cd.projectionMatrix, projection.r, sizeof(cd.projectionMatrix));
+        }
     } else {
         static bool warned = false;
         if (!warned) {
             warned = true;
             logf("xefg: can't calculate projectionMatrix (near=%.3f far=%.3f fov=%.3f aspect=%.3f)"
-                 " - camera values missing\n", near_plane, far_plane, f.camera_fov_y, f.aspect);
+                 " - using a default LH matrix (XeFG requires one)\n",
+                 near_plane, far_plane, f.camera_fov_y, f.aspect);
+        }
+        // XeFG requires view/projection matrices. OptiScaler leaves the struct zeroed when
+        // the camera values are unusable; a default LH projection is the safe fallback.
+        using namespace DirectX;
+        const float fov = (f.camera_fov_y > 0.05f && f.camera_fov_y < 2.5f)
+                              ? f.camera_fov_y
+                              : (60.0f * 3.14159265358979f / 180.0f);
+        float aspect = f.aspect;
+        if (!(aspect > 0.1f && aspect < 10.0f)) {
+            aspect = (g_height > 0) ? static_cast<float>(g_width) / static_cast<float>(g_height)
+                                    : (16.0f / 9.0f);
+        }
+        const XMMATRIX projection = XMMatrixPerspectiveFovLH(fov, aspect, 0.1f, 10000.0f);
+        memcpy(cd.projectionMatrix, projection.r, sizeof(cd.projectionMatrix));
+        if (cd.viewMatrix[0] == 0.0f && cd.viewMatrix[5] == 0.0f &&
+            cd.viewMatrix[10] == 0.0f) {
+            cd.viewMatrix[0] = cd.viewMatrix[5] = cd.viewMatrix[10] = cd.viewMatrix[15] = 1.0f;
         }
     }
 
@@ -1430,6 +1557,7 @@ void tag_begin(uint32_t frame_id, const MgpuFgFrame& f)
     g_last_tagged_id = frame_id;
     g_last_frame = f;          // the present path sends its constants (Dispatch order)
     g_tags_had_mv = false;
+    g_tags_size_ok = true;
 
     // IFGFeature_Dx12::NewFrame() (framegen/IFGFeature_Dx12.cpp:340): every *dispatched*
     // frame refreshes _lastFGFramePresentId and clears _waitingNewFrameData (re-activate).
@@ -1443,8 +1571,10 @@ void tag_begin(uint32_t frame_id, const MgpuFgFrame& f)
 
 uint32_t state_of(const MgpuFgResource& r)
 {
-    // Verbatim: `res.state = (D3D12_RESOURCE_STATES) tag.resource->state` - UINT_MAX when
-    // the title declared none, and the library sees exactly that.
+    // The title's declaration, except for the "not declared" sentinel: XeFG requires a
+    // valid D3D12_RESOURCE_STATES, and 0xFFFFFFFF is not one. COMMON is the neutral value
+    // that lets D3D12 promote/demote for the copy.
+    if (r.state == 0xFFFFFFFFu) { return static_cast<uint32_t>(D3D12_RESOURCE_STATE_COMMON); }
     return r.state;
 }
 
@@ -1460,10 +1590,11 @@ bool until_present(const MgpuFgResource& r)
 //   * from the present path it is nullptr and the caller has set UntilPresent: only that
 //     validity is legal once the title closed/executed the list (measured: handing it over
 //     there crashes).
-// MV + depth on `tag_list`, with the sizes OptiScaler's Upscaler_Inputs_Dx12 uses (see
-// below). Returns false when a tag the library actually received failed; XeFG_Dx12 then
-// does `UpdateTarget(); Deactivate();` (XeFG_Dx12.cpp:1639-1647), which the caller mirrors.
-bool tag_inputs(ID3D12CommandList* tag_list, uint32_t frame_id, const MgpuFgFrame& f,
+// MV + depth on `tag_list`. Returns false when a tag the library actually received failed;
+// XeFG_Dx12 then does `UpdateTarget(); Deactivate();` (XeFG_Dx12.cpp:1639-1647), which the
+// caller mirrors. Sizes come from each record stream (the title's own tag extent), not from
+// a config guess; mismatched MV/depth are resampled on the open list when possible.
+bool tag_inputs(ID3D12CommandList* tag_list, uint32_t frame_id, MgpuFgFrame& f,
                 bool upscaler_lane)
 {
     // Inputs. The FG contract declares these resources as readable for this pass, and
@@ -1476,24 +1607,54 @@ bool tag_inputs(ID3D12CommandList* tag_list, uint32_t frame_id, const MgpuFgFram
     const unsigned ow = (f.output_w >= 8) ? f.output_w : g_width;
     const unsigned oh = (f.output_h >= 8) ? f.output_h : g_height;
 
-    // Sizes, verbatim from OptiScaler's Upscaler_Inputs_Dx12.cpp:
-    //     velocity: LowResMV() ? RenderWidth/Height : TargetWidth/Height   (lines 167-177)
-    //     depth:    RenderWidth/Height                                     (lines 219-221)
-    // `LowResMV` is the negation of our HighResMv (IFeature.cpp:113 saves it that way:
-    // FGXeFGHighResMV = !_initFlags.LowResMV), and both numbers come from the upscaler's
-    // parameter block (IFeature.cpp:120-165), not from the resource descriptions.
-    const bool mv_at_render = (cfg().high_res_mv == 0) || cfg().mv_resample != 0;
-    const unsigned mv_w = mv_at_render ? rw : ow;
-    const unsigned mv_h = mv_at_render ? rh : oh;
+    // XeFG requires motion vectors and depth to have the same resourceSize
+    // (xess_fg_developer_guide_english.md:677/798/853). Titles in the field differ here:
+    // UE5's PBZ has MV 2562x1441 and depth 1704x960, Wuchang hands full-res MVs while depth
+    // is render-sized. When the extents differ, rebuild the MV field onto the depth grid on
+    // the title's open command list (the same pass OptiScaler's MvResample path uses).
+    // The record's own stream extents are authoritative; cfg().high_res_mv only decides the
+    // upscaler lane's create flag and must not override a resource size here.
+    UINT mv_w = f.stream[MGPU_FG_STREAM_MV].width;
+    UINT mv_h = f.stream[MGPU_FG_STREAM_MV].height;
+    UINT dp_w = f.stream[MGPU_FG_STREAM_DEPTH].width;
+    UINT dp_h = f.stream[MGPU_FG_STREAM_DEPTH].height;
+    if (mv_w < 8 || mv_h < 8) { mv_w = rw; mv_h = rh; }
+    if (dp_w < 8 || dp_h < 8) { dp_w = rw; dp_h = rh; }
+    const UINT mv_src_w = mv_w, mv_src_h = mv_h;
+    ID3D12CommandList* mv_tag_list =
+        resource_cmd(f.stream[MGPU_FG_STREAM_MV], f.stream_cmd[MGPU_FG_STREAM_MV], tag_list);
+    if (f.stream[MGPU_FG_STREAM_MV].resource != nullptr &&
+        f.stream[MGPU_FG_STREAM_DEPTH].resource != nullptr &&
+        (mv_w != dp_w || mv_h != dp_h) && mv_tag_list != nullptr &&
+        (!upscaler_lane || cfg().mv_resample != 0)) {
+        if (mv_resample_frame(mv_tag_list, &f, true)) {
+            mv_w = f.stream[MGPU_FG_STREAM_MV].width;
+            mv_h = f.stream[MGPU_FG_STREAM_MV].height;
+        }
+    }
+    g_tags_size_ok = (f.stream[MGPU_FG_STREAM_MV].resource == nullptr ||
+                      f.stream[MGPU_FG_STREAM_DEPTH].resource == nullptr ||
+                      (mv_w == dp_w && mv_h == dp_h));
+    if (!g_tags_size_ok) {
+        static bool told_mismatch = false;
+        if (!told_mismatch) {
+            told_mismatch = true;
+            logf("xefg: MV %ux%u != depth %ux%u and MvResample did not run - XeFG"
+                 " rejects mismatched resourceSize; generation stays at 1X\n",
+                 mv_w, mv_h, dp_w, dp_h);
+        }
+    }
     {
         static bool told_sizes = false;
         if (!told_sizes) {
             told_sizes = true;
             logf("xefg: tag sizes %s: mv %ux%u (resource %ux%u) depth %ux%u target %ux%u"
-                 " high_res_mv=%d\n",
+                 " high_res_mv=%d resampled=%d\n",
                  upscaler_lane ? "Upscaler" : "DLSSG",
                  mv_w, mv_h, f.stream[MGPU_FG_STREAM_MV].width,
-                 f.stream[MGPU_FG_STREAM_MV].height, rw, rh, ow, oh, cfg().high_res_mv);
+                 f.stream[MGPU_FG_STREAM_MV].height, dp_w, dp_h, ow, oh,
+                 cfg().high_res_mv,
+                 (mv_w != mv_src_w || mv_h != mv_src_h) ? 1 : 0);
         }
     }
 
@@ -1502,7 +1663,9 @@ bool tag_inputs(ID3D12CommandList* tag_list, uint32_t frame_id, const MgpuFgFram
     g_tags_had_depth = false;
     g_tags_had_mv = tag_one(XEFG_SWAPCHAIN_RES_MOTION_VECTOR,
                             static_cast<ID3D12Resource*>(f.stream[MGPU_FG_STREAM_MV].resource),
-                            mv_w, mv_h, state_of(f.stream[MGPU_FG_STREAM_MV]), tag_list,
+                            mv_w, mv_h, state_of(f.stream[MGPU_FG_STREAM_MV]),
+                            resource_cmd(f.stream[MGPU_FG_STREAM_MV],
+                                         f.stream_cmd[MGPU_FG_STREAM_MV], tag_list),
                             until_present(f.stream[MGPU_FG_STREAM_MV]));
     if (!g_tags_had_mv && f.stream[MGPU_FG_STREAM_MV].resource != nullptr) { ok = false; }
     // What we handed the library, once: the first thing to look at when it disagrees.
@@ -1519,8 +1682,10 @@ bool tag_inputs(ID3D12CommandList* tag_list, uint32_t frame_id, const MgpuFgFram
     ID3D12Resource* depth =
         static_cast<ID3D12Resource*>(f.stream[MGPU_FG_STREAM_DEPTH].resource);
     if (depth != nullptr) {
-        g_tags_had_depth = tag_one(XEFG_SWAPCHAIN_RES_DEPTH, depth, rw, rh,
-                                   state_of(f.stream[MGPU_FG_STREAM_DEPTH]), tag_list,
+        g_tags_had_depth = tag_one(XEFG_SWAPCHAIN_RES_DEPTH, depth, dp_w, dp_h,
+                                   state_of(f.stream[MGPU_FG_STREAM_DEPTH]),
+                                   resource_cmd(f.stream[MGPU_FG_STREAM_DEPTH],
+                                                f.stream_cmd[MGPU_FG_STREAM_DEPTH], tag_list),
                                    until_present(f.stream[MGPU_FG_STREAM_DEPTH]));
         if (!g_tags_had_depth) { ok = false; }
     }
@@ -1560,7 +1725,16 @@ bool tag_inputs(ID3D12CommandList* tag_list, uint32_t frame_id, const MgpuFgFram
     // (ID3D12CommandList*)1 sentinel OptiScaler passes for this tag: it carries no
     // pResource, so nothing is recorded into a list.
     if (!upscaler_lane && cfg().tag_backbuffer != 0) {
-        tag_backbuffer(frame_id, nullptr);
+        // The interpolation rect is the configured one, or the whole chain. Do NOT derive
+        // it from a scaled HUDless extent: a smaller HUDless is a transport scale, not a
+        // letterbox region (tag_color skips it instead).
+        const UINT rect_x = static_cast<UINT>(cfg().rect_left);
+        const UINT rect_y = static_cast<UINT>(cfg().rect_top);
+        UINT rect_w = (cfg().rect_w > 0) ? static_cast<UINT>(cfg().rect_w) : g_width;
+        UINT rect_h = (cfg().rect_h > 0) ? static_cast<UINT>(cfg().rect_h) : g_height;
+        if (rect_w > g_width) { rect_w = g_width; }
+        if (rect_h > g_height) { rect_h = g_height; }
+        tag_backbuffer(frame_id, nullptr, rect_w, rect_h, rect_x, rect_y);
     }
     // Frame constants are NOT sent here: OptiScaler sends them from Dispatch(), i.e.
     // in the present path, right before SetPresentId - they describe the frame that is
@@ -1579,19 +1753,63 @@ void tag_color(ID3D12CommandList* tag_list, uint32_t frame_id, const MgpuFgFrame
     if (upscaler_lane) { return; }
     g_frame_id = frame_id;   // tag_one stamps the frame with this
 
-    const unsigned ow = (f.output_w >= 8) ? f.output_w : g_width;
-    const unsigned oh = (f.output_h >= 8) ? f.output_h : g_height;
+    // XeFG: HUDless and UI must have the same format/colour space/size as the back buffer
+    // (xess_fg_developer_guide_english.md:855-871). The resourceSize comes from each tag's
+    // own extent, and tag_inputs() already moved the back buffer rect to the HUDless extent.
+    const UINT hw = (f.stream[MGPU_FG_STREAM_HUDLESS].width >= 8)
+                        ? f.stream[MGPU_FG_STREAM_HUDLESS].width : g_width;
+    const UINT hh = (f.stream[MGPU_FG_STREAM_HUDLESS].height >= 8)
+                        ? f.stream[MGPU_FG_STREAM_HUDLESS].height : g_height;
+    const UINT uw = (f.stream[MGPU_FG_STREAM_UI_COLOR].width >= 8)
+                        ? f.stream[MGPU_FG_STREAM_UI_COLOR].width : g_width;
+    const UINT uh = (f.stream[MGPU_FG_STREAM_UI_COLOR].height >= 8)
+                        ? f.stream[MGPU_FG_STREAM_UI_COLOR].height : g_height;
+    UINT target_w = (cfg().rect_w > 0) ? static_cast<UINT>(cfg().rect_w) : g_width;
+    UINT target_h = (cfg().rect_h > 0) ? static_cast<UINT>(cfg().rect_h) : g_height;
+    if (target_w > g_width) { target_w = g_width; }
+    if (target_h > g_height) { target_h = g_height; }
     if (cfg().tag_hudless != 0) {
-        tag_one(XEFG_SWAPCHAIN_RES_HUDLESS_COLOR,
-                static_cast<ID3D12Resource*>(f.stream[MGPU_FG_STREAM_HUDLESS].resource),
-                ow, oh, state_of(f.stream[MGPU_FG_STREAM_HUDLESS]), tag_list,
-                until_present(f.stream[MGPU_FG_STREAM_HUDLESS]));
+        const uint32_t fmt = f.stream[MGPU_FG_STREAM_HUDLESS].format;
+        if (hw != target_w || hh != target_h ||
+            (g_chain_fmt != 0 && fmt != 0 && fmt != g_chain_fmt)) {
+            static bool told_hf = false;
+            if (!told_hf) {
+                told_hf = true;
+                logf("xefg: HUDless %ux%u fmt %u != chain/rect %ux%u fmt %u - not tagging it"
+                     " (XeFG requires the same extent/format)\n",
+                     hw, hh, fmt, target_w, target_h, g_chain_fmt);
+            }
+        } else {
+            tag_one(XEFG_SWAPCHAIN_RES_HUDLESS_COLOR,
+                    static_cast<ID3D12Resource*>(f.stream[MGPU_FG_STREAM_HUDLESS].resource),
+                    hw, hh, state_of(f.stream[MGPU_FG_STREAM_HUDLESS]),
+                    resource_cmd(f.stream[MGPU_FG_STREAM_HUDLESS],
+                                 f.stream_cmd[MGPU_FG_STREAM_HUDLESS], tag_list),
+                    until_present(f.stream[MGPU_FG_STREAM_HUDLESS]));
+        }
     }
     if (cfg().tag_ui != 0) {
-        tag_one(XEFG_SWAPCHAIN_RES_UI,
-                static_cast<ID3D12Resource*>(f.stream[MGPU_FG_STREAM_UI_COLOR].resource),
-                ow, oh, state_of(f.stream[MGPU_FG_STREAM_UI_COLOR]), tag_list,
-                until_present(f.stream[MGPU_FG_STREAM_UI_COLOR]));
+        const uint32_t fmt = f.stream[MGPU_FG_STREAM_UI_COLOR].format;
+        // HUDless/UI/backbuffer share resourceSize: tag UI only when it matches the same
+        // chain/rect extent XeFG receives for the back buffer. (HUDless is skipped above if
+        // it does not match, so a UI-only fallback is still governed by the chain size.)
+        if ((uw != target_w || uh != target_h) ||
+            (g_chain_fmt != 0 && fmt != 0 && fmt != g_chain_fmt)) {
+            static bool told_ui = false;
+            if (!told_ui) {
+                told_ui = true;
+                logf("xefg: UI %ux%u fmt %u does not match HUDless %ux%u fmt %u (chain fmt %u)"
+                     " - not tagging UI\n", uw, uh, fmt, hw, hh,
+                     f.stream[MGPU_FG_STREAM_HUDLESS].format, g_chain_fmt);
+            }
+        } else {
+            tag_one(XEFG_SWAPCHAIN_RES_UI,
+                    static_cast<ID3D12Resource*>(f.stream[MGPU_FG_STREAM_UI_COLOR].resource),
+                    uw, uh, state_of(f.stream[MGPU_FG_STREAM_UI_COLOR]),
+                    resource_cmd(f.stream[MGPU_FG_STREAM_UI_COLOR],
+                                 f.stream_cmd[MGPU_FG_STREAM_UI_COLOR], tag_list),
+                    until_present(f.stream[MGPU_FG_STREAM_UI_COLOR]));
+        }
     }
 }
 
@@ -1604,13 +1822,18 @@ void xefg_tag(ID3D12GraphicsCommandList* list, uint32_t frame_id, const MgpuFgFr
               bool upscaler_lane)
 {
     if (g_ctx == nullptr) { return; }
-    tag_begin(frame_id, f);
-    if (!tag_inputs(static_cast<ID3D12CommandList*>(list), frame_id, f, upscaler_lane)) {
+    // Mutable copy: the DLSSG lane may resample MV onto the depth grid on the open list
+    // (XeFG requires the same resourceSize for the pair). tag_begin() below copies the
+    // pre-resample frame, so store the updated one back for the present path.
+    MgpuFgFrame frame = f;
+    tag_begin(frame_id, frame);
+    if (!tag_inputs(static_cast<ID3D12CommandList*>(list), frame_id, frame, upscaler_lane)) {
         // XeFG_Dx12.cpp:1639-1647: a rejected tag -> UpdateTarget(); Deactivate();
         xefg_pause(10);
         return;
     }
-    tag_color(static_cast<ID3D12CommandList*>(list), frame_id, f, upscaler_lane);
+    tag_color(static_cast<ID3D12CommandList*>(list), frame_id, frame, upscaler_lane);
+    g_last_frame = frame;
 }
 
 // TagAtEvaluate: the placement OptiScaler uses (inputs/FG/Upscaler_Inputs_Dx12.cpp).
@@ -1723,16 +1946,25 @@ void xefg_frame_feedback(bool tags_complete)
         // XeFG_Dx12::Activate() (XeFG_Dx12.cpp:583-610), verbatim:
         //     nativeAA = currentFeature->RenderWidth() == currentFeature->DisplayWidth();
         //     activate when IsLowResMV() || nativeAA || ForceFGRenderSizeMVs || IgnoreInitChecks
-        // IsLowResMV() is `!_constants.flags[DisplayResolutionMVs]` (IFGFeature.cpp:158) and
-        // that flag is `!feature->LowResMV()` (Upscaler_Inputs.cpp:66-67) - i.e. the
-        // upscaler's own create flag. The velocity resource's size does NOT enter, and our
-        // old `mv.width == output.width` heuristic turned a high-res-MV title that is
-        // upscaling into "native AA" and enabled XeFG on inputs it cannot use.
-        const bool low_res_mv = (cfg().high_res_mv == 0) || cfg().mv_resample != 0;
+        // IsLowResMV() is `!_constants.flags[DisplayResolutionMVs]` (IFGFeature.cpp:158).
+        // OptiScaler sets that flag from sl::Constants::motionVectorsDilated (or the NGX
+        // wide-MV declaration). The declaration alone is not enough here: some titles set
+        // dilated while the vectors are still render-sized, so require the actual MV
+        // extent to reach the display grid too. A resampled pair is low-res by
+        // construction and must pass.
         const unsigned render_w = g_last_frame.render_w;
         const unsigned render_h = g_last_frame.render_h;
         const unsigned target_w = (g_last_frame.output_w >= 8) ? g_last_frame.output_w : g_width;
         const unsigned target_h = (g_last_frame.output_h >= 8) ? g_last_frame.output_h : g_height;
+        const bool mv_hi_extent =
+            g_last_frame.stream[MGPU_FG_STREAM_MV].width >= target_w &&
+            g_last_frame.stream[MGPU_FG_STREAM_MV].height >= target_h &&
+            g_last_frame.stream[MGPU_FG_STREAM_MV].resource != nullptr;
+        const bool declared_high =
+            (g_last_frame.flags & MGPU_FG_FRAME_HI_RES_MV) != 0 ||
+            ((g_last_frame.flags & MGPU_FG_FRAME_MV_DILATED) != 0 && mv_hi_extent);
+        const bool low_res_mv = (!declared_high && cfg().high_res_mv == 0) ||
+                                cfg().mv_resample != 0;
         const bool native_aa = (render_w >= 8 && target_w >= 8 && render_w == target_w);
         // XeFG_Dx12::Activate(): `IsLowResMV() || nativeAA || ForceFGRenderSizeMVs ||
         // FGXeFGIgnoreInitChecks`.
@@ -1799,6 +2031,8 @@ void backend_shutdown()
 {
     g_tags_had_depth = false;
     g_tags_had_mv = false;
+    g_tags_size_ok = true;
+    g_chain_fmt = 0;
     g_last_tagged_id = 0;
     g_last_presented_id = 0;
     g_submit_frame_id = 0;
@@ -1807,6 +2041,14 @@ void backend_shutdown()
     g_eval_frame = MgpuFgFrame{};
     g_eval_frame_id = 0;
     g_eval_tag_fresh = false;
+    // P2-E: release the contexts retired across FGPreserveSwapChain=false recreations.
+    if (g_xapi.Destroy != nullptr) {
+        for (unsigned i = 0; i < g_retired_n; ++i) {
+            if (g_retired_ctx[i] != nullptr) { g_xapi.Destroy(g_retired_ctx[i]); }
+            g_retired_ctx[i] = nullptr;
+        }
+    }
+    g_retired_n = 0;
     if (g_ctx != nullptr && g_xapi.Destroy != nullptr) { g_xapi.Destroy(g_ctx); }
     if (g_xell != nullptr && g_xell_dll != nullptr) {
         auto destroy = reinterpret_cast<decltype(&xellDestroyContext)>(

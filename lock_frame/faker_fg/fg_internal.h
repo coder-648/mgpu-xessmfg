@@ -136,6 +136,12 @@ struct Config
     int     rect_w          = 0;
     int     rect_h          = 0;
     int     tag_ui          = 0;            // tag DLSSG.UI (+alpha) for recomposition
+    // OptiScaler FGOnlyAcceptFirstHudless: keep the first HUDless tag of a frame instead
+    // of letting a later one overwrite it. Off by default; set per title in the ini.
+    int     hudless_first   = 0;
+    // P1-B: refuse Evaluate when the staged tag/constants token differs. Title escape hatch
+    // if a game legitimately tags one frame ahead of its Evaluate.
+    int     strict_frame_token = 1;
     int     strip_dlssg     = 0;            // 1 = keep sl.dlss_g out (we answer it directly)
     int     fake_sl_player  = 1;            // 1 = answer slDLSSGSetOptions/GetState ourselves (OptiScaler: always)
     int     ngx_core_proxy  = 0;            // 1 = interpose nvngx.dll/_nvngx.dll (WIP: breaks DLSS-SR)
@@ -175,6 +181,13 @@ struct Config
     // OptiScaler SimulateWaitableObject: hand out our own frame-latency semaphore instead of
     // the proxy chain's (that chain has none). Off by default, exactly like theirs.
     int     simulate_waitable = 0;
+    // OptiScaler FGPreserveSwapChain = false (Wuthering Waves / NINJA GAIDEN 4 / DoA6 /
+    // Talos 2 / RDR2): a second swap chain for the same window must destroy the old XeFG
+    // context and create a new one instead of ResizeBuffers-ing the old chain.
+    int     recreate_swapchain = 0;
+    // OptiScaler OverrideVsync = true (Dead Space): present the XeFG chain with sync interval
+    // 0 even when the title asks for vsync.
+    int     override_vsync = 0;
     // OptiScaler's [FrameGen] FGInput / FGOutput: ONE input lane, ONE output, chosen by
     // config - there is no automatic lane. Codes are theirs:
     //   FgInput:  NoFG (default) | Upscaler | DLSSG | NVNGX | FSR
@@ -207,10 +220,21 @@ enum GameQuirk : unsigned
     Quirk_ForceUnrealEngine     = 1u << 0,   // ForceUnrealEngine
     Quirk_NoFSRFGFirstSwapchain = 1u << 1,   // NoFSRFGFirstSwapchain: first chain passes through
     Quirk_ForceFGRenderSizeMVs  = 1u << 2,   // ForceFGRenderSizeMVs: activate without low-res MV
-    Quirk_CyberpunkHudlessState = 1u << 3,   // CyberpunkHudlessState (hudless arrives SDR)
-    // CP2077 tags ScalingOutputColor (display-referred, before UI) alongside the
-    // scene-referred HUDLess. The former is the correct patch source for WGC matching.
-    Quirk_CyberpunkScalingHudless = 1u << 4,
+    Quirk_CyberpunkHudlessState = 1u << 3,   // CyberpunkHudlessState: PIXEL|NON_PIXEL means UAV
+    // OptiScaler GameConfigs IgnoreTagsWithoutHudlessForFG (Arknights: Endfield,
+    // Zenless Zone Zero): a DLSS-SR tag batch (depth+MV, no HUDless) must not overwrite
+    // the DLSS-G frame's inputs. Streamline_Hooks.cpp:487-515.
+    Quirk_IgnoreTagsWithoutHudless = 1u << 5,
+    // OptiScaler GameConfigs IgnoreValidUntilEvaluateForFG (007 First Light): drop
+    // sl::eValidUntilEvaluate tags in the FG lane. Streamline_Inputs.cpp:316-323.
+    Quirk_IgnoreValidUntilEvaluate = 1u << 6,
+    // The Witcher 3's velocity alpha==0 means "only the camera moved"; OptiScaler fills
+    // those pixels with CM_Dx12. We only transport RG16, so the fill is not implemented yet.
+    Quirk_XeFGCameraMotionFill = 1u << 7,
+    // OptiScaler DLSSGFrameLatencyWaitable (KCD2): create the FG chain with
+    // DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT so the game's own waitable is
+    // real and SL does not have to consume a simulated signal.
+    Quirk_DLSSGFrameLatencyWaitable = 1u << 8,
 };
 
 unsigned game_quirks();
@@ -304,6 +328,10 @@ bool     xefg_start(ID3D12Device* device, ID3D12CommandQueue* queue, IDXGIFactor
 // The chain we already own, for the same window (OptiScaler's FGPreserveSwapChain), with
 // one reference for the caller. nullptr when the window differs or nothing is owned.
 IDXGISwapChain1* xefg_owned_chain(HWND hwnd, const DXGI_SWAP_CHAIN_DESC1* desc);
+// FGPreserveSwapChain=false: destroy the current XeFG context/chain so the next
+// CreateSwapChainForHwnd builds a fresh one. Returns false when the old context could not
+// be destroyed (in which case the caller must pass the new chain through).
+bool     xefg_prepare_recreate();
 void     xefg_enable(bool on);
 void     xefg_set_count(unsigned n);
 unsigned xefg_max_interp();
@@ -360,6 +388,9 @@ bool     xefg_wants_generation();
 // The sl::Constants camera frame (right/up/forward/position), used to build the view matrix.
 void     xefg_camera(const float right[3], const float up[3], const float forward[3],
                      const float position[3]);
+// Streamline's sl::Preferences::engine (proxy_streamline.cpp). Used for the UE far-plane
+// rule (OptiScaler XeFG_Inputs_Dx12.cpp:464-478) and for the camera-value policy.
+bool     sl_engine_unreal();
 void     backend_shutdown();
 
 // ---------------------------------------------------------------- provider
@@ -376,13 +407,18 @@ void provider_block_fg(const char* why);
 bool provider_fg_blocked();
 void nvngx_withdraw_frame_generation();   // un-patches FrameGeneration.Available on the real block
 // Full-resolution MV -> interpolation size (MvResample). Records one compute dispatch on the
-// title's command list and rewrites f->stream[MV] to the resampled texture.
-bool mv_resample_frame(ID3D12CommandList* list, MgpuFgFrame* f);
+// title's command list and rewrites f->stream[MV] to the resampled texture. `force` bypasses
+// the MvResample ini switch (used by the DLSSG lane when the title's MV/depth extents differ).
+bool mv_resample_frame(ID3D12CommandList* list, MgpuFgFrame* f, bool force = false);
 void mv_resample_set_device(ID3D12Device* device);
 // OptiScaler's shader passes (passes.cpp).
 void pass_set_device(ID3D12Device* device);
 // Swap chain vtable hooks (fg_swapchain_hooks.cpp), OptiScaler's shape.
 bool fg_hook_swapchain(IDXGISwapChain* chain);
+// FGPreserveSwapChain=false: forget the old chain identity before the next
+// fg_hook_swapchain() call. The old vtable hooks stay installed but pass through because
+// their identity check no longer matches.
+void fg_reset_swapchain_hook();
 
 // Bridges the detours use, implemented in backend_xefg.cpp.
 void xefg_before_present(bool real_present);

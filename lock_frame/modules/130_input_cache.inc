@@ -207,6 +207,11 @@ static bool service_shared_layout()
                   " the flag did NOT take effect - restart the bridge after the game is"
                   " in-world, or pass --fg-jittered-mv\n");
         }
+        if (((g_producer_flags & ~before) & mgpu::kInputFlagInvertedDepth) != 0) {
+            logf_("[lock] WARNING: the producer only now reported inverted (reversed-Z) depth."
+                  " XEFG_SWAPCHAIN_INIT_FLAG_INVERTED_DEPTH was set at init, before this"
+                  " record arrived - restart the bridge or pass --fg-depth-inv\n");
+        }
     }
     return true;
 }

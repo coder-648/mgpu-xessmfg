@@ -409,6 +409,7 @@ static void record_upsample(UINT slot)
     // Target = the picture XeFG actually receives (the capture/present size), not the
     // game's internal render size. On a 1080p-render -> 4K-output title those differ,
     // and the user wants MV/depth matched to the input picture.
+    // 2026-11-25: the 1.3.2 "render grid only" variant was reverted with the 100/100 default.
     UINT tw = g_full_w, th = g_full_h;
     if (tw < 256 || th < 256) { tw = g_width; th = g_height; }
     if (tw < 256 || th < 256) {

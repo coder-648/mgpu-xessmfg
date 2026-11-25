@@ -4742,10 +4742,13 @@ void publish_frame(void* queue_ptr)
         fr.fg_flags     = f.flags |
                           ((g_copied_mask & mgpu::kRequestColor) ? mgpu::kInputFlagColourActive : 0u);
         fr.mv_invalid_value = 0.0f;
-        memset(fr.camera_pos, 0, sizeof(fr.camera_pos));
-        memset(fr.camera_up, 0, sizeof(fr.camera_up));
-        memset(fr.camera_right, 0, sizeof(fr.camera_right));
-        memset(fr.camera_fwd, 0, sizeof(fr.camera_fwd));
+        // v13 fields that used to stay zero. The consumer builds XeFG's viewMatrix from
+        // them exactly like OptiScaler (XeFG_Dx12.cpp:843-860); fakerFG fills them from
+        // sl::Constants.cameraRight/Up/Fwd/Pos in proxy_streamline.cpp (v3 record).
+        memcpy(fr.camera_pos,   f.camera_pos,   sizeof(fr.camera_pos));
+        memcpy(fr.camera_up,    f.camera_up,    sizeof(fr.camera_up));
+        memcpy(fr.camera_right, f.camera_right, sizeof(fr.camera_right));
+        memcpy(fr.camera_fwd,   f.camera_forward, sizeof(fr.camera_fwd));
         memset(fr.camera_pinhole, 0, sizeof(fr.camera_pinhole));
         fr.published = value;               // v10: what the consumer ACKs with
         fr.pub_seq   = pub_seq;             // v23: global order for the consumer loop

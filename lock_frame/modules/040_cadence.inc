@@ -1124,9 +1124,12 @@ static bool init_fg()
         g_producer_flags = g_ctl->producer.input_flags;
         adopt_producer_hints(g_producer_flags);
     }
-    // The count asked for here is what the DLL will actually add per real frame;
-    // want_interp was already clamped to maxSupportedInterpolations above.
-    ip.maxInterpolatedFrames = want_interp;
+    // The count asked for here is the CAPACITY (SDK: maxInterpolatedFrames is an upper
+    // bound; xefg_swapchain_d3d12.h:41-55). The live count is applied with
+    // SetNumInterpolatedFrames after SetEnabled. Older DLLs without that export can only
+    // use the init value, so they keep the current request.
+    ip.maxInterpolatedFrames = (g_api.has_mfg() && g_fg_interp_max > 0)
+                                   ? g_fg_interp_max : want_interp;
     ip.initFlags = g_fg_depth_inv ? XEFG_SWAPCHAIN_INIT_FLAG_INVERTED_DEPTH
                                   : XEFG_SWAPCHAIN_INIT_FLAG_NONE;
     // NDC velocity must be *declared*: without the flag XeFG reads the field as UV (0..1) and
@@ -1143,6 +1146,15 @@ static bool init_fg()
     // HIGH_RES_MV deliberately stays out: the SDK marks it
     // "Deprecated. Setting this flag has no effect." (xefg_swapchain.h:91).
     if (g_fg_jittered_mv) { ip.initFlags |= XEFG_SWAPCHAIN_INIT_FLAG_JITTERED_MV; }
+    // P1-F: UI alpha convention is frozen at context creation. The producer publishes
+    // kUiFlagPremultiplied for the game/synth UI plane; only an explicit "not
+    // premultiplied" needs the XeFG flag. Patch-only chains tag H' alone (mode 4), so
+    // this is inert there; it matters for a title that tags UIColorAndAlpha late.
+    const uint32_t ui_flags = (g_ctl != nullptr) ? g_ctl->streams[3].ui_flags : 0u;
+    if (ui_flags != 0u && (ui_flags & mgpu::kUiFlagPremultiplied) == 0u) {
+        ip.initFlags |= XEFG_SWAPCHAIN_INIT_FLAG_UITEXTURE_NOT_PREMUL_ALPHA;
+        logf_("[lock] UI stream declares straight alpha - UITEXTURE_NOT_PREMUL_ALPHA set\\n");
+    }
     if (ip.initFlags != XEFG_SWAPCHAIN_INIT_FLAG_NONE) {
         logf_("[lock] initFlags=0x%x (inverted_depth=%d jittered_mv=%d ndc_velocity=%d)\n",
               static_cast<unsigned>(ip.initFlags), g_fg_depth_inv ? 1 : 0,
@@ -1273,7 +1285,8 @@ static bool init_fg()
         // released, and any extra outstanding reference makes re-creating the
         // native swap chain fail.
         ip2.pApplicationSwapChain = app_swap.Detach();
-        ip2.maxInterpolatedFrames = want_interp;
+        ip2.maxInterpolatedFrames = (g_api.has_mfg() && g_fg_interp_max > 0)
+                                        ? g_fg_interp_max : want_interp;
         ip2.initFlags = ip.initFlags;
         ip2.uiMode = ip.uiMode;
         ip2.creationNodeMask = 1;
@@ -1284,14 +1297,23 @@ static bool init_fg()
         if (r != XEFG_SWAPCHAIN_RESULT_SUCCESS) { return false; }
     }
 
-    // What the library really applied (it may clamp the request).
+    // What the library really applied (it may clamp the capacity request).
     if (g_api.D3D12GetInitParams) {
         xefg_swapchain_d3d12_init_params_t got{};
         if (g_api.D3D12GetInitParams(g_fg, &got) == XEFG_SWAPCHAIN_RESULT_SUCCESS &&
             got.maxInterpolatedFrames > 0) {
-            g_fg_interp_actual = got.maxInterpolatedFrames;
-            logf_("[lock] applied maxInterpolatedFrames = %u -> %ux output\n",
-                  g_fg_interp_actual, g_fg_interp_actual + 1);
+            if (g_api.has_mfg()) {
+                g_fg_interp_max = got.maxInterpolatedFrames;
+                logf_("[lock] applied maxInterpolatedFrames (capacity) = %u -> up to %ux;"
+                      " live count %u (%ux)\n",
+                      g_fg_interp_max, g_fg_interp_max + 1,
+                      g_fg_interp_actual, g_fg_interp_actual + 1);
+            } else {
+                g_fg_interp_actual = got.maxInterpolatedFrames;
+                logf_("[lock] applied maxInterpolatedFrames = %u -> %ux output"
+                      " (no SetNumInterpolatedFrames export)\n",
+                      g_fg_interp_actual, g_fg_interp_actual + 1);
+            }
         }
     }
 
@@ -1406,6 +1428,9 @@ static bool init_fg()
 
     // If the init parameter could not express the request (older DLL, or a
     // mismatch after the library clamped it) try the runtime call as well.
+    // The init value is now the CAPACITY, so always force one SetNumInterpolatedFrames
+    // with the live count (otherwise a 6x-capacity context would start at 7x).
+    if (g_api.has_mfg()) { g_fg_interp_force = true; }
     fg_apply_interp("after SetEnabled");
     return true;
 }

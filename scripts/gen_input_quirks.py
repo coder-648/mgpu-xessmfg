@@ -60,7 +60,7 @@ print('entries:',len(rows))
 
 # only rows that mention anything FG-input related (plus all ue rows for detection)
 import collections
-fg_tokens=('FG','XeFG','ForceUnrealEngine','ForceFGRenderSizeMVs','IgnoreValidUntilEvaluateForFG','IgnoreTagsWithoutHudlessForFG','ForceDepthD32S8','XeFGCameraMotionFill','CyberpunkHudlessState')
+fg_tokens=('FG','XeFG','ForceUnrealEngine','ForceFGRenderSizeMVs','IgnoreValidUntilEvaluateForFG','IgnoreTagsWithoutHudlessForFG','ForceDepthD32S8','XeFGCameraMotionFill','CyberpunkHudlessState','DLSSGFrameLatencyWaitable','SimulateWaitableObject','ExtendedSearch','FixSlSimulationMarkers','SkipFirstFrames','CreateSLOnThe2ndDevice','NoFSRFGFirstSwapchain')
 def relevant(r):
     exes,ue,defaults,quirks=r
     blob=defaults+' '+quirks
@@ -96,5 +96,5 @@ for exes,ue,defaults,quirks in rel:
     out.append('    { %s, %s, %s, %s },' % (cstr(', '.join(exes)), cstr(', '.join(ue)), cstr(defaults), cstr(quirks)))
 out.append('};')
 out.append('static const unsigned kOptiGameRowCount = sizeof(kOptiGameRows)/sizeof(kOptiGameRows[0]);')
-open('lock_frame/input_quirks_data.h','w',encoding='utf-8').write('\n'.join(out)+'\n')
-print('wrote lock_frame/input_quirks_data.h', len(out),'lines')
+open('lock_frame/modules/input_quirks_data.h','w',encoding='utf-8').write('\n'.join(out)+'\n')
+print('wrote lock_frame/modules/input_quirks_data.h', len(out),'lines')

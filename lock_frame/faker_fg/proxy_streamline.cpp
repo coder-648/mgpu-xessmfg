@@ -29,6 +29,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 namespace fakerfg {
 namespace {
@@ -55,6 +56,9 @@ struct StageEntry
     // bigger texture carries a smaller valid region.
     uint32_t        ext_w         = 0;
     uint32_t        ext_h         = 0;
+    // The exact command list this tag arrived on. ValidNow resources must be copied on
+    // this list (OptiScaler's per-resource cmdList), not on the later Evaluate list.
+    void*           cmd           = nullptr;
 };
 
 struct Stage
@@ -79,6 +83,14 @@ struct Stage
     bool          game_enabled = false;
     uint32_t      game_frames  = 1;
     uint32_t      frame_token  = 0;    // sl::FrameToken of the frame being published
+    // P1-B: frame tokens of the tag/constants that filled this single stage. Evaluate
+    // refuses to publish when both are non-zero and disagree, instead of mixing two
+    // frames in a title that tags ahead / multi-view.
+    uint32_t      tag_token       = 0;
+    uint32_t      constants_token = 0;
+    // P1-E: per-frame first-HUDless policy (FGOnlyAcceptFirstHudless). Reset after a
+    // successful publish, never between tag calls of the same frame.
+    bool          hudless_seen    = false;
 };
 
 Stage g_stage{};
@@ -155,6 +167,11 @@ sl_pfn_pcl_marker    o_pcl_marker     = nullptr;
 bool    g_sl_installed  = false;
 bool    g_sl_tried      = false;
 HMODULE g_interposer = nullptr;
+// sl::Preferences::engine is ground truth (OptiScaler's Streamline_Hooks.cpp:168-171).
+// Non-Unreal titles have their near/far recomputed from cameraViewToClip unconditionally
+// (Streamline_Inputs.cpp:195-201); Unreal hands a matrix that is not a usable projection,
+// so there the title's own camera values are kept.
+static bool g_sl_engine_unreal = false;
 
 // ---------------------------------------------------------------- helpers
 // CP2077 tags HUDLESS_COLOR as onlyValidNow. At present-staged that resource can
@@ -227,9 +244,11 @@ static bool snapshot_hudless(const sl::ResourceTag& tag, void* cmd, StageEntry& 
     }
     // OptiScaler's CyberpunkHudlessState quirk: CP2077 declares HUDLESS as
     // PIXEL|NON_PIXEL but the resource is actually a UAV. Using the declared state
-    // for the barrier/copy reads undefined data (black). Treat it as UAV.
+    // for the barrier/copy reads undefined data (black). Treat it as UAV, but only for
+    // titles that carry the quirk - another title's PIXEL|NON_PIXEL may be real.
     D3D12_RESOURCE_STATES before = declared;
-    if (before == (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+    if (has_game_quirk(Quirk_CyberpunkHudlessState) &&
+        before == (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)) {
         before = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     }
@@ -297,15 +316,38 @@ static bool snapshot_hudless(const sl::ResourceTag& tag, void* cmd, StageEntry& 
 void remember(StageEntry& slot, const sl::ResourceTag& tag, void* cmd)
 {
     if (tag.resource == nullptr || tag.resource->native == nullptr) { return; }
+    // OptiScaler GameConfigs IgnoreValidUntilEvaluateForFG (007 First Light):
+    // Streamline_Inputs.cpp:316-323 drops eValidUntilEvaluate tags in the FG lane. They are
+    // normally the upscaler's tags and are already consumed when they arrive here.
+    if (cfg().fg_input == static_cast<int>(FgInputSource::DLSSG) &&
+        has_game_quirk(Quirk_IgnoreValidUntilEvaluate) &&
+        tag.lifecycle == sl::eValidUntilEvaluate) {
+        static bool told = false;
+        if (!told) {
+            told = true;
+            logf("sl: IgnoreValidUntilEvaluateForFG - dropping an eValidUntilEvaluate tag\n");
+        }
+        return;
+    }
     if (tag.type == sl::kBufferTypeHUDLessColor &&
         tag.lifecycle != sl::eValidUntilPresent && snapshot_hudless(tag, cmd, slot)) {
         slot.ext_w = tag.extent.width;
         slot.ext_h = tag.extent.height;
+        slot.cmd = cmd;
         if (cmd != nullptr) { g_stage.cmd = cmd; }
         return;
     }
     slot.resource      = reinterpret_cast<ID3D12Resource*>(tag.resource->native);
     slot.state         = tag.resource->state;                       // the title's declaration
+    // OptiScaler CyberpunkHudlessState (Streamline_Hooks.cpp:527-535): CP2077 declares the
+    // HUDless as PIXEL|NON_PIXEL while the resource is actually a UAV. Only that title gets
+    // the rewrite; every other title keeps its declaration.
+    if (tag.type == sl::kBufferTypeHUDLessColor &&
+        has_game_quirk(Quirk_CyberpunkHudlessState) &&
+        slot.state == (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)) {
+        slot.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
     // Sl_Inputs::reportResource (Streamline_Inputs.cpp:344-359):
     //   * eValidUntilPresent -> UntilPresent, anything else -> ValidNow;
     //   * a non-UntilPresent tag with no command buffer cannot be copied later, so it is
@@ -332,6 +374,7 @@ void remember(StageEntry& slot, const sl::ResourceTag& tag, void* cmd)
     }
     slot.ext_w         = tag.extent.width;
     slot.ext_h         = tag.extent.height;
+    slot.cmd           = cmd;
     if (cmd != nullptr) { g_stage.cmd = cmd; }
 }
 
@@ -425,6 +468,7 @@ static bool tag_time_synth(const sl::ResourceTag& tag, void* cmd, StageEntry& sl
     slot.until_present = false;      // only used if the pending tag synth is lost
     slot.ext_w         = tag.extent.width;
     slot.ext_h         = tag.extent.height;
+    slot.cmd           = cmd;
     if (cmd != nullptr) { g_stage.cmd = cmd; }
     static bool told = false;
     if (!told) {
@@ -437,12 +481,55 @@ static bool tag_time_synth(const sl::ResourceTag& tag, void* cmd, StageEntry& sl
 void record_tags(const sl::ResourceTag* tags, uint32_t count, void* cmd)
 {
     if (tags == nullptr) { return; }
+
+    // OptiScaler GameConfigs IgnoreTagsWithoutHudlessForFG (Arknights: Endfield,
+    // Zenless Zone Zero). Streamline_Hooks.cpp:487-515: when the DLSS-G lane is active, a
+    // batch that carries depth + MV but no HUDless is the upscaler's tag batch; reporting it
+    // would overwrite the DLSS-G frame's inputs (Unity titles flip them). The original
+    // slSetTag still runs - we only stop staging it for the FG record.
+    if (cfg().fg_input == static_cast<int>(FgInputSource::DLSSG) &&
+        has_game_quirk(Quirk_IgnoreTagsWithoutHudless)) {
+        bool has_depth = false, has_mv = false, has_hudless = false;
+        for (uint32_t i = 0; i < count; ++i) {
+            const sl::ResourceTag& t = tags[i];
+            if (t.resource == nullptr || t.resource->native == nullptr) { continue; }
+            switch (t.type) {
+            case sl::kBufferTypeDepth:
+            case sl::kBufferTypeHiResDepth:
+            case sl::kBufferTypeLinearDepth: has_depth = true; break;
+            case sl::kBufferTypeMotionVectors: has_mv = true; break;
+            case sl::kBufferTypeHUDLessColor: has_hudless = true; break;
+            default: break;
+            }
+        }
+        if (has_depth && has_mv && !has_hudless) {
+            static bool told = false;
+            if (!told) {
+                told = true;
+                logf("sl: IgnoreTagsWithoutHudlessForFG - skipping a depth+MV tag batch"
+                     " without HUDless (upscaler tags, not the FG frame)\n");
+            }
+            return;
+        }
+    }
+
     for (uint32_t i = 0; i < count; ++i) {
         const sl::ResourceTag& t = tags[i];
         switch (t.type) {
         case sl::kBufferTypeHUDLessColor:
             census_tag("hudless", 1u << 0, t);
             if (hudless_staging_enabled()) {
+                if (t.resource == nullptr || t.resource->native == nullptr) { break; }
+                if (cfg().hudless_first != 0 && g_stage.hudless_seen) {
+                    static bool told_first = false;
+                    if (!told_first) {
+                        told_first = true;
+                        logf("sl: FGOnlyAcceptFirstHudless - keeping the first HUDless of"
+                             " this frame, later tags ignored\n");
+                    }
+                    break;
+                }
+                g_stage.hudless_seen = true;
                 if (!tag_time_synth(t, cmd, g_stage.hudless)) {
                     remember(g_stage.hudless, t, cmd);
                 }
@@ -514,13 +601,14 @@ void record_tags(const sl::ResourceTag* tags, uint32_t count, void* cmd)
 }
 
 // ---------------------------------------------------------------- camera from matrix
-// Sl_Inputs::CaptureConstants' loadCameraMatrix (Streamline_Inputs.cpp:153-201): when the
-// title's own camera fields are unusable, near/far/fov are recovered from
-// cameraViewToClip. OptiScaler recomputes for every non-UE title; here the derived values
-// only fill fields that are missing/implausible, so a title that reports a correct camera
-// is never overridden (UE passes a matrix that is not a usable projection, which is why
-// OptiScaler skips the recalculation for UE at all).
-bool projection_camera(const sl::Constants& c, float& out_near, float& out_far, float& out_fov)
+// Sl_Inputs::CaptureConstants' camera handling (Streamline_Inputs.cpp:153-260): non-Unreal
+// titles always have near/far recomputed from cameraViewToClip; Unreal passes a matrix that
+// is not a usable projection, so there the title's own values win. FOV is radians in the
+// Streamline contract - CP2077's 75/60 degree values are converted in
+// fill_camera_from_constants(). The returned aspect is b/|m[0]|, the same number OptiScaler
+// derives for its XeFG frame constants.
+bool projection_camera(const sl::Constants& c, float& out_near, float& out_far, float& out_fov,
+                       float& out_aspect)
 {
     if (c.orthographicProjection == sl::Boolean::eTrue) { return false; }
 
@@ -533,34 +621,101 @@ bool projection_camera(const sl::Constants& c, float& out_near, float& out_far, 
     static const float kIdentity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
     if (memcmp(m, kIdentity, sizeof(m)) == 0) { return false; }
 
+    // Same derivation as the consumer's derive_near_far_from_matrix()
+    // (lock_frame/modules/020_state_overlay.inc:866-893), which was validated against
+    // CP2077's real matrix:
+    //     [1.1792 0 0 0][0 2.0963 0 0][0 0 ~0 1][0 0 0.02 0]
+    // The old OptiScaler-shaped version here required e < 0 and therefore *rejected* that
+    // matrix (it produced zn = 0), silently keeping whatever the title declared.
+    //   depth(z) = (c*z + d) / (e*z),  c = m[10], d = m[14], e = m[11]
+    //   c == 0  -> near = d/|e|, far = infinity
+    //   c != 0  -> near/far = the two extents |−d/c| and |d/(e−c)|
     const double b  = m[5];       // projMatrix[1][1]
     const double cc = m[10];      // projMatrix[2][2]
     const double d  = m[14];      // projMatrix[3][2]
     const double e  = m[11];      // projMatrix[2][3]
+    if (!(std::fabs(std::fabs(e) - 1.0) <= 1.0e-3)) { return false; }
+    if (!std::isfinite(d)) { return false; }
     if (!(std::fabs(b) > 1e-6)) { return false; }
 
     double zn = 0.0;
     double zf = 0.0;
-    if (e < 0.0) {
-        zn = (cc == 0.0) ? 0.0 : (d / cc);
-        zf = (cc + 1.0 == 0.0) ? 0.0 : (d / (cc + 1.0));
+    if (std::fabs(cc) <= 1.0e-9) {
+        if (!(d > 0.0)) { return false; }
+        zn = d / std::fabs(e);
+        zf = std::numeric_limits<double>::infinity();
     } else {
-        zn = (cc == 0.0) ? 0.0 : (-d / cc);
-        zf = (cc - 1.0 == 0.0) ? 0.0 : (-d / (cc - 1.0));
+        const double z0 = std::fabs(-d / cc);        // depth == 0
+        const double z1 = std::fabs(d / (e - cc));   // depth == 1
+        if (!std::isfinite(z0) || !std::isfinite(z1)) { return false; }
+        zn = (z0 < z1) ? z0 : z1;
+        zf = (z0 < z1) ? z1 : z0;
+        if (!(zn > 0.0) || !(zf > zn * 1.001)) { return false; }
     }
-    if (c.depthInverted == sl::Boolean::eTrue) {
-        const double t = zn;
-        zn = zf;
-        zf = t;
-    }
+
     const double fov = 2.0 * std::atan(1.0 / std::fabs(b));
-    if (!std::isfinite(zn) || !std::isfinite(zf) || !std::isfinite(fov)) { return false; }
-    if (!(zn > 0.0) || !(zf > zn) || !(fov > 0.05) || !(fov < 2.5)) { return false; }
+    if (!std::isfinite(zn) || !std::isfinite(fov)) { return false; }
+    if (!(fov > 0.05) || !(fov < 2.5)) { return false; }
 
     out_near = static_cast<float>(zn);
     out_far  = static_cast<float>(zf);
     out_fov  = static_cast<float>(fov);
+    // OptiScaler's XeFG output derives the aspect the same way: b / |m[0]|
+    // (XeFG_Dx12.cpp:885-887).
+    out_aspect = (m[0] != 0.0f) ? static_cast<float>(std::fabs(b) / std::fabs(m[0])) : 0.0f;
     return true;
+}
+
+// Everything XeFG's frame constants need from sl::Constants, filled once and used by both
+// publish lanes (Evaluate and the present-staged fallback). This is the data the consumer
+// previously had to invent: near/far/fov (OptiScaler always recomputes them for non-Unreal
+// titles) and the camera basis the XeFG viewMatrix is built from.
+static void fill_camera_from_constants(const sl::Constants& c, MgpuFgFrame& f)
+{
+    float cam_near = c.cameraNear;
+    float cam_far  = c.cameraFar;
+    float cam_fov  = c.cameraFOV;
+    float aspect   = c.cameraAspectRatio;
+
+    // CP2077 puts 75/60 (degrees) in cameraFOV; Streamline documents radians. Anything
+    // above 3 rad is certainly a degree value (the whole [-0.5, 0.5]... [-90, 90] range is
+    // < 1.6 rad, and 3 rad is already 172 degrees).
+    if (cam_fov > 3.0f) { cam_fov *= 0.017453292519943295f; }
+
+    const bool camera_ok = (cam_near > 0.0f) && (cam_far > cam_near) &&
+                           (cam_fov > 0.05f) && (cam_fov < 2.5f);
+    float dn = 0.0f, df = 0.0f, dv = 0.0f, da = 0.0f;
+    const bool derived = projection_camera(c, dn, df, dv, da);
+    // OptiScaler: `if (engineType != sl::EngineType::eUnreal && !dontRecalc) loadCameraMatrix();`
+    // (Streamline_Inputs.cpp:195-201). Keep the title's values only for Unreal or when the
+    // matrix does not look like a projection.
+    if (derived && (!g_sl_engine_unreal || !camera_ok)) {
+        cam_near = dn;
+        cam_far  = df;
+        cam_fov  = dv;
+        if (da > 0.1f && da < 10.0f) { aspect = da; }
+    }
+    // A CameraFar of zero means an infinite far plane; FSR/XeFG consumers require
+    // CameraFar > CameraNear, so keep that invariant here (Streamline_Inputs.cpp:217-230).
+    if (cam_near > 0.0f && cam_far == 0.0f) { cam_far = cam_near + 1.0f; }
+
+    f.camera_near  = cam_near;
+    f.camera_far   = cam_far;
+    f.camera_fov_y = cam_fov;
+    f.aspect       = aspect;
+
+    f.camera_right[0]   = c.cameraRight.x;
+    f.camera_right[1]   = c.cameraRight.y;
+    f.camera_right[2]   = c.cameraRight.z;
+    f.camera_up[0]      = c.cameraUp.x;
+    f.camera_up[1]      = c.cameraUp.y;
+    f.camera_up[2]      = c.cameraUp.z;
+    f.camera_forward[0] = c.cameraFwd.x;
+    f.camera_forward[1] = c.cameraFwd.y;
+    f.camera_forward[2] = c.cameraFwd.z;
+    f.camera_pos[0]     = c.cameraPos.x;
+    f.camera_pos[1]     = c.cameraPos.y;
+    f.camera_pos[2]     = c.cameraPos.z;
 }
 
 // ---------------------------------------------------------------- the six answers
@@ -881,10 +1036,13 @@ sl::Result hk_init(const sl::Preferences& pref, uint64_t sdk_version)
     // What the title actually asked Streamline to load. CP2077 hiding DLSS is a question
     // about this list, so it has to be in the log.
     // Streamline_Hooks.cpp:168-171 treats the engine type it reports as ground truth.
+    g_sl_engine_unreal = (pref.engine == sl::EngineType::eUnreal);
     if (pref.engine == sl::EngineType::eUnreal) {
         set_game_quirk(Quirk_ForceUnrealEngine);
-        set_game_quirk(Quirk_NoFSRFGFirstSwapchain);
-        logf("sl: engine is Unreal - ForceUnrealEngine + NoFSRFGFirstSwapchain quirks on\n");
+        // NoFSRFGFirstSwapchain is a per-game quirk (OptiScaler GameConfigs: RDR2), not
+        // an Unreal-wide rule. Keeping it off here avoids skipping the first chain for
+        // every UE title, which only cost a present hook/waitable.
+        logf("sl: engine is Unreal - ForceUnrealEngine quirk on\n");
     }
 
     static bool told = false;
@@ -923,6 +1081,11 @@ sl::Result hk_init(const sl::Preferences& pref, uint64_t sdk_version)
 sl::Result hk_set_tag(const sl::ViewportHandle& viewport, const sl::ResourceTag* tags,
                       uint32_t count, sl::CommandBuffer* cmd)
 {
+    // No frame token on this entry point: the tags cannot be matched to an Evaluate
+    // token, so do not carry a stale token from an earlier slSetTagForFrame call. The
+    // constants token is cleared too: this lane is explicitly token-less.
+    g_stage.tag_token = 0;
+    g_stage.constants_token = 0;
     record_tags(tags, count, cmd);
     return (o_set_tag != nullptr) ? o_set_tag(viewport, tags, count, cmd) : sl::Result::eOk;
 }
@@ -930,6 +1093,7 @@ sl::Result hk_set_tag(const sl::ViewportHandle& viewport, const sl::ResourceTag*
 sl::Result hk_set_tag_frame(const sl::FrameToken& frame, const sl::ViewportHandle& viewport,
                             const sl::ResourceTag* tags, uint32_t count, sl::CommandBuffer* cmd)
 {
+    g_stage.tag_token = static_cast<uint32_t>(frame);
     record_tags(tags, count, cmd);
     return (o_set_tag_frame != nullptr) ? o_set_tag_frame(frame, viewport, tags, count, cmd)
                                         : sl::Result::eOk;
@@ -962,6 +1126,7 @@ sl::Result hk_set_constants(const sl::Constants& values, const sl::FrameToken& f
 
     memcpy(g_stage.constants_raw, &c, sizeof(c));
     g_stage.have_constants = true;
+    g_stage.constants_token = static_cast<uint32_t>(frame);
     return (o_set_constants != nullptr) ? o_set_constants(values, frame, viewport)
                                         : sl::Result::eOk;
 }
@@ -984,6 +1149,34 @@ sl::Result hk_evaluate(sl::Feature feature, const sl::FrameToken& frame,
         }
         return (o_evaluate != nullptr) ? o_evaluate(feature, frame, inputs, numInputs, cmd)
                                        : sl::Result::eErrorFeatureMissing;
+    }
+
+    const uint32_t eval_token = static_cast<uint32_t>(frame);
+    // P1-B: a single stage cannot hold two frames. If the title tagged/constant-set for a
+    // different non-zero token, publishing would pair this Evaluate with the other
+    // frame's resources. Refuse this frame (1X) rather than mix them.
+    if (cfg().strict_frame_token != 0 &&
+        g_stage.tag_token != 0 && eval_token != 0 && g_stage.tag_token != eval_token) {
+        static unsigned told_tag = 0;
+        if (told_tag++ < 5) {
+            logf("sl: evaluate token %u != staged tag token %u - refusing to mix frames"
+                 " (single-stage input lane); frame presented at 1X\n",
+                 eval_token, g_stage.tag_token);
+        }
+        g_stage.hudless_seen = false;
+        return sl::Result::eOk;
+    }
+    if (cfg().strict_frame_token != 0 && g_stage.tag_token != 0 &&
+        g_stage.constants_token != 0 && eval_token != 0 &&
+        g_stage.constants_token != eval_token) {
+        static unsigned told_c = 0;
+        if (told_c++ < 5) {
+            logf("sl: evaluate token %u != staged constants token %u - refusing to mix"
+                 " frames (single-stage input lane); frame presented at 1X\n",
+                 eval_token, g_stage.constants_token);
+        }
+        g_stage.hudless_seen = false;
+        return sl::Result::eOk;
     }
 
     MgpuFgFrame f      = make_empty_record();
@@ -1056,29 +1249,12 @@ sl::Result hk_evaluate(sl::Feature feature, const sl::FrameToken& frame,
                 f.mv_scale_y *= mh;
             }
         }
-        // Camera: keep the title's values when they are plausible; otherwise recover
-        // near/far/fov from cameraViewToClip (OptiScaler's loadCameraMatrix). A far plane
-        // of zero means "infinite"; CameraFar must stay > CameraNear for the consumers.
-        float cam_near = c.cameraNear;
-        float cam_far  = c.cameraFar;
-        float cam_fov  = c.cameraFOV;
-        const bool camera_ok = (cam_near > 0.0f) && (cam_far > cam_near) &&
-                               (cam_fov > 0.05f) && (cam_fov < 2.5f);
-        if (!camera_ok) {
-            float dn = 0.0f, df = 0.0f, dv = 0.0f;
-            if (projection_camera(c, dn, df, dv)) {
-                cam_near = dn;
-                cam_far  = df;
-                cam_fov  = dv;
-            }
-        }
-        if (cam_near > 0.0f && cam_far == 0.0f) { cam_far = cam_near + 1.0f; }
-        f.camera_near  = cam_near;
-        f.camera_far   = cam_far;
-        f.camera_fov_y = cam_fov;
-        f.aspect       = c.cameraAspectRatio;
+        // Camera: near/far/fov and the basis vectors. The helper recomputes near/far from
+        // cameraViewToClip for non-Unreal titles, exactly like OptiScaler's Sl_Inputs
+        // (Streamline_Inputs.cpp:195-201), and converts CP2077's degree FOV to radians.
+        fill_camera_from_constants(c, f);
         flags |= MGPU_FG_FRAME_HAS_MATRIX | MGPU_FG_FRAME_HAS_PREV_CLIP;
-        if (cam_near > 0.0f && cam_far > cam_near) {
+        if (f.camera_near > 0.0f && f.camera_far > f.camera_near) {
             flags |= MGPU_FG_FRAME_HAS_CAMERA;
         }
         if (c.depthInverted == sl::Boolean::eTrue)        { flags |= MGPU_FG_FRAME_DEPTH_INVERTED; }
@@ -1096,7 +1272,6 @@ sl::Result hk_evaluate(sl::Feature feature, const sl::FrameToken& frame,
     // the same frame id (resources only get replaced).
     static uint32_t s_eval_id_token = 0;
     static uint32_t s_eval_id = 0;
-    const uint32_t eval_token = static_cast<uint32_t>(frame);
     uint32_t present_id = 0;
     if (eval_token != 0 && eval_token == s_eval_id_token && s_eval_id != 0) {
         present_id = s_eval_id;
@@ -1113,6 +1288,13 @@ sl::Result hk_evaluate(sl::Feature feature, const sl::FrameToken& frame,
 
     g_sl_eval_token = static_cast<uint32_t>(frame);
     sl_publish_record(f, g_sl_eval_token, "evaluate");
+    // The staged tag set has now been consumed by this frame; the next frame's first
+    // HUDless tag starts a new per-frame first-HUDless decision. Constants may be
+    // reused by a title that only updates them on changes, so their token is cleared
+    // (the values stay staged).
+    g_stage.hudless_seen = false;
+    g_stage.constants_token = 0;
+    g_stage.tag_token = 0;
     // FGInput=DLSSG only: this lane is Sl_Inputs, so it must not tag anything when the
     // configured input lane is the upscaler (OptiScaler has exactly one active lane).
     if (cfg().fg_output == static_cast<int>(FgOutputSink::XeFG) &&
@@ -1127,8 +1309,10 @@ sl::Result hk_evaluate(sl::Feature feature, const sl::FrameToken& frame,
     static unsigned logged = 0;
     ++logged;
     if (logged <= 3 || (logged % 600) == 0) {
-        logf("sl: evaluate #%u id=%u render=%ux%u out=%ux%u mv=%p depth=%p hudless=%p ui=%p"
-             " game=%d/%u\n", logged, present_id, f.render_w, f.render_h, f.output_w,
+        logf("sl: evaluate #%u id=%u token=%u tag_token=%u const_token=%u render=%ux%u"
+             " out=%ux%u mv=%p depth=%p hudless=%p ui=%p game=%d/%u\n",
+             logged, present_id, eval_token, g_stage.tag_token, g_stage.constants_token,
+             f.render_w, f.render_h, f.output_w,
              f.output_h, f.stream[MGPU_FG_STREAM_MV].resource,
              f.stream[MGPU_FG_STREAM_DEPTH].resource,
              f.stream[MGPU_FG_STREAM_HUDLESS].resource,
@@ -1143,6 +1327,10 @@ sl::Result hk_evaluate(sl::Feature feature, const sl::FrameToken& frame,
 } // namespace
 } // namespace fakerfg
 namespace fakerfg {
+
+// Streamline's engine type, captured in hk_init from sl::Preferences. The XeFG frame
+// constants use it for OptiScaler's UE far-plane rule (75000, XeFG_Inputs_Dx12.cpp:464-478).
+bool sl_engine_unreal() { return g_sl_engine_unreal; }
 
 // Installs the Streamline layer. Called from the loader thread and retried from the
 // early entry points, because sl.interposer arrives with the game's own streaming
@@ -1283,6 +1471,7 @@ int sl_stage_inputs(MgpuFgFrame& f)
         f.stream[stream].width    = e.ext_w ? e.ext_w : static_cast<uint32_t>(d.Width);
         f.stream[stream].height   = e.ext_h ? e.ext_h : d.Height;
         f.stream[stream].format   = static_cast<uint32_t>(d.Format);
+        f.stream_cmd[stream] = e.cmd;
         ++provided;
     };
 
@@ -1296,6 +1485,10 @@ int sl_stage_inputs(MgpuFgFrame& f)
         const float forward[3] = { c.cameraFwd.x, c.cameraFwd.y, c.cameraFwd.z };
         const float position[3] = { c.cameraPos.x, c.cameraPos.y, c.cameraPos.z };
         xefg_camera(right, up, forward, position);
+        memcpy(f.camera_right, right, sizeof(right));
+        memcpy(f.camera_up, up, sizeof(up));
+        memcpy(f.camera_forward, forward, sizeof(forward));
+        memcpy(f.camera_pos, position, sizeof(position));
     }
 
     put(MGPU_FG_STREAM_MV, g_stage.mv);
@@ -1313,9 +1506,7 @@ int sl_stage_inputs(MgpuFgFrame& f)
     // same space as DLSSG.Backbuffer). The patch colour, however, can come from the
     // display-referred ScalingOutputColor, which matches the WGC present. Keep the two
     // roles separate: HUDLESS = mask/fallback, SCALING = optional display patch source.
-    const bool want_scaling =
-        (cfg().hudless_source == 1) ||
-        (cfg().hudless_source == 0 && has_game_quirk(Quirk_CyberpunkScalingHudless));
+    const bool want_scaling = (cfg().hudless_source == 1);
     const bool use_scaling = scaling_ok && (want_scaling || !snapshot_ok);
     if (snapshot_ok) {
         put(MGPU_FG_STREAM_HUDLESS, g_stage.hudless);
@@ -1376,6 +1567,18 @@ void sl_publish_staged()
     }
     if (!g_stage.game_enabled) { xefg_capture_disable(); return; }   // DLSSFG off: release the gate
 
+    // P1-B: the present-staged lane has no Evaluate token to compare, but the PCL marker
+    // carries one. Refuse to publish tags staged for a different token.
+    if (cfg().strict_frame_token != 0 && g_stage.tag_token != 0 &&
+        g_stage.frame_token != 0 && g_stage.tag_token != g_stage.frame_token) {
+        static unsigned told_staged_token = 0;
+        if (told_staged_token++ < 5) {
+            logf("sl: present-staged token %u != tag token %u - publishing anyway"
+                 " (present fallback has no Evaluate to reject); check the title\n",
+                 g_stage.frame_token, g_stage.tag_token);
+        }
+    }
+
     MgpuFgFrame f = make_empty_record();
     f.cmd_list     = g_stage.cmd;
     f.mode         = api_mode();
@@ -1427,12 +1630,21 @@ void sl_publish_staged()
         f.jitter_y = c.jitterOffset.y;
         f.mv_scale_x = c.mvecScale.x;
         f.mv_scale_y = c.mvecScale.y;
-        f.camera_near = c.cameraNear;
-        f.camera_far = c.cameraFar;
-        f.camera_fov_y = c.cameraFOV;
-        f.aspect = c.cameraAspectRatio;
+        // Same texel -> pixel factor as the Evaluate lane: Sl_Inputs multiplies the
+        // declared scale by the MV extent (Streamline_Inputs.cpp:231-238). The staged
+        // record used to publish the raw (1,1) here, i.e. a 3840x too small scale on
+        // CP2077 for any title that only reaches this lane.
+        if (cfg().mv_scale_resolution != 0) {
+            const float mw = static_cast<float>(f.stream[MGPU_FG_STREAM_MV].width);
+            const float mh = static_cast<float>(f.stream[MGPU_FG_STREAM_MV].height);
+            if (mw > 1.0f && mh > 1.0f) {
+                f.mv_scale_x *= mw;
+                f.mv_scale_y *= mh;
+            }
+        }
+        fill_camera_from_constants(c, f);
         flags |= MGPU_FG_FRAME_HAS_MATRIX | MGPU_FG_FRAME_HAS_PREV_CLIP;
-        if (c.cameraNear > 0.0f && c.cameraFar > c.cameraNear) {
+        if (f.camera_near > 0.0f && f.camera_far > f.camera_near) {
             flags |= MGPU_FG_FRAME_HAS_CAMERA;
         }
         if (c.depthInverted == sl::Boolean::eTrue)        { flags |= MGPU_FG_FRAME_DEPTH_INVERTED; }
@@ -1460,6 +1672,7 @@ void sl_publish_staged()
     f.device = dev;
     g_sl_staged_token = g_stage.frame_token;
     sl_publish_record(f, g_sl_staged_token, "present-staged");
+    g_stage.hudless_seen = false;
     if (dev != nullptr) { dev->Release(); }
 
     static unsigned logged = 0;

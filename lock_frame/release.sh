@@ -7,6 +7,7 @@
 #    VERSION=1.0.0 ./lock_frame/release.sh   # 覆盖 version.h 里的版本号
 #    WITH_XESS=1 ./lock_frame/release.sh     # 把 Intel 运行时一起放进包里
 #    WITH_MFG_ASSETS=1 ./lock_frame/release.sh # 本地包带上 MFG 实验资产（不公开分发）
+#    WITH_LOCAL_EXTRAS=1 ./lock_frame/release.sh # 本地包带上 camvm A/B 脚本与验证记录
 #    WITH_THIRD_PARTY=1 ./lock_frame/release.sh  # 源码包也放入本地 third_party 副本
 #    DIST_DIR=/mnt/c/Users/.../Downloads ./lock_frame/release.sh  # 输出到指定目录
 #
@@ -140,6 +141,24 @@ if [ "${WITH_MFG_ASSETS:-0}" = "1" ]; then
     say "including local MFG experiment assets (do not redistribute)"
     cp -a "$REPO/build/xefg_programs" "$OUT/"
     cp -f "$HERE/xefg_mfg/NOTICE.md" "$OUT/docs/MFG-PORT-NOTICE.md"
+fi
+
+# --- optional local test extras (camvm round) --------------------------------
+# Local validation build only: the A/B scripts are meant to be copied next to
+# lock_frame.exe in the game directory. The verification record ships in docs/.
+if [ "${WITH_LOCAL_EXTRAS:-0}" = "1" ]; then
+    say "including local test extras (cp2077_ab + verification record)"
+    mkdir -p "$OUT/extras/cp2077_ab"
+    cp -f "$HERE/scripts/cp2077_ab/ab__env.bat" "$OUT/extras/cp2077_ab/"
+    cp -f "$HERE"/scripts/cp2077_ab/ab_5[0-5]_camvm_*.bat "$OUT/extras/cp2077_ab/"
+    cp -f "$HERE/scripts/cp2077_ab/ab_99_camvm_check.bat" \
+          "$HERE/scripts/cp2077_ab/ab_99_camvm_check.ps1" "$OUT/extras/cp2077_ab/"
+    cp -f "$HERE/scripts/cp2077_ab/AB_README_CAMVM.txt" "$OUT/extras/cp2077_ab/"
+    mkdir -p "$OUT/extras/pbz_ab"
+    cp -f "$HERE"/scripts/pbz_ab/* "$OUT/extras/pbz_ab/" 2>/dev/null || true
+    if [ -f "$REPO/docs/design/INPUT_ALIGNMENT_CAMVM.md" ]; then
+        cp -f "$REPO/docs/design/INPUT_ALIGNMENT_CAMVM.md" "$OUT/docs/"
+    fi
 fi
 
 # --- manifest + checksums ----------------------------------------------------

@@ -15,5 +15,7 @@
 | [`../scripts/capture_dataset.bat`](../scripts/capture_dataset.bat) | **抓一套可复用数据集**（colour+MV+depth+meta）：一条命令改 ini / 等重开游戏 / 等 `dump complete` / 写 `manifest.json`；设计见 `docs/design/LOSSLESS_TRANSPORT.md` §11.5 |
 | [`PBZ_TEST_STEPS.txt`](PBZ_TEST_STEPS.txt) | PBZ 测试步骤 |
 | [`PBZ_DLSSG_LANE_TEST.md`](PBZ_DLSSG_LANE_TEST.md) | PBZ DLSSG 输入车道测试 |
+| [`PER_GAME_COMPAT_2026-11-25.md`](PER_GAME_COMPAT_2026-11-25.md) | 逐游戏兼容性：本轮落地与剩余清单 |
+| [`NEXT_ROUND_2026-11-26.md`](NEXT_ROUND_2026-11-26.md) | 下一轮回归、未覆盖链路的验证项与禁止项 |
 | [`test-configs/pbz_dlssg_lane.ini`](test-configs/pbz_dlssg_lane.ini) | PBZ DLSSG 车道测试配置 |
 | [`archive/LOCK_FRAME_30X4_NOTES.md`](archive/LOCK_FRAME_30X4_NOTES.md) | 30x4 版本的历史设计笔记 |

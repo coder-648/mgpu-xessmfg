@@ -105,6 +105,7 @@ void harvest(void* params, ID3D12GraphicsCommandList* list, MgpuFgFrame& f)
     auto* p = static_cast<NVSDK_NGX_Parameter*>(params);
     f = make_empty_record();
     f.cmd_list     = list;
+    for (int i = 0; i < MGPU_FG_STREAM_COUNT; ++i) { f.stream_cmd[i] = list; }
     f.frame_qpc_ms = now_qpc_ms();
     f.mode         = api_mode();
 
@@ -160,6 +161,20 @@ void harvest(void* params, ID3D12GraphicsCommandList* list, MgpuFgFrame& f)
     get_f32(p, NVSDK_NGX_DLSSG_Parameter_CameraFar, f.camera_far);
     get_f32(p, NVSDK_NGX_DLSSG_Parameter_CameraFOV, f.camera_fov_y);
     get_f32(p, NVSDK_NGX_DLSSG_Parameter_CameraAspectRatio, f.aspect);
+    // Camera basis: the NGX DLSS-G contract carries it; the local XeFG viewMatrix is built
+    // from the record (backend_xefg::tag_frame_constants). Streamline fills the same fields.
+    get_f32(p, NVSDK_NGX_DLSSG_Parameter_CameraRightX, f.camera_right[0]);
+    get_f32(p, NVSDK_NGX_DLSSG_Parameter_CameraRightY, f.camera_right[1]);
+    get_f32(p, NVSDK_NGX_DLSSG_Parameter_CameraRightZ, f.camera_right[2]);
+    get_f32(p, NVSDK_NGX_DLSSG_Parameter_CameraUpX, f.camera_up[0]);
+    get_f32(p, NVSDK_NGX_DLSSG_Parameter_CameraUpY, f.camera_up[1]);
+    get_f32(p, NVSDK_NGX_DLSSG_Parameter_CameraUpZ, f.camera_up[2]);
+    get_f32(p, NVSDK_NGX_DLSSG_Parameter_CameraFwdX, f.camera_forward[0]);
+    get_f32(p, NVSDK_NGX_DLSSG_Parameter_CameraFwdY, f.camera_forward[1]);
+    get_f32(p, NVSDK_NGX_DLSSG_Parameter_CameraFwdZ, f.camera_forward[2]);
+    get_f32(p, NVSDK_NGX_DLSSG_Parameter_CameraPosX, f.camera_pos[0]);
+    get_f32(p, NVSDK_NGX_DLSSG_Parameter_CameraPosY, f.camera_pos[1]);
+    get_f32(p, NVSDK_NGX_DLSSG_Parameter_CameraPosZ, f.camera_pos[2]);
     get_matrix(p, NVSDK_NGX_DLSSG_Parameter_CameraViewToClip, f.view_to_clip,
                MGPU_FG_FRAME_HAS_MATRIX, flags);
     get_matrix(p, NVSDK_NGX_DLSSG_Parameter_ClipToPrevClip, f.clip_to_prev_clip,

@@ -419,6 +419,9 @@ static bool start_wgc()
 
 // --dyn-mfg needs to be visible to fg_apply_interp() below (it decides the start count).
 static bool g_dyn_mfg = false;
+// Force one SetNumInterpolatedFrames after init: the init value is now the CAPACITY, so the
+// library would otherwise start at the maximum count. Cleared by fg_set_interp().
+static bool g_fg_interp_force = false;
 
 // Runtime count changes go through xefgSwapChainSetNumInterpolatedFrames. Only a
 // DLL that exports it can change the count after initialization; the official
@@ -433,7 +436,8 @@ static void fg_set_interp(UINT want, const char* when, bool quiet = false)
 {
     if (want < 1) { want = 1; }
     if (want > g_fg_interp_max) { want = g_fg_interp_max; }
-    if (want == g_fg_interp_actual) { return; }
+    if (want == g_fg_interp_actual && !g_fg_interp_force) { return; }
+    g_fg_interp_force = false;
 
     if (!g_api.has_mfg()) {
         logf_("[lock] cannot apply interp=%u %s: this DLL has no"

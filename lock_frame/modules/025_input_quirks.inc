@@ -92,16 +92,20 @@ inline std::string describe(const OptiGameRow& r)
     std::string out;
     auto add = [&out](const char* s) { if (!out.empty()) { out += "; "; } out += s; };
     if (has(r.quirks, "ForceUnrealEngine"))             { add("UE far plane (apply --fg-far-finite 75000)"); }
-    if (has(r.quirks, "ForceFGRenderSizeMVs"))          { add("render-size MVs (--upsample, default)"); }
-    if (has(r.quirks, "IgnoreValidUntilEvaluateForFG")) { add("lc=2 tags ignored (producer already)"); }
-    if (has(r.quirks, "IgnoreTagsWithoutHudlessForFG")) { add("Unity flipped tags (WGC path immune)"); }
+    if (has(r.quirks, "ForceFGRenderSizeMVs"))          { add("render-size MV gate (fakerFG quirk; not a data resample)"); }
+    if (has(r.quirks, "IgnoreValidUntilEvaluateForFG")) { add("drop eValidUntilEvaluate tags (fakerFG)"); }
+    if (has(r.quirks, "IgnoreTagsWithoutHudlessForFG")) { add("skip depth+MV tag batches without HUDless (fakerFG)"); }
     if (has(r.quirks, "ForceDepthD32S8"))               { add("D32 depth (supported)"); }
     if (has(r.quirks, "XeFGCameraMotionFill"))          { add("NOT PORTED: camera-motion fill"); }
-    if (has(r.quirks, "CyberpunkHudlessState"))         { add("FSR-FG hudless only (no XeFG effect)"); }
+    if (has(r.quirks, "CyberpunkHudlessState"))         { add("HUDless state PIXEL|NON_PIXEL -> UAV (fakerFG)"); }
+    if (has(r.quirks, "DLSSGFrameLatencyWaitable"))     { add("DLSSG frame-latency waitable (KCD2; test SimulateWaitableObject)"); }
+    if (has(r.quirks, "FixSlSimulationMarkers"))        { add("SL marker correction (not ported)"); }
+    if (has(r.quirks, "ExtendedSearch"))                { add("plugin search path (we load from fakerFG\\)"); }
+    if (has(r.defaults, "SimulateWaitableObject = true")) { add("simulate waitable (CONTROL Resonant; fakerFG profile)"); }
     if (has(r.defaults, "FGXeFGJitteredMV = true"))     { add("jittered MV (apply)"); }
     if (has(r.defaults, "FGXeFGDepthInverted = true"))  { add("inverted depth (apply)"); }
     if (has(r.defaults, "FGDisableHUDFix"))             { add("no HUD fix (we do not tag UI)"); }
-    if (has(r.defaults, "FGPreserveSwapChain"))         { add("preserve chain (we do)"); }
+    if (has(r.defaults, "FGPreserveSwapChain = false")) { add("recreate FG chain (fakerFG profile)"); }
     if (has(r.defaults, "FGSkipResizeBuffers"))         { add("skip resize (we pause)"); }
     if (has(r.defaults, "FGXeFGForceBorderless"))       { add("borderless (we force it)"); }
     if (has(r.defaults, "ReprojectionDepthCutoff"))     { add("reprojection depth cutoff (info: their reprojection path)"); }
@@ -137,7 +141,16 @@ static void apply_input_quirks()
     using namespace input_quirks;
     if (g_input_quirk_mode == QUIRK_OFF || g_game_exe.empty()) { return; }
 
-    const std::string exe = lower(std::string(g_game_exe.begin(), g_game_exe.end()));
+    std::string exe;
+    {
+        const int n = WideCharToMultiByte(CP_UTF8, 0, g_game_exe.c_str(), -1, nullptr, 0,
+                                          nullptr, nullptr);
+        if (n > 1) {
+            exe.resize(static_cast<size_t>(n - 1));
+            WideCharToMultiByte(CP_UTF8, 0, g_game_exe.c_str(), -1, &exe[0], n, nullptr, nullptr);
+        }
+        exe = lower(exe);
+    }
     bool matched = false;
 
     for (unsigned i = 0; i < kOptiGameRowCount; ++i) {
@@ -145,7 +158,10 @@ static void apply_input_quirks()
         if (!list_has(r.exes, exe) && !ue_matches(r.ue_exes, exe)) { continue; }
         matched = true;
 
-        const bool ue_row = has(r.quirks, "ForceUnrealEngine") || ue_matches(r.ue_exes, exe);
+        const bool known_ue_exe = list_has(r.exes, "pbz.exe");   // PBZ ships as PBZ.exe
+        const bool ue_row = known_ue_exe || has(r.quirks, "ForceUnrealEngine") ||
+                            ue_matches(r.ue_exes, exe);
+        if (known_ue_exe) { g_game_is_unreal = true; }
         logf_("[lock] input quirks: %s%s\n",
               (r.exes != nullptr && *r.exes != '\0') ? r.exes : "ue:",
               (r.exes != nullptr && *r.exes != '\0') ? "" : r.ue_exes);

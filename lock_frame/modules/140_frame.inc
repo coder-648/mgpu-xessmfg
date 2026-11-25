@@ -251,6 +251,21 @@ static bool slot_gate_drop()
     return false;
 }
 
+static void fg_tag_result(const char* what, xefg_swapchain_result_t r)
+{
+    if (r == XEFG_SWAPCHAIN_RESULT_SUCCESS) { return; }
+    // OptiScaler deactivates on a rejected tag/constant/present id
+    // (XeFG_Dx12.cpp:919-941, :1639-1647). Do the same for THIS frame: no constants, no
+    // present id and no backbuffer tag, so the library presents the real frame.
+    g_mv_gate_off = true;
+    static const char* told[8] = {};
+    static int n = 0;
+    for (int i = 0; i < n; ++i) { if (told[i] == what) { return; } }
+    if (n < 8) { told[n++] = what; }
+    logf_("[lock] XeFG %s failed: %s (%d) - skipping the FG tags for this frame\n",
+          what, xefg_str(r), static_cast<int>(r));
+}
+
 static void run_frame_ex(ID3D11Texture2D* colour11)
 {
     if (!service_shared_layout()) { return; }
@@ -948,16 +963,30 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     // UI unblend: only after this frame's UI copy exists. A failed/missing UI stream leaves
     // hudless_res null, so the tag section below falls back to tagging UI (mode 2).
     D3D12_RESOURCE_STATES hudless_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    // The HUDless tag's resourceSize must describe the texture being tagged. The unblend /
+    // patch composition writes a chain-sized H', but the legacy clean stream 4 is allocated
+    // at the producer's stream size. Sending draw_w/draw_h for both was an unaligned extent
+    // whenever those differ (the same mistake OptiScaler avoids by using the tag's extent).
+    UINT hudless_tag_w = draw_w, hudless_tag_h = draw_h;
+    // Tag sizes for the one-line xefg-in dump below.
+    UINT tag_mv_w = 0, tag_mv_h = 0, tag_depth_w = 0, tag_depth_h = 0;
     // v34: the support patch lives on stream 4. It is composed on this card (H' = present
     // outside the support, patch inside); stream 4 itself is never tagged directly.
     const bool patch_stream = g_ctl != nullptr &&
         (g_ctl->active_mask & mgpu::kRequestHudless) != 0 &&
         (g_ctl->streams[4].ui_flags & mgpu::kHudlessFlagPatchPayload) != 0;
-    if (!patch_stream && g_hudless_stream && pair_ok && g_hudless_fresh[slot] &&
-        g_hudless_local[slot] && draw_w >= 64 && draw_h >= 64) {
+    const bool clean_size_ok =
+        g_ctl != nullptr && g_ctl->streams[4].width == draw_w &&
+        g_ctl->streams[4].height == draw_h;
+    if (!patch_stream && clean_size_ok && g_hudless_stream && pair_ok &&
+        g_hudless_fresh[slot] && g_hudless_local[slot] && draw_w >= 64 && draw_h >= 64) {
         // v32: clean HUDless from stream 4. No unblend, no division by (1-a).
         hudless_res = g_hudless_local[slot].Get();
         hudless_state = D3D12_RESOURCE_STATE_COMMON;
+        if (g_ctl->streams[4].width >= 64 && g_ctl->streams[4].height >= 64) {
+            hudless_tag_w = g_ctl->streams[4].width;
+            hudless_tag_h = g_ctl->streams[4].height;
+        }
         static bool told_clean = false;
         if (!told_clean) {
             told_clean = true;
@@ -965,6 +994,43 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
         }
     } else if (pair_ok && !g_of_miss && !g_no_inputs && !cq) {
         hudless_res = record_ui_unblend(slot, bbres, draw_w, draw_h);
+    }
+
+    // XeFG requires HUDless to have the same format/colour space as the back buffer
+    // (xess_fg_developer_guide_english.md:855-860). The chain is R10 PQ; a title/stream
+    // that produced something else must not be tagged. Disabling the HUDless keeps the
+    // real frame correct (mode NONE) instead of feeding XeFG an invalid resource.
+    if (hudless_res != nullptr) {
+        const DXGI_FORMAT hf = hudless_res->GetDesc().Format;
+        if (hf != bb_desc.Format) {
+            static bool told_hf = false;
+            if (!told_hf) {
+                told_hf = true;
+                logf_("[lock] hudless format %u != chain format %u - not tagging HUDless"
+                      " (XeFG requires the same format)\n", (unsigned)hf,
+                      (unsigned)bb_desc.Format);
+            }
+            hudless_res = nullptr;
+        }
+    }
+
+    // XeFG requires HUDless/UI/backbuffer to share resourceSize
+    // (xess_fg_developer_guide_english.md:796-802). A clean-stream HUDless can be smaller
+    // than the chain because the transport scaled it; that is NOT a letterbox rect, so it
+    // must not be tagged at a centred sub-rect (the geometry would be wrong). Skip it and
+    // present the real frame without composition instead.
+    UINT tag_rect_x = 0, tag_rect_y = 0;
+    UINT tag_rect_w = draw_w, tag_rect_h = draw_h;
+    if (hudless_res != nullptr && hudless_tag_w >= 8 && hudless_tag_h >= 8 &&
+        (hudless_tag_w != draw_w || hudless_tag_h != draw_h)) {
+        static bool told_rect = false;
+        if (!told_rect) {
+            told_rect = true;
+            logf_("[lock] HUDless %ux%u != chain %ux%u - not tagging HUDless"
+                  " (XeFG requires equal extents; no centred sub-rect guess)\n",
+                  hudless_tag_w, hudless_tag_h, draw_w, draw_h);
+        }
+        hudless_res = nullptr;
     }
 
     // The chain buffer stayed in RENDER_TARGET through the unblend pass so the pass could
@@ -987,7 +1053,6 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     // needs M consecutive MV frames before switching back on. Both default to the old
     // behaviour (0 / 1); a missing *pairing* is never tolerated.
     {
-        static bool gated_off = false;
         static int miss_run = 0;
         static int ok_run = 0;
         static bool tolerated_run = false;
@@ -1026,14 +1091,18 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
         else { if (miss_run < 1000) { ++miss_run; } ok_run = 0; }
 
         g_mv_gate_tolerated = false;
-        if (!mv_available && !gated_off) {
-            // Tolerate a short run of MV-missing frames (menu blip, one dropped publication)
-            // instead of resetting XeFG's history for it.
+        if (!mv_available) {
+            // P2-B: Dispatch()'s early-out. A frame without ready inputs hands XeFG no
+            // tags/constants/present id, but the library stays enabled: no
+            // SetEnabled(0)/SetEnabled(1) cycle, no history reset, no rebuild. This is
+            // exactly what XeFG_Dx12::Dispatch does when Depth/Velocity are not ready.
+            // A short tolerated run additionally keeps the same state (g_mv_gate_tolerated
+            // only changes the log/tag guard, not the library).
             if (!hard_miss && g_fg_gate_hold > 0 && miss_run <= g_fg_gate_hold) {
                 g_mv_gate_tolerated = true;
                 if (!tolerated_run) {
                     tolerated_run = true;
-                    logf_("[lock] MV missing this frame -> holding FG on (%d/%d tolerated)"
+                    logf_("[lock] MV missing this frame -> holding inputs off (%d/%d)"
                           " [pair=%d producer_mv=%d of=%d/%d]\n",
                           miss_run, g_fg_gate_hold, pair_ok ? 1 : 0, producer_mv ? 1 : 0,
 #if MGPU_FG_OF
@@ -1043,38 +1112,27 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
 #endif
                           );
                 }
-            } else {
-                const xefg_swapchain_result_t r = g_api.SetEnabled(g_fg, 0);
-                logf_("[lock] %s -> 1X (%s, %d) [pair=%d producer_mv=%d of=%d/%d]\n",
-                      pair_ok ? "MV missing this frame" : "colour/motion pairing unverified",
-                      xefg_str(r), (int)r, pair_ok ? 1 : 0, producer_mv ? 1 : 0,
+            } else if (miss_run == 1 || (miss_run % 120u) == 0u) {
+                static unsigned told_1x = 0;
+                if (told_1x++ < 20) {
+                    logf_("[lock] %s -> 1X this frame (Dispatch early-out; library stays"
+                          " enabled) [pair=%d producer_mv=%d of=%d/%d]\n",
+                          pair_ok ? "MV missing" : "colour/motion pairing unverified",
+                          pair_ok ? 1 : 0, producer_mv ? 1 : 0,
 #if MGPU_FG_OF
-                      g_of_ready ? 1 : 0, g_of_fresh ? 1 : 0
+                          g_of_ready ? 1 : 0, g_of_fresh ? 1 : 0
 #else
-                      0, 0
+                          0, 0
 #endif
-                      );
-                if (r == XEFG_SWAPCHAIN_RESULT_SUCCESS) { gated_off = true; }
+                          );
+                }
                 tolerated_run = false;
-            }
-        } else if (mv_available && gated_off) {
-            // --fg-gate-up: require a short run of good frames, so an alternating hit/miss
-            // pattern cannot make SetEnabled flap every frame.
-            if (ok_run >= g_fg_gate_up) {
-                const xefg_swapchain_result_t r = g_api.SetEnabled(g_fg, 1);
-                logf_("[lock] MV back -> FG on (%s, %d) [%d consecutive]\n",
-                      xefg_str(r), (int)r, ok_run);
-                if (r == XEFG_SWAPCHAIN_RESULT_SUCCESS) { gated_off = false; }
-            } else if (ok_run == 1 && g_fg_gate_up > 1) {
-                logf_("[lock] MV back - waiting for %d consecutive frames before FG on\n",
-                      g_fg_gate_up);
             }
         }
         if (mv_available) { tolerated_run = false; }
-        // Nothing to tag while the gate is closed: the swap chain is in 1X and the real frame
-        // goes straight out. (An early return here would skip Close()/Present.)
-        // `|| !pair_ok` keeps the tag guard closed even if SetEnabled(0) itself failed.
-        g_mv_gate_off = gated_off || !pair_ok || g_mv_gate_tolerated;
+        // Nothing to tag while the gate is closed; the real frame goes straight out.
+        // (An early return here would skip Close()/Present.)
+        g_mv_gate_off = !pair_ok || g_mv_gate_tolerated || !mv_available;
     }
 
 
@@ -1111,7 +1169,11 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     }
     rd.incomingState = D3D12_RESOURCE_STATE_COMMON;
     rd.type = XEFG_SWAPCHAIN_RES_MOTION_VECTOR;
-    if (!g_mv_gate_off) { g_api.D3D12TagFrameResource(g_fg, tag_list, present_id, &rd); }
+    tag_mv_w = rd.resourceSize.x;
+    tag_mv_h = rd.resourceSize.y;
+    if (!g_mv_gate_off) {
+        fg_tag_result("tag MV", g_api.D3D12TagFrameResource(g_fg, tag_list, present_id, &rd));
+    }
 
     if (g_upsample && g_up_valid && g_up_slot == slot && g_up_depth) {
         rd.resourceSize = { g_up_w, g_up_h };
@@ -1136,7 +1198,24 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
         }
     }
     rd.type = XEFG_SWAPCHAIN_RES_DEPTH;
-    if (!g_mv_gate_off) { g_api.D3D12TagFrameResource(g_fg, tag_list, present_id, &rd); }
+    tag_depth_w = rd.resourceSize.x;
+    tag_depth_h = rd.resourceSize.y;
+    if (!g_mv_gate_off) {
+        fg_tag_result("tag depth", g_api.D3D12TagFrameResource(g_fg, tag_list, present_id, &rd));
+    }
+    if (!g_upsample && tag_mv_w >= 8 && tag_depth_w >= 8 &&
+        (tag_mv_w != tag_depth_w || tag_mv_h != tag_depth_h)) {
+        static bool told_sizes = false;
+        if (!told_sizes) {
+            told_sizes = true;
+            logf_("[lock] WARNING: --no-upsample tags MV %ux%u and depth %ux%u - XeFG"
+                  " requires the same resourceSize; skipping FG for this frame (use the"
+                  " default --upsample for this title)\n",
+                  tag_mv_w, tag_mv_h, tag_depth_w, tag_depth_h);
+        }
+        // Do not send constants/present id for a pair XeFG will reject as MISMATCH.
+        g_mv_gate_off = true;
+    }
 
     // Tag HUDless + UI together whenever both exist: XeFG's AUTO then selects
     // BACKBUFFER_HUDLESS_UITEXTURE (mode 5) for BOTH a game-supplied and a render-card
@@ -1153,7 +1232,10 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     // UI resources are per UI publication slot (see ui_slot_index in 060), not per MV slot:
     // 8 local decode targets instead of 32 at 4K (~1.06 GB -> 265 MB).
     const UINT uil = ui_slot_index(slot);
+    const bool ui_fmt_ok = g_ui_local[uil] &&
+                           g_ui_local[uil]->GetDesc().Format == bb_desc.Format;
     const bool ui_active = g_ui_local[uil] && g_ui_fresh[uil] && pair_ok && !g_of_miss &&
+                           ui_fmt_ok &&
                            (g_ctl->active_mask & mgpu::kRequestUi) != 0 &&
                            g_ctl->streams[3].width >= 64 && g_ctl->streams[3].height >= 64;
     const uint32_t ui_src = ui_source_now();
@@ -1175,21 +1257,28 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     // a game UI plane, do not combine it here (mode 5 costs another UI encode/decode and
     // is intentionally sealed off).
     if (!ui_patch && hudless_res != nullptr && ui_active) {
-        mode5 = (g_ui_mode5 != 2) && ui_full_res;
+        // XeFG requires HUDless/UI/backbuffer to share resourceSize: a clean stream 4 that
+        // is not chain-sized must not be combined with a chain-sized UI either.
+        mode5 = (g_ui_mode5 != 2) && ui_full_res &&
+                hudless_tag_w == draw_w && hudless_tag_h == draw_h;
     }
     if (hudless_res != nullptr) {
-        rd.resourceSize = { draw_w, draw_h };
+        rd.resourceSize = { hudless_tag_w, hudless_tag_h };
         rd.pResource = hudless_res;
         rd.incomingState = hudless_state;
         rd.type = XEFG_SWAPCHAIN_RES_HUDLESS_COLOR;
-        if (!g_mv_gate_off) { g_api.D3D12TagFrameResource(g_fg, tag_list, present_id, &rd); }
+        if (!g_mv_gate_off) {
+            fg_tag_result("tag HUDless",
+                          g_api.D3D12TagFrameResource(g_fg, tag_list, present_id, &rd));
+        }
         if (mode5) {
             rd.resourceSize = { draw_w, draw_h };
             rd.pResource = g_ui_local[uil].Get();
             rd.incomingState = D3D12_RESOURCE_STATE_COMMON;
             rd.type = XEFG_SWAPCHAIN_RES_UI;
             if (!g_mv_gate_off) {
-                g_api.D3D12TagFrameResource(g_fg, tag_list, present_id, &rd);
+                fg_tag_result("tag UI (mode 5)",
+                              g_api.D3D12TagFrameResource(g_fg, tag_list, present_id, &rd));
             }
             static int told_mode5 = -1;
             const int k = ui_derived ? 1 : 0;
@@ -1199,12 +1288,15 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
                       ui_derived ? "render-synth" : "game", ui_q);
             }
         }
-    } else if (ui_active && !ui_patch && ui_src == mgpu::kUiSourceGame) {
+    } else if (ui_active && !ui_patch && ui_src == mgpu::kUiSourceGame && ui_full_res) {
         rd.resourceSize = { g_ctl->streams[3].width, g_ctl->streams[3].height };
         rd.pResource = g_ui_local[uil].Get();
         rd.incomingState = D3D12_RESOURCE_STATE_COMMON;
         rd.type = XEFG_SWAPCHAIN_RES_UI;
-        if (!g_mv_gate_off) { g_api.D3D12TagFrameResource(g_fg, tag_list, present_id, &rd); }
+        if (!g_mv_gate_off) {
+            fg_tag_result("tag UI",
+                          g_api.D3D12TagFrameResource(g_fg, tag_list, present_id, &rd));
+        }
     } else if (ui_active && !ui_patch) {
         // Derived UI is only a means to rebuild HUDless; without a HUDless this frame it
         // must not be tagged as UI (that would freeze scene colour into the overlay).
@@ -1409,6 +1501,12 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     static float    pc_zn = 0.0f, pc_zf = 0.0f;
     static bool     pc_inf = false;
     static uint64_t pc_tick = 0;
+    // v3 camera basis: same 2 s cache as the projection. A record without sl::Constants
+    // carries camera_right/... = 0; reusing the last real view beats dropping to identity
+    // for half the frames.
+    static float    pc_view[16]{};
+    static bool     pc_view_valid = false;
+    static uint64_t pc_view_tick = 0;
     const uint64_t proj_now = GetTickCount64();
     const bool pc_fresh = pc_matrix && proj_now >= pc_tick && (proj_now - pc_tick) < 2000ull;
     if (have_matrix) {
@@ -1425,6 +1523,16 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
                   " projection (two publications per frame, cache <2 s)\n");
         }
     }
+    float cur_view[16]{};
+    const bool view_now = view_from_camera_basis(fr.camera_right, fr.camera_up,
+                                                 fr.camera_fwd, fr.camera_pos, cur_view);
+    if (view_now) {
+        memcpy(pc_view, cur_view, sizeof(pc_view));
+        pc_view_valid = true;
+        pc_view_tick = proj_now;
+    }
+    const bool view_fresh = pc_view_valid && proj_now >= pc_view_tick &&
+                            (proj_now - pc_view_tick) < 2000ull;
     // 0 = no matrix, 1 = this frame's own matrix, 2 = cached (this record had none)
     const int mtx_src = have_matrix ? 1 : (pc_fresh ? 2 : 0);
     const bool mtx_eff = mtx_src != 0;
@@ -1461,23 +1569,25 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     float proj_zf = cam_ok ? fr.far_plane : 10000.0f;
     bool far_infinite = !std::isfinite(proj_zf) || proj_zf <= 0.0f;
     bool zn_zf_derived = false;
-    if (!cam_ok) {
-        if (have_matrix) {
-            float dn = 0.0f, df = 0.0f;
-            bool dinf = false;
-            if (derive_near_far_from_matrix(fr.view_to_clip, dn, df, dinf)) {
-                pc_zn = dn;
-                pc_zf = df;
-                pc_inf = dinf;
-                pc_planes = true;
-            }
+    // Keep the derived-plane cache warm even when the producer's camera is usable: a
+    // transient record without constants must fall back to the last real planes, not to
+    // --fg-zn / 10000. (The producer now publishes near/far itself for non-Unreal titles,
+    // so cam_ok is usually true and this cache is the safety net.)
+    if (have_matrix) {
+        float dn = 0.0f, df = 0.0f;
+        bool dinf = false;
+        if (derive_near_far_from_matrix(fr.view_to_clip, dn, df, dinf)) {
+            pc_zn = dn;
+            pc_zf = df;
+            pc_inf = dinf;
+            pc_planes = true;
         }
-        if (pc_planes) {          // this record's matrix, or the cached one
-            proj_zn = pc_zn;
-            proj_zf = pc_zf;
-            far_infinite = pc_inf;
-            zn_zf_derived = true;
-        }
+    }
+    if (!cam_ok && pc_planes) {          // this record's matrix, or the cached one
+        proj_zn = pc_zn;
+        proj_zf = pc_zf;
+        far_infinite = pc_inf;
+        zn_zf_derived = true;
     }
     if (g_fg_far_finite > 0.0f && far_infinite) {
         proj_zf = g_fg_far_finite;
@@ -1508,20 +1618,61 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
                   g_fg_far_finite);
         }
     }
-    if (mtx_eff && g_fg_use_matrix) {
-        const float* src = have_matrix ? fr.view_to_clip : pc_m;
-        for (int i = 0; i < 16; ++i) { cd.projectionMatrix[i] = src[i]; }
-    } else if (use_rz) { approx_projection_rz(cd.projectionMatrix, proj_aspect, proj_fov, proj_zn); }
-    else { approx_projection(cd.projectionMatrix, proj_aspect, proj_fov, proj_zn, proj_zf); }
-    cd.viewMatrix[0] = 1.0f;
-    cd.viewMatrix[5] = 1.0f;
-    cd.viewMatrix[10] = 1.0f;
-    cd.viewMatrix[15] = 1.0f;
+    // ---- XeFG frame constants: projection + view -------------------------------
+    // Data-completion order. The game's own view-to-clip is the SDK-native projection and
+    // is what the title's own XeFG integration would pass, so it is the default whenever a
+    // fresh matrix is available (v12 already transports it). When it is not, build the same
+    // form OptiScaler uses for its DLSSG lane - XMMatrixPerspectiveFovLH from the now-real
+    // near/far/FOV (XeFG_Dx12.cpp:879-881) - instead of the old right-handed synthetic
+    // matrices (m[11] = -1), which matched neither the game nor OptiScaler.
+    // --fg-proj-rz keeps the legacy reverse-Z approximation for A/B; --fg-use-matrix is kept
+    // as a no-op alias because the matrix is the default now; --fg-no-proj = identity.
+    const bool planes_ok = proj_zn > 0.0f && (far_infinite || proj_zf > proj_zn) &&
+                           proj_fov > 0.05f && proj_fov < 2.5f &&
+                           proj_aspect > 0.1f && proj_aspect < 10.0f;
+    const char* proj_src = "identity";
     if (g_fg_no_proj) {
-        // Test switch: hand XeFG a plain identity instead of our aspect guess.
         for (int i = 0; i < 16; ++i) { cd.projectionMatrix[i] = 0.0f; }
         cd.projectionMatrix[0] = cd.projectionMatrix[5] = cd.projectionMatrix[10] = 1.0f;
         cd.projectionMatrix[15] = 1.0f;
+        proj_src = "identity (--fg-no-proj)";
+    } else if (g_fg_proj_rz) {
+        approx_projection_rz(cd.projectionMatrix, proj_aspect, proj_fov, proj_zn);
+        proj_src = "reversed-Z approximation (--fg-proj-rz)";
+    } else if (mtx_eff) {
+        const float* src = have_matrix ? fr.view_to_clip : pc_m;
+        for (int i = 0; i < 16; ++i) { cd.projectionMatrix[i] = src[i]; }
+        proj_src = have_matrix ? "game view-to-clip" : "game view-to-clip (cached)";
+    } else if (planes_ok) {
+        projection_lh(cd.projectionMatrix, proj_aspect, proj_fov, proj_zn, proj_zf,
+                      far_infinite);
+        proj_src = "LH camera (OptiScaler form)";
+    } else if (use_rz) {
+        approx_projection_rz(cd.projectionMatrix, proj_aspect, proj_fov, proj_zn);
+        proj_src = "reversed-Z approximation";
+    } else {
+        approx_projection(cd.projectionMatrix, proj_aspect, proj_fov, proj_zn, proj_zf);
+        proj_src = "aspect approximation";
+    }
+    (void)g_fg_use_matrix;   // historical alias; the game matrix is the default above
+    // The viewMatrix OptiScaler builds from cameraRight/Up/Fwd/Pos. A record without
+    // sl::Constants is covered by the 2 s cache above; only a title that never declared a
+    // camera keeps the old identity.
+    const char* view_src = "identity";
+    if (!g_fg_no_proj) {
+        if (view_now) {
+            memcpy(cd.viewMatrix, cur_view, sizeof(cd.viewMatrix));
+            view_src = "camera";
+        } else if (view_fresh) {
+            memcpy(cd.viewMatrix, pc_view, sizeof(cd.viewMatrix));
+            view_src = "camera (cached)";
+        }
+    }
+    if (strcmp(view_src, "identity") == 0) {
+        cd.viewMatrix[0] = 1.0f;
+        cd.viewMatrix[5] = 1.0f;
+        cd.viewMatrix[10] = 1.0f;
+        cd.viewMatrix[15] = 1.0f;
     }
     // Always the producer's jitter: the game's motion vectors are computed on the jittered
     // render, so this is what XeFG needs to align its history (see g_fg_jitter_zero above).
@@ -1599,13 +1750,11 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
                         "camera=synthetic (--fg-fov %.1f, --fg-zn %.2f)",
                         g_fg_fov_y, g_fg_near_z);
         }
-        logf_("[lock] frame constants: jitter=(%.4f, %.4f)%s proj=%s %s"
+        logf_("[lock] frame constants: jitter=(%.4f, %.4f)%s proj=%s view=%s %s"
               " aspect=%.5f (%ux%u) mvscale=(%.4f, %.4f) game_dt=%.2fms\n",
               cd.jitterOffsetX, cd.jitterOffsetY,
               g_fg_jitter_flip ? " (flipped)" : "",
-              g_fg_no_proj ? "identity"
-                           : (use_rz ? "reversed-Z approximation" : "aspect approximation"),
-              fov_buf, const_aspect, proj_w, proj_h,
+              proj_src, view_src, fov_buf, const_aspect, proj_w, proj_h,
               cd.motionVectorScaleX, cd.motionVectorScaleY,
               static_cast<double>(fr.frame_time_ms));
     }
@@ -1616,7 +1765,8 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     // --fg-rt-mode picks *which* estimate of the input frame time: the historical
     // EMA (default), the raw last interval, a 16-sample median that ignores WGC's
     // +-1 vblank quantization, or that median snapped to whole vblanks.
-    const double rt_ms = fg_render_time_ms();
+    double rt_ms = g_fg_rt_producer ? game_median_ms() : fg_render_time_ms();
+    if (rt_ms <= 0.0 && g_fg_rt_producer) { rt_ms = fg_render_time_ms(); }
     cd.frameRenderTime = static_cast<float>(rt_ms);
     // v6 cross-check: the add-on measures the game's own present interval. A large
     // mismatch means our capture cadence is not the game's (WGC batching, a limiter
@@ -1679,9 +1829,42 @@ static void run_frame_ex(ID3D11Texture2D* colour11)
     // early-out (XeFG_Dx12.cpp:696-703), which returns before TagFrameConstants/SetPresentId.
     // Calling SetPresentId with no inputs for that id is a different (unproven) shape, so the
     // id gaps by one here - a not-ready dispatch upstream does exactly the same.
-    if (!g_mv_gate_tolerated) {
-        g_api.TagFrameConstants(g_fg, present_id, &cd);
-        g_api.SetPresentId(g_fg, present_id);
+    if (!g_mv_gate_tolerated && !g_mv_gate_off) {
+        fg_tag_result("TagFrameConstants", g_api.TagFrameConstants(g_fg, present_id, &cd));
+        if (!g_mv_gate_off) {
+            fg_tag_result("SetPresentId", g_api.SetPresentId(g_fg, present_id));
+        }
+        // OptiScaler tags BACKBUFFER right after SetPresentId for every non-Upscaler lane
+        // (XeFG_Dx12.cpp:944-991). It is the only explicit carrier of the interpolation
+        // rect/pos, and it is what makes the rect follow the HUDless extent instead of
+        // relying on the library's full-backbuffer default. pResource stays null (XeFG's
+        // own backbuffer) and the sentinel list is the same one OptiScaler passes.
+        if (!g_mv_gate_off) {
+            xefg_swapchain_d3d12_resource_data_t bbr{};
+            bbr.type         = XEFG_SWAPCHAIN_RES_BACKBUFFER;
+            bbr.validity     = XEFG_SWAPCHAIN_RV_UNTIL_NEXT_PRESENT;
+            bbr.resourceBase = { tag_rect_x, tag_rect_y };
+            bbr.resourceSize = { tag_rect_w, tag_rect_h };
+            bbr.pResource    = nullptr;
+            fg_tag_result("tag BACKBUFFER",
+                          g_api.D3D12TagFrameResource(g_fg,
+                                                      reinterpret_cast<ID3D12CommandList*>(1),
+                                                      present_id, &bbr));
+        }
+        static bool told_in = false;
+        if (!told_in) {
+            told_in = true;
+            logf_("[lock] xefg-in: mv=%ux%u depth=%ux%u hudless=%ux%u rect=%ux%u+%u+%u"
+                  " (chain %ux%u) proj=%s view=%s zn=%.3f zf=%.0f%s fov=%.2fdeg"
+                  " mvscale=(%.3f, %.3f)\n",
+                  tag_mv_w, tag_mv_h, tag_depth_w, tag_depth_h,
+                  hudless_res ? hudless_tag_w : 0u, hudless_res ? hudless_tag_h : 0u,
+                  tag_rect_w, tag_rect_h, tag_rect_x, tag_rect_y, draw_w, draw_h,
+                  proj_src, view_src, proj_zn, proj_zf,
+                  far_infinite ? " (inf)" : "",
+                  proj_fov * 180.0f / 3.14159265f,
+                  cd.motionVectorScaleX, cd.motionVectorScaleY);
+        }
     }
     const double fg1 = qpc_ms();
     g_ms_fg = g_ms_fg * 0.9 + (fg1 - fg0) * 0.1;

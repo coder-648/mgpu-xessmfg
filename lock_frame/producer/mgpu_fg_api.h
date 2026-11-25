@@ -45,7 +45,14 @@
 //     consumer that has to record GPU copies: the record's `cmd_list` is only open during
 //     the Evaluate call it was published from. The sink runs synchronously inside that
 //     window, on the thread the title evaluated on.
-#define MGPU_FG_API_VERSION   2u
+// v3: `MgpuFgFrame.camera_*` basis vectors appended at the END of the struct, so the v2
+//     prefix layout is untouched and an older capture can still read the fields it knows.
+//     The consumer builds XeFG's viewMatrix from them exactly the way OptiScaler does.
+// v4: `MgpuFgFrame.stream_cmd[stream]` appended (per-resource ValidNow command list;
+//     OptiScaler's Sl_Inputs stores the same). The v3 prefix layout is untouched, so an
+//     older capture can still read the fields it knows; the producer/faker pair is built
+//     together.
+#define MGPU_FG_API_VERSION   4u
 #define MGPU_FG_API_EXPORT    "MgpuFgGetApi"
 #define MGPU_FG_MODULE_NAME   L"fakerFG.dll"
 
@@ -172,6 +179,21 @@ typedef struct MgpuFgFrame
     float          view_to_clip[16];
     float          clip_to_prev_clip[16];
     float          prev_clip_to_clip[16];
+
+    // ---- v3: camera basis, appended so the v2 prefix stays byte-compatible ----
+    // Streamline's `sl::Constants.cameraRight/Up/Fwd/Pos`. XeFG's frame constants carry a
+    // `viewMatrix`; OptiScaler builds it from these (XeFG_Dx12.cpp:843-860) and our consumer
+    // does the same in lock_frame/modules/020_state_overlay.inc. Zero when the title
+    // declared no camera, which is exactly what OptiScaler forwards in that case.
+    float          camera_right[3];
+    float          camera_up[3];
+    float          camera_forward[3];
+    float          camera_pos[3];
+    // v4: per-resource command list the resource was tagged on (ValidNow reads/copies
+    // must use it; OptiScaler's per-resource cmdList). Borrowed and only valid in the
+    // producer process during the publication window. Appended after the v3 fields so
+    // the v3 prefix remains readable by an older capture.
+    void*          stream_cmd[MGPU_FG_STREAM_COUNT];
 } MgpuFgFrame;
 
 // ---------------------------------------------------------------- the table

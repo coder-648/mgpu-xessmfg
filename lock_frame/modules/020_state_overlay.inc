@@ -435,6 +435,9 @@ static UINT         g_nopace_windows = 0;   // consecutive suspicious windows
 //   --fg-jittered-mv / --fg-no-jittered-mv  JITTERED_MV init flag ("remove jitter from
 //                  input velocity"); normally driven by the producer's DLSS MVJittered hint
 static bool         g_fg_rt_zero = false;
+// --fg-rt-producer: feed XeFG frameRenderTime from the producer's own present interval
+// (FrameShared.frame_time_ms median) instead of our capture cadence. A/B only.
+static bool         g_fg_rt_producer = false;
 // The frame constants are the one input XeFG gets that we can only approximate. UE5's
 // jitter sign and the synthetic projection matrix are the two remaining suspects for the
 // "never goes away" edge / model-edge artifacts, so both are switchable at runtime.
@@ -447,12 +450,9 @@ static bool         g_fg_jitter_flip = false;   // --fg-jitter-flip
 // MV source fixes.
 static bool         g_fg_jitter_zero = false;   // --fg-jitter-zero: pass jitter = 0
 static bool         g_fg_no_proj = false;       // --fg-no-proj
-// --fg-use-matrix: hand the game's own view-to-clip to XeFG verbatim. Off by default, because
-// OptiScaler does NOT do that even though it has the same matrix: it derives near/far/FOV from
-// it and passes camera values instead, with a comment that UE titles "seem to not be passing
-// the correct cameraViewToClip" (inputs/FG/Streamline_Inputs.cpp:207). Deriving keeps us on the
-// projection form this code already ships (reversed-Z infinite far) and only makes the numbers
-// real - which is the whole point of v12 anyway.
+// --fg-use-matrix: HISTORICAL. The game's own view-to-clip is the SDK-native projection and
+// is now the default whenever the producer publishes a fresh matrix (v12). Kept as a CLI
+// alias so old scripts still parse; it no longer changes anything.
 static bool         g_fg_use_matrix = false;
 // --fg-proj-rz: build the synthetic projection in reversed-Z / infinite-far form. Only the
 // SYNTHETIC matrix is ever affected (the game's own matrix needs --fg-use-matrix), and
@@ -498,15 +498,13 @@ static int          g_ui_mode5 = 0;
 // value is 0..255; 8 is a good first cut for an 8-bit-equivalent HUD overlay.
 static float        g_ui_synth_threshold = 8.0f / 255.0f;
 static bool         g_mv_gate_off = false;   // this frame has no MV -> 1X, no tagging
-// --fg-gate N (default 0 = current behaviour): tolerate up to N *consecutive* frames that
-// only lack the motion-vector stream before turning generation off. Menus, loading screens
-// and a single dropped publication then no longer cost a SetEnabled(0)/SetEnabled(1) cycle,
-// which resets XeFG's history (and, for 1<->2, rebuilds inside the library). During the
-// tolerated frames XeFG gets no inputs and no present id, i.e. OptiScaler's Dispatch
-// early-out shape (XeFG_Dx12.cpp:696-703). A missing *pairing* is never tolerated.
+// --fg-gate N (default 0): tolerate up to N consecutive frames that only lack the
+// motion-vector stream. During those frames XeFG gets no inputs and no present id
+// (OptiScaler's Dispatch early-out, XeFG_Dx12.cpp:696-703); the library is NOT toggled,
+// so its history is not reset. A missing *pairing* is never tolerated.
 static int          g_fg_gate_hold = 0;
-// --fg-gate-up M (default 1 = current behaviour): consecutive MV frames required before
-// generation is switched back on. Keeps an alternating hit/miss pattern from flapping.
+// Kept for command-line compatibility; the gate no longer calls SetEnabled, so there is
+// no re-enable debounce to apply.
 static int          g_fg_gate_up = 1;
 // Set by the gate for the current frame: FG is left enabled but nothing is sent downstream.
 static bool         g_mv_gate_tolerated = false;
@@ -844,6 +842,59 @@ static void approx_projection(float* m, float aspect, float fov_y_rad, float zn,
     m[10] = zf / (zn - zf);
     m[11] = -1.0f;
     m[14] = (zn * zf) / (zn - zf);
+}
+
+// The projection form OptiScaler hands XeFG for its DLSSG lane:
+//     XMMatrixPerspectiveFovLH(vfov, aspect, near, far)   (XeFG_Dx12.cpp:879-881)
+// i.e. a LEFT-HANDED perspective in DirectX's row-major/row-vector convention:
+//     m[0]  = 1/(aspect*tan(fov/2))
+//     m[5]  = 1/tan(fov/2)
+//     m[10] = far/(far-near),  m[11] = +1,  m[14] = -near*far/(far-near)
+// The infinite-far limit is m[10] = 1, m[14] = -near. The previous synthetic helpers used
+// m[11] = -1 (a right-handed/negative-w form), which is a different projection from both
+// the game's own matrix and OptiScaler's - one of the "data not aligned" items.
+static void projection_lh(float* m, float aspect, float fov_y_rad, float zn, float zf,
+                          bool infinite)
+{
+    const float f = 1.0f / tanf(fov_y_rad * 0.5f);
+    memset(m, 0, 16 * sizeof(float));
+    m[0] = f / aspect;
+    m[5] = f;
+    if (infinite || !(zf > zn)) {
+        m[10] = 1.0f;
+        m[11] = 1.0f;
+        m[14] = -zn;
+    } else {
+        m[10] = zf / (zf - zn);
+        m[11] = 1.0f;
+        m[14] = -(zn * zf) / (zf - zn);
+    }
+}
+
+// XeFG's frame constants carry a viewMatrix. OptiScaler builds it from Streamline's
+// cameraRight/Up/Fwd/Pos (XeFG_Dx12.cpp:843-860):
+//     view = [ right.x  up.x  fwd.x  0 ]   with translation (-dot(pos,right),
+//            [ right.y  up.y  fwd.y  0 ]                    -dot(pos,up),
+//            [ right.z  up.z  fwd.z  0 ]                    -dot(pos,fwd))
+//            [ tx       ty       tz     1 ]
+// The basis vectors are transported per frame (producer FrameShared.camera_right/...);
+// zeros mean "the title declared no camera", in which case the old identity is kept.
+static bool view_from_camera_basis(const float* right, const float* up, const float* fwd,
+                                   const float* pos, float* m)
+{
+    const float rl = right[0]*right[0] + right[1]*right[1] + right[2]*right[2];
+    const float ul = up[0]*up[0] + up[1]*up[1] + up[2]*up[2];
+    const float fl = fwd[0]*fwd[0] + fwd[1]*fwd[1] + fwd[2]*fwd[2];
+    if (!(rl > 1.0e-8f) || !(ul > 1.0e-8f) || !(fl > 1.0e-8f)) { return false; }
+    memset(m, 0, 16 * sizeof(float));
+    m[0]  = right[0]; m[1]  = up[0]; m[2]  = fwd[0]; m[3]  = 0.0f;
+    m[4]  = right[1]; m[5]  = up[1]; m[6]  = fwd[1]; m[7]  = 0.0f;
+    m[8]  = right[2]; m[9]  = up[2]; m[10] = fwd[2]; m[11] = 0.0f;
+    m[12] = -(pos[0]*right[0] + pos[1]*right[1] + pos[2]*right[2]);
+    m[13] = -(pos[0]*up[0]    + pos[1]*up[1]    + pos[2]*up[2]);
+    m[14] = -(pos[0]*fwd[0]   + pos[1]*fwd[1]   + pos[2]*fwd[2]);
+    m[15] = 1.0f;
+    return true;
 }
 
 // near/far from the game's own view-to-clip, used only when the producer declared no

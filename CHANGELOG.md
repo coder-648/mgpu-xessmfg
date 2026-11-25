@@ -3,6 +3,118 @@
 只记**用户能感知**的变化与对应实测依据。每条结论的原始数据在
 `docs/findings/PERF_BASELINE.md` / `FINAL_CONFIG.md`。
 
+### local: 逐游戏 XeFG 兼容补齐 + 输入契约修复（2026-11-25）
+
+详见 `lock_frame/docs/PER_GAME_COMPAT_2026-11-25.md`。只动输入/一致性，不改模型与节奏：
+
+- fakerFG：Endfield/ZZZ `IgnoreTagsWithoutHudlessForFG`、007 `IgnoreValidUntilEvaluateForFG`、
+  CP2077 `CyberpunkHudlessState` 真正按 quirk 生效；UE 无限远 → 75000；
+  MV/depth 按各自 extent tag，不同则强制 resample；HUDless/UI 的尺寸/格式必须与链一致，
+  否则不 tag（不用居中 rect 猜 letterbox）。
+- fakerFG profile：CONTROL Resonant / KCD2 waitable、Wuthering Waves / NG4 / DoA6 / Talos 2 /
+  RDR2 的 `FGPreserveSwapChain=false`（保留旧 XeFG context 到退出再释放，避免旧 facade UAF）、
+  Dead Space `OverrideVsync`。
+- bridge：BACKBUFFER/HUDless/UI 同尺寸/同格式校验；所有 tag/FrameConstants/SetPresentId
+  检查返回值；1X 不再发 constants/presentId；init 写容量、SetNum 落当前 count
+  （修 `--dyn-mfg` 升档 `INVALID_ARGUMENT`）；UE 自动 75000；late flags 增加 WARNING。
+- 生成器：输出路径修正到 `modules/`，补 `DLSSGFrameLatencyWaitable` / `SimulateWaitableObject` /
+  `ExtendedSearch` / `FixSlSimulationMarkers` / `SkipFirstFrames` 等 token，补进 KCD2、
+  CONTROL Resonant、PBZ、Wuchang 行；`025` 的 4 条错误描述已校正。
+- 2026-11-25 CP2077 port-vs-keep2x 复测：两者都真正生效（port: model 15→16；
+  keep2x: 2x-model route）。视觉结论 keep2x 更好；日志也显示 port 的 color/marker
+  pairing lag 为 3.30–3.60 帧（keep2x 0.03–0.05），且 port 出现 GPU 8.5/10.6 ms 尖峰和
+  118/119 presents 窗口。port 无契约错误，但保留为实验路径；keep2x 继续默认。
+- **第二轮（2026-11-25）**：补上 `MgpuFgFrame.stream_cmd[stream]`（API v4，本地 lane 的 ValidNow
+  资源使用各自的 tag list）；tag/constants frame token 不匹配时拒绝混帧；高分辨率 MV
+  激活改读记录声明；HUDless 尺寸不一致时优先走 unblend/patch 重建；新增
+  `FGOnlyAcceptFirstHudless`；UI premultiplied 初始化标志；1X 改为纯 Dispatch early-out
+  （不再 SetEnabled 翻转）；NoFSRFGFirstSwapchain 收窄到 RDR2；KCD2 使用真实
+  `FRAME_LATENCY_WAITABLE_OBJECT`；`FGPreserveSwapChain=false` 旧 context 延迟释放避免 UAF。
+- 仍未做：CameraMotionFill（需要 RGBA velocity 协议）、late init flags 的 context 重建
+  （patch-only 不依赖）、桥接 transport 的跨 command-list 提交（本地 lane 已按资源列表）。
+- 实机更正（CP2077）：**4x 的边缘模糊带比 3x 更宽**；3x 仍是默认画质档。3x 输入
+  ~38 fps（target 40）会出现 `NOT-EXACT`/pacer hold，但它不是切换到 4x 的理由。
+
+
+1.3.2-local.camvm 把 codec/StreamPercent 全改 100 并默认关闭消费端重建；实机对比后
+**收益不足、性能成本偏高**（depth 从 1704×960 回到 2562×1441：码流 +~8 MB/帧、
+depth 编码约 +1.3 ms；人物边缘没有可见改善），因此：
+
+- 运行环境回退到 **1.3.1-local.camvm** 的已验证二进制（CP2077/PBZ 都是 1.3.1，
+  `fakerFG.ini` 回到 `StreamPercent*=150 / DepthCodecPercent=150`）；
+- 仓库默认值/代码路径同步回退：080 联合重建默认开、目标仍为输入画面尺寸；
+  `version.h` 回 1.3.1；UI 默认 150；`check_release.py` 要求 150；
+- 1.3.2 的包保留在 Downloads 仅作记录，**不要使用**；
+- `viewMatrix / rect / extent` 等输入对齐（1.3.1 的收益）保留。
+
+### local: lock_frame 1.3.2-local.camvm —— 默认 100/100 + 消费端不再上采样（2026-11-25）
+
+发布说明见 `lock_frame/docs/RELEASE_NOTES_1.3.2-local.camvm.md`。协议仍 **v34**，
+`fakerFG` API v3；producer/fakerFG/consumer/UI 需一起更新。
+
+- **默认值**：`CodecStreamPercent / MvCodecPercent / DepthCodecPercent`
+  与 `StreamPercent(Mv/Depth)` 全部改为 **100**（1:1 比特精确）。
+- **消费端不再上采样**：100/100 时直接按游戏 **render/MV 网格** tag，重建到 3840×2160
+  的 joint pass 默认关闭；日志 `--upsample: OFF (default)`，`xefg-in` 的 MV/depth 尺寸 =
+  render（PBZ 为 2562×1441），且没有 `rebuilt ... to 3840`。
+- `--upsample` 仅作显式 A/B；旧 ini 两条流尺寸不同时，消费端自动重建到 **render 网格**
+  （不再到 4K），并打一行提示。
+- **UI 同步**：版本 `1.3.2-local.camvm`；传输比例/深度码流默认 100%；文案改为
+  “默认 1:1，不上采样”；写 ini 的逻辑不变。
+- **PBZ/UE5 更正**：撤回 2026-11-10 的“PBZ MV 不可用”结论（`--fg-of` 同样有人物边缘
+  伪影）；屏幕边缘收益跨引擎成立；人物模型边缘残留待定为 XeFG 模型/库本身。
+  `extras/pbz_ab/` 随包带上 2x / port / 原生网格 / 符号 / 抖动对照脚本。
+- 验证记录：`docs/design/INPUT_ALIGNMENT_CAMVM.md` §6–§7。
+
+### local: XeFG 输入契约补齐（相机 / view / 投影 / rect / extent，2026-11-25）
+
+> **`MgpuFgFrame` v2 → v3：`fakerFG.dll` 与 `xess_mfg_producer.dll` 必须一起重编/替换。**
+> 协议（SharedControl/FrameShared）布局未变。
+
+把“DLSSG 数据本身是可信的、只差把 XeFG 契约字段补齐”这一层落地。只动输入侧，不改调度/节奏。
+
+- **相机基向量进共享块**：`MgpuFgFrame` 末尾追加 `camera_right/up/forward/pos`（v3，前缀兼容），
+  `proxy_streamline` 从 `sl::Constants` 填充，producer 写入 `FrameShared.camera_*`（原来是
+  `memset 0`）。消费端用与 OptiScaler 相同的公式构造 **`viewMatrix`**（原来恒为单位阵），
+  带 2 s 缓存，避免“只有一条记录带 constants”时逐帧掉回单位阵。
+- **near/far/FOV 修正并发布**：`proxy_streamline::projection_camera()` 换成与消费者
+  `derive_near_far_from_matrix()` 相同的、与符号/行列布局无关的公式（旧版 `e<0` 会**拒绝**
+  CP2077 的真实矩阵）；非 Unreal 标题**一律**从 `cameraViewToClip` 反算（OptiScaler 规则）；
+  `cameraFOV>3` 视为角度并转弧度（CP2077 给 75/60 度）。实测该矩阵得到
+  `zn=0.020 / zf=∞ / fov=51.01° / aspect=1.7777`，与消费端原先派生值一致。
+- **投影来源补齐**：默认直接把游戏的 `view_to_clip` 交给 XeFG（v12 已在传，之前只有
+  `--fg-use-matrix` 才用）；没有新鲜矩阵时退回 OptiScaler 的
+  `XMMatrixPerspectiveFovLH(near,far,fov,aspect)` 形式（旧的合成矩阵是 `m[11]=-1` 的右手形式，
+  与游戏和 OptiScaler 都不一致）。`--fg-proj-rz` 保留为旧近似 A/B，`--fg-use-matrix` 成为
+  历史别名，`--fg-no-proj` 仍为 identity。
+- **插值矩形**：消费端每帧补 `XEFG_SWAPCHAIN_RES_BACKBUFFER`（`rect={0,0,draw_w,draw_h}`，
+  `pResource=nullptr`，与 OptiScaler `XeFG_Dx12.cpp:944-991` 同形），放在 `SetPresentId` 之后、
+  MV gate 打开时。
+- **HUDless extent**：老版 clean-stream 4 的 `resourceSize` 改用 stream 4 的真实尺寸
+  （H' 合成路径仍是链尺寸）；`mode 5` 只在三者同尺寸时启用，避免尺寸不一致。
+- **present-staged 车道的 `mvecScale`**：补上 `×MV extent`（与 Evaluate 车道一致）。此前只走
+  present-staged 的标题会发布原始 `(1,1)`，等于 3840× 偏小。
+- 日志：`frame constants:` 增加 `view=`、`proj=` 来源；新增一行
+  `xefg-in: mv/depth/hudless/rect/proj/view/zn/zf/fov/mvscale`，用于和 OptiScaler 的
+  `XeFG input:/SetMVScale` 逐项对照。
+- **未改**：`frameRenderTime` 取值策略（帧节奏域）、`initFlags` 持久化、UI 平面传输
+  （双卡设计取舍）、marker。`--fg-far-finite` 现在只影响“没有游戏矩阵”的退回路径。
+
+**实机结果（2026-11-25，CP2077 4K DLAA，3x / 4x）**
+
+- 07:43 会话确认 API v3 生效：`api ready (version 3, record 640 bytes)`、
+  `producer: subscribed ... (api v3 ...)`；消费端
+  `camera=1`、`view=camera`、`proj=game view-to-clip`、`zn=0.020 / zf=16777`、
+  `mvscale=(3840.000, 2160.000)`、`rect=3840x2160+0+0`、`initFlags=0x1`。
+- 4x/3x 观感明显好于上一版；`ab_50`（游戏矩阵）与 `ab_51`（`--fg-proj-rz`）**无可见差异**
+  ⇒ 收益不来自投影来源，而来自新补齐的 **`viewMatrix`**（两者都是 `view=camera`）。
+- 4x 仍 `xN=4.00 / show≈120`，3x `xN=3.00 / show=120`，`xNmiss=0`；
+  `xefg-in` 首帧的 `hudless=0x0` 是首帧 patch 尚未到达，稳态不变。
+- **UE5 / PBZ（2026-11-25 追加）**：PBZ 3x 同一构建下屏幕边缘伪影基本消失（viewMatrix 的
+  收益跨引擎成立），人物模型边缘仍有残留；显式 `--fg-of` 后表现相同 ⇒ **撤回** 2026-11-10
+  的“PBZ MV 不可用”结论，残留不在 MV 来源。后续优先验证 2x（t=0.5）、
+  `DepthCodecPercent=100 + --no-upsample`（原生 render 网格）与 port model 15。
+
 ### release: lock_frame 1.3.0（2026-11-24）—— UI 合成 mode 4 定稿（DLSS FG 双卡链路完成）
 
 发布说明见 `lock_frame/docs/RELEASE_NOTES_1.3.0.md`。协议 **v34**。

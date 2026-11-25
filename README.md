@@ -12,10 +12,11 @@
 ## 版本与维护状态
 
 **正式版 1.3.0**（2026-11-24）· 共享协议 **v34** · GPL-3.0
+（本地验证 **1.3.1-local.camvm**；1.3.2 的 100/100 + 不上采样已因性能成本回退）
 
 - 跨卡只传 **MV / depth / UI 支撑域 patch**（颜色走 WGC 单卡捕获）：
-  MV 100% **比特精确**、depth 150%；UI 合成默认开启（producer 支撑域 patch，
-  **固定 mode 4**，stream 3 / mode 5 关闭）。
+  MV 100% **比特精确**、depth 150%（消费端联合重建到输入画面尺寸）；
+  UI 合成默认开启（producer 支撑域 patch，**固定 mode 4**，stream 3 / mode 5 关闭）。
   硬件不支持无损码流时自动退回拷贝路径。
 - **DLSS FG 双卡补帧链路已完成**：CP2077 / PBZ / Wuchang 实机通过，UI 稳定无拖影；
   CP2077 patch-only UI 开销约 2.5 pp。模型边缘剩余伪影来自 XeFG 模型本身。

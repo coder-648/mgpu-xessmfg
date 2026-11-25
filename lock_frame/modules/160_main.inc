@@ -233,6 +233,11 @@ int main()
     if (const wchar_t* rt = wcsstr(GetCommandLineW(), L"--fg-rt ")) {
         if (wcsncmp(rt + 8, L"0", 1) == 0) { g_fg_rt_zero = true; }
     }
+    if (wcsstr(GetCommandLineW(), L"--fg-rt-producer") != nullptr) {
+        g_fg_rt_producer = true;
+        logf_("[lock] --fg-rt-producer: frameRenderTime = the game's own present interval"
+              " (A/B; default is our capture cadence)\n");
+    }
     if (wcsstr(GetCommandLineW(), L"--fg-ui none")) { g_fg_ui_none = true; }
     // B mode 4 (UI stream + unblend) is not accepted yet: OFF by default, no user-facing
     // switch. These two flags are internal A/B only and are deliberately undocumented
@@ -936,6 +941,8 @@ int main()
     // 2026-11-21: --no-upsample is an explicit A/B for the ported MFG model. It tags the
     // producer's low-res MV/depth pair directly and lets XeFG do the resampling; model 15/16
     // is much more sensitive to reconstructed motion than the 2x model at screen edges.
+    // 2026-11-25: the 1.3.2 default (100/100 + no rebuild) was reverted - the extra depth
+    // bandwidth/codec cost did not buy a visible character-edge improvement.
     const bool no_upsample = wcsstr(GetCommandLineW(), L"--no-upsample") != nullptr;
     g_upsample         = !no_upsample;
     if (!g_stream_mask_explicit) {
@@ -1094,6 +1101,21 @@ int main()
         }
         logf_("[lock] game window %p\n", (void*)game_wnd);
         g_game_wnd = game_wnd;
+
+        // ---- UE detection and the XeFG far-plane rule ----
+        // OptiScaler's XeFG output uses 75000 for Unreal's infinite far plane
+        // (XeFG_Inputs_Dx12.cpp:464-478). Detect a UE shipping build independently of the
+        // MV-source policy below, then apply the finite far plane if nothing explicit was
+        // given. The value only replaces an INFINITE far plane (140_frame.inc).
+        if (!g_game_is_unreal && g_game_exe_set &&
+            wcs_ends_with_ci(g_game_exe.c_str(), L"-Win64-Shipping.exe")) {
+            g_game_is_unreal = true;
+        }
+        if (g_game_is_unreal && g_fg_far_finite == 0.0f) {
+            g_fg_far_finite = 75000.0f;
+            logf_("[lock] Unreal shipping build - --fg-far-finite 75000 for XeFG"
+                  " (OptiScaler's UE rule)\n");
+        }
 
         // ---- MV source policy for Unreal titles ----
         // Measured on 2026-11-10 on this machine: with the game's own motion vectors both
