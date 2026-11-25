@@ -186,12 +186,15 @@ depth 编码约 +1.3 ms；人物边缘没有可见改善），因此：
   `extras/pbz_ab/` 随包带上 2x / port / 原生网格 / 符号 / 抖动对照脚本。
 - 验证记录：`docs/design/INPUT_ALIGNMENT_CAMVM.md` §6–§7。
 
-### local: XeFG 输入契约补齐（相机 / view / 投影 / rect / extent，2026-11-25）
+### local: 1.3.1 XeFG 输入契约补齐 —— 屏幕边缘伪影修复（相机 / view / 投影 / rect / extent，2026-11-25）
 
 > **`MgpuFgFrame` v2 → v3：`fakerFG.dll` 与 `xess_mfg_producer.dll` 必须一起重编/替换。**
 > 协议（SharedControl/FrameShared）布局未变。
 
 把“DLSSG 数据本身是可信的、只差把 XeFG 契约字段补齐”这一层落地。只动输入侧，不改调度/节奏。
+
+**核心收益：屏幕边缘伪影基本消失**（CP2077 4x/3x、PBZ 3x，收益来自 `viewMatrix`）。
+人物模型边缘残留仍在，已定位为 XeFG 模型/库本身（`--fg-of` 后表现相同），不是 MV 来源。
 
 - **相机基向量进共享块**：`MgpuFgFrame` 末尾追加 `camera_right/up/forward/pos`（v3，前缀兼容），
   `proxy_streamline` 从 `sl::Constants` 填充，producer 写入 `FrameShared.camera_*`（原来是

@@ -7,7 +7,7 @@
 | [`RELEASE_NOTES_1.0.0.md`](RELEASE_NOTES_1.0.0.md) | 1.0.0 发布说明 |
 | [`RELEASE_1.0.0.md`](RELEASE_1.0.0.md) | GitHub Release 发布正文（下载/校验/安装/已知限制） |
 | [`RELEASE_NOTES_1.3.0.md`](RELEASE_NOTES_1.3.0.md) | 1.3.0 发布说明（UI 合成 mode 4 定稿，DLSS FG 双卡链路完成） |
-| [`RELEASE_NOTES_1.3.1-local.camvm.md`](RELEASE_NOTES_1.3.1-local.camvm.md) | 1.3.1 本地验证版（XeFG 输入契约：view/proj/rect/extent） |
+| [`RELEASE_NOTES_1.3.1-local.camvm.md`](RELEASE_NOTES_1.3.1-local.camvm.md) | 1.3.1 本地验证版（**屏幕边缘伪影修复**：view/proj/rect/extent） |
 | [`RELEASE_NOTES_1.3.2-local.camvm.md`](RELEASE_NOTES_1.3.2-local.camvm.md) | 1.3.2 本地版（100/100，**已回退，勿用**） |
 | [`RELEASE_NOTES_1.3.3.md`](RELEASE_NOTES_1.3.3.md) | **1.3.3 发布说明**（A/C/D/E/F + B/J/R + UI mode 4） |
 | [`RELEASE_PLAN_2026-11-17.md`](RELEASE_PLAN_2026-11-17.md) | 正式版规划、决策记录、实施状态 |

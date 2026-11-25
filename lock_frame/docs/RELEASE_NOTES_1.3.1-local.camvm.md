@@ -6,7 +6,7 @@
 
 ## 1. 本版做了什么
 
-只补 XeFG 的输入契约，不改调度、模型、UI、marker：
+只补 XeFG 的输入契约，不改调度、模型、UI、marker。核心收益是**屏幕边缘伪影基本消失**：
 
 - **`viewMatrix`**：用 `sl::Constants.cameraRight/Up/Fwd/Pos` 构造（原来恒为单位阵），
   带 2 s 缓存，记录没有 constants 的帧不会掉回单位阵。
@@ -38,7 +38,9 @@ xefg-in: mv=3840x2160 depth=3840x2160 rect=3840x2160+0+0
 
 - 4x `xN=4.00 / show≈120`，3x `xN=3.00 / show=120`，`xNmiss=0`；
 - `ab_50`（游戏矩阵）vs `ab_51`（`--fg-proj-rz`）**无可见差异** ⇒ model 18 不消费投影；
-- 相对上一版（identity view）**明显改善** ⇒ 收益来自 **`viewMatrix`**；
+- **屏幕边缘伪影基本消失**（相对上一版的 identity view 明显改善）⇒ 收益来自 **`viewMatrix`**；
+- PBZ 3x 同一构建下屏幕边缘伪影也基本消失（跨引擎成立）；人物模型边缘残留仍在，
+  与 MV 来源无关（`--fg-of` 后表现相同），详见 `docs/design/INPUT_ALIGNMENT_CAMVM.md` §6；
 - `xefg-in` 首帧 `hudless=0x0` 是首帧 patch 未到达，稳态不变。
 
 详见仓库 `docs/design/INPUT_ALIGNMENT_CAMVM.md`（也会随包放到 `docs/`）。

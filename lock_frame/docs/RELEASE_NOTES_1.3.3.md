@@ -4,7 +4,8 @@
 > `fakerFG.dll` / `xess_mfg_producer.dll` / `lock_frame.exe` / `lock_frame_ui.exe`
 > 必须同版本一起更新（旧 producer 会拒绝 attach，不会错读布局）。
 
-本版把 1.3.1 / 1.3.2 的输入契约修复与回退结论收口，并完成四件事：
+本版包含 **1.3.1 的核心修复：屏幕边缘伪影**（`viewMatrix` 从单位阵改为相机基向量，
+并补齐投影 / near-far / rect / extent），以及四项运行时收尾：
 **4K 显存降 43%**、**环满时只复用安全槽**、**consumer 退出后 producer 停止空转**、
 **UI mode 4 的小 UI 抖动**。协议布局与 ini 键保持兼容。
 
@@ -20,21 +21,37 @@
 
 ## 2. 重点变化
 
-### 2.1 4K 显存映射 −43%
+### 2.1 屏幕边缘伪影（1.3.1 的核心修复，本版已包含）
+
+1.3.0 的画质短板是**屏幕边缘伪影**：传给 XeFG 的 `viewMatrix` 恒为单位阵，near/far/FOV、
+插值 `rect`、HUDless `extent` 也没有按游戏真实数据对齐。1.3.1 起：
+
+- `viewMatrix` 用 `sl::Constants` 的 `cameraRight/Up/Fwd/Pos` 构造（带 2 s 缓存，
+  记录缺 constants 的帧不会掉回单位阵）；
+- 非 Unreal 标题一律从 `cameraViewToClip` 反算 near/far/FOV（`cameraFOV>3` 视为角度转弧度）；
+- 投影默认用游戏自己的 `view_to_clip`，缺矩阵时退回 `XMMatrixPerspectiveFovLH` 形式；
+- 每帧补 `BACKBUFFER` 插值矩形；HUDless 用 stream 4 的真实尺寸。
+
+实测：CP2077 4x/3x 与 PBZ 3x 的**屏幕边缘伪影基本消失**（收益来自 `viewMatrix`；
+`--fg-proj-rz` 对照无可见差异）。**人物模型边缘仍有残留**，已定位为 XeFG 模型/库本身
+（显式 `--fg-of` 后表现相同，不是 MV 来源），详见
+`docs/design/INPUT_ALIGNMENT_CAMVM.md` §6（随包为 `docs/INPUT_ALIGNMENT_CAMVM.md`）。
+
+### 2.2 4K 显存映射 −43%
 
 `TransportSlots` 默认 **16**（可设 4..32）。4K codec 每槽约 33 MiB，CP2077 4K 实测映射
 **1773.6 MB → 1017.6 MB**。`frames[] / consumed[]` 仍是 32 项，consumer 按 `st.slots`
 工作，无需改逻辑。出现稳态 `pair: no_slot` 时把 `fakerFG.ini` 的 `TransportSlots`
 调到 24/32 并重启游戏（余量换显存）。
 
-### 2.2 环满时只复用安全槽
+### 2.3 环满时只复用安全槽
 
 producer 以前无条件覆盖最旧的槽，实测每个新 run 启动都会 `reclaimed oldest slot 1/2/3`，
 可能盖掉 consumer 正要配对的槽。现在只覆盖“消费者不可能还需要”的槽
 （`frame_id == 0`，或 `frame_id + 2 <= colour_seq`），其余丢帧等 ACK 后自然恢复。
 日志由 `reclaimed oldest slot` 变为 `reclaimed SAFE slot` / `no safe slot to reuse`。
 
-### 2.3 consumer 退出后不再空转
+### 2.4 consumer 退出后不再空转
 
 consumer 以 `TerminateProcess` 退出时 `request_mask` 会残留，producer 以前一直每帧编码/拷贝
 两路流。现在用 `consumer_session` 高 32 位的 pid 每秒探测一次：消失 3 s 后暂停拷贝，
@@ -42,7 +59,7 @@ consumer 以 `TerminateProcess` 退出时 `request_mask` 会残留，producer �
 `lock_frame_ui.exe` 会持有一整个生命周期。consumer 两处令牌构造改为
 `(pid << 32) | 低 32 位`，保证高半区永远是 pid。
 
-### 2.4 UI mode 4：小 UI 抖动
+### 2.5 UI mode 4：小 UI 抖动
 
 - **hard edge 设为默认**（`--ui-patch-box-feather` 可回退）：7×7 盒平均的权重是 1/49 量化的，
   小 UI 移动时混合强度逐帧变化，是“抖动”的来源；5×5 max 膨胀的权重只会是 1 或 0。
@@ -52,7 +69,7 @@ consumer 以 `TerminateProcess` 退出时 `request_mask` 会残留，producer �
 - `--tag-dump` 新增 `tag_XX_alpha.bmp`（支撑掩码）与 `tag_XX_diff.bmp`（`|P − H'| × 8`），
   用于肉眼检查 HUDless 重建。
 
-### 2.5 跨卡同步与状态修正（consumer）
+### 2.6 跨卡同步与状态修正（consumer）
 
 - **A**：帧内 MV/depth 的拷贝/解码前，把 producer 的 `fwd[slot]`（值 = `frames[slot].published`）
   排进同一条队列（`order_publication_read()`）。此前只有 prefetch 路径做这件事，而 prefetch
@@ -72,7 +89,7 @@ consumer 以 `TerminateProcess` 退出时 `request_mask` 会残留，producer �
 
 ### producer（`xess_mfg_producer.dll`）
 
-- 上述 2.1 / 2.2 / 2.3；
+- 上述 2.2 / 2.3 / 2.4；
 - `UiStats`（默认 **60**）：synth 的覆盖率/诊断 `InterlockedAdd` 从每帧改成每 N 帧
   （`0`=从不，`1`=旧行为）。4K、6% 覆盖时原来约 50 万 + 13 万次 atomic/帧，读数本来就只按 1 Hz 记录；
 - `UiSynthThreshold`（随包 ini **2**，代码兜底 8）：P/H 差分支撑阈值，之前硬编码 8。
@@ -112,6 +129,7 @@ consumer 以 `TerminateProcess` 退出时 `request_mask` 会残留，producer �
   的色差；差分支撑里残留的少量“正常画面小区块”是干净像素残差越过阈值，视觉无害。
 
 本轮实机回归以 CP2077 为主；PBZ / Wuchang 沿用 1.3.0 的验证结论，未在本轮重跑。
+屏幕边缘伪影的对照记录在 1.3.1（CP2077 4x/3x、PBZ 3x）；本版没有改动输入对齐，画质继承。
 
 ## 6. 安装 / 升级 / 回滚
 

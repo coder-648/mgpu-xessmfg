@@ -1,5 +1,8 @@
 # lock_frame 1.3.0 发布说明
 
+> 后续 **1.3.1** 已通过 `viewMatrix` 输入对齐解决**屏幕边缘伪影**；人物模型边缘残留
+> 归因 XeFG 模型本身。当前发布见 [`RELEASE_NOTES_1.3.3.md`](RELEASE_NOTES_1.3.3.md)。
+
 ## 状态：DLSS FG 双卡补帧链路完成
 
 1.3.0 的 UI 合成链路已经定稿并通过 **CP2077 / PBZ / Wuchang** 实机验证：

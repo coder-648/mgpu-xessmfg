@@ -60,6 +60,8 @@ present 3840x2160 == window client 3840x2160 (1:1, no stretch)
 
 ## 4. 结论与保留项
 
+- **核心收益：屏幕边缘伪影基本消失**（CP2077 4x/3x、PBZ 3x）；根因是 `viewMatrix`
+  恒为单位阵，以及投影 / near-far / rect / extent 未按游戏真实数据对齐。
 - **保留新默认**：游戏 `view_to_clip` + camera `viewMatrix`（SDK 原生、零成本）；
   `--fg-proj-rz` / `--fg-no-proj` 仅作为 A/B。
 - 仍存在、但本轮有意未做的项：
