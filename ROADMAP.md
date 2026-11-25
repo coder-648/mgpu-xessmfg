@@ -1,7 +1,9 @@
-> **2026-11-14 状态**：游戏侧已改为 `fakerFG.dll` + `xess_mfg_producer.dll`（无 ReShade、
-> 无 add-on），消费端当前是 **`xess_mfg_consumer.exe`**（`bridge.exe` 为 legacy）。
+> **历史状态（2026-11-14）**：游戏侧已改为 `fakerFG.dll` + `xess_mfg_producer.dll`（无 ReShade、
+> 无 add-on），消费端当时是 `xess_mfg_consumer.exe`；当前消费端是 **`lock_frame.exe`**
+> （共享协议 v34，见 `lock_frame/docs/`），`bridge.exe` 为 legacy。
 > 本文件里的条目大量来自 add-on/bridge 时代，**当前 backlog 以
-> [`docs/PROJECT_STATUS_2026-11-14.md`](docs/PROJECT_STATUS_2026-11-14.md) §5 为准**。
+> [`lock_frame/docs/NEXT_ROUND_2026-11-26.md`](lock_frame/docs/NEXT_ROUND_2026-11-26.md)
+> 与 [`docs/PROJECT_STATUS_2026-11-14.md`](docs/PROJECT_STATUS_2026-11-14.md) §5 为准**。
 > 现行链路见 `docs/design/XEFG_CHAIN_STANDARD.md`、`docs/design/CONSUMER_ARCH.md`
 > 与 `docs/design/XESS_MFG_PRODUCER.md`。
 

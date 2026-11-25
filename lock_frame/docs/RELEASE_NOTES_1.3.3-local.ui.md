@@ -35,7 +35,7 @@
 - **UI patch（mode 4）**
   - `UiStats`（默认 60）：synth 的覆盖率/诊断 `InterlockedAdd` 从每帧改成每 N 帧
     （4K、6% 覆盖时约 50 万+13 万次 atomic/帧，读数本来就只按 1 Hz 记录）；
-  - `UiSynthThreshold`（默认 **2**）：P/H 差分支撑阈值，之前是硬编码 8。实测 8 会漏掉
+  - `UiSynthThreshold`（随包 ini **2**，代码兜底仍 8）：P/H 差分支撑阈值，之前是硬编码 8。实测 8 会漏掉
     小 UI 的软边（移动时抖），2 明显更好；干净像素残差约 0.012 码值，所以 2 会把少量
     噪声也收进支撑（视觉无害，只多一点码流）。
 
@@ -49,7 +49,7 @@
 | 键 | 1.3.1 | 1.3.3 |
 |---|---|---|
 | `TransportSlots` | 32（硬编码） | **16** |
-| `UiSynthThreshold` | 8（硬编码） | **2** |
+| `UiSynthThreshold` | 8（硬编码） | **2**（随包 ini；代码兜底 8） |
 | `UiStats` | 每帧 | **每 60 帧** |
 | UI mode 4 边界 | 7×7 盒羽化 | **5×5 hard edge** |
 | LUT 直方图 | 每帧清零 | **每帧衰减 92%** |
@@ -76,5 +76,9 @@
 
 - 把包内 `lock_frame_ui.exe` 放在任意可写目录；UI 会把 `fakerFG.dll` / `xess_mfg_producer.dll`
   等装进游戏目录，并重写 `fakerFG.ini`（原文件有备份）。
+- **从 1.3.1 升级**：`TransportSlots` / `UiSynthThreshold` / `UiStats` 这三个新默认值随包里的
+  `fakerFG.ini` 模板生效。旧部署请点一次「安装 / 应用配置」（或「配置版本 → 精简」）覆盖
+  游戏目录的 `fakerFG.ini`，再重启游戏；只替换 exe/dll 而不重写 ini 时，producer 的代码兜底
+  仍是 `TransportSlots=16` / `UiStats=60`，但 `UiSynthThreshold` 会保持旧值 8（小 UI 仍会抖）。
 - 本次实测部署：`xess_mfg_producer.dll` 需**重启游戏**；`lock_frame.exe` 可随 UI 重启。
 - 回滚：UI → 「还原 / 移除组件」；或恢复 `dxgi.dll.bak` / `nvngx_dlssg_real.dll`。

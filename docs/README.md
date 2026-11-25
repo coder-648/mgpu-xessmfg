@@ -2,23 +2,26 @@
 
 23 篇平铺太乱，所以分三层。**新读者按 0 → 1 → 2 → 3 读，其余按需查。**
 
-## 0. 当前状态（2026-11-14）
+## 0. 当前状态（2026-11-25）
+
+**当前发布：lock_frame 1.3.3-local.ui**（共享协议 **v34**）。先看
+[`../README.md`](../README.md)（项目说明）与
+[`../lock_frame/docs/README.md`](../lock_frame/docs/README.md)（当前技术文档、发布说明、
+审查记录）。本文件第 1–4 节是 0.14 时代的索引，**只作历史参考**。
 
 | 文档 | 内容 |
 |---|---|
-| [`PROJECT_STATUS_2026-11-14.md`](PROJECT_STATUS_2026-11-14.md) | **全仓体检（先看这篇）**：当前真实链路、各组件现状与优化点、文档新鲜度、风险、P0/P1/P2 backlog |
-| [`PROGRESS_2026-11-15.md`](PROGRESS_2026-11-15.md) | **动态逐帧进度与基线确认**：固定倍率实测基线、epoch/out-clock 否决数据、carry 胜出、后续 hold 迭代路线 |
+| [`PROJECT_STATUS_2026-11-14.md`](PROJECT_STATUS_2026-11-14.md) | 全仓体检（**历史快照**）：链路、组件、文档新鲜度、风险、P0/P1/P2 backlog |
+| [`PROGRESS_2026-11-15.md`](PROGRESS_2026-11-15.md) | 动态逐帧进度与基线确认（**历史快照**） |
+| [`HANDOVER_2026-11-15.md`](HANDOVER_2026-11-15.md) | 交接清单（**历史快照**）：现行真值、已过时清单、部署状态、未完成项 |
 
-> **当前链路** = `fakerFG.dll`（游戏进程）→ `xess_mfg_producer.dll`（跨卡传输：颜色 +
-> MV + 深度同一发布）→ `xess_mfg_consumer.exe`（XeFG 上屏），协议 `kSharedVersion = 22`。
-> WGC 已删除；设计见 [`design/COLOUR_TRANSPORT_V22.md`](design/COLOUR_TRANSPORT_V22.md)。
-> `bridge.exe` / `game_capture.addon64` / ReShade 安装器都是 **legacy**。
-> 第 1–2 节的文档已按当前链路重写；旧版说明保留在
-> [`design/archive/`](design/archive/) 与 [`ops/archive/`](ops/archive/)。
-> 仍然以旧链路为主语的专题文档，以 `PROJECT_STATUS` 的 §3 表为准。
-
-**从这里开始**：[`HANDOVER_2026-11-15.md`](HANDOVER_2026-11-15.md) ——
-现行真值 8 份、参考事实、**已过时清单**、部署状态、未完成清单（P0/P1/P2）。
+> **当前链路** = `fakerFG.dll`（游戏进程：DLSSG 输入车道 + XeFG 输出）→
+> `xess_mfg_producer.dll`（跨卡 MV / depth / UI 支撑域 patch，协议 v34）→
+> `lock_frame.exe`（XeFG 上屏；颜色走**同卡 WGC 捕获**）。
+> `bridge.exe` / `game_capture.addon64` / ReShade 安装器 / `xess_mfg_consumer.exe`
+> 都是 **legacy**；旧版说明保留在 [`design/archive/`](design/archive/) 与
+> [`ops/archive/`](ops/archive/)。
+> 下面提到协议 17/22 或“WGC 已删除”的段落均已过时。
 
 ## 1. 先读这些
 

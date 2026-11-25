@@ -11,8 +11,9 @@
 
 ## 版本与维护状态
 
-**正式版 1.3.0**（2026-11-24）· 共享协议 **v34** · GPL-3.0
-（本地验证 **1.3.1-local.camvm**；1.3.2 的 100/100 + 不上采样已因性能成本回退）
+**当前发布 1.3.3-local.ui**（2026-11-25）· 共享协议 **v34** · GPL-3.0
+（上一个公开正式版 **1.3.0**；1.3.2 的 100/100 + 不上采样已因性能成本回退。
+本版说明见 [`RELEASE_NOTES_1.3.3-local.ui.md`](lock_frame/docs/RELEASE_NOTES_1.3.3-local.ui.md)）
 
 - 跨卡只传 **MV / depth / UI 支撑域 patch**（颜色走 WGC 单卡捕获）：
   MV 100% **比特精确**、depth 150%（消费端联合重建到输入画面尺寸）；
@@ -144,6 +145,8 @@ UI 增量 5 pp → 3 pp（sparse UI codec，105% → 103%）。
   干净 HUDless，XeFG 有游戏 UI 时走 mode 5、没有时走 mode 4；`UiPatch=0`（或 UI「UI 合成 → 关闭」）可回退。
   需要游戏在 DLSS-G evaluate 里提供 HUDless；HDR 下要求 R10/HDR10，SDR 标题会自动
   退化（不 tag UI）。已知残差约 3–4%（逐通道 LUT 无法表达交叉通道项）。
+- **4K codec 的映射余量**：默认 `TransportSlots=16`（CP2077 4K 实测映射约 1.0 GB）。
+  出现 `pair: no_slot` 时把游戏目录 `fakerFG.ini` 的 `TransportSlots` 调到 24/32 并重启游戏。
 - 全局扫描（Steam/Epic/GOG/注册表批量导入）暂从界面下线，改为手动添加 exe。
 - 中文重命名依赖输入法提交字符，暂没有 IME 候选浮层。
 - 没有「删除游戏配置」按钮：删掉 `profiles\*.ini` 后重启 UI 即可。

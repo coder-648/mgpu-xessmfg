@@ -16,8 +16,8 @@
   （退出 3 s 后暂停拷贝 + 5 s 保活）；`UiStats` 计数器降频；`UiSynthThreshold` 可配。
 - **UI mode 4**：hard edge 设为默认（`--ui-patch-box-feather` 回退）；LUT 直方图
   时间平滑（`--ui-lut-decay 92`）；`--ui-lut-stride`；`--tag-dump` 增加 alpha/diff。
-- **默认值**：`TransportSlots=16`、`UiSynthThreshold=2`、`UiStats=60`、hard edge on、
-  LUT decay 92%。
+- **默认值（随包 `fakerFG.ini`）**：`TransportSlots=16`、`UiSynthThreshold=2`（代码兜底 8）、
+  `UiStats=60`、hard edge on、LUT decay 92%。
 - 实机（CP2077 4K/40/3x）：`pair exact=40 no_slot=0`、`xN=3.00`、`out 120/120`、
   `wait=0`、`slow/timeouts=0`；UI 重建与呈现画面无可肉眼分辨的色差。
 
@@ -29,7 +29,7 @@
   **每帧、每 UI 像素 2 次 + 每 8×8 一次 4 连发**的 `InterlockedAdd`（4K、6% 覆盖 ≈ 50 万 + 13 万次，
   全部打在固定的几个地址上），而读数只有 1 Hz 一行日志。现在只在每 N 帧写一次
   （`0`=从不，`1`=旧行为），渲染卡稳态少几十万次 atomic。
-- **producer `UiSynthThreshold`（默认 8/255）**：patch 支撑阈值之前是硬编码的，
+- **producer `UiSynthThreshold`（代码兜底 8/255，随包 ini 设 2）**：patch 支撑阈值之前是硬编码的，
   现在可以在 ini 里调。它是"淡边/孤立小 UI 是否进支撑"的旋钮。
 - **consumer `--ui-patch-hard-edge`（默认关）**：把 7×7 盒平均 + smoothstep 的羽化换成
   5×5 max 硬膨胀。盒平均的权重是 1/49 量化的，小 UI 移动时混合强度逐帧变化；
@@ -49,7 +49,7 @@ A/B：`audit_2_3x_keep2x_ui.bat`（基线）→ 改 `UiSynthThreshold=2` 重启�
   和 `tag_XX_diff.bmp`（`|P − H'| × 8`，亮 = H' 仍与呈现画面不同），用来肉眼判断
   消费端 H' 的重建效果。新脚本 `audit_ui_tagdump.bat`（8 帧连续，第 300 帧起）。
 
-
+### local: 槽位复用 / TransportSlots / consumer 判活（B/J/R，2026-11-25，已实机回归）
 
 审查与实测见 `lock_frame/docs/SELF_AUDIT_2026-11-25.md` §3 B、§4 J、§3 R、§9。协议仍 **v34**，
 布局不变；producer 与 consumer 需要一起更新（consumer 只改了会话令牌格式）。
@@ -153,6 +153,8 @@ producer、不改模型与节奏：
 - 实机更正（CP2077）：**4x 的边缘模糊带比 3x 更宽**；3x 仍是默认画质档。3x 输入
   ~38 fps（target 40）会出现 `NOT-EXACT`/pacer hold，但它不是切换到 4x 的理由。
 
+
+### local: 1.3.2（100/100）回退到 1.3.1 已验证二进制（2026-11-25）
 
 1.3.2-local.camvm 把 codec/StreamPercent 全改 100 并默认关闭消费端重建；实机对比后
 **收益不足、性能成本偏高**（depth 从 1704×960 回到 2562×1441：码流 +~8 MB/帧、

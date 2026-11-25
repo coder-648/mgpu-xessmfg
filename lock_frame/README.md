@@ -7,6 +7,11 @@ XeSS-FG 插帧，再叠加回游戏窗口。支持固定 **2x / 3x / 4x**。
 安装时这两个 DLL 会被写入 `<游戏>\fakerFG\`，供游戏进程里的 XeFG 使用
 （1.2.1 修复：此前只放在工具目录，游戏会加载它自带的旧版运行时）。
 
+当前包版本 **1.3.3-local.ui**（共享协议 v34）。producer / fakerFG / consumer / UI
+必须同版本一起更新；替换 `xess_mfg_producer.dll` 后需要重启游戏。
+从旧版升级请点一次 **安装 / 应用配置**，让新的 `fakerFG.ini` 模板
+（`TransportSlots` / `UiSynthThreshold` / `UiStats`）写进游戏目录。
+
 ---
 
 ## 一、解压与启动
@@ -59,14 +64,16 @@ XeSS-FG 插帧，再叠加回游戏窗口。支持固定 **2x / 3x / 4x**。
   它会把本包的 Intel 运行时写进 `<游戏>\fakerFG\`；然后重启游戏。
 - **提示"请先关闭游戏"**：安装/还原会替换 `dxgi.dll`，必须完全退出游戏（含托盘）。
 - **3x/4x 实际只有 2x**：确认 `libxell.dll` 在工具目录；部分游戏只支持 2x。
+- **日志出现 `pair: no_slot`**：4K 下默认 `TransportSlots=16`（映射约 1 GB）。把游戏目录
+  `fakerFG.ini` 的 `TransportSlots` 调到 `24` 或 `32` 后重启游戏；应回到 `pair: exact`。
 - **画面撕裂/菜单点不动**：高级设置里检查 `分层窗口 / 输入转发 / OSD`，或先试 2x。
 - **改了配置没生效**：游戏侧 `fakerFG.ini` 每次进游戏只读一次，改完要重启游戏。
 - **想恢复原样**：点「还原 / 移除组件」（会恢复游戏原来的 `dxgi.dll` / `nvngx_dlssg.dll` /
   `version.dll` 并删除组件；`fakerFG.ini` 保留）。
 - **UI 合成（HUDless）**：**默认开启，固定 mode 4**（producer 支撑域 patch；
   stream 3 / mode 5 关闭）。consumer 只 tag H' 走 mode 4；插值帧的 HUD
-  不再残影。默认用 33³ 3D LUT 对齐 HUDless 与 WGC 的颜色；`UiPatch=0` 可回退
-  （改完需重启游戏）。
+  不再残影。默认用 33³ 3D LUT（逐帧保留 92%，约 12 帧记忆）对齐 HUDless 与 WGC
+  的颜色，patch 边界用 5×5 hard edge；`UiPatch=0` 可回退（改完需重启游戏）。
 - **反馈问题**：运行 `collect_diagnostics.bat`，把 zip 和日志一起提供。
 
 更多排障见 `docs/TROUBLESHOOTING.md`；玩法与原理见 `docs/SUPPORTED-GAMES.md` 与本仓库文档。

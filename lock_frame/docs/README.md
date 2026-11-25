@@ -6,6 +6,10 @@
 | [`UI_CLIENT_PLAN.md`](UI_CLIENT_PLAN.md) | 可视化客户端：易用性分析、简易模式规格、落地状态 |
 | [`RELEASE_NOTES_1.0.0.md`](RELEASE_NOTES_1.0.0.md) | 1.0.0 发布说明 |
 | [`RELEASE_1.0.0.md`](RELEASE_1.0.0.md) | GitHub Release 发布正文（下载/校验/安装/已知限制） |
+| [`RELEASE_NOTES_1.3.0.md`](RELEASE_NOTES_1.3.0.md) | 1.3.0 发布说明（UI 合成 mode 4 定稿，DLSS FG 双卡链路完成） |
+| [`RELEASE_NOTES_1.3.1-local.camvm.md`](RELEASE_NOTES_1.3.1-local.camvm.md) | 1.3.1 本地验证版（XeFG 输入契约：view/proj/rect/extent） |
+| [`RELEASE_NOTES_1.3.2-local.camvm.md`](RELEASE_NOTES_1.3.2-local.camvm.md) | 1.3.2 本地版（100/100，**已回退，勿用**） |
+| [`RELEASE_NOTES_1.3.3-local.ui.md`](RELEASE_NOTES_1.3.3-local.ui.md) | **1.3.3-local.ui 发布说明**（A/C/D/E/F + B/J/R + UI mode 4） |
 | [`RELEASE_PLAN_2026-11-17.md`](RELEASE_PLAN_2026-11-17.md) | 正式版规划、决策记录、实施状态 |
 | [`PRE_RELEASE_20261117.md`](PRE_RELEASE_20261117.md) | 尝鲜版说明（历史） |
 | [`FG_PIPELINE.md`](FG_PIPELINE.md) | fakerFG 输入/输出管线 |
@@ -19,6 +23,5 @@
 | [`NEXT_ROUND_2026-11-26.md`](NEXT_ROUND_2026-11-26.md) | 下一轮回归、未覆盖链路的验证项与禁止项 |
 | [`SELF_AUDIT_2026-11-25.md`](SELF_AUDIT_2026-11-25.md) | **lock_frame 自身链路审查**：consumer/producer 的同步、状态、显存与性能项（A–O） |
 | [`UI_MODE4_2026-11-25.md`](UI_MODE4_2026-11-25.md) | **UI 合成（mode 4）审查**：patch 的渲染卡开销、小 UI 抖动定位与 A/B 步骤 |
-| [`RELEASE_NOTES_1.3.3-local.ui.md`](RELEASE_NOTES_1.3.3-local.ui.md) | 1.3.3-local.ui 发布说明（A/C/D/E/F + B/J/R + UI mode 4） |
 | [`test-configs/pbz_dlssg_lane.ini`](test-configs/pbz_dlssg_lane.ini) | PBZ DLSSG 车道测试配置 |
 | [`archive/LOCK_FRAME_30X4_NOTES.md`](archive/LOCK_FRAME_30X4_NOTES.md) | 30x4 版本的历史设计笔记 |
